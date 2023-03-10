@@ -75,6 +75,7 @@ implicit none ; private
 public shelf_calc_flux, initialize_ice_shelf, ice_shelf_end, ice_shelf_query
 public ice_shelf_save_restart, solo_step_ice_shelf, add_shelf_forces
 public initialize_ice_shelf_fluxes, initialize_ice_shelf_forces
+public point_to_calving
 
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
 ! consistency testing. These are noted in comments with units like Z, H, L, and T, along with
@@ -151,6 +152,8 @@ type, public :: ice_shelf_CS ; private
                             !! will be called (note: GL_regularize and GL_couple
                             !! should be exclusive)
   logical :: calve_to_mask  !< If true, calve any ice that passes outside of a masked area
+  logical  :: calve_ice_shelf_bergs=.false. !< If true, flux through a static ice front is converted
+                                            !!to point bergs
   real :: min_thickness_simple_calve !< min. ice shelf thickness criteria for calving [Z ~> m].
   real :: T0                !< temperature at ocean surface in the restoring region [C ~> degC]
   real :: S0                !< Salinity at ocean surface in the restoring region [S ~> ppt].
@@ -779,7 +782,7 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
 
     ! advect the ice shelf, and advance the front. Calving will be in here somewhere as well..
     ! when we decide on how to do it
-    call update_ice_shelf(CS%dCS, ISS, G, US, time_step, Time, &
+    call update_ice_shelf(CS%dCS, ISS, G, US, time_step, Time, CS%calve_ice_shelf_bergs, &
                           sfc_state%ocean_mass, coupled_GL)
 
   endif
@@ -817,6 +820,24 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
   if (CS%debug) call MOM_forcing_chksum("End of shelf calc flux", fluxes, G, CS%US, haloshift=0)
 
 end subroutine shelf_calc_flux
+
+!> Points the ocean_public_type version of calving/calving_hflx (from ice shelves to ocean) to the
+!! same variables of type ice-shelf state (ISS) type
+subroutine point_to_calving(calving,calving_hflx,IS_mask,CS)
+  real, pointer, dimension(:,:) :: calving
+  real, pointer, dimension(:,:) :: calving_hflx
+  real, pointer, dimension(:,:) :: IS_mask
+  type(ice_shelf_CS),      pointer :: CS        !< A pointer to the control structure returned
+                                                !! by a previous call to initialize_ice_shelf.
+  ! Local variables
+  type(ice_shelf_state), pointer :: ISS => NULL() !< A structure with elements that describe
+                                                  !! the ice-shelf state
+  ISS => CS%ISS
+  calving => ISS%calving
+  calving_hflx => ISS%calving
+  IS_mask => ISS%hmask
+  CS%calve_ice_shelf_bergs=.true.
+end subroutine point_to_calving
 
 !> Changes the thickness (mass) of the ice shelf based on sub-ice-shelf melting
 subroutine change_thickness_using_melt(ISS, G, US, time_step, fluxes, density_ice, debug)
@@ -2234,7 +2255,7 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
     update_ice_vel = ((time_step > min_time_step) .or. (remaining_time > 0.0))
     coupled_GL = .false.
 
-    call update_ice_shelf(CS%dCS, ISS, G, US, time_step, Time, must_update_vel=update_ice_vel)
+    call update_ice_shelf(CS%dCS, ISS, G, US, time_step, Time, CS%calve_ice_shelf_bergs, must_update_vel=update_ice_vel)
 
     call enable_averages(time_step, Time, CS%diag)
     if (CS%id_area_shelf_h > 0) call post_data(CS%id_area_shelf_h, ISS%area_shelf_h, CS%diag)
