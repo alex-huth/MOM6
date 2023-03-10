@@ -682,13 +682,16 @@ end function ice_time_step_CFL
 
 !> This subroutine updates the ice shelf velocities, mass, stresses and properties due to the
 !! ice shelf dynamics.
-subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, ocean_mass, coupled_grounding, must_update_vel)
+subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_bergs, &
+  ocean_mass, coupled_grounding, must_update_vel)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
   type(ice_shelf_state),  intent(inout) :: ISS !< A structure with elements that describe
                                               !! the ice-shelf state
   type(ocean_grid_type),  intent(inout) :: G  !< The grid structure used by the ice shelf.
   type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
   real,                   intent(in)    :: time_step !< time step [T ~> s]
+  logical,                intent(in)    :: calve_ice_shelf_bergs !< To convert ice flux through front
+                                                                 !! to bergs
   type(time_type),        intent(in)    :: Time !< The current model time
   real, dimension(SZDI_(G),SZDJ_(G)), &
                 optional, intent(in)    :: ocean_mass !< If present this is the mass per unit area
@@ -709,7 +712,7 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, ocean_mass, coupled
   coupled_GL = .false.
   if (present(ocean_mass) .and. present(coupled_grounding)) coupled_GL = coupled_grounding
 !
-  call ice_shelf_advect(CS, ISS, G, time_step, Time)
+  call ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
   CS%elapsed_velocity_time = CS%elapsed_velocity_time + time_step
   if (CS%elapsed_velocity_time >= CS%velocity_update_time_step) update_ice_vel = .true.
 
@@ -767,14 +770,15 @@ end subroutine update_ice_shelf
 !> This subroutine takes the velocity (on the Bgrid) and timesteps h_t = - div (uh) once.
 !! Additionally, it will update the volume of ice in partially-filled cells, and update
 !! hmask accordingly
-subroutine ice_shelf_advect(CS, ISS, G, time_step, Time)
+subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
   type(ice_shelf_state),  intent(inout) :: ISS !< A structure with elements that describe
                                                !! the ice-shelf state
   type(ocean_grid_type),  intent(inout) :: G  !< The grid structure used by the ice shelf.
   real,                   intent(in)    :: time_step !< time step [T ~> s]
   type(time_type),        intent(in)    :: Time !< The current model time
-
+  logical,                intent(in)    :: calve_ice_shelf_bergs !< To convert ice flux through front
+                                                                 !! to bergs
 
 ! 3/8/11 DNG
 !
@@ -840,6 +844,21 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time)
     if (CS%calve_to_mask) then
       call calve_to_mask(G, ISS%h_shelf, ISS%area_shelf_h, ISS%hmask, CS%calve_mask)
     endif
+  elseif (calve_ice_shelf_bergs) then
+    !advect the front to create partially-filled cells
+    call shelf_advance_front(CS, ISS, G, ISS%hmask, uh_ice, vh_ice)
+    !add mass of the partially-filled cells to calving field, which is used to initialize icebergs
+    !Then, remove the partially-filled cells from the ice shelf
+    !Note that the ocean_public_type calving and calving_hflx point
+    !to ISS%calving and ISS%calving_hflx, repectively
+    where (ISS%hmask==2)
+      ISS%calving = ISS%calving + &
+        ISS%h_shelf*ISS%area_shelf_h*CS%density_ice/(G%areaT * time_step) !kg/m2s
+      !2009 J/kgC = specific heat capacity of ice from Holland and Jenkins 1999
+      ISS%calving_hflx = ISS%calving_hflx + &
+        2009.0 * ISS%h_shelf*ISS%area_shelf_h*CS%density_ice * abs(CS%t_shelf)/G%areaT  !W/m2
+      ISS%h_shelf = 0.0; ISS%area_shelf_h=0.0; ISS%hmask=0
+    end where
   endif
 
   !call enable_averages(time_step, Time, CS%diag)
