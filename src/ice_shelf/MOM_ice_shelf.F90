@@ -824,9 +824,10 @@ end subroutine shelf_calc_flux
 !> Points the ocean_public_type version of calving/calving_hflx (from ice shelves to ocean) to the
 !! same variables of type ice-shelf state (ISS) type
 subroutine point_to_calving(calving,calving_hflx,IS_mask,CS)
-  real, pointer, dimension(:,:) :: calving
-  real, pointer, dimension(:,:) :: calving_hflx
-  real, pointer, dimension(:,:) :: IS_mask
+  real, pointer, dimension(:,:), intent(inout) :: calving      !< The mass per unit area of the ice shelf
+                                                               !! to convert to bergs [R Z ~> kg m-2].
+  real, pointer, dimension(:,:), intent(inout) :: calving_hflx !< Calving heat flux [Q R Z T-1 ~> W m-2].
+  real, pointer, dimension(:,:), intent(inout) :: IS_mask      !< Ice sheet mask (1=ice sheet, 0=ocean)
   type(ice_shelf_CS),      pointer :: CS        !< A pointer to the control structure returned
                                                 !! by a previous call to initialize_ice_shelf.
   ! Local variables
@@ -1799,7 +1800,8 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, forces_in,
   endif
 
   if (shelf_mass_is_dynamic) &
-    call initialize_ice_shelf_dyn(param_file, Time, ISS, CS%dCS, G, US, CS%diag, new_sim, solo_ice_sheet_in)
+    call initialize_ice_shelf_dyn(param_file, Time, ISS, CS%dCS, G, US, CS%diag, new_sim, CS%Cp_ice, &
+    solo_ice_sheet_in)
 
   call fix_restart_unit_scaling(US, unscaled=.true.)
 
@@ -2051,7 +2053,7 @@ subroutine change_thickness_using_precip(CS, ISS, G, US, fluxes, time_step, Time
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
     if ((ISS%hmask(i,j) == 1) .or. (ISS%hmask(i,j) == 2)) then
 
-      if (-fluxes%shelf_sfc_mass_flux(i,j) * time_step  < ISS%h_shelf(i,j)) then
+      if (-fluxes%shelf_sfc_mass_flux(i,j) * time_step * I_rho_ice  < ISS%h_shelf(i,j)) then
         ISS%h_shelf(i,j) = ISS%h_shelf(i,j) + fluxes%shelf_sfc_mass_flux(i,j) * time_step * I_rho_ice
       else
         ! the ice is about to ablate, so set thickness, area, and mask to zero

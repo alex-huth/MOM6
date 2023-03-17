@@ -247,7 +247,8 @@ subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, wind_stagger, gas
                                               !! in the calculation of additional gas or other
                                               !! tracer fluxes, and can be used to spawn related
                                               !! internal variables in the ice model.
-  logical, optional,   intent(in)    :: calve_ice_shelf_bergs
+  logical, optional,   intent(in)    :: calve_ice_shelf_bergs !< If true, track ice shelf flux through a
+                                              !! static ice shelf, so that it can be converted into icebergs
   ! Local variables
   real :: Rho0        ! The Boussinesq ocean density [R ~> kg m-3]
   real :: G_Earth     ! The gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
