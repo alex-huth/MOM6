@@ -117,6 +117,7 @@ type, public :: ice_shelf_dyn_CS ; private
 
   real :: g_Earth      !< The gravitational acceleration [L2 Z-1 T-2 ~> m s-2].
   real :: density_ice  !< A typical density of ice [R ~> kg m-3].
+  real :: Cp_ice       !< The heat capacity of fresh ice [Q C-1 ~> J kg-1 degC-1].
 
   character(len=40) :: ice_viscosity_compute !< Specifies whether the ice viscosity is computed internally
                                    !! according to Glen's flow law; is constant (for debugging purposes)
@@ -315,7 +316,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
 end subroutine register_ice_shelf_dyn_restarts
 
 !> Initializes shelf model data, parameters and diagnostics
-subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_sim, solo_ice_sheet_in)
+subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_sim, Cp_ice, solo_ice_sheet_in)
   type(param_file_type),   intent(in)    :: param_file !< A structure to parse for run-time parameters
   type(time_type),         intent(inout) :: Time !< The clock that that will indicate the model time
   type(ice_shelf_state),   intent(in)    :: ISS  !< A structure with elements that describe
@@ -326,6 +327,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   type(diag_ctrl), target, intent(in)    :: diag !< A structure that is used to regulate the diagnostic output.
   logical,                 intent(in)    :: new_sim !< If true this is a new simulation, otherwise
                                                  !! has been started from a restart file.
+  real,                    intent(in)    :: Cp_ice !< Heat capacity of ice (J kg-1 K-1)
   logical,       optional, intent(in)    :: solo_ice_sheet_in !< If present, this indicates whether
                                                  !! a solo ice-sheet driver.
 
@@ -455,6 +457,8 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   call get_param(param_file, mdl, "MIN_THICKNESS_SIMPLE_CALVE", CS%min_thickness_simple_calve, &
                  "Min thickness rule for the VERY simple calving law",&
                  units="m", default=0.0, scale=US%m_to_Z)
+  CS%Cp_ice = Cp_ice !Heat capacity of ice (J kg-1 K-1), needed for heat flux of any bergs calved from
+                     !the ice shelf and for ice sheet temperature solver
 
   ! Allocate memory in the ice shelf dynamics control structure that was not
   ! previously allocated for registration for restarts.
@@ -777,8 +781,8 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
   type(ocean_grid_type),  intent(inout) :: G  !< The grid structure used by the ice shelf.
   real,                   intent(in)    :: time_step !< time step [T ~> s]
   type(time_type),        intent(in)    :: Time !< The current model time
-  logical,                intent(in)    :: calve_ice_shelf_bergs !< To convert ice flux through front
-                                                                 !! to bergs
+  logical,                intent(in)    :: calve_ice_shelf_bergs !< If true, track ice shelf flux through a
+                                               !! static ice shelf, so that it can be converted into icebergs
 
 ! 3/8/11 DNG
 !
@@ -854,9 +858,12 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
     where (ISS%hmask==2)
       ISS%calving = ISS%calving + &
         ISS%h_shelf*ISS%area_shelf_h*CS%density_ice/(G%areaT * time_step) !kg/m2s
-      !2009 J/kgC = specific heat capacity of ice from Holland and Jenkins 1999
+      !is this correct (which Cp and T do you use?) See river definition of calving_hflx?
+      !see MOM_forcing_type.F90...why use heat capacity of seawater there.
+      !here, we use Cp_ice of freshwater, and dT is the shelf temperature (maybe should be
+      !shelf temperature - local seawater temperature?)
       ISS%calving_hflx = ISS%calving_hflx + &
-        2009.0 * ISS%h_shelf*ISS%area_shelf_h*CS%density_ice * abs(CS%t_shelf)/G%areaT  !W/m2
+        CS%Cp_ice * ISS%h_shelf*ISS%area_shelf_h*CS%density_ice * abs(CS%t_shelf)/G%areaT  !W/m2
       ISS%h_shelf = 0.0; ISS%area_shelf_h=0.0; ISS%hmask=0
     end where
   endif
