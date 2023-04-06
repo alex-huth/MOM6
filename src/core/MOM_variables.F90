@@ -59,7 +59,8 @@ type, public :: surface
     ocean_heat, &  !< The total heat content of the ocean in [C R Z ~> degC kg m-2].
     ocean_salt, &  !< The total salt content of the ocean in [1e-3 S R Z ~> kgSalt m-2].
     taux_shelf, &  !< The zonal stresses on the ocean under shelves [R L Z T-2 ~> Pa].
-    tauy_shelf     !< The meridional stresses on the ocean under shelves [R L Z T-2 ~> Pa].
+    tauy_shelf, &  !< The meridional stresses on the ocean under shelves [R L Z T-2 ~> Pa].
+    ish            !< Set to a value of 1 if there is fractional ice sheet/shelf coverage, 0 otherwise
   logical :: T_is_conT = .false. !< If true, the temperature variable SST is actually the
                    !! conservative temperature in [C ~> degC].
   logical :: S_is_absS = .false. !< If true, the salinity variable SSS is actually the
@@ -382,6 +383,8 @@ subroutine allocate_surface_state(sfc_state, G, use_temperature, do_integrals, &
   allocate(sfc_state%Hml(isd:ied,jsd:jed), source=0.0)
   allocate(sfc_state%u(IsdB:IedB,jsd:jed), source=0.0)
   allocate(sfc_state%v(isd:ied,JsdB:JedB), source=0.0)
+
+  if (alloc_iceshelves) allocate(sfc_state%ish(isd:ied,jsd:jed), source=0.0)
 
   if (use_melt_potential) then
     allocate(sfc_state%melt_potential(isd:ied,jsd:jed), source=0.0)
