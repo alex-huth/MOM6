@@ -3724,6 +3724,20 @@ subroutine extract_surface_state(CS, sfc_state_in)
     enddo ! end of j loop
   endif   ! melt_potential
 
+  ! Use the fractional shelf area to create a boolean variable which
+  ! can be used to designate cells being potentially ice shelf covered.
+  ! This usage will be subject to change when dynamically evolving ice
+  ! shelf fronts are allowed.
+  if (associated(CS%frac_shelf_h)) then
+    !$OMP parallel do default(shared)
+    do j=js,je ; do I=is-1,ie
+      sfc_state%ish(i,j) = 0.0
+      if (CS%frac_shelf_h(i,j)>0.0) &
+         sfc_state%ish(i,j) = 1.0
+    enddo ; enddo
+  endif
+
+
   if (allocated(sfc_state%taux_shelf) .and. allocated(CS%visc%taux_shelf)) then
     !$OMP parallel do default(shared)
     do j=js,je ; do I=is-1,ie
