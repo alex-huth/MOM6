@@ -47,6 +47,7 @@ public post_data_1d_k
 public safe_alloc_ptr, safe_alloc_alloc
 public enable_averaging, enable_averages, disable_averaging, query_averaging_enabled
 public diag_mediator_init, diag_mediator_end, set_diag_mediator_grid
+public solo_ice_shelf_diag_mediator_end
 public diag_mediator_infrastructure_init
 public diag_mediator_close_registration, get_diag_time_end
 public diag_axis_init, ocean_register_diag, register_static_field
@@ -3646,6 +3647,100 @@ subroutine diag_mediator_end(time, diag_CS, end_diag_manager)
   endif
 
 end subroutine diag_mediator_end
+
+!> A copy of diag_mediator_end, but modified to be called from the ice shelf solo-driver by
+!! removing deallocation of fields that were never allocated
+subroutine solo_ice_shelf_diag_mediator_end(time, diag_CS, end_diag_manager)
+  type(time_type),   intent(in)  :: time !< The current model time
+  type(diag_ctrl), intent(inout) :: diag_CS !< Structure used to regulate diagnostic output
+  logical, optional, intent(in)  :: end_diag_manager !< If true, call diag_manager_end()
+
+  ! Local variables
+  type(diag_type), pointer :: diag, next_diag
+  integer :: i, dl
+
+  if (diag_CS%available_diag_doc_unit > -1) then
+    close(diag_CS%available_diag_doc_unit) ; diag_CS%available_diag_doc_unit = -3
+  endif
+  if (diag_CS%chksum_iounit > -1) then
+    close(diag_CS%chksum_iounit) ; diag_CS%chksum_iounit = -3
+  endif
+
+  do i=1, diag_cs%next_free_diag_id - 1
+    if (associated(diag_cs%diags(i)%next)) then
+      next_diag => diag_cs%diags(i)%next
+      do while (associated(next_diag))
+        diag => next_diag
+        next_diag => diag%next
+        deallocate(diag)
+      enddo
+    endif
+  enddo
+
+  deallocate(diag_cs%diags)
+
+  do i=1, diag_cs%num_diag_coords
+    call diag_remap_end(diag_cs%diag_remap_cs(i))
+  enddo
+
+  call diag_grid_storage_end(diag_cs%diag_grid_temp)
+
+  ! axes_grp masks may point to diag_cs masks, so do these after mask dealloc
+  do i=1, diag_cs%num_diag_coords
+    call axes_grp_end(diag_cs%remap_axesZL(i))
+    call axes_grp_end(diag_cs%remap_axesZi(i))
+    call axes_grp_end(diag_cs%remap_axesTL(i))
+    call axes_grp_end(diag_cs%remap_axesTi(i))
+    call axes_grp_end(diag_cs%remap_axesBL(i))
+    call axes_grp_end(diag_cs%remap_axesBi(i))
+    call axes_grp_end(diag_cs%remap_axesCuL(i))
+    call axes_grp_end(diag_cs%remap_axesCui(i))
+    call axes_grp_end(diag_cs%remap_axesCvL(i))
+    call axes_grp_end(diag_cs%remap_axesCvi(i))
+  enddo
+
+  if (diag_cs%num_diag_coords > 0) then
+    deallocate(diag_cs%remap_axesZL)
+    deallocate(diag_cs%remap_axesZi)
+    deallocate(diag_cs%remap_axesTL)
+    deallocate(diag_cs%remap_axesTi)
+    deallocate(diag_cs%remap_axesBL)
+    deallocate(diag_cs%remap_axesBi)
+    deallocate(diag_cs%remap_axesCuL)
+    deallocate(diag_cs%remap_axesCui)
+    deallocate(diag_cs%remap_axesCvL)
+    deallocate(diag_cs%remap_axesCvi)
+  endif
+
+  do dl=2,MAX_DSAMP_LEV
+    if (allocated(diag_cs%dsamp(dl)%remap_axesTL)) &
+      deallocate(diag_cs%dsamp(dl)%remap_axesTL)
+    if (allocated(diag_cs%dsamp(dl)%remap_axesTi)) &
+      deallocate(diag_cs%dsamp(dl)%remap_axesTi)
+    if (allocated(diag_cs%dsamp(dl)%remap_axesBL)) &
+      deallocate(diag_cs%dsamp(dl)%remap_axesBL)
+    if (allocated(diag_cs%dsamp(dl)%remap_axesBi)) &
+      deallocate(diag_cs%dsamp(dl)%remap_axesBi)
+    if (allocated(diag_cs%dsamp(dl)%remap_axesCuL)) &
+      deallocate(diag_cs%dsamp(dl)%remap_axesCuL)
+    if (allocated(diag_cs%dsamp(dl)%remap_axesCui)) &
+      deallocate(diag_cs%dsamp(dl)%remap_axesCui)
+    if (allocated(diag_cs%dsamp(dl)%remap_axesCvL)) &
+      deallocate(diag_cs%dsamp(dl)%remap_axesCvL)
+    if (allocated(diag_cs%dsamp(dl)%remap_axesCvi)) &
+      deallocate(diag_cs%dsamp(dl)%remap_axesCvi)
+  enddo
+
+
+#if defined(DEBUG) || defined(__DO_SAFETY_CHECKS__)
+  deallocate(diag_cs%h_old)
+#endif
+
+  if (present(end_diag_manager)) then
+    if (end_diag_manager) call MOM_diag_manager_end(time)
+  endif
+
+end subroutine solo_ice_shelf_diag_mediator_end
 
 !> Convert the first n elements (up to 3) of an integer array to an underscore delimited string.
 function i2s(a,n_in)
