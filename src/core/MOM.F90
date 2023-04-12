@@ -3753,7 +3753,7 @@ subroutine extract_surface_state(CS, sfc_state_in)
   ! can be used to designate cells being potentially ice shelf covered.
   ! This usage will be subject to change when dynamically evolving ice
   ! shelf fronts are allowed.
-  if (associated(CS%frac_shelf_h)) then
+  if (associated(CS%frac_shelf_h) .and. allocated(sfc_state%ish)) then
     !$OMP parallel do default(shared)
     do j=js,je ; do I=is-1,ie
       sfc_state%ish(i,j) = 0.0
