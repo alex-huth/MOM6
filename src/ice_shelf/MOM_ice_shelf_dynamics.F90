@@ -54,13 +54,14 @@ type, public :: ice_shelf_dyn_CS ; private
                                        !! not vertices. Will represent boundary conditions on computational boundary
                                        !! (or permanent boundary between fast-moving and near-stagnant ice
                                        !! FOR NOW: 1=interior bdry, 0=no-flow boundary, 2=stress bdry condition,
-                                       !! 3=inhomogeneous Dirichlet boundary for u, 4=flux boundary: at these faces a flux
+                                       !! 3=inhomogeneous Dirichlet boundary for u and v, 4=flux boundary: at these faces a flux
                                        !! will be specified which will override velocities; a homogeneous velocity
                                        !! condition will be specified (this seems to give the solver less difficulty)
-                                       !! 5=inhomogenous Dirichlet boundary for both u and v. 6=inhomogenous Dirichlet
-                                       !! boundary for v
+                                       !! 5=inhomogenous Dirichlet boundary for u only. 6=inhomogenous Dirichlet
+                                       !! boundary for v only
   real, pointer, dimension(:,:) :: v_face_mask => NULL()  !< A mask for velocity boundary conditions on the C-grid
-                                       !! v-face, with valued defined similarly to u_face_mask.
+                                       !! v-face, with valued defined similarly to u_face_mask, but 5 is Dirichlet for v and
+                                       !! 6 is Dirichlet for u
   real, pointer, dimension(:,:) :: u_face_mask_bdry => NULL() !< A duplicate copy of u_face_mask?
   real, pointer, dimension(:,:) :: v_face_mask_bdry => NULL() !< A duplicate copy of v_face_mask?
   real, pointer, dimension(:,:) :: u_flux_bdry_val => NULL() !< The ice volume flux per unit face length into the cell
@@ -539,11 +540,11 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
           if (CS%u_face_mask(I-1,j) == 3) then
             CS%u_shelf(I-1,J-1) = CS%u_bdry_val(I-1,J-1)
             CS%u_shelf(I-1,J) = CS%u_bdry_val(I-1,J)
+            CS%v_shelf(I-1,J-1) = CS%v_bdry_val(I-1,J-1)
+            CS%v_shelf(I-1,J) = CS%v_bdry_val(I-1,J)
           elseif (CS%u_face_mask(I-1,j) == 5) then
             CS%u_shelf(I-1,J-1) = CS%u_bdry_val(I-1,J-1)
             CS%u_shelf(I-1,J) = CS%u_bdry_val(I-1,J)
-            CS%v_shelf(I-1,J-1) = CS%v_bdry_val(I-1,J-1)
-            CS%v_shelf(I-1,J) = CS%v_bdry_val(I-1,J)
           elseif (CS%u_face_mask(I-1,j) == 6) then
             CS%v_shelf(I-1,J-1) = CS%v_bdry_val(I-1,J-1)
             CS%v_shelf(I-1,J) = CS%v_bdry_val(I-1,J)
@@ -553,11 +554,11 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
           if (CS%v_face_mask(i,J-1) == 3) then
             CS%v_shelf(I-1,J-1) = CS%v_bdry_val(I-1,J-1)
             CS%v_shelf(I,J-1) = CS%v_bdry_val(I,J-1)
+            CS%u_shelf(I-1,J-1) = CS%u_bdry_val(I-1,J-1)
+            CS%u_shelf(I,J-1) = CS%u_bdry_val(I,J-1)
           elseif (CS%v_face_mask(i,J-1) == 5) then
             CS%v_shelf(I-1,J-1) = CS%v_bdry_val(I-1,J-1)
             CS%v_shelf(I,J-1) = CS%v_bdry_val(I,J-1)
-            CS%u_shelf(I-1,J-1) = CS%u_bdry_val(I-1,J-1)
-            CS%u_shelf(I,J-1) = CS%u_bdry_val(I,J-1)
           elseif (CS%v_face_mask(i,J-1) == 6) then
             CS%u_shelf(I-1,J-1) = CS%u_bdry_val(I-1,J-1)
             CS%u_shelf(I,J-1) = CS%u_bdry_val(I,J-1)
@@ -2156,7 +2157,7 @@ end subroutine calc_shelf_driving_stress
 
 !       if ((hmask(i,j) == 0) .or. (hmask(i,j) == 1) .or. (hmask(i,j) == 2)) then
 !         if ((i <= iec).and.(i >= isc)) then
-!           if (CS%u_face_mask(I-1,j) == 3) then
+!           if (CS%u_face_mask(I-1,j) == 5) then
 !             CS%u_bdry_val(I-1,J-1) = (1 - ((G%geoLatBu(I-1,J-1) - 0.5*G%len_lat)*2./G%len_lat)**2) * &
 !                   1.5 * input_flux / input_thick
 !             CS%u_bdry_val(I-1,J) = (1 - ((G%geoLatBu(I-1,J) - 0.5*G%len_lat)*2./G%len_lat)**2) * &
@@ -2164,7 +2165,7 @@ end subroutine calc_shelf_driving_stress
 !           endif
 !         endif
 !         if ((j <= jec).and.(j >= jsc)) then
-!           if (CS%v_face_mask(i,J-1) == 3) then
+!           if (CS%v_face_mask(i,J-1) == 5) then
 !             !TODO: do the same for v:
 !             ! CS%v_bdry_val(I-1,J-1) = (1 - ((G%geoLatBu(I-1,J-1) - 0.5*G%len_lat)*2./G%len_lat)**2) * &
 !             !       1.5 * input_flux / input_thick
@@ -2176,13 +2177,13 @@ end subroutine calc_shelf_driving_stress
 
 !       if (.not.(new_sim)) then
 !         if (.not. G%symmetric) then
-!           if (((i+i_off) == (G%domain%nihalo+1)).and.(CS%u_face_mask(I-1,j) == 3)) then
+!           if (((i+i_off) == (G%domain%nihalo+1)).and.(CS%u_face_mask(I-1,j) == 5)) then
 !             CS%u_shelf(I-1,J-1) = CS%u_bdry_val(I-1,J-1)
 !             CS%u_shelf(I-1,J) = CS%u_bdry_val(I-1,J)
 !             !CS%v_shelf(I-1,J-1) = CS%v_bdry_val(I-1,J-1)
 !             !CS%v_shelf(I-1,J) = CS%v_bdry_val(I-1,J)
 !           endif
-!           if (((j+j_off) == (G%domain%njhalo+1)).and.(CS%v_face_mask(i,J-1) == 3)) then
+!           if (((j+j_off) == (G%domain%njhalo+1)).and.(CS%v_face_mask(i,J-1) == 5)) then
 !             !CS%u_shelf(I-1,J-1) = CS%u_bdry_val(I-1,J-1)
 !             !CS%u_shelf(I,J-1) = CS%u_bdry_val(I,J-1)
 !             CS%v_shelf(I-1,J-1) = CS%v_bdry_val(I-1,J-1)
@@ -3250,10 +3251,10 @@ subroutine update_velocity_masks(CS, G, hmask, umask, vmask, u_face_mask, v_face
         do k=0,1
 
           select case (int(CS%u_face_mask_bdry(I-1+k,j)))
-            case (3)
+            case (5)
               umask(I-1+k,J-1:J) = 3.
               u_face_mask(I-1+k,j) = 3.
-            case (5)
+            case (3)
               umask(I-1+k,J-1:J) = 3.
               vmask(I-1+k,J-1:J) = 3.
               u_face_mask(I-1+k,j) = 5.
@@ -3279,10 +3280,10 @@ subroutine update_velocity_masks(CS, G, hmask, umask, vmask, u_face_mask, v_face
         do k=0,1
 
           select case (int(CS%v_face_mask_bdry(i,J-1+k)))
-            case (3)
+            case (5)
               vmask(I-1:I,J-1+k) = 3.
               v_face_mask(i,J-1+k) = 3.
-            case (5)
+            case (3)
               vmask(I-1:I,J-1+k) = 3.
               umask(I-1:I,J-1+k) = 3.
               v_face_mask(i,J-1+k) = 5.
