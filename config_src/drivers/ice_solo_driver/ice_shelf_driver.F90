@@ -129,6 +129,7 @@ program Shelf_main
                                 ! files and +2 (bit 1) for time-stamped files.  A
                                 ! restart file is saved at the end of a run segment
                                 ! unless Restart_control is negative.
+  logical :: save_both_restarts ! To save both time-stamped and non-time-stamped restart files
 
   real            :: Time_unit       ! The time unit for the following input fields [s].
   type(time_type) :: restint         ! The time between saves of the restart file.
@@ -333,6 +334,9 @@ program Shelf_main
                  "(bit 0) for a non-time-stamped file. A non-time-stamped "//&
                  "restart file is saved at the end of the run segment "//&
                  "for any non-negative value.", default=1)
+  call get_param(param_file, mod_name, "SAVE_BOTH_RESTARTS", save_both_restarts, &
+                 "If true, save both a time-stamped and non-time-stamped "//&
+                 "restart file after each restart interval.", default=.false.)
   call get_param(param_file, mod_name, "RESTINT", restint, &
                  "The interval between saves of the restart file in units "//&
                  "of TIMEUNIT.  Use 0 (the default) to not save "//&
@@ -421,11 +425,26 @@ program Shelf_main
 
 !  See if it is time to write out a restart file - timestamped or not.
     if ((permit_incr_restart) .and. (Time + (Time_step_shelf/2) > restart_time)) then
-      if (BTEST(Restart_control,1)) then
+      if (BTEST(Restart_control,1) .or. save_both_restarts) then
         call ice_shelf_save_restart(ice_shelf_CSp, Time, dirs%restart_output_dir, .true.)
       endif
-      if (BTEST(Restart_control,0)) then
+      if (BTEST(Restart_control,0) .or. save_both_restarts) then
         call ice_shelf_save_restart(ice_shelf_CSp, Time, dirs%restart_output_dir)
+
+        ! Write ice shelf solo restart file.
+        if (is_root_pe())then
+          call open_ASCII_file(unit, trim(dirs%restart_output_dir)//'shelf.res')
+          write(unit, '(i6,8x,a)') calendar_type, &
+            '(Calendar: no_calendar=0, thirty_day_months=1, julian=2, gregorian=3, noleap=4)'
+
+          call get_date(Start_time, yr, mon, day, hr, mins, sec)
+          write(unit, '(6i6,8x,a)') yr, mon, day, hr, mins, sec, &
+            'Model start time:   year, month, day, hour, minute, second'
+          call get_date(Time, yr, mon, day, hr, mins, sec)
+          write(unit, '(6i6,8x,a)') yr, mon, day, hr, mins, sec, &
+            'Current model time: year, month, day, hour, minute, second'
+          call close_file(unit)
+        endif
       endif
       restart_time = restart_time + restint
     endif
