@@ -54,14 +54,14 @@ type, public :: ice_shelf_dyn_CS ; private
                                        !! not vertices. Will represent boundary conditions on computational boundary
                                        !! (or permanent boundary between fast-moving and near-stagnant ice
                                        !! FOR NOW: 1=interior bdry, 0=no-flow boundary, 2=stress bdry condition,
-                                       !! 3=inhomogeneous Dirichlet boundary for u and v, 4=flux boundary: at these faces a flux
-                                       !! will be specified which will override velocities; a homogeneous velocity
-                                       !! condition will be specified (this seems to give the solver less difficulty)
-                                       !! 5=inhomogenous Dirichlet boundary for u only. 6=inhomogenous Dirichlet
-                                       !! boundary for v only
+                                       !! 3=inhomogeneous Dirichlet boundary for u and v, 4=flux boundary: at these
+                                       !! faces a flux will be specified which will override velocities; a homogeneous
+                                       !! velocity condition will be specified (this seems to give the solver less
+                                       !! difficulty)  5=inhomogenous Dirichlet boundary for u only. 6=inhomogenous
+                                       !! Dirichlet boundary for v only
   real, pointer, dimension(:,:) :: v_face_mask => NULL()  !< A mask for velocity boundary conditions on the C-grid
-                                       !! v-face, with valued defined similarly to u_face_mask, but 5 is Dirichlet for v and
-                                       !! 6 is Dirichlet for u
+                                       !! v-face, with valued defined similarly to u_face_mask, but 5 is Dirichlet for v
+                                       !! and 6 is Dirichlet for u
   real, pointer, dimension(:,:) :: u_face_mask_bdry => NULL() !< A duplicate copy of u_face_mask?
   real, pointer, dimension(:,:) :: v_face_mask_bdry => NULL() !< A duplicate copy of v_face_mask?
   real, pointer, dimension(:,:) :: u_flux_bdry_val => NULL() !< The ice volume flux per unit face length into the cell
@@ -2772,7 +2772,8 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
         ! Here CS%Aglen_visc(i,j) is the ice viscocity [Pa s-1] computed from obs and read from a file
       elseif (trim(CS%ice_viscosity_compute) == "MODEL") then
 
-        Visc_coef = ( (US%RL2_T2_to_Pa)**(-CS%n_glen)*US%T_to_s )**(-1./CS%n_glen) * (CS%AGlen_visc(i,j))**(-1./CS%n_glen)
+        Visc_coef = ( (US%RL2_T2_to_Pa)**(-CS%n_glen)*US%T_to_s )**(-1./CS%n_glen) * &
+          (CS%AGlen_visc(i,j))**(-1./CS%n_glen)
         ! Units of Aglen_visc [Pa-3 s-1]
 
         ux = u_shlf(I-1,J-1) * PhiC(1,i,j) + &
@@ -2798,9 +2799,10 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
         CS%ice_visc(i,j) = 0.5 * Visc_coef * (G%areaT(i,j) * ISS%h_shelf(i,j)) * &
           (US%s_to_T**2 * (ux**2 + vy**2 + ux*vy + 0.25*(uy+vx)**2 + eps_min**2))**((1.-n_g)/(2.*n_g))
       elseif (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") then
-        !in this case, we will compute viscosity at quadrature points within subroutines CG_action and apply_boundary_values
-        !CS%ice_visc(i,j) will include everything except the effective strain rate term:
-        Visc_coef = ( (US%RL2_T2_to_Pa)**(-CS%n_glen)*US%T_to_s )**(-1./CS%n_glen) * (CS%AGlen_visc(i,j))**(-1./CS%n_glen)
+        !in this case, we will compute viscosity at quadrature points within subroutines CG_action
+        !and apply_boundary_values. CS%ice_visc(i,j) will include everything except the effective strain rate term:
+        Visc_coef = ( (US%RL2_T2_to_Pa)**(-CS%n_glen)*US%T_to_s )**(-1./CS%n_glen) * &
+          (CS%AGlen_visc(i,j))**(-1./CS%n_glen)
         CS%ice_visc(i,j) = 0.5 * Visc_coef * (G%areaT(i,j) * ISS%h_shelf(i,j))
 
         do iq=1,2 ; do jq=1,2
@@ -2825,7 +2827,8 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
                v_shlf(I-1,J) * Phi(6,2*(jq-1)+iq,i,j) + &
                v_shlf(I,J) * Phi(8,2*(jq-1)+iq,i,j)
 
-          CS%Ee(i,j,2*(jq-1)+iq) = (US%s_to_T**2 * (ux**2 + vy**2 + ux*vy + 0.25*(uy+vx)**2 + eps_min**2))**((1.-n_g)/(2.*n_g))
+          CS%Ee(i,j,2*(jq-1)+iq) = &
+            (US%s_to_T**2 * (ux**2 + vy**2 + ux*vy + 0.25*(uy+vx)**2 + eps_min**2))**((1.-n_g)/(2.*n_g))
         enddo; enddo
       endif
     endif
