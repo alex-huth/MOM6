@@ -74,6 +74,7 @@ implicit none ; private
 public shelf_calc_flux, initialize_ice_shelf, ice_shelf_end, ice_shelf_query
 public ice_shelf_save_restart, solo_step_ice_shelf, add_shelf_forces
 public initialize_ice_shelf_fluxes, initialize_ice_shelf_forces
+public point_to_calving
 
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
 ! consistency testing. These are noted in comments with units like Z, H, L, and T, along with
@@ -150,6 +151,8 @@ type, public :: ice_shelf_CS ; private
                             !! will be called (note: GL_regularize and GL_couple
                             !! should be exclusive)
   logical :: calve_to_mask  !< If true, calve any ice that passes outside of a masked area
+  logical  :: calve_ice_shelf_bergs=.false. !< If true, flux through a static ice front is converted
+                                            !!to point bergs
   real :: min_thickness_simple_calve !< min. ice shelf thickness criteria for calving [Z ~> m].
   real :: T0                !< temperature at ocean surface in the restoring region [C ~> degC]
   real :: S0                !< Salinity at ocean surface in the restoring region [S ~> ppt].
@@ -764,7 +767,7 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
 
     ! advect the ice shelf, and advance the front. Calving will be in here somewhere as well..
     ! when we decide on how to do it
-    call update_ice_shelf(CS%dCS, ISS, G, US, time_step, Time, &
+    call update_ice_shelf(CS%dCS, ISS, G, US, time_step, Time, CS%calve_ice_shelf_bergs, &
                           sfc_state%ocean_mass, coupled_GL)
 
   endif
@@ -802,6 +805,25 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
   if (CS%debug) call MOM_forcing_chksum("End of shelf calc flux", fluxes, G, CS%US, haloshift=0)
 
 end subroutine shelf_calc_flux
+
+!> Points the ocean_public_type version of calving/calving_hflx (from ice shelves to ocean) to the
+!! same variables of type ice-shelf state (ISS) type
+subroutine point_to_calving(calving,calving_hflx,IS_mask,CS)
+  real, pointer, dimension(:,:), intent(inout) :: calving      !< The mass per unit area of the ice shelf
+                                                               !! to convert to bergs [R Z ~> kg m-2].
+  real, pointer, dimension(:,:), intent(inout) :: calving_hflx !< Calving heat flux [Q R Z T-1 ~> W m-2].
+  real, pointer, dimension(:,:), intent(inout) :: IS_mask      !< Ice sheet mask (1=ice sheet, 0=ocean)
+  type(ice_shelf_CS),      pointer :: CS        !< A pointer to the control structure returned
+                                                !! by a previous call to initialize_ice_shelf.
+  ! Local variables
+  type(ice_shelf_state), pointer :: ISS => NULL() !< A structure with elements that describe
+                                                  !! the ice-shelf state
+  ISS => CS%ISS
+  calving => ISS%calving
+  calving_hflx => ISS%calving
+  IS_mask => ISS%hmask
+  CS%calve_ice_shelf_bergs=.true.
+end subroutine point_to_calving
 
 !> Changes the thickness (mass) of the ice shelf based on sub-ice-shelf melting
 subroutine change_thickness_using_melt(ISS, G, US, time_step, fluxes, density_ice, debug)
@@ -1780,7 +1802,8 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, forces_in,
   endif
 
   if (shelf_mass_is_dynamic) &
-    call initialize_ice_shelf_dyn(param_file, Time, ISS, CS%dCS, G, US, CS%diag, new_sim, solo_ice_sheet_in)
+    call initialize_ice_shelf_dyn(param_file, Time, ISS, CS%dCS, G, US, CS%diag, new_sim, CS%Cp_ice, &
+    solo_ice_sheet_in)
 
   call fix_restart_unit_scaling(US, unscaled=.true.)
 
@@ -1874,7 +1897,8 @@ subroutine initialize_ice_shelf_fluxes(CS, ocn_grid, US, fluxes_in)
          press=.true., water=CS%isthermo, heat=CS%isthermo, shelf_sfc_accumulation = CS%active_shelf_dynamics)
   else
     call MOM_mesg("MOM_ice_shelf.F90, initialize_ice_shelf: allocating fluxes in solo mode.")
-    call allocate_forcing_type(CS%Grid_in, fluxes_in, ustar=.true., shelf=.true., press=.true.)
+    call allocate_forcing_type(CS%Grid_in, fluxes_in, ustar=.true., shelf=.true., press=.true., &
+      shelf_sfc_accumulation = CS%active_shelf_dynamics)
   endif
   if (CS%rotate_index) then
     allocate(fluxes)
@@ -2032,7 +2056,7 @@ subroutine change_thickness_using_precip(CS, ISS, G, US, fluxes, time_step, Time
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
     if ((ISS%hmask(i,j) == 1) .or. (ISS%hmask(i,j) == 2)) then
 
-      if (-fluxes%shelf_sfc_mass_flux(i,j) * time_step  < ISS%h_shelf(i,j)) then
+      if (-fluxes%shelf_sfc_mass_flux(i,j) * time_step * I_rho_ice  < ISS%h_shelf(i,j)) then
         ISS%h_shelf(i,j) = ISS%h_shelf(i,j) + fluxes%shelf_sfc_mass_flux(i,j) * time_step * I_rho_ice
       else
         ! the ice is about to ablate, so set thickness, area, and mask to zero
@@ -2179,19 +2203,22 @@ subroutine ice_shelf_end(CS)
 end subroutine ice_shelf_end
 
 !> This routine is for stepping a stand-alone ice shelf model without an ocean.
-subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in)
+subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in, fluxes_in)
   type(ice_shelf_CS), pointer    :: CS      !< A pointer to the ice shelf control structure
   type(time_type), intent(in)    :: time_interval !< The time interval for this update [s].
   integer,         intent(inout) :: nsteps  !< The running number of ice shelf steps.
   type(time_type), intent(inout) :: Time    !< The current model time
   real,  optional, intent(in)    :: min_time_step_in !< The minimum permitted time step [T ~> s].
-
+  type(forcing),      optional, target, intent(inout) :: fluxes_in !< A structure containing pointers to any
+                                                         !!  possible thermodynamic or mass-flux forcing fields.
   type(ocean_grid_type), pointer :: G => NULL()  ! A pointer to the ocean's grid structure
   type(unit_scale_type), pointer :: US => NULL() ! Pointer to a structure containing
                                                  ! various unit conversion factors
   type(ice_shelf_state), pointer :: ISS => NULL() !< A structure with elements that describe
                                           !! the ice-shelf state
+  !type(time_type) :: TimeInt ! The internal time during this call
   real :: remaining_time    ! The remaining time in this call [T ~> s]
+  !real :: time1             ! The time at the end of this call
   real :: time_step         ! The internal time step during this call [T ~> s]
   real :: min_time_step     ! The minimal required timestep that would indicate a fatal problem [T ~> s]
   character(len=240) :: mesg
@@ -2199,6 +2226,7 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
   logical :: coupled_GL     ! If true the grounding line position is determined based on
                             ! coupled ice-ocean dynamics.
   integer :: is, iec, js, jec
+  logical :: override
 
   G => CS%grid
   US => CS%US
@@ -2206,6 +2234,9 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
   is = G%isc ; iec = G%iec ; js = G%jsc ; jec = G%jec
 
   remaining_time = US%s_to_T*time_type_to_real(time_interval)
+
+  !Time at the end of the call (must be real)
+  !time1 = US%s_to_T*(time_type_to_real(time_interval) + time_type_to_real(Time))
 
   if (present (min_time_step_in)) then
     min_time_step = min_time_step_in
@@ -2229,6 +2260,16 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
       call MOM_mesg("solo_step_ice_shelf: "//mesg, 5)
     endif
 
+    ! if (CS%data_override_shelf_fluxes) then
+    !   !data override only works for mosaics.
+    !   Current time used to read in the surface mass flux
+    !   TimeInt = real_to_time(US%T_to_s*(time1 - remaining_time))
+    !   call data_override(G%Domain, 'shelf_sfc_mass_flux', fluxes_in%shelf_sfc_mass_flux, &
+    !     TimeInt, scale=US%kg_m2s_to_RZ_T, override=override)
+    ! endif
+
+    call change_thickness_using_precip(CS, ISS, G, US, fluxes_in, time_step, Time)
+
     remaining_time = remaining_time - time_step
 
     ! If the last mini-timestep is a day or less, we cannot expect velocities to change by much.
@@ -2236,7 +2277,7 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
     update_ice_vel = ((time_step > min_time_step) .or. (remaining_time > 0.0))
     coupled_GL = .false.
 
-    call update_ice_shelf(CS%dCS, ISS, G, US, time_step, Time, must_update_vel=update_ice_vel)
+    call update_ice_shelf(CS%dCS, ISS, G, US, time_step, Time, CS%calve_ice_shelf_bergs, must_update_vel=update_ice_vel)
 
     call enable_averages(time_step, Time, CS%diag)
     if (CS%id_area_shelf_h > 0) call post_data(CS%id_area_shelf_h, ISS%area_shelf_h, CS%diag)

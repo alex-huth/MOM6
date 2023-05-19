@@ -179,6 +179,7 @@ type, public :: ice_ocean_boundary_type
   real, pointer, dimension(:,:) :: sw_flux_nir_dif =>NULL() !< diffuse Near InfraRed sw radiation [W m-2]
   real, pointer, dimension(:,:) :: lprec           =>NULL() !< mass flux of liquid precip [kg m-2 s-1]
   real, pointer, dimension(:,:) :: fprec           =>NULL() !< mass flux of frozen precip [kg m-2 s-1]
+  real, pointer, dimension(:,:) :: fprec_IS        =>NULL() !< mass flux of frozen precip on the ice sheet [kg m-2 s-1]
   real, pointer, dimension(:,:) :: runoff          =>NULL() !< mass flux of liquid runoff [kg m-2 s-1]
   real, pointer, dimension(:,:) :: calving         =>NULL() !< mass flux of frozen runoff [kg m-2 s-1]
   real, pointer, dimension(:,:) :: stress_mag      =>NULL() !< The time-mean magnitude of the stress on the ocean [Pa]
@@ -435,6 +436,12 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
       fluxes%fprec(i,j) = kg_m2_s_conversion * IOB%fprec(i-i0,j-j0) * G%mask2dT(i,j)
       if (CS%check_no_land_fluxes) &
         call check_mask_val_consistency(IOB%fprec(i-i0,j-j0), G%mask2dT(i,j), i, j, 'fprec', G)
+    endif
+
+    !fprec on ice sheet
+    if (associated(IOB%fprec_IS)) then
+      if (associated(fluxes%shelf_sfc_mass_flux)) &
+        fluxes%shelf_sfc_mass_flux(i,j) = kg_m2_s_conversion * IOB%fprec_IS(i-i0,j-j0)
     endif
 
     if (associated(IOB%q_flux)) then

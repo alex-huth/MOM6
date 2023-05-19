@@ -55,6 +55,7 @@ use MOM_verticalGrid, only : verticalGrid_type
 use MOM_ice_shelf, only : initialize_ice_shelf, shelf_calc_flux, ice_shelf_CS
 use MOM_ice_shelf, only : initialize_ice_shelf_fluxes, initialize_ice_shelf_forces
 use MOM_ice_shelf, only : add_shelf_forces, ice_shelf_end, ice_shelf_save_restart
+use MOM_ice_shelf, only : point_to_calving
 use MOM_wave_interface, only: wave_parameters_CS, MOM_wave_interface_init
 use MOM_wave_interface, only: Update_Surface_Waves
 use iso_fortran_env, only : int64
@@ -122,7 +123,13 @@ type, public ::  ocean_public_type
                         !! formation in the ocean.
     melt_potential => NULL(), & !< Instantaneous heat used to melt sea ice [J m-2].
     OBLD => NULL(),   & !< Ocean boundary layer depth [m].
-    area => NULL()      !< cell area of the ocean surface [m2].
+    area => NULL(),   & !< cell area of the ocean surface [m2].
+    calving=> NULL(), &   !< The mass per unit area of the ice shelf to convert to
+                          !!bergs [R Z ~> kg m-2].
+    calving_hflx=> NULL(),& !< Calving heat flux [Q R Z T-1 ~> W m-2].
+    IS_mask=> NULL()        !< 1: fully-covered by ice sheet, 2: partial coverage, 0: no ice
+                            !! 3: bdry condition on thickness set (not in computational domain),
+                            !! -2: out of computational domain and not = 3
   type(coupler_2d_bc_type) :: fields    !< A structure that may contain named
                                         !! arrays of tracer-related surface fields.
   integer                  :: avg_kount !< A count of contributions to running
@@ -225,7 +232,7 @@ contains
 !!   This subroutine initializes both the ocean state and the ocean surface type.
 !! Because of the way that indices and domains are handled, Ocean_sfc must have
 !! been used in a previous call to initialize_ocean_type.
-subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, wind_stagger, gas_fields_ocn)
+subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, wind_stagger, gas_fields_ocn, calve_ice_shelf_bergs)
   type(ocean_public_type), target, &
                        intent(inout) :: Ocean_sfc !< A structure containing various publicly
                                 !! visible ocean surface properties after initialization,
@@ -243,6 +250,8 @@ subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, wind_stagger, gas
                                               !! in the calculation of additional gas or other
                                               !! tracer fluxes, and can be used to spawn related
                                               !! internal variables in the ice model.
+  logical, optional,   intent(in)    :: calve_ice_shelf_bergs !< If true, track ice shelf flux through a
+                                              !! static ice shelf, so that it can be converted into icebergs
   ! Local variables
   real :: Rho0        ! The Boussinesq ocean density [R ~> kg m-3]
   real :: G_Earth     ! The gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
@@ -408,6 +417,12 @@ subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, wind_stagger, gas
 
     call convert_state_to_ocean_type(OS%sfc_state, Ocean_sfc, OS%grid, OS%US)
 
+  endif
+
+  if (present(calve_ice_shelf_bergs)) then
+    if (calve_ice_shelf_bergs) then
+      call point_to_calving(Ocean_sfc%calving,Ocean_sfc%calving_hflx,Ocean_sfc%IS_mask,OS%Ice_shelf_CSp)
+    endif
   endif
 
   call close_param_file(param_file)
