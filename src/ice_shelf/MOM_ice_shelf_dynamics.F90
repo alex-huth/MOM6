@@ -3256,11 +3256,11 @@ subroutine update_velocity_masks(CS, G, hmask, umask, vmask, u_face_mask, v_face
           select case (int(CS%u_face_mask_bdry(I-1+k,j)))
             case (5)
               umask(I-1+k,J-1:J) = 3.
-              u_face_mask(I-1+k,j) = 3.
+              u_face_mask(I-1+k,j) = 5.
             case (3)
               umask(I-1+k,J-1:J) = 3.
               vmask(I-1+k,J-1:J) = 3.
-              u_face_mask(I-1+k,j) = 5.
+              u_face_mask(I-1+k,j) = 3.
             case (6)
               vmask(I-1+k,J-1:J) = 3.
               u_face_mask(I-1+k,j) = 6.
@@ -3285,11 +3285,11 @@ subroutine update_velocity_masks(CS, G, hmask, umask, vmask, u_face_mask, v_face
           select case (int(CS%v_face_mask_bdry(i,J-1+k)))
             case (5)
               vmask(I-1:I,J-1+k) = 3.
-              v_face_mask(i,J-1+k) = 3.
+              v_face_mask(i,J-1+k) = 5.
             case (3)
               vmask(I-1:I,J-1+k) = 3.
               umask(I-1:I,J-1+k) = 3.
-              v_face_mask(i,J-1+k) = 5.
+              v_face_mask(i,J-1+k) = 3.
             case (6)
               umask(I-1:I,J-1+k) = 3.
               v_face_mask(i,J-1+k) = 6.

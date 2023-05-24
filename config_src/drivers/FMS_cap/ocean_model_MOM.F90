@@ -118,7 +118,6 @@ type, public ::  ocean_public_type
     v_surf => NULL(), & !< j-velocity at the locations indicated by stagger [m s-1].
     sea_lev => NULL(), & !< Sea level in m after correction for surface pressure,
                          !! i.e. dzt(1) + eta_t + patm/rho0/grav [m]
-    ish => NULL(), &     !< Set to a value of 1 if the grid cell is under and ice shelf/sheet.
     frazil =>NULL(), &  !< Accumulated heating [J m-2] from frazil
                         !! formation in the ocean.
     melt_potential => NULL(), & !< Instantaneous heat used to melt sea ice [J m-2].
@@ -809,7 +808,6 @@ subroutine initialize_ocean_public_type(input_domain, Ocean_sfc, diag, gas_field
              Ocean_sfc%u_surf (isc:iec,jsc:jec), &
              Ocean_sfc%v_surf (isc:iec,jsc:jec), &
              Ocean_sfc%sea_lev(isc:iec,jsc:jec), &
-             Ocean_sfc%ish(isc:iec,jsc:jec),     &
              Ocean_sfc%area   (isc:iec,jsc:jec), &
              Ocean_sfc%melt_potential(isc:iec,jsc:jec), &
              Ocean_sfc%OBLD   (isc:iec,jsc:jec), &
@@ -903,12 +901,6 @@ subroutine convert_state_to_ocean_type(sfc_state, Ocean_sfc, G, US, patm, press_
   if (allocated(sfc_state%frazil)) then
     do j=jsc_bnd,jec_bnd ; do i=isc_bnd,iec_bnd
       Ocean_sfc%frazil(i,j) = US%Q_to_J_kg*US%RZ_to_kg_m2 * sfc_state%frazil(i+i0,j+j0)
-    enddo ; enddo
-  endif
-
-  if (allocated(sfc_state%ish)) then
-    do j=jsc_bnd,jec_bnd ; do i=isc_bnd,iec_bnd
-      Ocean_sfc%ish(i,j) = sfc_state%ish(i+i0,j+j0)
     enddo ; enddo
   endif
 
