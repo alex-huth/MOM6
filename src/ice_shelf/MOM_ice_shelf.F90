@@ -835,7 +835,7 @@ subroutine point_to_calving(calving,calving_hflx,IS_mask,CS)
                                                   !! the ice-shelf state
   ISS => CS%ISS
   calving => ISS%calving
-  calving_hflx => ISS%calving
+  calving_hflx => ISS%calving_hflx
   IS_mask => ISS%hmask
   CS%calve_ice_shelf_bergs=.true.
 end subroutine point_to_calving
