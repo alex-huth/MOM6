@@ -287,7 +287,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate( CS%ground_frac(isd:ied,jsd:jed), source=0.0 )
     allocate( CS%taudx_shelf(IsdB:IedB,JsdB:JedB), source=0.0 )
     allocate( CS%taudy_shelf(IsdB:IedB,JsdB:JedB), source=0.0 )
-    allocate( CS%bed_elev(isd:ied,jsd:jed) ) ; CS%bed_elev(:,:) = G%bathyT(:,:) + G%Z_ref
+    allocate( CS%bed_elev(isd:ied,jsd:jed), source=0.0 )! ; CS%bed_elev(:,:) = G%bathyT(:,:) + G%Z_ref
     allocate( CS%u_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0 )
     allocate( CS%v_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0 )
     allocate( CS%u_face_mask_bdry(IsdB:IedB,JsdB:JedB), source=-2.0 )
@@ -321,6 +321,8 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
                                 "ice-stiffness parameter", "Pa-3 s-1")
     call register_restart_field(CS%h_bdry_val, "h_bdry_val", .false., restart_CS, &
                                 "ice thickness at the boundary", "m", conversion=US%Z_to_m)
+    call register_restart_field(CS%bed_elev, "bed elevation", .true., restart_CS, &
+                                "bed elevation", "m", conversion=US%Z_to_m)
   endif
 
 end subroutine register_ice_shelf_dyn_restarts
@@ -509,6 +511,22 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
 
   ! Take additional initialization steps, for example of dependent variables.
   if (active_shelf_dynamics .and. .not.new_sim) then
+    if ((US%m_to_Z_restart /= 0.0) .and. (US%m_to_Z_restart /= 1.0)) then
+      Z_rescale = 1.0 / US%m_to_Z_restart
+      do j=G%jsc,G%jec ; do i=G%isc,G%iec
+        CS%OD_av(i,j) = Z_rescale * CS%OD_av(i,j)
+        CS%bed_elev(i,j) = Z_rescale * CS%bed_elev(i,j)
+      enddo ; enddo
+    endif
+
+    if ((US%m_to_L_restart*US%s_to_T_restart /= 0.0) .and. &
+        (US%m_to_L_restart /= US%s_to_T_restart)) then
+      vel_rescale = US%s_to_T_restart / US%m_to_L_restart
+      do J=G%jsc-1,G%jec ; do I=G%isc-1,G%iec
+        CS%u_shelf(I,J) = vel_rescale * CS%u_shelf(I,J)
+        CS%v_shelf(I,J) = vel_rescale * CS%v_shelf(I,J)
+      enddo ; enddo
+    endif
 
     ! this is unfortunately necessary; if grid is not symmetric the boundary values
     !  of u and v are otherwise not set till the end of the first linear solve, and so
@@ -606,6 +624,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       call initialize_ice_flow_from_file(CS%bed_elev,CS%u_shelf, CS%v_shelf, CS%ground_frac, &
                   G, US, param_file)
       call pass_vector(CS%u_shelf, CS%v_shelf, G%domain, TO_ALL, BGRID_NE)
+      call pass_var(CS%ground_frac,G%domain)
       call pass_var(CS%bed_elev, G%domain,CENTER)
       call update_velocity_masks(CS, G, ISS%hmask, CS%umask, CS%vmask, CS%u_face_mask, CS%v_face_mask)
     endif
