@@ -287,7 +287,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate( CS%ground_frac(isd:ied,jsd:jed), source=0.0 )
     allocate( CS%taudx_shelf(IsdB:IedB,JsdB:JedB), source=0.0 )
     allocate( CS%taudy_shelf(IsdB:IedB,JsdB:JedB), source=0.0 )
-    allocate( CS%bed_elev(isd:ied,jsd:jed) ) ; CS%bed_elev(:,:) = G%bathyT(:,:) + G%Z_ref
+    allocate( CS%bed_elev(isd:ied,jsd:jed), source=0.0 )! ; CS%bed_elev(:,:) = G%bathyT(:,:) + G%Z_ref
     allocate( CS%u_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0 )
     allocate( CS%v_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0 )
     allocate( CS%u_face_mask_bdry(IsdB:IedB,JsdB:JedB), source=-2.0 )
@@ -321,6 +321,8 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
                                 "ice-stiffness parameter", "Pa-3 s-1")
     call register_restart_field(CS%h_bdry_val, "h_bdry_val", .false., restart_CS, &
                                 "ice thickness at the boundary", "m", conversion=US%Z_to_m)
+    call register_restart_field(CS%bed_elev, "bed elevation", .true., restart_CS, &
+                                "bed elevation", "m", conversion=US%Z_to_m)
   endif
 
 end subroutine register_ice_shelf_dyn_restarts
@@ -517,6 +519,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       Z_rescale = 1.0 / US%m_to_Z_restart
       do j=G%jsc,G%jec ; do i=G%isc,G%iec
         CS%OD_av(i,j) = Z_rescale * CS%OD_av(i,j)
+        CS%bed_elev(i,j) = Z_rescale * CS%bed_elev(i,j)
       enddo ; enddo
     endif
 
@@ -625,6 +628,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       call initialize_ice_flow_from_file(CS%bed_elev,CS%u_shelf, CS%v_shelf, CS%ground_frac, &
                   G, US, param_file)
       call pass_vector(CS%u_shelf, CS%v_shelf, G%domain, TO_ALL, BGRID_NE)
+      call pass_var(CS%ground_frac,G%domain)
       call pass_var(CS%bed_elev, G%domain,CENTER)
       call update_velocity_masks(CS, G, ISS%hmask, CS%umask, CS%vmask, CS%u_face_mask, CS%v_face_mask)
     endif

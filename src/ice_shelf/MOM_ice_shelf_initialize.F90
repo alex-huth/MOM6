@@ -454,7 +454,7 @@ subroutine initialize_ice_flow_from_file(bed_elev,u_shelf, v_shelf,float_cond,&
   call MOM_read_data(filename, trim(floatfr_varname), float_cond, G%Domain, scale=1.)
 
   filename = trim(inputdir)//trim(bed_topo_file)
-  call MOM_read_data(filename,trim(bed_varname), bed_elev, G%Domain, scale=1.0)
+  call MOM_read_data(filename,trim(bed_varname), bed_elev, G%Domain, scale=US%m_to_Z)
 
 
 end subroutine initialize_ice_flow_from_file
