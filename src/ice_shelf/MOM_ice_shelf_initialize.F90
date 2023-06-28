@@ -438,6 +438,9 @@ subroutine initialize_ice_flow_from_file(bed_elev,u_shelf, v_shelf,float_cond,&
   call get_param(PF, mdl, "ICE_VISC_VARNAME", ice_visc_varname, &
                  "The name of the ice viscosity variable in ICE_VELOCITY_FILE.", &
                  default="viscosity")
+  call get_param(PF, mdl, "ICE_FLOAT_FRAC_VARNAME", floatfr_varname, &
+                 "The name of the ice float fraction (grounding fraction) variable in ICE_VELOCITY_FILE.", &
+                 default="float_frac")
   call get_param(PF, mdl, "BED_TOPO_FILE", bed_topo_file, &
                  "The file from which the bed elevation is read.", &
                  default="ice_shelf_vel.nc")
@@ -446,8 +449,6 @@ subroutine initialize_ice_flow_from_file(bed_elev,u_shelf, v_shelf,float_cond,&
                  default="depth")
   if (.not.file_exists(filename, G%Domain)) call MOM_error(FATAL, &
        " initialize_ice_shelf_velocity_from_file: Unable to open "//trim(filename))
-
-  floatfr_varname = "float_frac"
 
   call MOM_read_data(filename, trim(ushelf_varname), u_shelf, G%Domain, position=CORNER, scale=US%m_s_to_L_T)
   call MOM_read_data(filename, trim(vshelf_varname), v_shelf, G%Domain, position=CORNER, scale=US%m_s_to_L_T)
