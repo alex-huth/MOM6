@@ -660,11 +660,11 @@ subroutine initialize_ice_AGlen(AGlen, G, US, PF)
   endif
 end subroutine initialize_ice_AGlen
 
-!> Initialize ice surface mass balance parameter. For stand-alone ice sheet modeling without an ocean.
+!> Initialize ice surface mass balance field that is held constant over time
 subroutine initialize_ice_SMB(SMB, G, US, PF)
   type(ocean_grid_type), intent(in)    :: G    !< The ocean's grid structure
   real, dimension(SZDI_(G),SZDJ_(G)), &
-                         intent(inout) :: SMB !< Ice surface mass balance parameter, often in [kg m-2 s-1
+                         intent(inout) :: SMB !< Ice surface mass balance parameter, often in [kg m-2 s-1]
   type(unit_scale_type), intent(in)    :: US !< A structure containing unit conversion factors
   type(param_file_type), intent(in)    :: PF !< A structure to parse for run-time parameters
 
