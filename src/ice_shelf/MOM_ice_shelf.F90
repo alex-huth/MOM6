@@ -2069,10 +2069,10 @@ subroutine change_thickness_using_precip(CS, ISS, G, US, fluxes, time_step, Time
     endif
   enddo ; enddo
 
-  call pass_var(ISS%area_shelf_h, G%domain, complete=.false.)
-  call pass_var(ISS%h_shelf, G%domain, complete=.false.)
-  call pass_var(ISS%hmask, G%domain, complete=.false.)
-  call pass_var(ISS%mass_shelf, G%domain, complete=.true.)
+  call pass_var(ISS%area_shelf_h, G%domain)!, complete=.false.)
+  call pass_var(ISS%h_shelf, G%domain)!, complete=.false.)
+  call pass_var(ISS%hmask, G%domain)!, complete=.false.)
+  call pass_var(ISS%mass_shelf, G%domain)!, complete=.true.)
 
 end subroutine change_thickness_using_precip
 
@@ -2220,6 +2220,7 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
   real :: remaining_time    ! The remaining time in this call [T ~> s]
   !real :: time1             ! The time at the end of this call
   real :: time_step         ! The internal time step during this call [T ~> s]
+  real :: full_time_step    ! The external time step (sum of internal time steps) during this call [T ~> s]
   real :: min_time_step     ! The minimal required timestep that would indicate a fatal problem [T ~> s]
   character(len=240) :: mesg
   logical :: update_ice_vel ! If true, it is time to update the ice shelf velocities.
@@ -2234,6 +2235,7 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
   is = G%isc ; iec = G%iec ; js = G%jsc ; jec = G%jec
 
   remaining_time = US%s_to_T*time_type_to_real(time_interval)
+  full_time_step = remaining_time
 
   !Time at the end of the call (must be real)
   !time1 = US%s_to_T*(time_type_to_real(time_interval) + time_type_to_real(Time))
@@ -2279,13 +2281,13 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
 
     call update_ice_shelf(CS%dCS, ISS, G, US, time_step, Time, CS%calve_ice_shelf_bergs, must_update_vel=update_ice_vel)
 
-    call enable_averages(time_step, Time, CS%diag)
+  enddo
+
+  call enable_averages(full_time_step, Time, CS%diag)
     if (CS%id_area_shelf_h > 0) call post_data(CS%id_area_shelf_h, ISS%area_shelf_h, CS%diag)
     if (CS%id_h_shelf > 0) call post_data(CS%id_h_shelf, ISS%h_shelf, CS%diag)
     if (CS%id_h_mask > 0) call post_data(CS%id_h_mask, ISS%hmask, CS%diag)
-    call disable_averaging(CS%diag)
-
-  enddo
+  call disable_averaging(CS%diag)
 
 end subroutine solo_step_ice_shelf
 
