@@ -55,7 +55,7 @@ use MOM_verticalGrid, only : verticalGrid_type
 use MOM_ice_shelf, only : initialize_ice_shelf, shelf_calc_flux, ice_shelf_CS
 use MOM_ice_shelf, only : initialize_ice_shelf_fluxes, initialize_ice_shelf_forces
 use MOM_ice_shelf, only : add_shelf_forces, ice_shelf_end, ice_shelf_save_restart
-use MOM_ice_shelf, only : point_to_calving
+use MOM_ice_shelf, only : ice_sheet_calving_to_ocean_sfc
 use MOM_wave_interface, only: wave_parameters_CS, MOM_wave_interface_init
 use MOM_wave_interface, only: Update_Surface_Waves
 use iso_fortran_env, only : int64
@@ -126,9 +126,7 @@ type, public ::  ocean_public_type
     calving=> NULL(), &   !< The mass per unit area of the ice shelf to convert to
                           !!bergs [R Z ~> kg m-2].
     calving_hflx=> NULL(),& !< Calving heat flux [Q R Z T-1 ~> W m-2].
-    IS_mask=> NULL()        !< 1: fully-covered by ice sheet, 2: partial coverage, 0: no ice
-                            !! 3: bdry condition on thickness set (not in computational domain),
-                            !! -2: out of computational domain and not = 3
+    IS_mask=> NULL()        !< 0: ice sheet, 1: ocean
   type(coupler_2d_bc_type) :: fields    !< A structure that may contain named
                                         !! arrays of tracer-related surface fields.
   integer                  :: avg_kount !< A count of contributions to running
@@ -162,6 +160,8 @@ type, public :: ocean_state_type ; private
 
   logical :: icebergs_alter_ocean !< If true, the icebergs can change ocean the
                               !! ocean dynamics and forcing fluxes.
+  logical :: calve_ice_shelf_bergs = .false. !< If true, bergs are initialized according to
+                              !! ice shelf flux through the ice front
   real :: press_to_z          !< A conversion factor between pressure and ocean depth,
                               !! usually 1/(rho_0*g) [Z T2 R-1 L-2 ~> m Pa-1].
   real :: C_p                 !< The heat capacity of seawater [J degC-1 kg-1].
@@ -417,7 +417,8 @@ subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, wind_stagger, gas
 
   if (present(calve_ice_shelf_bergs)) then
     if (calve_ice_shelf_bergs) then
-      call point_to_calving(Ocean_sfc%calving,Ocean_sfc%calving_hflx,Ocean_sfc%IS_mask,OS%Ice_shelf_CSp)
+      call convert_shelf_state_to_ocean_type(Ocean_sfc, OS%Ice_shelf_CSp, OS%US)
+      OS%calve_ice_shelf_bergs=.true.
     endif
   endif
 
@@ -683,6 +684,9 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
 !  call convert_state_to_ocean_type(OS%sfc_state, Ocean_sfc, OS%grid, OS%US, &
 !                                   OS%fluxes%p_surf_full, OS%press_to_z)
   call convert_state_to_ocean_type(OS%sfc_state, Ocean_sfc, OS%grid, OS%US)
+  if (OS%calve_ice_shelf_bergs) then
+    call convert_shelf_state_to_ocean_type(Ocean_sfc,OS%Ice_shelf_CSp, OS%US)
+  endif
   Time1 = OS%Time ; if (do_dyn) Time1 = OS%Time_dyn
   call coupler_type_send_data(Ocean_sfc%fields, Time1)
 
@@ -804,6 +808,9 @@ subroutine initialize_ocean_public_type(input_domain, Ocean_sfc, diag, gas_field
              Ocean_sfc%u_surf (isc:iec,jsc:jec), &
              Ocean_sfc%v_surf (isc:iec,jsc:jec), &
              Ocean_sfc%sea_lev(isc:iec,jsc:jec), &
+             Ocean_sfc%calving(isc:iec,jsc:jec), &
+             Ocean_sfc%calving_hflx(isc:iec,jsc:jec), &
+             Ocean_sfc%IS_mask(isc:iec,jsc:jec), &
              Ocean_sfc%area   (isc:iec,jsc:jec), &
              Ocean_sfc%melt_potential(isc:iec,jsc:jec), &
              Ocean_sfc%OBLD   (isc:iec,jsc:jec), &
@@ -814,6 +821,9 @@ subroutine initialize_ocean_public_type(input_domain, Ocean_sfc, diag, gas_field
   Ocean_sfc%u_surf(:,:)  = 0.0  ! time averaged u-current (m/sec) passed to atmosphere/ice models
   Ocean_sfc%v_surf(:,:)  = 0.0  ! time averaged v-current (m/sec)  passed to atmosphere/ice models
   Ocean_sfc%sea_lev(:,:) = 0.0  ! time averaged thickness of top model grid cell (m) plus patm/rho0/grav
+  Ocean_sfc%calving(:,:)  = 0.0  ! time accumulated ice sheet calving (kg m-2) passed to ice model
+  Ocean_sfc%calving_hflx(:,:) = 0.0 ! time accumulated ice sheet calving heat flux (W m-2) passed to ice model
+  Ocean_sfc%IS_mask(:,:) = 0.0 ! ice sheet mask passed to ice model
   Ocean_sfc%frazil(:,:)  = 0.0  ! time accumulated frazil (J/m^2) passed to ice model
   Ocean_sfc%melt_potential(:,:)  = 0.0  ! time accumulated melt potential (J/m^2) passed to ice model
   Ocean_sfc%OBLD(:,:)    = 0.0  ! ocean boundary layer depth (m)
@@ -946,6 +956,32 @@ subroutine convert_state_to_ocean_type(sfc_state, Ocean_sfc, G, US, patm, press_
   endif
 
 end subroutine convert_state_to_ocean_type
+
+!> Converts the ice-shelf-to-ocean calving and calving_hflx variables from the ice-shelf state (ISS) type
+!! to the ocean public type
+subroutine convert_shelf_state_to_ocean_type(Ocean_sfc, CS, US)
+  type(ocean_public_type), &
+               target, intent(inout) :: Ocean_sfc !< A structure containing various publicly
+                                                  !! visible ocean surface fields, whose elements
+                                                  !! have their data set here.
+  type(ice_shelf_CS),      pointer :: CS        !< A pointer to the ice shelf control structure
+  type(unit_scale_type), intent(in)    :: US   !< A dimensional unit scaling type
+  integer :: isc_bnd, iec_bnd, jsc_bnd, jec_bnd, i, j
+
+  call get_domain_extent(Ocean_sfc%Domain, isc_bnd, iec_bnd, jsc_bnd, jec_bnd)
+
+  call ice_sheet_calving_to_ocean_sfc(CS,US,Ocean_sfc%calving(isc_bnd:iec_bnd,jsc_bnd:jec_bnd),&
+    Ocean_sfc%calving_hflx(isc_bnd:iec_bnd,jsc_bnd:jec_bnd),Ocean_sfc%IS_mask(isc_bnd:iec_bnd,jsc_bnd:jec_bnd))
+
+  do j=jsc_bnd,jec_bnd ; do i=isc_bnd,iec_bnd
+    if (Ocean_sfc%IS_mask(i,j)==1) then
+      Ocean_sfc%IS_mask(i,j)=0.0
+    else
+      Ocean_sfc%IS_mask(i,j)=1.0
+    endif
+  enddo; enddo
+
+end subroutine convert_shelf_state_to_ocean_type
 
 !>   This subroutine extracts the surface properties from the ocean's internal
 !! state and stores them in the ocean type returned to the calling ice model.
