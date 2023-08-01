@@ -74,7 +74,7 @@ implicit none ; private
 public shelf_calc_flux, initialize_ice_shelf, ice_shelf_end, ice_shelf_query
 public ice_shelf_save_restart, solo_step_ice_shelf, add_shelf_forces
 public initialize_ice_shelf_fluxes, initialize_ice_shelf_forces
-public point_to_calving
+public ice_sheet_calving_to_ocean_sfc
 
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
 ! consistency testing. These are noted in comments with units like Z, H, L, and T, along with
@@ -806,24 +806,32 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
 
 end subroutine shelf_calc_flux
 
-!> Points the ocean_public_type version of calving/calving_hflx (from ice shelves to ocean) to the
-!! same variables of type ice-shelf state (ISS) type
-subroutine point_to_calving(calving,calving_hflx,IS_mask,CS)
-  real, pointer, dimension(:,:), intent(inout) :: calving      !< The mass per unit area of the ice shelf
-                                                               !! to convert to bergs [R Z ~> kg m-2].
-  real, pointer, dimension(:,:), intent(inout) :: calving_hflx !< Calving heat flux [Q R Z T-1 ~> W m-2].
-  real, pointer, dimension(:,:), intent(inout) :: IS_mask      !< Ice sheet mask (1=ice sheet, 0=ocean)
-  type(ice_shelf_CS),      pointer :: CS        !< A pointer to the control structure returned
-                                                !! by a previous call to initialize_ice_shelf.
+!> Converts the ice-shelf-to-ocean calving and calving_hflx variables from the ice-shelf state (ISS) type
+!! to the ocean public type
+subroutine ice_sheet_calving_to_ocean_sfc(CS,US,calving,calving_hflx,IS_mask)
+  type(ice_shelf_CS),      pointer :: CS        !< A pointer to the ice shelf control structure
+  type(unit_scale_type), intent(in)    :: US   !< A dimensional unit scaling type
+  real, dimension(:,:), intent(inout) :: calving      !< The mass per unit area of the ice shelf
+                                                      !! to convert to bergs [R Z ~> kg m-2].
+  real, dimension(:,:), intent(inout) :: calving_hflx !< Calving heat flux [Q R Z T-1 ~> W m-2].
+  real, dimension(:,:), intent(inout) :: IS_mask      !< Ice sheet mask (1=ice sheet, 0=ocean)
   ! Local variables
   type(ice_shelf_state), pointer :: ISS => NULL() !< A structure with elements that describe
                                                   !! the ice-shelf state
+  type(ocean_grid_type), pointer :: G => NULL()   !< A pointer to the ocean grid metric.
+  integer :: is, ie, js, je
+
+  G=>CS%Grid
   ISS => CS%ISS
-  calving => ISS%calving
-  calving_hflx => ISS%calving_hflx
-  IS_mask => ISS%hmask
+  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
+
+  calving = US%RZ_to_kg_m2 * ISS%calving(is:ie, js:je)
+  calving_hflx = US%QRZ_T_to_W_m2 * ISS%calving_hflx(is:ie,js:je)
+  IS_mask = ISS%hmask(is:ie,js:je)
+
   CS%calve_ice_shelf_bergs=.true.
-end subroutine point_to_calving
+
+end subroutine ice_sheet_calving_to_ocean_sfc
 
 !> Changes the thickness (mass) of the ice shelf based on sub-ice-shelf melting
 subroutine change_thickness_using_melt(ISS, G, US, time_step, fluxes, density_ice, debug)
