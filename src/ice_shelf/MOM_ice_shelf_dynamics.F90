@@ -567,20 +567,20 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       enddo ; enddo
     endif
 
-    call pass_var(CS%OD_av,G%domain)
-    call pass_var(CS%ground_frac,G%domain)
-    call pass_var(CS%ice_visc,G%domain)
+    call pass_var(CS%OD_av,G%domain, complete=.false.)
+    call pass_var(CS%ground_frac,G%domain, complete=.false.)
+    call pass_var(CS%ice_visc,G%domain, complete=.false.)
+    call pass_var(CS%basal_traction, G%domain, complete=.false.)
+    call pass_var(CS%AGlen_visc, G%domain, complete=.false.)
+    call pass_var(CS%bed_elev, G%domain, complete=.false.)
+    call pass_var(CS%C_basal_friction, G%domain, complete=.false.)
+    call pass_var(CS%h_bdry_val, G%domain, complete=.false.)
+    call pass_var(CS%thickness_bdry_val, G%domain, complete=.true.)
     if (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") call pass_var(CS%Ee,G%domain)
-    call pass_var(CS%basal_traction, G%domain)
-    call pass_var(CS%AGlen_visc, G%domain)
-    call pass_vector(CS%u_shelf, CS%v_shelf, G%domain, TO_ALL, BGRID_NE)
 
-    call pass_var(CS%bed_elev, G%domain)
-    call pass_var(CS%C_basal_friction, G%domain)
-    call pass_var(CS%h_bdry_val, G%domain)
-    call pass_var(CS%thickness_bdry_val, G%domain)
-    call pass_vector(CS%u_bdry_val, CS%v_bdry_val, G%domain, TO_ALL, BGRID_NE)
-    call pass_vector(CS%u_face_mask_bdry, CS%v_face_mask_bdry, G%domain, TO_ALL, BGRID_NE)
+    call pass_vector(CS%u_shelf, CS%v_shelf, G%domain, TO_ALL, BGRID_NE, complete=.false.)
+    call pass_vector(CS%u_bdry_val, CS%v_bdry_val, G%domain, TO_ALL, BGRID_NE, complete=.false.)
+    call pass_vector(CS%u_face_mask_bdry, CS%v_face_mask_bdry, G%domain, TO_ALL, BGRID_NE, complete=.true.)
     call update_velocity_masks(CS, G, ISS%hmask, CS%umask, CS%vmask, CS%u_face_mask, CS%v_face_mask)
   endif
 
@@ -613,28 +613,28 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     ! initialize basal friction coefficients
     if (new_sim) then
       call initialize_ice_C_basal_friction(CS%C_basal_friction, G, US, param_file)
-      call pass_var(CS%C_basal_friction, G%domain)
+      call pass_var(CS%C_basal_friction, G%domain, complete=.false.)
 
       ! initialize ice-stiffness AGlen
       call initialize_ice_AGlen(CS%AGlen_visc, G, US, param_file)
-      call pass_var(CS%AGlen_visc, G%domain)
+      call pass_var(CS%AGlen_visc, G%domain, complete=.false.)
 
       !initialize boundary conditions
       call initialize_ice_shelf_boundary_from_file(CS%u_face_mask_bdry, CS%v_face_mask_bdry, &
                   CS%u_bdry_val, CS%v_bdry_val, CS%umask, CS%vmask, CS%h_bdry_val, &
                   CS%thickness_bdry_val, ISS%hmask,  ISS%h_shelf, G, US, param_file )
-      call pass_var(ISS%hmask, G%domain)
-      call pass_var(CS%h_bdry_val, G%domain)
-      call pass_var(CS%thickness_bdry_val, G%domain)
-      call pass_vector(CS%u_bdry_val, CS%v_bdry_val, G%domain, TO_ALL, BGRID_NE)
-      call pass_vector(CS%u_face_mask_bdry, CS%v_face_mask_bdry, G%domain, TO_ALL, BGRID_NE)
+      call pass_var(ISS%hmask, G%domain, complete=.false.)
+      call pass_var(CS%h_bdry_val, G%domain, complete=.false.)
+      call pass_var(CS%thickness_bdry_val, G%domain, complete=.true.)
+      call pass_vector(CS%u_bdry_val, CS%v_bdry_val, G%domain, TO_ALL, BGRID_NE, complete=.false.)
+      call pass_vector(CS%u_face_mask_bdry, CS%v_face_mask_bdry, G%domain, TO_ALL, BGRID_NE, complete=.false.)
 
       !initialize ice flow characteristic (velocities, bed elevation under the grounded part, etc) from file
       call initialize_ice_flow_from_file(CS%bed_elev,CS%u_shelf, CS%v_shelf, CS%ground_frac, &
                   G, US, param_file)
-      call pass_vector(CS%u_shelf, CS%v_shelf, G%domain, TO_ALL, BGRID_NE)
-      call pass_var(CS%ground_frac,G%domain)
-      call pass_var(CS%bed_elev, G%domain)
+      call pass_vector(CS%u_shelf, CS%v_shelf, G%domain, TO_ALL, BGRID_NE, complete=.true.)
+      call pass_var(CS%ground_frac,G%domain, complete=.false.)
+      call pass_var(CS%bed_elev, G%domain, complete=.true.)
       call update_velocity_masks(CS, G, ISS%hmask, CS%umask, CS%vmask, CS%u_face_mask, CS%v_face_mask)
     endif
 
@@ -1042,7 +1042,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
       endif
     enddo ; enddo
 
-    call pass_var(float_cond, G%Domain)
+    call pass_var(float_cond, G%Domain, complete=.false.)
 
     call bilinear_shape_functions_subgrid(Phisub, nsub)
 
@@ -1056,10 +1056,10 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   enddo ; enddo
 
   call calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
-  call pass_var(CS%ice_visc, G%domain)
-  if (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") call pass_var(CS%Ee,G%domain)
+  call pass_var(CS%ice_visc, G%domain, complete=.false.)
   call calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
-  call pass_var(CS%basal_traction, G%domain)
+  call pass_var(CS%basal_traction, G%domain, complete=.true.)
+  if (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") call pass_var(CS%Ee,G%domain)
 
   ! This makes sure basal stress is only applied when it is supposed to be
   do j=G%jsd,G%jed ; do i=G%isd,G%ied
@@ -1132,10 +1132,11 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     call MOM_mesg(mesg, 5)
 
     call calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
-    call pass_var(CS%ice_visc, G%domain)
-    if (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") call pass_var(CS%Ee,G%domain)
+    call pass_var(CS%ice_visc, G%domain, complete=.false.)
     call calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
-    call pass_var(CS%basal_traction, G%domain)
+    call pass_var(CS%basal_traction, G%domain, complete=.true.)
+    if (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") call pass_var(CS%Ee,G%domain)
+
     ! makes sure basal stress is only applied when it is supposed to be
 
     do j=G%jsd,G%jed ; do i=G%isd,G%ied
@@ -1324,18 +1325,18 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
   RHSu(:,:) = taudx(:,:) !- ubd(:,:)
   RHSv(:,:) = taudy(:,:) !- vbd(:,:)
 
-  call pass_vector(RHSu, RHSv, G%domain, TO_ALL, BGRID_NE)
+  call pass_vector(RHSu, RHSv, G%domain, TO_ALL, BGRID_NE, complete=.false.)
 
   call matrix_diagonal(CS, G, US, float_cond, H_node, CS%ice_visc, CS%basal_traction, &
                        hmask, rhoi_rhow, Phisub, DIAGu, DIAGv)
 
-  call pass_vector(DIAGu, DIAGv, G%domain, TO_ALL, BGRID_NE)
+  call pass_vector(DIAGu, DIAGv, G%domain, TO_ALL, BGRID_NE, complete=.false.)
 
   call CG_action(CS, Au, Av, u_shlf, v_shlf, Phi, Phisub, CS%umask, CS%vmask, hmask, &
                  H_node, CS%ice_visc, float_cond, CS%bed_elev, CS%basal_traction, &
                  G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow)
 
-  call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
+  call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE, complete=.true.)
 
   Ru(:,:) = (RHSu(:,:) - Au(:,:))
   Rv(:,:) = (RHSv(:,:) - Av(:,:))
@@ -1497,9 +1498,9 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
 
     if (cg_halo == 0) then
      ! pass vectors
-      call pass_vector(Du, Dv, G%domain, TO_ALL, BGRID_NE)
-      call pass_vector(u_shlf, v_shlf, G%domain, TO_ALL, BGRID_NE)
-      call pass_vector(Ru, Rv, G%domain, TO_ALL, BGRID_NE)
+      call pass_vector(Du, Dv, G%domain, TO_ALL, BGRID_NE, complete=.false.)
+      call pass_vector(u_shlf, v_shlf, G%domain, TO_ALL, BGRID_NE, complete=.false.)
+      call pass_vector(Ru, Rv, G%domain, TO_ALL, BGRID_NE, complete=.true.)
       cg_halo = 3
     endif
 
@@ -3142,8 +3143,8 @@ subroutine update_OD_ffrac(CS, G, US, ocean_mass, find_avg)
       CS%OD_rt(i,j) = 0.0 ; CS%ground_frac_rt(i,j) = 0.0
     enddo ; enddo
 
-    call pass_var(CS%ground_frac, G%domain)
-    call pass_var(CS%OD_av, G%domain)
+    call pass_var(CS%ground_frac, G%domain, complete=.false.)
+    call pass_var(CS%OD_av, G%domain, complete=.true.)
   endif
 
 end subroutine update_OD_ffrac
@@ -3757,8 +3758,8 @@ subroutine ice_shelf_temp(CS, ISS, G, US, time_step, melt_rate, Time)
     endif
   enddo ; enddo
 
-  call pass_var(CS%t_shelf, G%domain)
-  call pass_var(CS%tmask, G%domain)
+  call pass_var(CS%t_shelf, G%domain, complete=.false.)
+  call pass_var(CS%tmask, G%domain, complete=.true.)
 
   if (CS%debug) then
     call hchksum(CS%t_shelf, "temp after front", G%HI, haloshift=3, scale=US%C_to_degC)

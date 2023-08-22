@@ -888,9 +888,9 @@ subroutine change_thickness_using_melt(ISS, G, US, time_step, fluxes, density_ic
     endif
   enddo ; enddo
 
-  call pass_var(ISS%area_shelf_h, G%domain)
-  call pass_var(ISS%h_shelf, G%domain)
-  call pass_var(ISS%hmask, G%domain)
+  call pass_var(ISS%area_shelf_h, G%domain, complete=.false.)
+  call pass_var(ISS%h_shelf, G%domain, complete=.false.)
+  call pass_var(ISS%hmask, G%domain, complete=.false.)
   call pass_var(ISS%mass_shelf, G%domain)
 
 end subroutine change_thickness_using_melt
@@ -1783,10 +1783,10 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, forces_in,
   id_clock_pass = cpu_clock_id(' Ice shelf halo updates', grain=CLOCK_ROUTINE)
 
   call cpu_clock_begin(id_clock_pass)
-  call pass_var(ISS%area_shelf_h, G%domain)
-  call pass_var(ISS%h_shelf, G%domain)
-  call pass_var(ISS%mass_shelf, G%domain)
-  call pass_var(ISS%hmask, G%domain)
+  call pass_var(ISS%area_shelf_h, G%domain, complete=.false.)
+  call pass_var(ISS%h_shelf, G%domain, complete=.false.)
+  call pass_var(ISS%mass_shelf, G%domain, complete=.false.)
+  call pass_var(ISS%hmask, G%domain, complete=.false.)
   call pass_var(G%bathyT, G%domain)
   call cpu_clock_end(id_clock_pass)
 
@@ -2075,10 +2075,10 @@ subroutine change_thickness_using_precip(CS, ISS, G, US, fluxes, time_step, Time
     endif
   enddo ; enddo
 
-  call pass_var(ISS%area_shelf_h, G%domain)!, complete=.false.)
-  call pass_var(ISS%h_shelf, G%domain)!, complete=.false.)
-  call pass_var(ISS%hmask, G%domain)!, complete=.false.)
-  call pass_var(ISS%mass_shelf, G%domain)!, complete=.true.)
+  call pass_var(ISS%area_shelf_h, G%domain, complete=.false.)
+  call pass_var(ISS%h_shelf, G%domain, complete=.false.)
+  call pass_var(ISS%hmask, G%domain, complete=.false.)
+  call pass_var(ISS%mass_shelf, G%domain, complete=.true.)
 
 end subroutine change_thickness_using_precip
 
@@ -2131,10 +2131,10 @@ subroutine update_shelf_mass(G, US, CS, ISS, Time)
                                        CS%min_thickness_simple_calve, halo=0)
   endif
 
-  call pass_var(ISS%area_shelf_h, G%domain)
-  call pass_var(ISS%h_shelf, G%domain)
-  call pass_var(ISS%hmask, G%domain)
-  call pass_var(ISS%mass_shelf, G%domain)
+  call pass_var(ISS%area_shelf_h, G%domain, complete=.false.)
+  call pass_var(ISS%h_shelf, G%domain, complete=.false.)
+  call pass_var(ISS%hmask, G%domain, complete=.false.)
+  call pass_var(ISS%mass_shelf, G%domain, complete=.true.)
 
 end subroutine update_shelf_mass
 
