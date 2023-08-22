@@ -1904,7 +1904,8 @@ subroutine initialize_ice_shelf_fluxes(CS, ocn_grid, US, fluxes_in)
          tau_mag=.true.)
   else
     call MOM_mesg("MOM_ice_shelf.F90, initialize_ice_shelf: allocating fluxes in solo mode.")
-    call allocate_forcing_type(CS%Grid_in, fluxes_in, ustar=.true., shelf=.true., press=.true., shelf_sfc_accumulation = CS%active_shelf_dynamics, tau_mag=.true.)
+    call allocate_forcing_type(CS%Grid_in, fluxes_in, ustar=.true., shelf=.true., &
+         press=.true., shelf_sfc_accumulation = CS%active_shelf_dynamics, tau_mag=.true.)
   endif
   if (CS%rotate_index) then
     allocate(fluxes)
