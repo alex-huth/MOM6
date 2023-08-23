@@ -1348,7 +1348,7 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
   do j=jscq,jecq ; do i=iscq,iecq
     if (CS%umask(I,J) == 1) sum_vec(I,J) = resid2_scale*Ru(I,J)**2
     if (CS%vmask(I,J) == 1) sum_vec(I,J) = sum_vec(I,J) + resid2_scale*Rv(I,J)**2
-  enddo; enddo
+  enddo ; enddo
 
   dot_p1 = reproducing_sum( sum_vec, Js_sum, Ie_sum, Js_sum, Je_sum )
 
@@ -1475,7 +1475,7 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
       enddo
     enddo
 
-    ! D valid region moves in by 1
+   ! D valid region moves in by 1
 
     sum_vec(:,:) = 0.0
     do j=jscq,jecq ; do i=iscq,iecq
@@ -2693,8 +2693,8 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
               0.25 * basal_trac(i,j) * vq * (xquad(ilq) * xquad(jlq))
           endif
         endif
-      enddo; enddo
-    enddo; enddo
+      enddo ; enddo
+    enddo ; enddo
 
     if (float_cond(i,j) == 1) then
       Hcell(:,:) = H_node(i-1:i,j-1:j)
@@ -2706,7 +2706,7 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
         if (CS%vmask(Itgt,Jtgt) == 1) then
           v_diagonal(Itgt,Jtgt) = v_diagonal(Itgt,Jtgt) + sub_ground(iphi,jphi) * basal_trac(i,j)
         endif
-      enddo; enddo
+      enddo ; enddo
     endif
   endif ; enddo ; enddo
 
@@ -3023,7 +3023,7 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
         enddo; enddo
       endif
     endif
-  enddo; enddo
+  enddo ; enddo
 
   if (trim(CS%ice_viscosity_compute) == "MODEL") deallocate(PhiC)
   if (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") deallocate(Phi)
