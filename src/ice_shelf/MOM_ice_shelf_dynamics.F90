@@ -144,6 +144,10 @@ type, public :: ice_shelf_dyn_CS ; private
   real :: n_glen            !< Nonlinearity exponent in Glen's Law [nondim]
   real :: eps_glen_min      !< Min. strain rate to avoid infinite Glen's law viscosity, [T-1 ~> s-1].
   real :: n_basal_fric      !< Exponent in sliding law tau_b = C u^(m_slide) [nondim]
+  logical :: CoulombFriction !< Use Coulomb friction law (Schoof 2005, Gagliardini et al 2007)
+  real :: CF_MinN           !< Minimum Coulomb friction effective pressure [R L2 T-2 ~> Pa]
+  real :: CF_PostPeak       !< Coulomb friction post peak exponent [nondim]
+  real :: CF_Max            !< Coulomb friction maximum coefficient [nondim]
   real :: density_ocean_avg !< A typical ocean density [R ~> kg m-3].  This does not affect ocean
                             !! circulation or thermodynamics.  It is used to estimate the
                             !! gravitational driving force at the shelf front (until we think of
@@ -423,6 +427,19 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     call get_param(param_file, mdl, "BASAL_FRICTION_EXP", CS%n_basal_fric, &
                  "Exponent in sliding law \tau_b = C u^(n_basal_fric)", &
                  units="none", fail_if_missing=.true.)
+    call get_param(param_file, mdl, "USE_COULOMB_FRICTION", CS%CoulombFriction, &
+                 "Use Coulomb Friction Law", &
+                 units="none", default=.false., fail_if_missing=.false.)
+    call get_param(param_file, mdl, "CF_MinN", CS%CF_MinN, &
+                 "Minimum Coulomb friction effective pressure", &
+                 units="Pa", default=1.0, fail_if_missing=.false.)
+    call get_param(param_file, mdl, "CF_PostPeak", CS%CF_PostPeak, &
+                 "Coulomb friction post peak exponent", &
+                 units="none", default=1.0, fail_if_missing=.false.)
+    call get_param(param_file, mdl, "CF_Max", CS%CF_Max, &
+                 "Coulomb friction maximum coefficient", &
+                 units="none", default=0.5, fail_if_missing=.false.)
+
     call get_param(param_file, mdl, "DENSITY_ICE", CS%density_ice, &
                  "A typical density of ice.", units="kg m-3", default=917.0, scale=US%kg_m3_to_R)
     call get_param(param_file, mdl, "CONJUGATE_GRADIENT_TOLERANCE", CS%cg_tolerance, &
@@ -2814,6 +2831,7 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
   integer :: i, j, iscq, iecq, jscq, jecq, isd, jsd, ied, jed, iegq, jegq
   integer :: giec, gjec, gisc, gjsc, isc, jsc, iec, jec, is, js
   real :: umid, vmid, unorm, eps_min ! Velocities [L T-1 ~> m s-1]
+  real :: alpha, Hf, fN, fB !for Coulomb Friction
 
   isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
   iscq = G%iscB ; iecq = G%iecB ; jscq = G%jscB ; jecq = G%jecB
@@ -2825,15 +2843,34 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
 
   eps_min = CS%eps_glen_min
 
+  if (CS%CoulombFriction) then
+    if (CS%CF_PostPeak.ne.1.0) THEN
+      alpha = (CS%CF_PostPeak-1.0)**(CS%CF_PostPeak-1.0) / CS%CF_PostPeak**CS%CF_PostPeak
+    else
+      alpha = 1.0
+    endif
+  endif
 
   do j=jsd+1,jed
     do i=isd+1,ied
       if ((ISS%hmask(i,j) == 1) .OR. (ISS%hmask(i,j) == 3)) then
         umid = ((u_shlf(I,J) + u_shlf(I-1,J-1)) + (u_shlf(I,J-1) + u_shlf(I-1,J))) * 0.25
         vmid = ((v_shlf(I,J) + v_shlf(I-1,J-1)) + (v_shlf(I,J-1) + v_shlf(I-1,J))) * 0.25
-        unorm = sqrt(umid**2 + vmid**2 + eps_min**2*(G%dxT(i,j)**2 + G%dyT(i,j)**2))
-!        CS%basal_traction(i,j) = G%areaT(i,j) * CS%C_basal_friction * (US%L_T_to_m_s*unorm)**(CS%n_basal_fric-1)
-        CS%basal_traction(i,j) = G%areaT(i,j) * CS%C_basal_friction(i,j) * (US%L_T_to_m_s*unorm)**(CS%n_basal_fric-1)
+        unorm = US%L_T_to_m_s*sqrt(umid**2 + vmid**2 + eps_min**2*(G%dxT(i,j)**2 + G%dyT(i,j)**2))
+
+        !Coulomb friction (Schoof 2005, Gagliardini et al 2007)
+        if (CS%CoulombFriction) then
+          !Effective pressure
+          Hf = max(CS%density_ocean_avg * CS%bed_elev(i,j)/CS%density_ice, 0.0)
+          fN = max(CS%density_ice * CS%g_Earth * (ISS%h_shelf(i,j) - Hf),US%RL2_T2_to_Pa*CS%CF_MinN)
+
+          fB = alpha * (CS%C_basal_friction(i,j) / (CS%CF_Max * fN))**(CS%CF_PostPeak/CS%n_basal_fric)
+          CS%basal_traction(i,j) = G%areaT(i,j) * CS%C_basal_friction(i,j) * &
+            unorm**(CS%n_basal_fric-1.0) / (1.0 + fB * unorm**CS%CF_PostPeak)**(CS%n_basal_fric)
+        else
+          !linear (CS%n_basal_fric=1) or "Weertman"/power-law (CS%n_basal_fric .ne. 1)
+          CS%basal_traction(i,j) = G%areaT(i,j) * CS%C_basal_friction(i,j) * unorm**(CS%n_basal_fric-1)
+        endif
       endif
     enddo
   enddo
