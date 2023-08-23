@@ -117,7 +117,7 @@ type, public ::  ocean_public_type
     u_surf => NULL(), & !< i-velocity at the locations indicated by stagger [m s-1].
     v_surf => NULL(), & !< j-velocity at the locations indicated by stagger [m s-1].
     sea_lev => NULL(), & !< Sea level in m after correction for surface pressure,
-                         !! i.e. dzt(1) + eta_t + patm/rho0/grav [m]
+                        !! i.e. dzt(1) + eta_t + patm/rho0/grav [m]
     frazil =>NULL(), &  !< Accumulated heating [J m-2] from frazil
                         !! formation in the ocean.
     melt_potential => NULL(), & !< Instantaneous heat used to melt sea ice [J m-2].

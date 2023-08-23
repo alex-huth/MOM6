@@ -293,7 +293,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate( CS%ground_frac(isd:ied,jsd:jed), source=0.0 )
     allocate( CS%taudx_shelf(IsdB:IedB,JsdB:JedB), source=0.0 )
     allocate( CS%taudy_shelf(IsdB:IedB,JsdB:JedB), source=0.0 )
-    allocate( CS%bed_elev(isd:ied,jsd:jed), source=0.0 )! ; CS%bed_elev(:,:) = G%bathyT(:,:) + G%Z_ref
+    allocate( CS%bed_elev(isd:ied,jsd:jed), source=0.0 )
     allocate( CS%u_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0 )
     allocate( CS%v_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0 )
     allocate( CS%u_face_mask_bdry(IsdB:IedB,JsdB:JedB), source=-2.0 )
@@ -533,7 +533,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     !  of u and v are otherwise not set till the end of the first linear solve, and so
     !  viscosity is not calculated correctly.
     ! This has to occur after init_boundary_values or some of the arrays on the
-    ! right hand side have not been set up yet. (is this actually true for a restart?)
+    ! right hand side have not been set up yet.
     if (.not. G%symmetric) then
       do j=G%jsd,G%jed ; do i=G%isd,G%ied
         if ((i+G%idg_offset) == (G%domain%nihalo+1)) then
@@ -773,7 +773,7 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
 
   coupled_GL = .false.
   if (present(ocean_mass) .and. present(coupled_grounding)) coupled_GL = coupled_grounding
-  !
+!
   if (CS%advect_shelf) then
     call ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
   endif
@@ -1348,8 +1348,6 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
   do j=jscq,jecq ; do i=iscq,iecq
     if (CS%umask(I,J) == 1) sum_vec(I,J) = resid2_scale*Ru(I,J)**2
     if (CS%vmask(I,J) == 1) sum_vec(I,J) = sum_vec(I,J) + resid2_scale*Rv(I,J)**2
-    !if (CS%umask(I,J) == 1) sum_vec(I,J) = resid2_scale*RHSu(I,J)**2
-    !if (CS%vmask(I,J) == 1) sum_vec(I,J) = sum_vec(I,J) + resid2_scale*RHSv(I,J)**2
   enddo; enddo
 
   dot_p1 = reproducing_sum( sum_vec, Js_sum, Ie_sum, Js_sum, Je_sum )
@@ -1963,7 +1961,6 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
 !    (it is assumed that base_ice = bed + OD)
 
   real, dimension(SIZE(OD,1),SIZE(OD,2))  :: S     ! surface elevation [Z ~> m].
-                           !BASE     ! basal elevation of shelf/stream [Z ~> m].
 
   real    :: rho, rhow, rhoi_rhow ! Ice and ocean densities [R ~> kg m-3]
   real    :: sx, sy    ! Ice shelf top slopes [Z L-1 ~> nondim]
@@ -1994,8 +1991,6 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
   rhoi_rhow = rho/rhow
   ! prelim - go through and calculate S
 
-  ! or is this faster?
-!  BASE(:,:) = -CS%bed_elev(:,:) + OD(:,:)
   S(:,:) = -CS%bed_elev(:,:) + ISS%h_shelf(:,:)
   ! check whether the ice is floating or grounded
 
@@ -2326,83 +2321,74 @@ subroutine calc_shelf_driving_stress_b(CS, ISS, G, US, taudx, taudy, OD, H_node)
   deallocate(Phi)
 end subroutine calc_shelf_driving_stress_b
 
-! Not used? If uncommenting, note that treatment of u_face_mask and v_face_mask here need updating
-! subroutine init_boundary_values(CS, G, time, hmask, input_flux, input_thick, new_sim)
-!   type(ice_shelf_dyn_CS),intent(inout) :: CS !< A pointer to the ice shelf control structure
-!   type(ocean_grid_type), intent(inout) :: G  !< The grid structure used by the ice shelf.
-!   type(time_type),       intent(in)    :: Time !< The current model time
-!   real, dimension(SZDI_(G),SZDJ_(G)), &
-!                          intent(in)    :: hmask !< A mask indicating which tracer points are
-!                                              !! partly or fully covered by an ice-shelf
-!   real,                  intent(in)    :: input_flux !< The integrated inward ice thickness flux per
-!                                              !! unit face length [Z L T-1 ~> m2 s-1]
-!   real,                  intent(in)    :: input_thick !< The ice thickness at boundaries [Z ~> m].
-!   logical,     optional, intent(in)    :: new_sim !< If present and false, this run is being restarted
+! Not used? Seems to be only set up to work for a specific test case with u_face_mask==3
+subroutine init_boundary_values(CS, G, time, hmask, input_flux, input_thick, new_sim)
+  type(ice_shelf_dyn_CS),intent(inout) :: CS !< A pointer to the ice shelf control structure
+  type(ocean_grid_type), intent(inout) :: G  !< The grid structure used by the ice shelf.
+  type(time_type),       intent(in)    :: Time !< The current model time
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                         intent(in)    :: hmask !< A mask indicating which tracer points are
+                                             !! partly or fully covered by an ice-shelf
+  real,                  intent(in)    :: input_flux !< The integrated inward ice thickness flux per
+                                             !! unit face length [Z L T-1 ~> m2 s-1]
+  real,                  intent(in)    :: input_thick !< The ice thickness at boundaries [Z ~> m].
+  logical,     optional, intent(in)    :: new_sim !< If present and false, this run is being restarted
 
-! ! this will be a per-setup function. the boundary values of thickness and velocity
-! ! (and possibly other variables) will be updated in this function
+! this will be a per-setup function. the boundary values of thickness and velocity
+! (and possibly other variables) will be updated in this function
 
-! ! FOR RESTARTING PURPOSES: if grid is not symmetric and the model is restarted, we will
-! !               need to update those velocity points not *technically* in any
-! !               computational domain -- if this function gets moves to another module,
-! !               DO NOT TAKE THE RESTARTING BIT WITH IT
-!   integer :: i, j , isd, jsd, ied, jed
-!   integer :: isc, jsc, iec, jec
-!   integer :: i_off, j_off
+! FOR RESTARTING PURPOSES: if grid is not symmetric and the model is restarted, we will
+!               need to update those velocity points not *technically* in any
+!               computational domain -- if this function gets moves to another module,
+!               DO NOT TAKE THE RESTARTING BIT WITH IT
+  integer :: i, j , isd, jsd, ied, jed
+  integer :: isc, jsc, iec, jec
+  integer :: i_off, j_off
 
-!   isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
-!   isd = G%isd ; jsd = G%jsd ; ied = G%ied ; jed = G%jed
-!   i_off = G%idg_offset ; j_off = G%jdg_offset
+  isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
+  isd = G%isd ; jsd = G%jsd ; ied = G%ied ; jed = G%jed
+  i_off = G%idg_offset ; j_off = G%jdg_offset
 
-!   ! this loop results in some values being set twice but... eh.
+  ! this loop results in some values being set twice but... eh.
 
-!   do j=jsd,jed
-!     do i=isd,ied
+  do j=jsd,jed
+    do i=isd,ied
 
-!       if (hmask(i,j) == 3) then
-!         CS%thickness_bdry_val(i,j) = input_thick
-!       endif
+      if (hmask(i,j) == 3) then
+        CS%thickness_bdry_val(i,j) = input_thick
+      endif
 
-!       if ((hmask(i,j) == 0) .or. (hmask(i,j) == 1) .or. (hmask(i,j) == 2)) then
-!         if ((i <= iec).and.(i >= isc)) then
-!           if (CS%u_face_mask(I-1,j) == 5) then
-!             CS%u_bdry_val(I-1,J-1) = (1 - ((G%geoLatBu(I-1,J-1) - 0.5*G%len_lat)*2./G%len_lat)**2) * &
-!                   1.5 * input_flux / input_thick
-!             CS%u_bdry_val(I-1,J) = (1 - ((G%geoLatBu(I-1,J) - 0.5*G%len_lat)*2./G%len_lat)**2) * &
-!                   1.5 * input_flux / input_thick
-!           endif
-!         endif
-!         if ((j <= jec).and.(j >= jsc)) then
-!           if (CS%v_face_mask(i,J-1) == 5) then
-!             !TODO: do the same for v:
-!             ! CS%v_bdry_val(I-1,J-1) = (1 - ((G%geoLatBu(I-1,J-1) - 0.5*G%len_lat)*2./G%len_lat)**2) * &
-!             !       1.5 * input_flux / input_thick
-!             ! CS%v_bdry_val(I,J-1) = (1 - ((G%geoLatBu(I-1,J) - 0.5*G%len_lat)*2./G%len_lat)**2) * &
-!             !       1.5 * input_flux / input_thick
-!           endif
-!         endif
-!       endif
+      if ((hmask(i,j) == 0) .or. (hmask(i,j) == 1) .or. (hmask(i,j) == 2)) then
+        if ((i <= iec).and.(i >= isc)) then
+          if (CS%u_face_mask(I-1,j) == 3) then
+            CS%u_bdry_val(I-1,J-1) = (1 - ((G%geoLatBu(I-1,J-1) - 0.5*G%len_lat)*2./G%len_lat)**2) * &
+                  1.5 * input_flux / input_thick
+            CS%u_bdry_val(I-1,J) = (1 - ((G%geoLatBu(I-1,J) - 0.5*G%len_lat)*2./G%len_lat)**2) * &
+                  1.5 * input_flux / input_thick
+          endif
+        endif
+      endif
 
-!       if (.not.(new_sim)) then
-!         if (.not. G%symmetric) then
-!           if (((i+i_off) == (G%domain%nihalo+1)).and.(CS%u_face_mask(I-1,j) == 5)) then
-!             CS%u_shelf(I-1,J-1) = CS%u_bdry_val(I-1,J-1)
-!             CS%u_shelf(I-1,J) = CS%u_bdry_val(I-1,J)
-!             !CS%v_shelf(I-1,J-1) = CS%v_bdry_val(I-1,J-1)
-!             !CS%v_shelf(I-1,J) = CS%v_bdry_val(I-1,J)
-!           endif
-!           if (((j+j_off) == (G%domain%njhalo+1)).and.(CS%v_face_mask(i,J-1) == 5)) then
-!             !CS%u_shelf(I-1,J-1) = CS%u_bdry_val(I-1,J-1)
-!             !CS%u_shelf(I,J-1) = CS%u_bdry_val(I,J-1)
-!             CS%v_shelf(I-1,J-1) = CS%v_bdry_val(I-1,J-1)
-!             CS%v_shelf(I,J-1) = CS%v_bdry_val(I,J-1)
-!           endif
-!         endif
-!       endif
-!     enddo
-!   enddo
+      if (.not.(new_sim)) then
+        if (.not. G%symmetric) then
+          if (((i+i_off) == (G%domain%nihalo+1)).and.(CS%u_face_mask(I-1,j) == 3)) then
+            CS%u_shelf(I-1,J-1) = CS%u_bdry_val(I-1,J-1)
+            CS%u_shelf(I-1,J) = CS%u_bdry_val(I-1,J)
+            CS%v_shelf(I-1,J-1) = CS%v_bdry_val(I-1,J-1)
+            CS%v_shelf(I-1,J) = CS%v_bdry_val(I-1,J)
+          endif
+          if (((j+j_off) == (G%domain%njhalo+1)).and.(CS%v_face_mask(i,J-1) == 3)) then
+            CS%u_shelf(I-1,J-1) = CS%u_bdry_val(I-1,J-1)
+            CS%u_shelf(I,J-1) = CS%u_bdry_val(I,J-1)
+            CS%v_shelf(I-1,J-1) = CS%v_bdry_val(I-1,J-1)
+            CS%v_shelf(I,J-1) = CS%v_bdry_val(I,J-1)
+          endif
+        endif
+      endif
+    enddo
+  enddo
 
-! end subroutine init_boundary_values
+end subroutine init_boundary_values
 
 
 subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, hmask, H_node, &
@@ -3458,10 +3444,6 @@ subroutine update_velocity_masks(CS, G, hmask, umask, vmask, u_face_mask, v_face
     do i=is,G%ied
 
       if ((hmask(i,j) == 1) .OR. (hmask(i,j) == 3)) then
-
-        !now properly set in case defaults
-        !umask(I,j) = 1.
-        !vmask(I,j) = 1.
 
         do k=0,1
 

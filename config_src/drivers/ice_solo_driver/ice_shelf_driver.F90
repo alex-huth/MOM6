@@ -145,7 +145,7 @@ program Shelf_main
                                            ! containing all run-time parameters.
   real :: smb !A constant surface mass balance that can be specified in the param_file
   character(len=9)  :: month
-  character(len=16) :: calendar = 'noleap' !'julian'
+  character(len=16) :: calendar = 'noleap'
   integer :: calendar_type=-1
 
   integer :: unit, io_status, ierr
@@ -490,7 +490,6 @@ program Shelf_main
   endif
 
   call callTree_waypoint("End Shelf_main")
-
   call ice_shelf_end(ice_shelf_CSp)
   call solo_ice_shelf_diag_mediator_end(Time, diag, end_diag_manager=.true.)
   if (cpu_steps > 0) call write_cputime(Time, ns-1, write_CPU_CSp, call_end=.true.)

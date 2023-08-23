@@ -2353,8 +2353,7 @@ subroutine fluxes_accumulate(flux_tmp, fluxes, G, wt2, forces)
   if (associated(fluxes%shelf_sfc_mass_flux) &
                  .and. associated(flux_tmp%shelf_sfc_mass_flux)) then
     do i=isd,ied ; do j=jsd,jed
-      !fluxes%shelf_sfc_mass_flux(i,j)  = flux_tmp%shelf_sfc_mass_flux(i,j)
-      fluxes%shelf_sfc_mass_flux(i,j)  = wt1*fluxes%shelf_sfc_mass_flux(i,j) + wt2*flux_tmp%shelf_sfc_mass_flux(i,j)
+      fluxes%shelf_sfc_mass_flux(i,j)  = flux_tmp%shelf_sfc_mass_flux(i,j)
     enddo ; enddo
   endif
   if (associated(fluxes%frac_shelf_h) .and. associated(flux_tmp%frac_shelf_h)) then

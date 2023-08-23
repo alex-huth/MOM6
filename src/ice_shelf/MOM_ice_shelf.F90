@@ -2223,9 +2223,7 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
                                                  ! various unit conversion factors
   type(ice_shelf_state), pointer :: ISS => NULL() !< A structure with elements that describe
                                           !! the ice-shelf state
-  !type(time_type) :: TimeInt ! The internal time during this call
   real :: remaining_time    ! The remaining time in this call [T ~> s]
-  !real :: time1             ! The time at the end of this call
   real :: time_step         ! The internal time step during this call [T ~> s]
   real :: full_time_step    ! The external time step (sum of internal time steps) during this call [T ~> s]
   real :: min_time_step     ! The minimal required timestep that would indicate a fatal problem [T ~> s]
@@ -2243,9 +2241,6 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
 
   remaining_time = US%s_to_T*time_type_to_real(time_interval)
   full_time_step = remaining_time
-
-  !Time at the end of the call (must be real)
-  !time1 = US%s_to_T*(time_type_to_real(time_interval) + time_type_to_real(Time))
 
   if (present (min_time_step_in)) then
     min_time_step = min_time_step_in
@@ -2268,14 +2263,6 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
     else
       call MOM_mesg("solo_step_ice_shelf: "//mesg, 5)
     endif
-
-    ! if (CS%data_override_shelf_fluxes) then
-    !   !data override only works for mosaics.
-    !   Current time used to read in the surface mass flux
-    !   TimeInt = real_to_time(US%T_to_s*(time1 - remaining_time))
-    !   call data_override(G%Domain, 'shelf_sfc_mass_flux', fluxes_in%shelf_sfc_mass_flux, &
-    !     TimeInt, scale=US%kg_m2s_to_RZ_T, override=override)
-    ! endif
 
     call change_thickness_using_precip(CS, ISS, G, US, fluxes_in, time_step, Time)
 
