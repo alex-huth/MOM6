@@ -1025,6 +1025,8 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
                    CS%ice_visc, float_cond, CS%bed_elev, CS%basal_traction, &
                    G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow)
 
+    call pass_vector(Au,Av,G%domain,TO_ALL,BGRID_NE)
+
     err_max = 0
 
     if (CS%nonlin_solve_err_mode == 1) then
