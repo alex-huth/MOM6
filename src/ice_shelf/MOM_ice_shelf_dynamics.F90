@@ -1961,7 +1961,8 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
       dyh = G%dyT(i,j)
       Dx=dxh
       Dy=dyh
-      if (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3) then ! we are inside the global computational bdry, at an ice-filled cell
+      if (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3) then
+        ! we are inside the global computational bdry, at an ice-filled cell
 
         ! calculate sx
         if ((i+i_off) == gisc) then ! at west computational bdry
