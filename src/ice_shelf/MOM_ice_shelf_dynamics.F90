@@ -2610,9 +2610,9 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
   is = iscq - 1; js = jscq - 1
     i_off = G%idg_offset ; j_off = G%jdg_offset
 
-  allocate(Phi(1:8,1:4,isd:ied,jsd:jed), source=0.0)
+  allocate(Phi(1:8,1:4,isc:iec,jsc:jec), source=0.0)
 
-  do j=jsd,jed ; do i=isd,ied
+  do j=jsc,jec ; do i=isc,iec
     call bilinear_shape_fn_grid(G, i, j, Phi(:,:,i,j))
   enddo ; enddo
 
