@@ -772,10 +772,6 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
 
   if (CS%debug) call MOM_forcing_chksum("Before add shelf flux", fluxes, G, CS%US, haloshift=0)
 
-  call add_shelf_flux(G, US, CS, sfc_state, fluxes)
-
-  ! now the thermodynamic data is passed on... time to update the ice dynamic quantities
-
   if (CS%active_shelf_dynamics) then
     update_ice_vel = .false.
     coupled_GL = (CS%GL_couple .and. .not.CS%solo_ice_sheet)
@@ -786,6 +782,9 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
                           sfc_state%ocean_mass, coupled_GL)
 
   endif
+
+  ! pass on the updated ice sheet geometry (for pressure on ocean) and thermodynamic data
+  call add_shelf_flux(G, US, CS, sfc_state, fluxes)
 
   call enable_averages(time_step, Time, CS%diag)
   if (CS%id_shelf_mass > 0) call post_data(CS%id_shelf_mass, ISS%mass_shelf, CS%diag)
@@ -884,7 +883,7 @@ subroutine change_thickness_using_melt(ISS, G, US, time_step, fluxes, density_ic
         ISS%hmask(i,j) = 0.0
         ISS%area_shelf_h(i,j) = 0.0
       endif
-      ISS%mass_shelf(i,j) = ISS%h_shelf(i,j) * density_ice
+      ISS%mass_shelf(i,j) = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j)/G%areaT(i,j) * density_ice
     endif
   enddo ; enddo
 
@@ -2072,7 +2071,7 @@ subroutine change_thickness_using_precip(CS, ISS, G, US, fluxes, time_step, Time
         ISS%hmask(i,j) = 0.0
         ISS%area_shelf_h(i,j) = 0.0
       endif
-      ISS%mass_shelf(i,j) = ISS%h_shelf(i,j) * CS%density_ice
+      ISS%mass_shelf(i,j) = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j)/G%areaT(i,j) * CS%density_ice
     endif
   enddo ; enddo
 
