@@ -768,11 +768,6 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
                    scale=US%RZ_to_kg_m2)
     endif
 
-  endif
-
-  if (CS%debug) call MOM_forcing_chksum("Before add shelf flux", fluxes, G, CS%US, haloshift=0)
-
-  if (CS%active_shelf_dynamics) then
     update_ice_vel = .false.
     coupled_GL = (CS%GL_couple .and. .not.CS%solo_ice_sheet)
 
@@ -780,8 +775,9 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
     ! when we decide on how to do it
     call update_ice_shelf(CS%dCS, ISS, G, US, time_step, Time, CS%calve_ice_shelf_bergs, &
                           sfc_state%ocean_mass, coupled_GL)
-
   endif
+
+  if (CS%debug) call MOM_forcing_chksum("Before add shelf flux", fluxes, G, CS%US, haloshift=0)
 
   ! pass on the updated ice sheet geometry (for pressure on ocean) and thermodynamic data
   call add_shelf_flux(G, US, CS, sfc_state, fluxes)
