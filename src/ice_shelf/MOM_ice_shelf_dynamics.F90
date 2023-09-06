@@ -2940,13 +2940,13 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
     i_off = G%idg_offset ; j_off = G%jdg_offset
 
   if (trim(CS%ice_viscosity_compute) == "MODEL") then
-    allocate(PhiC(1:8,isd:ied,jsd:jed), source=0.0)
-    do j=jsd,jed ; do i=isd,ied
+    allocate(PhiC(1:8,isc:iec,jsc:jec), source=0.0)
+    do j=jsc,jec ; do i=isc,iec
       call bilinear_shape_fn_grid_1qp(G, i, j, PhiC(:,i,j))
     enddo; enddo
   elseif (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") then
-    allocate(Phi(1:8,1:4,isd:ied,jsd:jed), source=0.0)
-    do j=jsd,jed ; do i=isd,ied
+    allocate(Phi(1:8,1:4,isc:iec,jsc:jec), source=0.0)
+    do j=jsc,jec ; do i=isc,iec
       call bilinear_shape_fn_grid(G, i, j, Phi(:,:,i,j))
     enddo; enddo
   endif
