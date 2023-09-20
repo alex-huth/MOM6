@@ -50,7 +50,7 @@ use MOM_EOS, only : calculate_density, calculate_density_derivs, calculate_TFree
 use MOM_EOS, only : EOS_type, EOS_init
 use MOM_ice_shelf_dynamics, only : ice_shelf_dyn_CS, update_ice_shelf
 use MOM_ice_shelf_dynamics, only : register_ice_shelf_dyn_restarts, initialize_ice_shelf_dyn
-use MOM_ice_shelf_dynamics, only : ice_shelf_min_thickness_calve
+use MOM_ice_shelf_dynamics, only : ice_shelf_min_thickness_calve, change_in_draft
 use MOM_ice_shelf_dynamics, only : ice_time_step_CFL, ice_shelf_dyn_end
 use MOM_ice_shelf_initialize, only : initialize_ice_thickness
 !MJH use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary
@@ -178,6 +178,8 @@ type, public :: ice_shelf_CS ; private
   logical :: const_gamma                 !< If true, gamma_T is specified by the user.
   logical :: constant_sea_level          !< if true, apply an evaporative, heat and salt
                                          !! fluxes. It will avoid large increase in sea level.
+  logical :: constant_sea_level_misomip  !< If true, constant_sea_level fluxes are applied only over
+                                         !! the surface sponge cells from the ISOMIP/MISOMIP configuration
   real    :: min_ocean_mass_float        !< The minimum ocean mass per unit area before the ice
                                          !! shelf is considered to float when constant_sea_level
                                          !! is used [R Z ~> kg m-2]
@@ -201,7 +203,7 @@ type, public :: ice_shelf_CS ; private
              id_tfreeze = -1, id_tfl_shelf = -1, &
              id_thermal_driving = -1, id_haline_driving = -1, &
              id_u_ml = -1, id_v_ml = -1, id_sbdry = -1, &
-             id_h_shelf = -1, id_h_mask = -1, &
+             id_h_shelf = -1, id_dhdt_shelf, id_h_mask = -1, &
              id_surf_elev = -1, id_bathym = -1, &
              id_area_shelf_h = -1, &
              id_ustar_shelf = -1, id_shelf_mass = -1, id_mass_flux = -1, &
@@ -752,6 +754,9 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
 
   ! Melting has been computed, now is time to update thickness and mass with dynamic ice shelf
   if (CS%active_shelf_dynamics) then
+
+    ISS%dhdt_shelf = ISS%h_shelf
+
     call change_thickness_using_melt(ISS, G, US, time_step, fluxes, CS%density_ice, CS%debug)
 
     if (CS%debug) then
@@ -769,18 +774,20 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
     endif
 
     update_ice_vel = .false.
-    coupled_GL = (CS%GL_couple .and. .not.CS%solo_ice_sheet)
+    coupled_GL = (CS%GL_couple .and. .not. CS%solo_ice_sheet)
 
     ! advect the ice shelf, and advance the front. Calving will be in here somewhere as well..
     ! when we decide on how to do it
     call update_ice_shelf(CS%dCS, ISS, G, US, time_step, Time, CS%calve_ice_shelf_bergs, &
                           sfc_state%ocean_mass, coupled_GL)
+
+    ISS%dhdt_shelf = (ISS%h_shelf - ISS%dhdt_shelf)/time_step
   endif
 
   if (CS%debug) call MOM_forcing_chksum("Before add shelf flux", fluxes, G, CS%US, haloshift=0)
 
   ! pass on the updated ice sheet geometry (for pressure on ocean) and thermodynamic data
-  call add_shelf_flux(G, US, CS, sfc_state, fluxes)
+  call add_shelf_flux(G, US, CS, sfc_state, fluxes, time_step)
 
   call enable_averages(time_step, Time, CS%diag)
   if (CS%id_shelf_mass > 0) call post_data(CS%id_shelf_mass, ISS%mass_shelf, CS%diag)
@@ -800,6 +807,7 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
   if (CS%id_exch_vel_t > 0) call post_data(CS%id_exch_vel_t, exch_vel_t, CS%diag)
   if (CS%id_exch_vel_s > 0) call post_data(CS%id_exch_vel_s, exch_vel_s, CS%diag)
   if (CS%id_h_shelf > 0) call post_data(CS%id_h_shelf, ISS%h_shelf, CS%diag)
+  if (CS%id_dhdt_shelf > 0) call post_data(CS%id_dhdt_shelf, ISS%dhdt_shelf, CS%diag)
   if (CS%id_h_mask > 0) call post_data(CS%id_h_mask,ISS%hmask,CS%diag)
   call disable_averaging(CS%diag)
 
@@ -1037,13 +1045,13 @@ subroutine add_shelf_pressure(Ocn_grid, US, CS, fluxes)
 end subroutine add_shelf_pressure
 
 !> Updates surface fluxes that are influenced by sub-ice-shelf melting
-subroutine add_shelf_flux(G, US, CS, sfc_state, fluxes)
+subroutine add_shelf_flux(G, US, CS, sfc_state, fluxes, time_step)
   type(ocean_grid_type), intent(inout) :: G    !< The ocean's grid structure.
   type(unit_scale_type), intent(in)    :: US   !< A dimensional unit scaling type
   type(ice_shelf_CS),    pointer       :: CS   !< This module's control structure.
   type(surface),         intent(inout) :: sfc_state !< Surface ocean state
   type(forcing),         intent(inout) :: fluxes  !< A structure of surface fluxes that may be used/updated.
-
+  real,                  intent(in)    :: time_step !< Time step over which fluxes are applied
   ! local variables
   real :: frac_shelf       !< The fractional area covered by the ice shelf [nondim].
   real :: frac_open        !< The fractional area of the ocean that is not covered by the ice shelf [nondim].
@@ -1064,6 +1072,8 @@ subroutine add_shelf_flux(G, US, CS, sfc_state, fluxes)
                           !! at at previous time (Time-dt)
   real, dimension(SZDI_(G),SZDJ_(G))  :: last_area_shelf_h !< Ice shelf area [L2 ~> m2]
                           !! at at previous time (Time-dt)
+  real, dimension(SZDI_(G),SZDJ_(G))  :: delta_draft !< change in ice shelf draft thickness [L ~> m]
+                          !! since previous time (Time-dt)
   type(ice_shelf_state), pointer :: ISS => NULL() !< A structure with elements that describe
                                           !! the ice-shelf state
 
@@ -1190,22 +1200,36 @@ subroutine add_shelf_flux(G, US, CS, sfc_state, fluxes)
       else! first time step
         delta_mass_shelf = 0.0
       endif
-    else ! ice shelf mass does not change
-      delta_mass_shelf = 0.0
+    else
+      if (CS%active_shelf_dynamics) then ! change in ice_shelf draft
+        last_h_shelf = ISS%h_shelf - time_step * ISS%dhdt_shelf
+        call change_in_draft(CS%dCS, G, last_h_shelf, ISS%h_shelf, delta_draft)
+
+        !this currently assumes area_shelf_h is constant over the time step
+        delta_mass_shelf = global_area_integral(delta_draft, G, tmp_scale=US%RZ_to_kg_m2, &
+                                                area=ISS%area_shelf_h) &
+                                                * CS%Rho_ocn / CS%time_step
+      else ! ice shelf mass does not change
+        delta_mass_shelf = 0.0
+      endif
     endif
 
-    ! average total melt flux over sponge area
+    ! average total melt flux over sponge area (ISOMIP/MISOMIP only) or open ocean (general case)
     do j=js,je ; do i=is,ie
-      if ((G%mask2dT(i,j) > 0.0) .AND. (ISS%area_shelf_h(i,j) * G%IareaT(i,j) < 1.0)) then
-         ! Uncomment this for some ISOMIP cases:
-         !  .AND. (G%geoLonT(i,j) >= 790.0) .AND. (G%geoLonT(i,j) <= 800.0)) then
+      if (CS%constant_sea_level_misomip) then !for ismip/misomip only
+        if (G%geoLonT(i,j) >= 790.0) then
+          bal_frac(i,j) = max(1.0 - ISS%area_shelf_h(i,j) * G%IareaT(i,j), 0.0)
+        else
+          bal_frac(i,j) = 0.0
+        endif
+      elseif ((G%mask2dT(i,j) > 0.0) .and. (ISS%area_shelf_h(i,j) * G%IareaT(i,j) < 1.0)) then !general case
         bal_frac(i,j) = max(1.0 - ISS%area_shelf_h(i,j) * G%IareaT(i,j), 0.0)
       else
         bal_frac(i,j) = 0.0
       endif
     enddo ; enddo
 
-    balancing_area = global_area_integral(bal_frac, G)
+    balancing_area = global_area_integral(bal_frac, G, area=G%areaT)
     if (balancing_area > 0.0) then
       balancing_flux = ( global_area_integral(ISS%water_flux, G, tmp_scale=US%RZ_T_to_kg_m2s, &
                                               area=ISS%area_shelf_h) + &
@@ -1447,6 +1471,9 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, forces_in,
                  "ISOMIP+ experiments (Ocean3 and Ocean4). "//&
                  "IMPORTANT: it is not currently possible to do "//&
                  "prefect restarts using this flag.", default=.false.)
+  call get_param(param_file, mdl, "CONST_SEA_LEVEL_MISOMIP", CS%constant_sea_level_misomip, &
+                 "If true, constant_sea_level fluxes are applied only over "//&
+                 "the surface sponge cells from the ISOMIP/MISOMIP configuration", default=.false.)
   call get_param(param_file, mdl, "MIN_OCEAN_FLOAT_THICK", dz_ocean_min_float, &
                  "The minimum ocean thickness above which the ice shelf is considered to be "//&
                  "floating when CONST_SEA_LEVEL = True.", &
@@ -1826,6 +1853,8 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, forces_in,
       'mass of shelf', 'kg/m^2', conversion=US%RZ_to_kg_m2)
   CS%id_h_shelf = register_diag_field('ice_shelf_model', 'h_shelf', CS%diag%axesT1, CS%Time, &
       'ice shelf thickness', 'm', conversion=US%Z_to_m)
+  CS%id_dhdt_shelf = register_diag_field('ice_shelf_model', 'dhdt_shelf', CS%diag%axesT1, CS%Time, &
+      'change in ice shelf thickness over time', 'm/s', conversion=US%Z_to_m)
   CS%id_mass_flux = register_diag_field('ice_shelf_model', 'mass_flux', CS%diag%axesT1,&
       CS%Time, 'Total mass flux of freshwater across the ice-ocean interface.', &
       'kg/s', conversion=US%RZ_T_to_kg_m2s*US%L_to_m**2)
@@ -2245,6 +2274,8 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
   write (mesg,*) "TIME in ice shelf call, yrs: ", time_type_to_real(Time)/(365. * 86400.)
   call MOM_mesg("solo_step_ice_shelf: "//mesg, 5)
 
+  ISS%dhdt_shelf = ISS%h_shelf
+
   do while (remaining_time > 0.0)
     nsteps = nsteps+1
 
@@ -2271,9 +2302,12 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
 
   enddo
 
+  ISS%dhdt_shelf = (ISS%h_shelf - ISS%dhdt_shelf)/full_time_step
+
   call enable_averages(full_time_step, Time, CS%diag)
     if (CS%id_area_shelf_h > 0) call post_data(CS%id_area_shelf_h, ISS%area_shelf_h, CS%diag)
     if (CS%id_h_shelf > 0) call post_data(CS%id_h_shelf, ISS%h_shelf, CS%diag)
+    if (CS%id_dhdt_shelf > 0) call post_data(CS%id_dhdt_shelf, ISS%dhdt_shelf, CS%diag)
     if (CS%id_h_mask > 0) call post_data(CS%id_h_mask, ISS%hmask, CS%diag)
   call disable_averaging(CS%diag)
 

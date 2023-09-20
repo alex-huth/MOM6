@@ -31,7 +31,7 @@ implicit none ; private
 #include <MOM_memory.h>
 
 public register_ice_shelf_dyn_restarts, initialize_ice_shelf_dyn, update_ice_shelf
-public ice_time_step_CFL, ice_shelf_dyn_end
+public ice_time_step_CFL, ice_shelf_dyn_end, change_in_draft
 public shelf_advance_front, ice_shelf_min_thickness_calve, calve_to_mask
 
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
@@ -409,12 +409,19 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "ocean column thickness. This means that update_OD_ffrac "//&
                  "will be called.  GL_REGULARIZE and GL_COUPLE are exclusive.", &
                  default=.false., do_not_log=CS%GL_regularize)
-    if (CS%GL_regularize) CS%GL_couple = .false.
+    !if (CS%GL_regularize) CS%GL_couple = .false.
+    if (present(solo_ice_sheet_in)) then
+      if (solo_ice_sheet_in) CS%GL_couple = .false.
+    endif
     if (CS%GL_regularize .and. (CS%n_sub_regularize == 0)) call MOM_error (FATAL, &
       "GROUNDING_LINE_INTERP_SUBGRID_N must be a positive integer if GL regularization is used")
     call get_param(param_file, mdl, "DRIVING_STRESS_B", CS%driving_stress_b, &
                  "If true, calculate driving stress from "//&
                  "b-grid bed elevation and surface height)", default=.false.)
+    if (CS%GL_couple .and. CS%driving_stress_b) then
+      call MOM_error(FATAL, "MOM_ice_shelf_dyn.F90, initialize_ice_shelf_dyn: "// &
+                            "cannot set DRIVING_STRESS_B=.true. and GROUNDING_LINE_COUPLE=.true. yet")
+    endif
     call get_param(param_file, mdl, "ICE_SHELF_CFL_FACTOR", CS%CFL_factor, &
                  "A factor used to limit timestep as CFL_FACTOR * min (\Delta x / u). "//&
                  "This is only used with an ice-only model.", units="nondim", default=0.25)
@@ -773,7 +780,7 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
 
   coupled_GL = .false.
   if (present(ocean_mass) .and. present(coupled_grounding)) coupled_GL = coupled_grounding
-!
+
   if (CS%advect_shelf) then
     call ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
   endif
@@ -784,6 +791,7 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
     call update_OD_ffrac(CS, G, US, ocean_mass, update_ice_vel)
   elseif (update_ice_vel) then
     call update_OD_ffrac_uncoupled(CS, G, ISS%h_shelf(:,:))
+    CS%GL_couple=.false.
   endif
 
 
@@ -1008,18 +1016,22 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   CS%ground_frac(:,:) = 0.0
   allocate(Phisub(nsub,nsub,2,2,2,2), source=0.0)
 
-  do j=G%jsc,G%jec
-    do i=G%isc,G%iec
+  if (CS%GL_couple) then
+    do j=G%jsc,G%jec ; do i=G%isc,G%iec
+      float_cond(i,j) = CS%ground_frac(i,j)
+    enddo; enddo
+  else
+    do j=G%jsc,G%jec ; do i=G%isc,G%iec
       if (rhoi_rhow * ISS%h_shelf(i,j) - CS%bed_elev(i,j) > 0) then
         float_cond(i,j) = 1.0
         CS%ground_frac(i,j) = 1.0
         CS%OD_av(i,j) =0.0
       endif
-    enddo
-  enddo
+    enddo; enddo
+  endif
 
   if (CS%driving_stress_b) then
-    call interpolate_H_to_B_weighted(G, ISS%h_shelf, ISS%hmask, H_node)
+    call interpolate_var_to_B_weighted(G, ISS%h_shelf, ISS%hmask, H_node)
     call calc_shelf_driving_stress_b(CS, ISS, G, US, taudx, taudy, CS%OD_av, H_node)
   else
     call calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, CS%OD_av)
@@ -1035,24 +1047,46 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
   if (CS%GL_regularize) then
 
-    if (.not. CS%driving_stress_b) then
-      call interpolate_H_to_B(G, ISS%h_shelf, ISS%hmask, H_node)
-    endif
+    if (CS%GL_couple) then
+      !here, H_node is actually zb_node
+      call interpolate_var_to_B_weighted(G, CS%bed_elev-CS%OD_av, ISS%hmask, H_node)
 
-    do j=G%jsc,G%jec ; do i=G%isc,G%iec
-      nodefloat = 0
+      do j=G%jsc,G%jec ; do i=G%isc,G%iec
+        nodefloat = 0
 
-      do l=0,1 ; do k=0,1
-        if ((ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j)==3) .and. &
-            (rhoi_rhow * H_node(i-1+k,j-1+l) - CS%bed_elev(i,j) <= 0)) then
-          nodefloat = nodefloat + 1
+        do l=0,1 ; do k=0,1
+          if ((ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j)==3) .and. &
+            (H_node(i-1+k,j-1+l) + CS%thresh_float_col_depth > CS%bed_elev(i,j) )) then
+            nodefloat = nodefloat + 1
+          endif
+        enddo; enddo
+        if ((nodefloat > 0) .and. (nodefloat < 4)) then
+          float_cond(i,j) = 1.0
+          CS%ground_frac(i,j) = 1.0
         endif
-      enddo ; enddo
-      if ((nodefloat > 0) .and. (nodefloat < 4)) then
-        float_cond(i,j) = 1.0
-        CS%ground_frac(i,j) = 1.0
+      enddo; enddo
+
+    else
+
+      if (.not. CS%driving_stress_b) then
+        call interpolate_H_to_B(G, ISS%h_shelf, ISS%hmask, H_node)
       endif
-    enddo ; enddo
+
+      do j=G%jsc,G%jec ; do i=G%isc,G%iec
+        nodefloat = 0
+
+        do l=0,1 ; do k=0,1
+          if ((ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j)==3) .and. &
+            (rhoi_rhow * H_node(i-1+k,j-1+l) - CS%bed_elev(i,j) <= 0)) then
+            nodefloat = nodefloat + 1
+          endif
+        enddo; enddo
+        if ((nodefloat > 0) .and. (nodefloat < 4)) then
+          float_cond(i,j) = 1.0
+          CS%ground_frac(i,j) = 1.0
+        endif
+      enddo; enddo
+    endif
 
     call pass_var(float_cond, G%Domain, complete=.false.)
 
@@ -2005,18 +2039,22 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
   rhoi_rhow = rho/rhow
   ! prelim - go through and calculate S
 
-  S(:,:) = -CS%bed_elev(:,:) + ISS%h_shelf(:,:)
-  ! check whether the ice is floating or grounded
+  if (CS%GL_couple) then
+    S(:,:) = -CS%bed_elev(:,:) + OD(:,:) + ISS%h_shelf(:,:)
+  else
+    S(:,:) = -CS%bed_elev(:,:) + ISS%h_shelf(:,:)
+    ! check whether the ice is floating or grounded
 
-  do j=jsc-G%domain%njhalo,jec+G%domain%njhalo
-    do i=isc-G%domain%nihalo,iec+G%domain%nihalo
-      if (rhoi_rhow * ISS%h_shelf(i,j) - CS%bed_elev(i,j) <= 0) then
-        S(i,j) = (1 - rhoi_rhow)*ISS%h_shelf(i,j)
-      else
-        S(i,j) = ISS%h_shelf(i,j)-CS%bed_elev(i,j)
-      endif
+    do j=jsc-G%domain%njhalo,jec+G%domain%njhalo
+      do i=isc-G%domain%nihalo,iec+G%domain%nihalo
+        if (rhoi_rhow * ISS%h_shelf(i,j) - CS%bed_elev(i,j) <= 0) then
+          S(i,j) = (1 - rhoi_rhow)*ISS%h_shelf(i,j)
+        else
+          S(i,j) = ISS%h_shelf(i,j)-CS%bed_elev(i,j)
+        endif
+      enddo
     enddo
-  enddo
+  endif
 
   call pass_var(S, G%domain)
 
@@ -2547,8 +2585,13 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
       if (float_cond(i,j) == 1) then
         Ucell(:,:) = u_shlf(I-1:I,J-1:J) ; Vcell(:,:) = v_shlf(I-1:I,J-1:J)
         Hcell(:,:) = H_node(i-1:i,j-1:j)
-        call CG_action_subgrid_basal(Phisub, Hcell, Ucell, Vcell, bathyT(i,j), dens_ratio, Usub, Vsub)
-
+        if (CS%GL_couple) then
+          !here, Hcell is actually zb_cell
+          call CG_action_subgrid_basal_OD(Phisub, Hcell, Ucell, Vcell, bathyT(i,j), &
+                                          CS%thresh_float_col_depth, Usub, Vsub)
+        else
+          call CG_action_subgrid_basal(Phisub, Hcell, Ucell, Vcell, bathyT(i,j), dens_ratio, Usub, Vsub)
+        endif
         if (umask(I-1,J-1) == 1) uret(I-1,J-1) = uret(I-1,J-1) + Usub(1,1) * basal_trac(i,j)
         if (umask(I-1,J) == 1) uret(I-1,J) = uret(I-1,J) + Usub(1,2) * basal_trac(i,j)
         if (umask(I,J-1) == 1) uret(I,J-1) = uret(I,J-1) + Usub(2,1) * basal_trac(i,j)
@@ -2604,6 +2647,47 @@ subroutine CG_action_subgrid_basal(Phisub, H, U, V, bathyT, dens_ratio, Ucontr, 
   enddo ; enddo
 
 end subroutine CG_action_subgrid_basal
+
+!GL_couple=.true. version of CG_action_subgrid_basal. Here, H_node is actually zb_node
+subroutine CG_action_subgrid_basal_OD(Phisub, H, U, V, bathyT, thres, Ucontr, Vcontr)
+  real, dimension(:,:,:,:,:,:), &
+                        intent(in)    :: Phisub !< Quadrature structure weights at subgridscale
+                                            !! locations for finite element calculations [nondim]
+  real, dimension(2,2), intent(in)    :: H  !< The ice shelf thickness at nodal (corner) points [Z ~> m].
+  real, dimension(2,2), intent(in)    :: U  !< The zonal ice shelf velocity at vertices [L T-1 ~> m s-1]
+  real, dimension(2,2), intent(in)    :: V  !< The meridional ice shelf velocity at vertices [L T-1 ~> m s-1]
+  real,                 intent(in)    :: bathyT !< The depth of ocean bathymetry at tracer points
+                                            !! relative to sea-level [Z ~> m].
+  real,                 intent(in)    :: thres  !< The threshold for grounding with GL_couple=.true.
+  real, dimension(2,2), intent(out)   :: Ucontr !< The areal average of u-velocities where the ice shelf
+                                            !! is grounded, or 0 where it is floating [L T-1 ~> m s-1].
+  real, dimension(2,2), intent(out)   :: Vcontr !< The areal average of v-velocities where the ice shelf
+                                            !! is grounded, or 0 where it is floating [L T-1 ~> m s-1].
+
+  real    :: subarea ! The fractional sub-cell area [nondim]
+  real    :: hloc    ! The local sub-cell ice thickness [Z ~> m]
+  integer :: nsub, i, j, qx, qy, m, n
+
+  nsub = size(Phisub,1)
+  subarea = 1.0 / (nsub**2)
+
+  do n=1,2 ; do m=1,2
+    Ucontr(m,n) = 0.0 ; Vcontr(m,n) = 0.0
+    do qy=1,2 ; do qx=1,2 ; do j=1,nsub ; do i=1,nsub
+      hloc = (Phisub(i,j,1,1,qx,qy)*H(1,1) + Phisub(i,j,2,2,qx,qy)*H(2,2)) + &
+             (Phisub(i,j,1,2,qx,qy)*H(1,2) + Phisub(i,j,2,1,qx,qy)*H(2,1))
+      if (hloc + thres >= bathyT) then
+        Ucontr(m,n) = Ucontr(m,n) + subarea * 0.25 * Phisub(i,j,m,n,qx,qy) * &
+             ((Phisub(i,j,1,1,qx,qy) * U(1,1) + Phisub(i,j,2,2,qx,qy) * U(2,2)) + &
+              (Phisub(i,j,1,2,qx,qy) * U(1,2) + Phisub(i,j,2,1,qx,qy) * U(2,1)))
+        Vcontr(m,n) = Vcontr(m,n) + subarea * 0.25 * Phisub(i,j,m,n,qx,qy) * &
+             ((Phisub(i,j,1,1,qx,qy) * V(1,1) + Phisub(i,j,2,2,qx,qy) * V(2,2)) + &
+              (Phisub(i,j,1,2,qx,qy) * V(1,2) + Phisub(i,j,2,1,qx,qy) * V(2,1)))
+      endif
+    enddo ; enddo ; enddo ; enddo
+  enddo ; enddo
+
+end subroutine CG_action_subgrid_basal_OD
 
 !> returns the diagonal entries of the matrix for a Jacobi preconditioning
 subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, hmask, dens_ratio, &
@@ -2713,7 +2797,12 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
 
     if (float_cond(i,j) == 1) then
       Hcell(:,:) = H_node(i-1:i,j-1:j)
-      call CG_diagonal_subgrid_basal(Phisub, Hcell, CS%bed_elev(i,j), dens_ratio, sub_ground)
+      if (CS%GL_couple) then
+        !here, Hcell is actually zb_cell
+        call CG_diagonal_subgrid_basal(Phisub, Hcell, CS%bed_elev(i,j), CS%thresh_float_col_depth, sub_ground)
+      else
+        call CG_diagonal_subgrid_basal(Phisub, Hcell, CS%bed_elev(i,j), dens_ratio, sub_ground)
+      endif
       do iphi=1,2 ; do jphi=1,2 ; Itgt = I-2+iphi ; Jtgt = J-2+jphi
         if (CS%umask(Itgt,Jtgt) == 1) then
           u_diagonal(Itgt,Jtgt) = u_diagonal(Itgt,Jtgt) + sub_ground(iphi,jphi) * basal_trac(i,j)
@@ -2762,6 +2851,40 @@ subroutine CG_diagonal_subgrid_basal (Phisub, H_node, bathyT, dens_ratio, sub_gr
 
 end subroutine CG_diagonal_subgrid_basal
 
+!GL_couple=.true. version of CG_diagonal_subgrid_basal. Here, H_node is actually zb_node
+subroutine CG_diagonal_subgrid_basal_OD (Phisub, H_node, bathyT, thres, sub_grnd)
+  real, dimension(:,:,:,:,:,:), &
+                        intent(in) :: Phisub !< Quadrature structure weights at subgridscale
+                                             !! locations for finite element calculations [nondim]
+  real, dimension(2,2), intent(in) :: H_node !< The ice shelf thickness at nodal (corner)
+                                             !! points [Z ~> m].
+  real,                 intent(in) :: bathyT !< The depth of ocean bathymetry at tracer points [Z ~> m].
+  real,                 intent(in) :: thres  !< The threshold for grounding with GL_couple=.true.
+  real, dimension(2,2), intent(out) :: sub_grnd !< The weighted fraction of the sub-cell where the ice shelf
+                                                !! is grounded [nondim]
+
+  ! bathyT = cellwise-constant bed elevation
+
+  real    :: subarea ! The fractional sub-cell area [nondim]
+  real    :: hloc    ! The local sub-region thickness [Z ~> m]
+  integer :: nsub, i, j, qx, qy, m, n
+
+  nsub = size(Phisub,1)
+  subarea = 1.0 / (nsub**2)
+
+  sub_grnd(:,:) = 0.0
+  do m=1,2 ; do n=1,2 ; do j=1,nsub ; do i=1,nsub ; do qx=1,2 ; do qy = 1,2
+
+    hloc = (Phisub(i,j,1,1,qx,qy)*H_node(1,1) + Phisub(i,j,2,2,qx,qy)*H_node(2,2)) + &
+           (Phisub(i,j,1,2,qx,qy)*H_node(1,2) + Phisub(i,j,2,1,qx,qy)*H_node(2,1))
+
+    if (hloc +thres >= bathyT) then
+      sub_grnd(m,n) = sub_grnd(m,n) + subarea * 0.25 * Phisub(i,j,m,n,qx,qy)**2
+    endif
+
+  enddo ; enddo ; enddo ; enddo ; enddo ; enddo
+
+end subroutine CG_diagonal_subgrid_basal_OD
 
 subroutine apply_boundary_values(CS, ISS, G, US, time, Phisub, H_node, ice_visc, basal_trac, float_cond, &
                                  dens_ratio, u_bdry_contr, v_bdry_contr)
@@ -3141,6 +3264,13 @@ subroutine update_OD_ffrac(CS, G, US, ocean_mass, find_avg)
       CS%ground_frac(i,j) = 1.0 - (CS%ground_frac_rt(i,j) * I_counter)
       CS%OD_av(i,j) = CS%OD_rt(i,j) * I_counter
 
+      !does this make more sense?
+      if (CS%OD_av(i,j) <= CS%thresh_float_col_depth) then
+        CS%ground_frac(i,j) = 1.0
+      else
+        CS%ground_frac(i,j) = 0.0
+      endif
+
       CS%OD_rt(i,j) = 0.0 ; CS%ground_frac_rt(i,j) = 0.0
     enddo ; enddo
 
@@ -3177,6 +3307,53 @@ subroutine update_OD_ffrac_uncoupled(CS, G, h_shelf)
   enddo
 
 end subroutine update_OD_ffrac_uncoupled
+
+subroutine change_in_draft(CS, G, h_shelf0, h_shelf1, ddraft)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS !< A pointer to the ice shelf control structure
+  type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(in)    :: h_shelf0 !< the previous thickness of the ice shelf [Z ~> m].
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(in)    :: h_shelf1 !< the current thickness of the ice shelf [Z ~> m].
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(inout)    :: ddraft !< the change in shelf draft thickness
+  real :: b0,b1
+  integer :: i, j, isc, iec, jsc, jec
+  real    :: rhoi_rhow, OD
+
+  rhoi_rhow = CS%density_ice / CS%density_ocean_avg
+  isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
+  ddraft = 0.0
+
+  do j=jsc,jec
+    do i=isc,iec
+
+      b0=0.0; b1=0.0
+
+      if (h_shelf0(i,j)>0.0) then
+        OD = CS%bed_elev(i,j) - rhoi_rhow * h_shelf0(i,j)
+        if (OD >= 0) then
+          !floating
+          b0 = rhoi_rhow * h_shelf0(i,j)
+        else
+          b0 = CS%bed_elev(i,j)
+        endif
+      endif
+
+      if (h_shelf1(i,j)>0.0) then
+        OD = CS%bed_elev(i,j) - rhoi_rhow * h_shelf1(i,j)
+        if (OD >= 0) then
+          !floating
+          b1 = rhoi_rhow * h_shelf1(i,j)
+        else
+          b1 = CS%bed_elev(i,j)
+        endif
+      endif
+
+      ddraft(i,j) = b1-b0
+    enddo
+  enddo
+end subroutine change_in_draft
 
 !> This subroutine calculates the gradients of bilinear basis elements that
 !! that are centered at the vertices of the cell.  Values are calculated at
@@ -3606,18 +3783,17 @@ subroutine interpolate_H_to_B(G, h_shelf, hmask, H_node)
 
 end subroutine interpolate_H_to_B
 
-!> Interpolate the ice shelf thickness from tracer point to nodal points,
-!! subject to a mask. Weight the thickness contribution from each cell by cell area.
-subroutine interpolate_H_to_B_weighted(G, h_shelf, hmask, H_node)
+!> Interpolate an ice shelf variable from tracer point to nodal points,
+!! subject to a mask. Weight the contribution of the variable from each cell by cell area.
+subroutine interpolate_var_to_B_weighted(G, h_shelf, hmask, H_node)
   type(ocean_grid_type), intent(inout) :: G  !< The grid structure used by the ice shelf.
   real, dimension(SZDI_(G),SZDJ_(G)), &
-                         intent(in)    :: h_shelf !< The ice shelf thickness at tracer points [Z ~> m].
+                         intent(in)    :: h_shelf !< The ice shelf variable at tracer points [Z ~> m].
   real, dimension(SZDI_(G),SZDJ_(G)), &
                          intent(in)    :: hmask !< A mask indicating which tracer points are
                                              !! partly or fully covered by an ice-shelf
   real, dimension(SZDIB_(G),SZDJB_(G)), &
-                         intent(inout) :: H_node !< The ice shelf thickness at nodal (corner)
-                                             !! points [Z ~> m].
+                         intent(inout) :: H_node !< The ice shelf variable at nodal (corner) points.
 
   integer :: i, j, isc, iec, jsc, jec, num_h, k, l
   real    :: summ, suma
@@ -3649,7 +3825,7 @@ subroutine interpolate_H_to_B_weighted(G, h_shelf, hmask, H_node)
 
   call pass_var(H_node, G%domain,position=CORNER)
 
-end subroutine interpolate_H_to_B_weighted
+end subroutine interpolate_var_to_B_weighted
 
 !> Deallocates all memory associated with the ice shelf dynamics module
 subroutine ice_shelf_dyn_end(CS)
