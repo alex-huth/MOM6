@@ -98,9 +98,9 @@ type, public :: ice_shelf_dyn_CS ; private
                                                        !! the same as G%bathyT+Z_ref, when below sea-level.
                                                        !! Sign convention: positive below sea-level, negative above.
 
-  real, pointer, dimension(:,:) :: basal_traction => NULL() !< The area-integrated taub_beta field (m2 Pa s m-1, or kg s-1)
-                                                            !! related to the nonlinear part of "linearized"
-                                                            !! basal stress (Pa) [R L3 T-1 ~> kg s-1]
+  real, pointer, dimension(:,:) :: basal_traction => NULL() !< The area-integrated taub_beta field
+                                                            !! (m2 Pa s m-1, or kg s-1) related to the nonlinear part
+                                                            !! of "linearized" basal stress (Pa) [R L3 T-1 ~> kg s-1]
                 !!  The exact form depends on basal law exponent and/or whether flow is "hybridized" a la Goldberg 2011
   real, pointer, dimension(:,:) :: C_basal_friction => NULL()!< Coefficient in sliding law tau_b = C u^(n_basal_fric),
                                                             !!  units= Pa (m s-1)^(n_basal_fric)
