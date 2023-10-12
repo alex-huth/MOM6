@@ -98,11 +98,12 @@ type, public :: ice_shelf_dyn_CS ; private
                                                        !! the same as G%bathyT+Z_ref, when below sea-level.
                                                        !! Sign convention: positive below sea-level, negative above.
 
-  real, pointer, dimension(:,:) :: basal_traction => NULL() !< The area integrated nonlinear part of "linearized"
-                                                            !! basal stress (Pa) [R L2 T-2 ~> Pa].
+  real, pointer, dimension(:,:) :: basal_traction => NULL() !< The area-integrated taub_beta field (m2 Pa s m-1, or kg s-1)
+                                                            !! related to the nonlinear part of "linearized"
+                                                            !! basal stress (Pa) [R L3 T-1 ~> kg s-1]
                 !!  The exact form depends on basal law exponent and/or whether flow is "hybridized" a la Goldberg 2011
   real, pointer, dimension(:,:) :: C_basal_friction => NULL()!< Coefficient in sliding law tau_b = C u^(n_basal_fric),
-                                                            !!  units= Pa (m yr-1)-(n_basal_fric)
+                                                            !!  units= Pa (m s-1)^(n_basal_fric)
   real, pointer, dimension(:,:) :: OD_rt => NULL()         !< A running total for calculating OD_av [Z ~> m].
   real, pointer, dimension(:,:) :: ground_frac_rt => NULL() !< A running total for calculating ground_frac.
   real, pointer, dimension(:,:) :: OD_av => NULL()         !< The time average open ocean depth [Z ~> m].
@@ -281,7 +282,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%ice_visc(isd:ied,jsd:jed), source=0.0)
     allocate(CS%Ee(isd:ied,jsd:jed,4), source=0.0)
     allocate(CS%AGlen_visc(isd:ied,jsd:jed), source=2.261e-25) ! [Pa-3 s-1]
-    allocate(CS%basal_traction(isd:ied,jsd:jed), source=0.0)   ! [R L2 T-2 ~> Pa]
+    allocate(CS%basal_traction(isd:ied,jsd:jed), source=0.0)   ! [R L3 T-1 ~> kg s-1]
     allocate(CS%C_basal_friction(isd:ied,jsd:jed), source=5.0e10) ! [Pa (m-1 s)^n_sliding]
     allocate(CS%OD_av(isd:ied,jsd:jed), source=0.0)
     allocate(CS%ground_frac(isd:ied,jsd:jed), source=0.0)
@@ -432,7 +433,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  units="none", default=.false., fail_if_missing=.false.)
     call get_param(param_file, mdl, "CF_MinN", CS%CF_MinN, &
                  "Minimum Coulomb friction effective pressure", &
-                 units="Pa", default=1.0, fail_if_missing=.false.)
+                 units="Pa", default=1.0, scale=US%Pa_to_RL2_T2, fail_if_missing=.false.)
     call get_param(param_file, mdl, "CF_PostPeak", CS%CF_PostPeak, &
                  "Coulomb friction post peak exponent", &
                  units="none", default=1.0, fail_if_missing=.false.)
@@ -641,7 +642,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     CS%id_visc_shelf = register_diag_field('ice_shelf_model','ice_visc',CS%diag%axesT1, Time, &
        'vi-viscosity', 'Pa m s', conversion=US%RL2_T2_to_Pa*US%Z_to_m*US%T_to_s) !vertically integrated viscosity
     CS%id_taub = register_diag_field('ice_shelf_model','taub_beta',CS%diag%axesT1, Time, &
-       'taub', 'MPa', conversion=1e-6*US%RL2_T2_to_Pa)
+       'taub', 'MPa s m-1', conversion=1e-6*US%RL2_T2_to_Pa/(365.0*86400.0*US%L_T_to_m_s))
     CS%id_OD_av = register_diag_field('ice_shelf_model','OD_av',CS%diag%axesT1, Time, &
        'intermediate ocean column thickness passed to ice model', 'm', conversion=US%Z_to_m)
   endif
@@ -737,7 +738,8 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, ocean_mass, coupled
   real, dimension(SZDIB_(G),SZDJB_(G))  :: taud_x, taud_y  !<area-averaged driving stress [R L2 T-2 ~> Pa]
   real, dimension(SZDI_(G),SZDJ_(G))  :: ice_visc !< area-averaged vertically integrated ice viscosity
                                               !! [R L2 Z T-1 ~> Pa s m]
-  real, dimension(SZDI_(G),SZDJ_(G))  :: basal_tr !< area-averaged basal traction [R L2 T-2 ~> Pa]
+  real, dimension(SZDI_(G),SZDJ_(G))  :: basal_tr !< area-averaged taub_beta field related to basal traction,
+                                              !! [R L1 T-1 ~> Pa s m-1]
   integer :: iters
   logical :: update_ice_vel, coupled_GL
 
@@ -2215,8 +2217,8 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
                          intent(in)    :: bathyT !< The depth of ocean bathymetry at tracer points
                                                  !! relative to sea-level [Z ~> m].
   real, dimension(SZDI_(G),SZDJ_(G)), &
-                         intent(in)    :: basal_trac  !< A field related to the nonlinear part of the
-                                                !! "linearized" basal stress [R Z T-1 ~> kg m-2 s-1].
+                         intent(in)    :: basal_trac  !< Area-integrated taub_beta field related to the nonlinear
+                                                !! part of the "linearized" basal stress [R L3 T-1 ~> kg s-1].
 
   real,                  intent(in)    :: dens_ratio !< The density of ice divided by the density
                                                      !! of seawater, nondimensional
@@ -2390,8 +2392,8 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
                                                 !! flow law [R L4 Z T-1 ~> kg m2 s-1]. The exact form
                                                 !!  and units depend on the basal law exponent.
   real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(in)    :: basal_trac !< A field related to the nonlinear part of the
-                                                !! "linearized" basal stress [R Z T-1 ~> kg m-2 s-1].
+                          intent(in)    :: basal_trac !< Area-integrated taub_beta field related to the nonlinear
+                                                !! part of the "linearized" basal stress [R L3 T-1 ~> kg s-1].
 
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(in)    :: hmask !< A mask indicating which tracer points are
@@ -2550,8 +2552,8 @@ subroutine apply_boundary_values(CS, ISS, G, US, time, Phisub, H_node, ice_visc,
                                                 !! flow law. The exact form and units depend on the
                                                 !! basal law exponent.  [R L4 Z T-1 ~> kg m2 s-1].
   real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(in)    :: basal_trac !< A field related to the nonlinear part of the
-                                                !! "linearized" basal stress [R Z T-1 ~> kg m-2 s-1].
+                          intent(in)    :: basal_trac !< Area-integrated taub_beta field related to the nonlinear
+                                                !! part of the "linearized" basal stress [R L3 T-1 ~> kg s-1].
 
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(in)    :: float_cond !< An array indicating where the ice
@@ -2831,7 +2833,10 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
   integer :: i, j, iscq, iecq, jscq, jecq, isd, jsd, ied, jed, iegq, jegq
   integer :: giec, gjec, gisc, gjsc, isc, jsc, iec, jec, is, js
   real :: umid, vmid, unorm, eps_min ! Velocities [L T-1 ~> m s-1]
-  real :: alpha, Hf, fN, fB !for Coulomb Friction
+  real :: alpha !Coulomb coefficient [nondim]
+  real :: Hf !"floatation thickness" for Coulomb friction [Z ~> m]
+  real :: fN !Effective pressure (ice pressure - ocean pressure) for Coulomb friction [R L2 T-2 ~> Pa]
+  real :: fB !for Coulomb Friction [(L T-1)^CS%CF_PostPeak ~> (m s-1)^CS%CF_PostPeak]
 
   isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
   iscq = G%iscB ; iecq = G%iecB ; jscq = G%jscB ; jecq = G%jecB
@@ -2845,7 +2850,7 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
 
   if (CS%CoulombFriction) then
     if (CS%CF_PostPeak.ne.1.0) THEN
-      alpha = (CS%CF_PostPeak-1.0)**(CS%CF_PostPeak-1.0) / CS%CF_PostPeak**CS%CF_PostPeak
+      alpha = (CS%CF_PostPeak-1.0)**(CS%CF_PostPeak-1.0) / CS%CF_PostPeak**CS%CF_PostPeak ![nondim]
     else
       alpha = 1.0
     endif
@@ -2862,7 +2867,7 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
         if (CS%CoulombFriction) then
           !Effective pressure
           Hf = max(CS%density_ocean_avg * CS%bed_elev(i,j)/CS%density_ice, 0.0)
-          fN = max(CS%density_ice * CS%g_Earth * (ISS%h_shelf(i,j) - Hf),US%RL2_T2_to_Pa*CS%CF_MinN)
+          fN = max(CS%density_ice * CS%g_Earth * (ISS%h_shelf(i,j) - Hf),CS%CF_MinN)
 
           fB = alpha * (CS%C_basal_friction(i,j) / (CS%CF_Max * fN))**(CS%CF_PostPeak/CS%n_basal_fric)
           CS%basal_traction(i,j) = G%areaT(i,j) * CS%C_basal_friction(i,j) * &
