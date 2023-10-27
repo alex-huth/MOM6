@@ -888,6 +888,15 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time)
     endif
   endif
 
+  do j=jsc,jec; do i=isc,iec
+    ISS%mass_shelf(i,j) = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j)/G%areaT(i,j) * CS%density_ice
+  enddo; enddo
+
+  call pass_var(ISS%mass_shelf, G%domain, complete=.false.)
+  call pass_var(ISS%h_shelf, G%domain, complete=.false.)
+  call pass_var(ISS%area_shelf_h, G%domain, complete=.false.)
+  call pass_var(ISS%hmask, G%domain, complete=.true.)
+
   !call enable_averages(time_step, Time, CS%diag)
   !if (CS%id_h_after_adv > 0) call post_data(CS%id_h_after_adv, ISS%h_shelf, CS%diag)
   !call disable_averaging(CS%diag)
