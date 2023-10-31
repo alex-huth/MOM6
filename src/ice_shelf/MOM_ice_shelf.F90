@@ -271,6 +271,7 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
                !! interface, positive for melting and negative for freezing [S ~> ppt].
                !! This is computed as part of the ISOMIP diagnostics.
   real :: time_step !< Length of time over which these fluxes will be applied [T ~> s].
+  real :: Itime_step !< Inverse of the length of time over which these fluxes will be applied [T-1 ~> s-1]
   real :: VK       !< Von Karman's constant - dimensionless
   real :: ZETA_N   !< This is the stability constant xi_N = 0.052 from Holland & Jenkins '99
                    !! divided by the von Karman constant VK. Was 1/8. [nondim]
@@ -778,7 +779,10 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
     call update_ice_shelf(CS%dCS, ISS, G, US, time_step, Time, &
                           sfc_state%ocean_mass, coupled_GL)
 
-    ISS%dhdt_shelf(:,:) = (ISS%h_shelf(:,:) - ISS%dhdt_shelf(:,:))/time_step
+    Itime_step = 1./time_step
+    do j=js,je ; do i=is,ie
+      ISS%dhdt_shelf(i,j) = (ISS%h_shelf(i,j) - ISS%dhdt_shelf(i,j))*Itime_step
+    enddo; enddo
   endif
 
   if (CS%debug) call MOM_forcing_chksum("Before add shelf flux", fluxes, G, CS%US, haloshift=0)
@@ -857,7 +861,7 @@ subroutine change_thickness_using_melt(ISS, G, US, time_step, fluxes, density_ic
         ISS%hmask(i,j) = 0.0
         ISS%area_shelf_h(i,j) = 0.0
       endif
-      ISS%mass_shelf(i,j) = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j)/G%areaT(i,j) * density_ice
+      ISS%mass_shelf(i,j) = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) * G%IareaT(i,j) * density_ice
     endif
   enddo ; enddo
 
@@ -1172,7 +1176,9 @@ subroutine add_shelf_flux(G, US, CS, sfc_state, fluxes, time_step)
       endif
     else
       if (CS%active_shelf_dynamics) then ! change in ice_shelf draft
-        last_h_shelf(:,:) = ISS%h_shelf(:,:) - time_step * ISS%dhdt_shelf(:,:)
+        do j=js,je ; do i=is,ie
+          last_h_shelf(i,j) = ISS%h_shelf(i,j) - time_step * ISS%dhdt_shelf(i,j)
+        enddo ; enddo
         call change_in_draft(CS%dCS, G, last_h_shelf, ISS%h_shelf, delta_draft)
 
         !this currently assumes area_shelf_h is constant over the time step
@@ -2065,7 +2071,7 @@ subroutine change_thickness_using_precip(CS, ISS, G, US, fluxes, time_step, Time
         ISS%hmask(i,j) = 0.0
         ISS%area_shelf_h(i,j) = 0.0
       endif
-      ISS%mass_shelf(i,j) = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j)/G%areaT(i,j) * CS%density_ice
+      ISS%mass_shelf(i,j) = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) * G%IareaT(i,j) * CS%density_ice
     endif
   enddo ; enddo
 
@@ -2219,20 +2225,22 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
   real :: remaining_time    ! The remaining time in this call [T ~> s]
   real :: time_step         ! The internal time step during this call [T ~> s]
   real :: full_time_step    ! The external time step (sum of internal time steps) during this call [T ~> s]
+  real :: Ifull_time_step   ! The inverse of the external time step [T-1 ~> s-1]
   real :: min_time_step     ! The minimal required timestep that would indicate a fatal problem [T ~> s]
   character(len=240) :: mesg
   logical :: update_ice_vel ! If true, it is time to update the ice shelf velocities.
   logical :: coupled_GL     ! If true the grounding line position is determined based on
                             ! coupled ice-ocean dynamics.
-  integer :: is, iec, js, jec
+  integer :: is, ie, js, je, i, j
 
   G => CS%grid
   US => CS%US
   ISS => CS%ISS
-  is = G%isc ; iec = G%iec ; js = G%jsc ; jec = G%jec
+  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
 
   remaining_time = US%s_to_T*time_type_to_real(time_interval)
   full_time_step = remaining_time
+  Ifull_time_step = 1./full_time_step
 
   if (present (min_time_step_in)) then
     min_time_step = min_time_step_in
@@ -2271,7 +2279,9 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
 
   enddo
 
-  ISS%dhdt_shelf(:,:) = (ISS%h_shelf(:,:) - ISS%dhdt_shelf(:,:))/full_time_step
+  do j=js,je ; do i=is,ie
+    ISS%dhdt_shelf(i,j) = (ISS%h_shelf(i,j) - ISS%dhdt_shelf(i,j)) * Ifull_time_step
+  enddo; enddo
 
   call enable_averages(full_time_step, Time, CS%diag)
     if (CS%id_area_shelf_h > 0) call post_data(CS%id_area_shelf_h, ISS%area_shelf_h, CS%diag)
