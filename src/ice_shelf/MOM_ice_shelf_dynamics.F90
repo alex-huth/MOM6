@@ -1954,11 +1954,13 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
   ! prelim - go through and calculate S
 
   if (CS%GL_couple) then
-    S(:,:) = -CS%bed_elev(:,:) + OD(:,:) + ISS%h_shelf(:,:)
+    do j=jsc-G%domain%njhalo,jec+G%domain%njhalo
+      do i=isc-G%domain%nihalo,iec+G%domain%nihalo
+        S(i,j) = -CS%bed_elev(i,j) + (OD(i,j) + ISS%h_shelf(i,j))
+      enddo
+    enddo
   else
-    S(:,:) = -CS%bed_elev(:,:) + ISS%h_shelf(:,:)
     ! check whether the ice is floating or grounded
-
     do j=jsc-G%domain%njhalo,jec+G%domain%njhalo
       do i=isc-G%domain%nihalo,iec+G%domain%nihalo
         if (rhoi_rhow * ISS%h_shelf(i,j) - CS%bed_elev(i,j) <= 0) then
