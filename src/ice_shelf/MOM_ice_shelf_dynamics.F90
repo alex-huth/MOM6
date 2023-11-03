@@ -84,9 +84,9 @@ type, public :: ice_shelf_dyn_CS ; private
   real, pointer, dimension(:,:) :: t_shelf => NULL() !< Vertically integrated temperature in the ice shelf/stream,
                                                      !! on corner-points (B grid) [C ~> degC]
   real, pointer, dimension(:,:) :: tmask => NULL()   !< A mask on tracer points that is 1 where there is ice.
-  real, pointer, dimension(:,:) :: ice_visc => NULL()   !< Glen's law ice viscosity (Pa s),
+  real, pointer, dimension(:,:,:) :: ice_visc => NULL()   !< Glen's law ice viscosity (Pa s),
                                                        !!  in [R L2 T-1 ~> kg m-1 s-1].
-  real, pointer, dimension(:,:,:) :: Ee => NULL()   !< Glen's effective strain-rate ** (1-n)/(n)
+                                                       !!  at either 1 (cell-centered) or 4 quadrature points per cell
   real, pointer, dimension(:,:) :: AGlen_visc => NULL() !< Ice-stiffness parameter in Glen's law ice viscosity,
                                                       !! often in [Pa-3 s-1] if n_Glen is 3.
   real, pointer, dimension(:,:) :: thickness_bdry_val => NULL() !< The ice thickness at an inflowing boundary [Z ~> m].
@@ -128,6 +128,7 @@ type, public :: ice_shelf_dyn_CS ; private
   real :: density_ice  !< A typical density of ice [R ~> kg m-3].
 
   logical :: advect_shelf !< If true (default), advect ice shelf and evolve thickness
+  integer :: visc_qps !< The number of quadrature points per cell (1 or 4) on which to calculate ice viscosity.
   character(len=40) :: ice_viscosity_compute !< Specifies whether the ice viscosity is computed internally
                                    !! according to Glen's flow law; is constant (for debugging purposes)
                                    !! or using observed strain rates and read from a file
@@ -301,11 +302,19 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     call get_param(param_file, mdl, "MISSING_SHELF_TEMPERATURE", T_shelf_missing, &
                  "An ice shelf temperature to use where there is no ice shelf.",&
                  units="degC", default=-10.0, scale=US%degC_to_C, do_not_log=.true.)
+
+    call get_param(param_file, mdl, "NUMBER_OF_ICE_VISCOSITY_QUADRATURE_POINTS", CS%visc_qps, &
+                 "Number of ice viscosity quadrature points. Either 1 (cell-centered) for 4", &
+                  units="none", default=1)
+    if (CS%visc_qps/=1 .and. CS%visc_qps/=4) call MOM_error (FATAL, &
+      "NUMBER OF ICE_VISCOSITY_QUADRATURE_POINTS must be 1 or 4")
+
     allocate(CS%u_shelf(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%v_shelf(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%t_shelf(isd:ied,jsd:jed), source=T_shelf_missing) ! [C ~> degC]
-    allocate(CS%ice_visc(isd:ied,jsd:jed), source=0.0)
-    allocate(CS%Ee(isd:ied,jsd:jed,4), source=0.0)
+    !allocate(CS%ice_visc(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%ice_visc(isd:ied,jsd:jed,CS%visc_qps), source=0.0)
+    !allocate(CS%Ee(isd:ied,jsd:jed,4), source=0.0)
     allocate(CS%AGlen_visc(isd:ied,jsd:jed), source=2.261e-25) ! [Pa-3 s-1]
     allocate(CS%basal_traction(isd:ied,jsd:jed), source=0.0)   ! [R L3 T-1 ~> kg s-1]
     allocate(CS%C_basal_friction(isd:ied,jsd:jed), source=5.0e10) ! [Pa (m-1 s)^n_sliding]
@@ -500,11 +509,14 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "If true, advect ice shelf and evolve thickness", &
                  default=.true.)
     call get_param(param_file, mdl, "ICE_VISCOSITY_COMPUTE", CS%ice_viscosity_compute, &
-                 "If MODEL, compute ice viscosity internally at cell centers, if OBS read from a file,"//&
-                 "If MODEL_QUADRATURE, compute at quadrature points (4 per element),"//&
+                 "If MODEL, compute ice viscosity internally using 1 or 4 quadrature points,"//&
+                 "if OBS read from a file,"//&
                  "if CONSTANT a constant value (for debugging).", &
                  default="MODEL")
 
+    if ((CS%visc_qps/=1) .and. (trim(CS%ice_viscosity_compute) /= "MODEL")) then
+      call MOM_error(FATAL, "NUMBER_OF_ICE_VISCOSITY_QUADRATURE_POINTS must be 1 unless ICE_VISCOSITY_COMPUTE==MODEL.")
+    endif
     call get_param(param_file, mdl, "INFLOW_SHELF_TEMPERATURE", T_shelf_bdry, &
                  "A default ice shelf temperature to use for ice flowing in through "//&
                  "open boundaries.", units="degC", default=-15.0, scale=US%degC_to_C)
@@ -622,15 +634,14 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     endif
 
     call pass_var(CS%OD_av,G%domain, complete=.false.)
-    call pass_var(CS%ground_frac,G%domain, complete=.false.)
-    call pass_var(CS%ice_visc,G%domain, complete=.false.)
+    call pass_var(CS%ground_frac, G%domain, complete=.false.)
     call pass_var(CS%basal_traction, G%domain, complete=.false.)
     call pass_var(CS%AGlen_visc, G%domain, complete=.false.)
     call pass_var(CS%bed_elev, G%domain, complete=.false.)
     call pass_var(CS%C_basal_friction, G%domain, complete=.false.)
     call pass_var(CS%h_bdry_val, G%domain, complete=.false.)
     call pass_var(CS%thickness_bdry_val, G%domain, complete=.true.)
-    if (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") call pass_var(CS%Ee,G%domain)
+    call pass_var(CS%ice_visc, G%domain)
 
     call pass_vector(CS%u_shelf, CS%v_shelf, G%domain, TO_ALL, BGRID_NE, complete=.false.)
     call pass_vector(CS%u_bdry_val, CS%v_bdry_val, G%domain, TO_ALL, BGRID_NE, complete=.false.)
@@ -670,7 +681,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       call pass_var(CS%C_basal_friction, G%domain, complete=.false.)
 
       ! initialize ice-stiffness AGlen
-      call initialize_ice_AGlen(CS%AGlen_visc, G, US, param_file)
+      call initialize_ice_AGlen(CS%AGlen_visc, CS%ice_viscosity_compute, G, US, param_file)
       call pass_var(CS%AGlen_visc, G%domain, complete=.false.)
 
       !initialize boundary conditions
@@ -856,10 +867,11 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, ocean_mass, coupled
     if (CS%id_ground_frac > 0) call post_data(CS%id_ground_frac, CS%ground_frac, CS%diag)
     if (CS%id_OD_av >0) call post_data(CS%id_OD_av, CS%OD_av,CS%diag)
     if (CS%id_visc_shelf > 0) then
-      ice_visc(:,:) = CS%ice_visc(:,:)*G%IareaT(:,:)
-      if (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") then
-        ice_visc(:,:) = ice_visc(:,:) * &
-          0.25 * (CS%Ee(:,:,1) + CS%Ee(:,:,2) + CS%Ee(:,:,3) + CS%Ee(:,:,4))
+      if (CS%visc_qps==4) then
+        ice_visc(:,:) = &
+          0.25 * (CS%ice_visc(:,:,1) + CS%ice_visc(:,:,2) + CS%ice_visc(:,:,3) + CS%ice_visc(:,:,4)) * G%IareaT(:,:)
+      else
+        ice_visc(:,:) = CS%ice_visc(:,:,1)*G%IareaT(:,:)
       endif
       call post_data(CS%id_visc_shelf, ice_visc, CS%diag)
     endif
@@ -1215,11 +1227,10 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     call bilinear_shape_fn_grid(G, i, j, Phi(:,:,i,j))
   enddo ; enddo
 
-  call calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
-  call pass_var(CS%ice_visc, G%domain, complete=.false.)
   call calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
   call pass_var(CS%basal_traction, G%domain, complete=.true.)
-  if (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") call pass_var(CS%Ee,G%domain)
+  call calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
+  call pass_var(CS%ice_visc, G%domain)
 
   ! This makes sure basal stress is only applied when it is supposed to be
   if (CS%GL_regularize) then
@@ -1271,8 +1282,8 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     ! Include the edge if tile is at the southern bdry;  Should add a test to avoid this if reentrant.
     if (G%jsc+G%jdg_offset==G%jsg) Js_sum = G%JscB + (1-G%JsdB)
     do J=G%jscB,G%jecB ; do I=G%iscB,G%iecB
-      if (CS%umask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + u_shlf(I,J)*u_shlf(I,J)
-      if (CS%vmask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + v_shlf(I,J)*v_shlf(I,J)
+      if (CS%umask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + u_shlf(I,J)**2 * US%L_T_to_m_s**2
+      if (CS%vmask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + v_shlf(I,J)**2 * US%L_T_to_m_s**2
     enddo; enddo
     Norm = reproducing_sum( Normvec, Is_sum, Ie_sum, Js_sum, Je_sum )
     Norm = sqrt(Norm)
@@ -1295,11 +1306,10 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     write(mesg,*) "ice_shelf_solve_outer: linear solve done in ",iters," iterations"
     call MOM_mesg(mesg, 5)
 
-    call calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
-    call pass_var(CS%ice_visc, G%domain, complete=.false.)
     call calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
     call pass_var(CS%basal_traction, G%domain, complete=.true.)
-    if (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") call pass_var(CS%Ee,G%domain)
+    call calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
+    call pass_var(CS%ice_visc, G%domain)
 
     ! makes sure basal stress is only applied when it is supposed to be
     if (CS%GL_regularize) then
@@ -1372,8 +1382,8 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     elseif (CS%nonlin_solve_err_mode == 3) then
       PrevNorm=Norm; Norm=0.0; Normvec=0.0
       do J=G%jscB,G%jecB ; do I=G%iscB,G%iecB
-        if (CS%umask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + u_shlf(I,J)*u_shlf(I,J)
-        if (CS%vmask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + v_shlf(I,J)*v_shlf(I,J)
+        if (CS%umask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + u_shlf(I,J)**2 * US%L_T_to_m_s**2
+        if (CS%vmask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + v_shlf(I,J)**2 * US%L_T_to_m_s**2
       enddo; enddo
       Norm = reproducing_sum( Normvec, Is_sum, Ie_sum, Js_sum, Je_sum )
       Norm = sqrt(Norm)
@@ -2436,7 +2446,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   real, dimension(SZDI_(G),SZDJ_(G)), &
                          intent(in)    :: hmask !< A mask indicating which tracer points are
                                              !! partly or fully covered by an ice-shelf
-  real, dimension(SZDI_(G),SZDJ_(G)), &
+  real, dimension(SZDI_(G),SZDJ_(G),CS%visc_qps), &
                          intent(in)    :: ice_visc !< A field related to the ice viscosity from Glen's
                                                !! flow law [R L4 Z T-1 ~> kg m2 s-1]. The exact form
                                                !!  and units depend on the basal law exponent.
@@ -2479,14 +2489,19 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
 
   real :: ux, uy, vx, vy ! Components of velocity shears or divergence [T-1 ~> s-1]
   real :: uq, vq  ! Interpolated velocities [L T-1 ~> m s-1]
-  integer :: iq, jq, iphi, jphi, i, j, ilq, jlq, Itgt, Jtgt
+  integer :: iq, jq, iphi, jphi, i, j, ilq, jlq, Itgt, Jtgt, qp
+  logical :: visc_qp4
   real, dimension(2) :: xquad
   real, dimension(2,2) :: Ucell, Vcell, Hcell, Usub, Vsub
-  real :: Ee
 
   xquad(1) = .5 * (1-sqrt(1./3)) ; xquad(2) = .5 * (1+sqrt(1./3))
 
-  Ee=1.0
+  if (CS%visc_qps == 4) then
+    visc_qp4=.true.
+  else
+    visc_qp4=.false.
+    qp = 1
+  endif
 
   do j=js,je ; do i=is,ie ; if (hmask(i,j) == 1 .or. hmask(i,j)==3) then
 
@@ -2522,13 +2537,13 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
              v_shlf(I-1,J) * Phi(6,2*(jq-1)+iq,i,j) + &
              v_shlf(I,J) * Phi(8,2*(jq-1)+iq,i,j)
 
-        if (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") Ee = CS%Ee(i,j,2*(jq-1)+iq)
+        if (visc_qp4) qp = 2*(jq-1)+iq !current quad point for viscosity
 
         do iphi=1,2 ; do jphi=1,2 ; Itgt = I-2+iphi ; ;Jtgt = J-2+jphi
-          if (umask(Itgt,Jtgt) == 1) uret(Itgt,Jtgt) = uret(Itgt,Jtgt) + 0.25 * Ee * ice_visc(i,j) * &
+          if (umask(Itgt,Jtgt) == 1) uret(Itgt,Jtgt) = uret(Itgt,Jtgt) + 0.25 * ice_visc(i,j,qp) * &
                                ((4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq,i,j) + &
                                     (uy+vx) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq,i,j))
-          if (vmask(Itgt,Jtgt) == 1) vret(Itgt,Jtgt) = vret(Itgt,Jtgt) + 0.25 * Ee * ice_visc(i,j) * &
+          if (vmask(Itgt,Jtgt) == 1) vret(Itgt,Jtgt) = vret(Itgt,Jtgt) + 0.25 * ice_visc(i,j,qp) * &
                                    ((uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq,i,j) + &
                                 (4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq,i,j))
 
@@ -2617,7 +2632,7 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
   real, dimension(SZDIB_(G),SZDJB_(G)), &
                           intent(in)    :: H_node !< The ice shelf thickness at nodal
                                                  !! (corner) points [Z ~> m].
-  real, dimension(SZDI_(G),SZDJ_(G)), &
+  real, dimension(SZDI_(G),SZDJ_(G),CS%visc_qps), &
                           intent(in)    :: ice_visc !< A field related to the ice viscosity from Glen's
                                                 !! flow law [R L4 Z T-1 ~> kg m2 s-1]. The exact form
                                                 !!  and units depend on the basal law exponent.
@@ -2647,14 +2662,19 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
   real, dimension(8,4) :: Phi ! Weight gradients [L-1 ~> m-1]
   real, dimension(2)   :: xquad
   real, dimension(2,2) :: Hcell, sub_ground
-  integer :: i, j, isc, jsc, iec, jec, iphi, jphi, iq, jq, ilq, jlq, Itgt, Jtgt
-  real :: Ee
+  logical :: visc_qp4
+  integer :: i, j, isc, jsc, iec, jec, iphi, jphi, iq, jq, ilq, jlq, Itgt, Jtgt, qp
 
   isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
 
   xquad(1) = .5 * (1-sqrt(1./3)) ; xquad(2) = .5 * (1+sqrt(1./3))
 
-  Ee=1.0
+  if (CS%visc_qps == 4) then
+    visc_qp4=.true.
+  else
+    visc_qp4=.false.
+    qp = 1
+  endif
 
   do j=jsc-1,jec+1 ; do i=isc-1,iec+1 ; if (hmask(i,j) == 1 .or. hmask(i,j)==3) then
 
@@ -2665,7 +2685,8 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
 
     do iq=1,2 ; do jq=1,2
 
-      if (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") Ee = CS%Ee(i,j,2*(jq-1)+iq)
+      if (visc_qp4) qp = 2*(jq-1)+iq !current quad point for viscosity
+
       do iphi=1,2 ; do jphi=1,2
 
         Itgt = I-2+iphi ; Jtgt = J-2+jphi
@@ -2680,7 +2701,7 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
           vy = 0.
 
           u_diagonal(Itgt,Jtgt) = u_diagonal(Itgt,Jtgt) + &
-            0.25 * Ee * ice_visc(i,j) * ((4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq) + &
+            0.25 * ice_visc(i,j,qp) * ((4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq) + &
             (uy+vx) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq))
 
           if (float_cond(i,j) == 0) then
@@ -2698,7 +2719,7 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
           uy = 0.
 
           v_diagonal(Itgt,Jtgt) = v_diagonal(Itgt,Jtgt) + &
-            0.25 * Ee * ice_visc(i,j) * ((uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq) + &
+            0.25 * ice_visc(i,j,qp) * ((uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq) + &
             (4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq))
 
           if (float_cond(i,j) == 0) then
@@ -2777,7 +2798,7 @@ subroutine apply_boundary_values(CS, ISS, G, US, time, Phisub, H_node, ice_visc,
   real, dimension(SZDIB_(G),SZDJB_(G)), &
                           intent(in)    :: H_node !< The ice shelf thickness at nodal
                                                  !! (corner) points [Z ~> m].
-  real, dimension(SZDI_(G),SZDJ_(G)), &
+  real, dimension(SZDI_(G),SZDJ_(G),CS%visc_qps), &
                           intent(in)    :: ice_visc !< A field related to the ice viscosity from Glen's
                                                 !! flow law. The exact form and units depend on the
                                                 !! basal law exponent.  [R L4 Z T-1 ~> kg m2 s-1].
@@ -2805,14 +2826,19 @@ subroutine apply_boundary_values(CS, ISS, G, US, time, Phisub, H_node, ice_visc,
   real :: ux, uy, vx, vy ! Components of velocity shears or divergence [T-1 ~> s-1]
   real :: uq, vq  ! Interpolated velocities [L T-1 ~> m s-1]
   real, dimension(2,2) :: Ucell,Vcell,Hcell,Usubcontr,Vsubcontr
-  integer :: i, j, isc, jsc, iec, jec, iq, jq, iphi, jphi, ilq, jlq, Itgt, Jtgt
-  real :: Ee
+  logical :: visc_qp4
+  integer :: i, j, isc, jsc, iec, jec, iq, jq, iphi, jphi, ilq, jlq, Itgt, Jtgt, qp
 
   isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
 
   xquad(1) = .5 * (1-sqrt(1./3)) ; xquad(2) = .5 * (1+sqrt(1./3))
 
-  Ee=1.0
+  if (CS%visc_qps == 4) then
+    visc_qp4=.true.
+  else
+    visc_qp4=.false.
+    qp = 1
+  endif
 
   do j=jsc-1,jec+1 ; do i=isc-1,iec+1 ; if (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3) then
 
@@ -2860,7 +2886,7 @@ subroutine apply_boundary_values(CS, ISS, G, US, time, Phisub, H_node, ice_visc,
              CS%v_bdry_val(I-1,J) * Phi(6,2*(jq-1)+iq) + &
              CS%v_bdry_val(I,J) * Phi(8,2*(jq-1)+iq)
 
-        if (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") Ee = CS%Ee(i,j,2*(jq-1)+iq)
+        if (visc_qp4) qp = 2*(jq-1)+iq !current quad point for viscosity
 
         do iphi=1,2 ; do jphi=1,2 ; Itgt = I-2+iphi ; Jtgt = J-2+jphi
           ilq = 1 ; if (iq == iphi) ilq = 2
@@ -2868,7 +2894,7 @@ subroutine apply_boundary_values(CS, ISS, G, US, time, Phisub, H_node, ice_visc,
 
           if (CS%umask(Itgt,Jtgt) == 1) then
             u_bdry_contr(Itgt,Jtgt) = u_bdry_contr(Itgt,Jtgt) + &
-               0.25 * Ee * ice_visc(i,j) * ( (4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq) + &
+               0.25 * ice_visc(i,j,qp) * ( (4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq) + &
                                             (uy+vx) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq) )
 
             if (float_cond(i,j) == 0) then
@@ -2879,7 +2905,7 @@ subroutine apply_boundary_values(CS, ISS, G, US, time, Phisub, H_node, ice_visc,
 
           if (CS%vmask(Itgt,Jtgt) == 1) then
             v_bdry_contr(Itgt,Jtgt) = v_bdry_contr(Itgt,Jtgt) + &
-                0.25 *  Ee * ice_visc(i,j) * ( (uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq) + &
+                0.25 *  ice_visc(i,j,qp) * ( (uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq) + &
                                       (4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq) )
 
             if (float_cond(i,j) == 0) then
@@ -2938,8 +2964,7 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
   real :: Visc_coef, n_g
   real :: ux, uy, vx, vy
   real :: eps_min   ! Velocity shears [T-1 ~> s-1]
-!  real, dimension(8,4)  :: Phi
-!  real :: umid, vmid, unorm ! Velocities [L T-1 ~> m s-1]
+  logical :: model_qp1, model_qp4
 
   isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
   iscq = G%iscB ; iecq = G%iecB ; jscq = G%jscB ; jecq = G%jecB
@@ -2948,38 +2973,43 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
   gisc = G%domain%nihalo+1 ; gjsc = G%domain%njhalo+1
   giec = G%domain%niglobal+gisc ; gjec = G%domain%njglobal+gjsc
   is = iscq - 1; js = jscq - 1
-    i_off = G%idg_offset ; j_off = G%jdg_offset
+  i_off = G%idg_offset ; j_off = G%jdg_offset
 
   if (trim(CS%ice_viscosity_compute) == "MODEL") then
-    allocate(PhiC(1:8,isc:iec,jsc:jec), source=0.0)
-    do j=jsc,jec ; do i=isc,iec
-      call bilinear_shape_fn_grid_1qp(G, i, j, PhiC(:,i,j))
-    enddo; enddo
-  elseif (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") then
-    allocate(Phi(1:8,1:4,isc:iec,jsc:jec), source=0.0)
-    do j=jsc,jec ; do i=isc,iec
-      call bilinear_shape_fn_grid(G, i, j, Phi(:,:,i,j))
-    enddo; enddo
+    if (CS%visc_qps==1) then
+      allocate(PhiC(1:8,isc:iec,jsc:jec), source=0.0)
+      do j=jsc,jec ; do i=isc,iec
+        call bilinear_shape_fn_grid_1qp(G, i, j, PhiC(:,i,j))
+      enddo; enddo
+      model_qp1=.true.
+      model_qp4=.false.
+    else
+      allocate(Phi(1:8,1:4,isc:iec,jsc:jec), source=0.0)
+      do j=jsc,jec ; do i=isc,iec
+        call bilinear_shape_fn_grid(G, i, j, Phi(:,:,i,j))
+      enddo; enddo
+      model_qp1=.false.
+      model_qp4=.true.
+    endif
   endif
 
   n_g = CS%n_glen; eps_min = CS%eps_glen_min
-  CS%ice_visc(:,:) = 1.0e22
-!  Visc_coef = US%kg_m2s_to_RZ_T*US%m_to_L*US%Z_to_L*(CS%A_glen_isothermal)**(-1./CS%n_glen)
+
   do j=jsc,jec ; do i=isc,iec
 
     if ((ISS%hmask(i,j) == 1) .OR. (ISS%hmask(i,j) == 3)) then
 
       if (trim(CS%ice_viscosity_compute) == "CONSTANT") then
-        CS%ice_visc(i,j) = 1e15 * US%kg_m3_to_R*US%m_to_L*US%m_s_to_L_T * (G%areaT(i,j) * ISS%h_shelf(i,j))
+        CS%ice_visc(i,j,1) = 1e15 * US%kg_m3_to_R*US%m_to_L*US%m_s_to_L_T * (G%areaT(i,j) * ISS%h_shelf(i,j))
         ! constant viscocity for debugging
       elseif (trim(CS%ice_viscosity_compute) == "OBS") then
-        if (CS%AGlen_visc(i,j) >0) CS%ice_visc(i,j) = CS%AGlen_visc(i,j)*(G%areaT(i,j) * ISS%h_shelf(i,j))
-        ! Here CS%Aglen_visc(i,j) is the ice viscocity [Pa s-1] computed from obs and read from a file
-      elseif (trim(CS%ice_viscosity_compute) == "MODEL") then
+        if (CS%AGlen_visc(i,j) >0) CS%ice_visc(i,j,1) = CS%AGlen_visc(i,j) * (G%areaT(i,j) * ISS%h_shelf(i,j))
+        ! Here CS%Aglen_visc(i,j) is the ice viscosity [Pa s ~> R L2 T-1] computed from obs and read from a file
+      elseif (model_qp1) then
+        !calculate viscosity at 1 cell-centered quadrature point per cell
 
-        Visc_coef = ( (US%RL2_T2_to_Pa)**(-CS%n_glen)*US%T_to_s )**(-1./CS%n_glen) * &
-          (CS%AGlen_visc(i,j))**(-1./CS%n_glen)
-        ! Units of Aglen_visc [Pa-3 s-1]
+        Visc_coef = (CS%AGlen_visc(i,j))**(-1./n_g)
+        ! Units of Aglen_visc [Pa-(n_g) s-1]
 
         ux = u_shlf(I-1,J-1) * PhiC(1,i,j) + &
              u_shlf(I,J) * PhiC(7,i,j) + &
@@ -3001,14 +3031,13 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
              v_shlf(I-1,J) * PhiC(6,i,j) + &
              v_shlf(I,J-1) * PhiC(4,i,j)
 
-        CS%ice_visc(i,j) = 0.5 * Visc_coef * (G%areaT(i,j) * ISS%h_shelf(i,j)) * &
-          (US%s_to_T**2 * (ux**2 + vy**2 + ux*vy + 0.25*(uy+vx)**2 + eps_min**2))**((1.-n_g)/(2.*n_g))
-      elseif (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") then
-        !in this case, we will compute viscosity at quadrature points within subroutines CG_action
-        !and apply_boundary_values. CS%ice_visc(i,j) will include everything except the effective strain rate term:
-        Visc_coef = ( (US%RL2_T2_to_Pa)**(-CS%n_glen)*US%T_to_s )**(-1./CS%n_glen) * &
-          (CS%AGlen_visc(i,j))**(-1./CS%n_glen)
-        CS%ice_visc(i,j) = 0.5 * Visc_coef * (G%areaT(i,j) * ISS%h_shelf(i,j))
+        CS%ice_visc(i,j,1) = 0.5 * Visc_coef * (G%areaT(i,j) * ISS%h_shelf(i,j)) * &
+          (US%s_to_T**2 * (ux**2 + vy**2 + ux*vy + 0.25*(uy+vx)**2 + eps_min**2))**((1.-n_g)/(2.*n_g)) * &
+          (US%Pa_to_RL2_T2*US%s_to_T)
+      elseif (model_qp4) then
+        !calculate viscosity at 4 quadrature points per cell
+
+        Visc_coef = (CS%AGlen_visc(i,j))**(-1./n_g)
 
         do iq=1,2 ; do jq=1,2
 
@@ -3032,15 +3061,16 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
                v_shlf(I-1,J) * Phi(6,2*(jq-1)+iq,i,j) + &
                v_shlf(I,J) * Phi(8,2*(jq-1)+iq,i,j)
 
-          CS%Ee(i,j,2*(jq-1)+iq) = &
-            (US%s_to_T**2 * (ux**2 + vy**2 + ux*vy + 0.25*(uy+vx)**2 + eps_min**2))**((1.-n_g)/(2.*n_g))
+          CS%ice_visc(i,j,2*(jq-1)+iq) = 0.5 * Visc_coef * (G%areaT(i,j) * ISS%h_shelf(i,j)) * &
+            (US%s_to_T**2 * (ux**2 + vy**2 + ux*vy + 0.25*(uy+vx)**2 + eps_min**2))**((1.-n_g)/(2.*n_g)) * &
+            (US%Pa_to_RL2_T2*US%s_to_T)
         enddo; enddo
       endif
     endif
   enddo ; enddo
 
-  if (trim(CS%ice_viscosity_compute) == "MODEL") deallocate(PhiC)
-  if (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") deallocate(Phi)
+  if (model_qp1) deallocate(PhiC)
+  if (model_qp4) deallocate(Phi)
 end subroutine calc_shelf_visc
 
 
@@ -3669,7 +3699,6 @@ subroutine ice_shelf_dyn_end(CS)
   deallocate(CS%umask, CS%vmask)
 
   deallocate(CS%ice_visc, CS%AGlen_visc)
-  deallocate(CS%Ee)
   deallocate(CS%basal_traction,CS%C_basal_friction)
   deallocate(CS%OD_rt, CS%OD_av)
   deallocate(CS%t_bdry_val, CS%bed_elev)

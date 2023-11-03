@@ -393,8 +393,6 @@ end subroutine initialize_ice_shelf_boundary_channel
 !> Initialize ice shelf flow from file
 subroutine initialize_ice_flow_from_file(bed_elev,u_shelf, v_shelf,float_cond,&
                                          G, US, PF)
-!subroutine initialize_ice_flow_from_file(bed_elev,u_shelf, v_shelf,float_cond,ice_visc,&
-!                                         G, US, PF)
   type(ocean_grid_type), intent(in)    :: G    !< The ocean's grid structure
   real, dimension(SZDI_(G),SZDJ_(G)), &
                          intent(inout) :: bed_elev !< The bed elevation   [Z ~> m].
@@ -412,9 +410,8 @@ subroutine initialize_ice_flow_from_file(bed_elev,u_shelf, v_shelf,float_cond,&
   !  h_shelf [Z ~> m] and area_shelf_h [L2 ~> m2] (and dimensionless) and updates hmask
   character(len=200) :: filename,vel_file,inputdir,bed_topo_file ! Strings for file/path
   character(len=200) :: ushelf_varname, vshelf_varname, &
-                        ice_visc_varname, floatfr_varname, bed_varname  ! Variable name in file
+                        floatfr_varname, bed_varname  ! Variable name in file
   character(len=40)  :: mdl = "initialize_ice_velocity_from_file" ! This subroutine's name.
-  real :: len_sidestress
 
   call MOM_mesg("  MOM_ice_shelf_init_profile.F90, initialize_velocity_from_file: reading velocity")
 
@@ -423,9 +420,6 @@ subroutine initialize_ice_flow_from_file(bed_elev,u_shelf, v_shelf,float_cond,&
   call get_param(PF, mdl, "ICE_VELOCITY_FILE", vel_file, &
                  "The file from which the velocity is read.", &
                  default="ice_shelf_vel.nc")
-  call get_param(PF, mdl, "LEN_SIDE_STRESS", len_sidestress, &
-                 "position past which shelf sides are stress free.", &
-                 default=0.0, units="axis_units")
 
   filename = trim(inputdir)//trim(vel_file)
   call log_param(PF, mdl, "INPUTDIR/THICKNESS_FILE", filename)
@@ -435,9 +429,6 @@ subroutine initialize_ice_flow_from_file(bed_elev,u_shelf, v_shelf,float_cond,&
   call get_param(PF, mdl, "ICE_V_VEL_VARNAME", vshelf_varname, &
                  "The name of the v velocity variable in ICE_VELOCITY_FILE.", &
                  default="v_shelf")
-  call get_param(PF, mdl, "ICE_VISC_VARNAME", ice_visc_varname, &
-                 "The name of the ice viscosity variable in ICE_VELOCITY_FILE.", &
-                 default="viscosity")
   call get_param(PF, mdl, "ICE_FLOAT_FRAC_VARNAME", floatfr_varname, &
                  "The name of the ice float fraction (grounding fraction) variable in ICE_VELOCITY_FILE.", &
                  default="float_frac")
@@ -542,9 +533,9 @@ subroutine initialize_ice_shelf_boundary_from_file(u_face_mask_bdry, v_face_mask
 
 
   call MOM_read_data(filename, trim(ufcmskbdry_varname), u_face_mask_bdry, G%Domain, position=CORNER, &
-                     scale=US%m_s_to_L_T)
+                     scale=1.)
   call MOM_read_data(filename, trim(vfcmskbdry_varname), v_face_mask_bdry, G%Domain, position=CORNER, &
-                     scale=US%m_s_to_L_T)
+                     scale=1.)
   call MOM_read_data(filename, trim(ubdryv_varname), u_bdry_val, G%Domain, position=CORNER, scale=US%m_s_to_L_T)
   call MOM_read_data(filename, trim(vbdryv_varname), v_bdry_val, G%Domain, position=CORNER, scale=US%m_s_to_L_T)
   call MOM_read_data(filename, trim(umask_varname), umask, G%Domain, position=CORNER, scale=1.)
@@ -615,10 +606,13 @@ end subroutine
 
 
 !> Initialize ice-stiffness parameter
-subroutine initialize_ice_AGlen(AGlen, G, US, PF)
+subroutine initialize_ice_AGlen(AGlen, ice_viscosity_compute, G, US, PF)
   type(ocean_grid_type), intent(in)    :: G    !< The ocean's grid structure
   real, dimension(SZDI_(G),SZDJ_(G)), &
                          intent(inout) :: AGlen !< The ice-stiffness parameter A_Glen, often in [Pa-3 s-1]
+  character(len=40) :: ice_viscosity_compute !< Specifies whether the ice viscosity is computed internally
+                                             !! according to Glen's flow law; is constant (for debugging purposes)
+                                             !! or using observed strain rates and read from a file
   type(unit_scale_type), intent(in)    :: US !< A structure containing unit conversion factors
   type(param_file_type), intent(in)    :: PF !< A structure to parse for run-time parameters
 
@@ -635,7 +629,7 @@ subroutine initialize_ice_AGlen(AGlen, G, US, PF)
 
   if (trim(config)=="CONSTANT") then
     call get_param(PF, mdl, "A_GLEN", A_Glen, &
-                 "Ice-stiffness parameter.", units="Pa-3 s-1", default=2.261e-25)
+                   "Ice-stiffness parameter.", units="Pa-n_g s-1", default=2.261e-25)
 
     AGlen(:,:) = A_Glen
 
@@ -655,8 +649,14 @@ subroutine initialize_ice_AGlen(AGlen, G, US, PF)
 
     if (.not.file_exists(filename, G%Domain)) call MOM_error(FATAL, &
        " initialize_ice_stiffness_from_file: Unable to open "//trim(filename))
-    call MOM_read_data(filename,trim(varname), AGlen, G%Domain)
 
+    if (trim(ice_viscosity_compute) == "OBS") then
+      !AGlen is the ice viscosity [Pa s ~> R L2 T-1] computed from obs and read from a file
+      call MOM_read_data(filename, trim(varname), AGlen, G%Domain, scale=US%Pa_to_RL2_T2*US%s_to_T)
+    else
+      !AGlen is the ice stiffness parameter [Pa-n_g s-1]
+      call MOM_read_data(filename, trim(varname), AGlen, G%Domain)
+    endif
   endif
 end subroutine initialize_ice_AGlen
 
@@ -681,7 +681,7 @@ subroutine initialize_ice_SMB(SMB, G, US, PF)
 
   if (trim(config)=="CONSTANT") then
     call get_param(PF, mdl, "SMB", SMB_val, &
-                 "Surface mass balance.", units="kg m-2 s-1", default=0.0)
+                 "Surface mass balance.", units="kg m-2 s-1", default=0.0, scale=US%kg_m2s_to_RZ_T)
 
     SMB(:,:) = SMB_val
 
@@ -701,7 +701,7 @@ subroutine initialize_ice_SMB(SMB, G, US, PF)
 
     if (.not.file_exists(filename, G%Domain)) call MOM_error(FATAL, &
        " initialize_ice_SMV_from_file: Unable to open "//trim(filename))
-    call MOM_read_data(filename,trim(varname), SMB, G%Domain)
+    call MOM_read_data(filename,trim(varname), SMB, G%Domain, scale=US%kg_m2s_to_RZ_T)
 
   endif
 end subroutine initialize_ice_SMB
