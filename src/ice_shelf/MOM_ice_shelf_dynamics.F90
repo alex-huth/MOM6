@@ -16,8 +16,12 @@ use MOM_error_handler, only : MOM_error, MOM_mesg, FATAL, WARNING, is_root_pe
 use MOM_file_parser, only : read_param, get_param, log_param, log_version, param_file_type
 use MOM_grid, only : MOM_grid_init, ocean_grid_type
 use MOM_io, only : file_exists, slasher, MOM_read_data
+use MOM_io, only : open_ASCII_file, get_filename_appendix
+use MOM_io, only : APPEND_FILE, WRITEONLY_FILE
 use MOM_restart, only : register_restart_field, MOM_restart_CS
-use MOM_time_manager, only : time_type, set_time
+use MOM_time_manager, only : time_type, get_time, set_time, time_type_to_real, operator(>)
+use MOM_time_manager,  only : operator(+), operator(-), operator(*), operator(/)
+use MOM_time_manager,  only : operator(/=), operator(<=), operator(>=), operator(<)
 use MOM_unit_scaling, only : unit_scale_type, unit_scaling_init
 !MJH use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary
 use MOM_ice_shelf_state, only : ice_shelf_state
@@ -31,7 +35,7 @@ implicit none ; private
 #include <MOM_memory.h>
 
 public register_ice_shelf_dyn_restarts, initialize_ice_shelf_dyn, update_ice_shelf
-public ice_time_step_CFL, ice_shelf_dyn_end, change_in_draft
+public ice_time_step_CFL, ice_shelf_dyn_end, change_in_draft, write_ice_shelf_energy
 public shelf_advance_front, ice_shelf_min_thickness_calve, calve_to_mask
 
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
@@ -166,6 +170,27 @@ type, public :: ice_shelf_dyn_CS ; private
   integer :: nonlin_solve_err_mode  !< 1: exit vel solve based on nonlin residual
                     !! 2: exit based on "fixed point" metric (|u - u_last| / |u| < tol) where | | is infty-norm
                     !! 3: exit based on change of norm
+
+  ! for write_ice_shelf_energy
+  type(time_type) :: energysavedays            !< The interval between writing the energies
+                                               !! and other integral quantities of the run.
+  type(time_type) :: energysavedays_geometric  !< The starting interval for computing a geometric
+                                               !! progression of time deltas between calls to
+                                               !! write_energy. This interval will increase by a factor of 2.
+                                               !! after each call to write_energy.
+  logical         :: energysave_geometric      !< Logical to control whether calls to write_energy should
+                                               !! follow a geometric progression
+  type(time_type) :: write_energy_time         !< The next time to write to the energy file.
+  type(time_type) :: geometric_end_time        !< Time at which to stop the geometric progression
+                                               !! of calls to write_energy and revert to the standard
+                                               !! energysavedays interval
+  real    :: timeunit           !< The length of the units for the time axis and certain input parameters
+                                !! including ENERGYSAVEDAYS [s].
+  type(time_type) :: Start_time !< The start time of the simulation.
+                                ! Start_time is set in MOM_initialization.F90
+  integer :: prev_IS_energy_calls = 0 !< The number of times write_ice_shelf_energy has been called.
+  integer :: IS_fileenergy_ascii   !< The unit number of the ascii version of the energy file.
+  character(len=200) :: IS_energyfile  !< The name of the ice sheet energy file with path.
 
   ! ids for outputting intermediate thickness in advection subroutine (debugging)
   !integer :: id_h_after_uflux = -1, id_h_after_vflux = -1, id_h_after_adv = -1
@@ -329,7 +354,8 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
 end subroutine register_ice_shelf_dyn_restarts
 
 !> Initializes shelf model data, parameters and diagnostics
-subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_sim, solo_ice_sheet_in)
+subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_sim, &
+                                    Input_start_time, directory, solo_ice_sheet_in)
   type(param_file_type),   intent(in)    :: param_file !< A structure to parse for run-time parameters
   type(time_type),         intent(inout) :: Time !< The clock that that will indicate the model time
   type(ice_shelf_state),   intent(in)    :: ISS  !< A structure with elements that describe
@@ -340,6 +366,8 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   type(diag_ctrl), target, intent(in)    :: diag !< A structure that is used to regulate the diagnostic output.
   logical,                 intent(in)    :: new_sim !< If true this is a new simulation, otherwise
                                                  !! has been started from a restart file.
+  type(time_type),         intent(in)    :: Input_start_time !< The start time of the simulation.
+  character(len=*),        intent(in)    :: directory  !< The directory where the ice sheet energy file goes.
   logical,       optional, intent(in)    :: solo_ice_sheet_in !< If present, this indicates whether
                                                  !! a solo ice-sheet driver.
 
@@ -354,6 +382,8 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   logical :: shelf_mass_is_dynamic, override_shelf_movement, active_shelf_dynamics
   logical :: debug
   integer :: i, j, isd, ied, jsd, jed, Isdq, Iedq, Jsdq, Jedq, iters
+  character(len=200) :: IS_energyfile  ! The name of the energy file.
+  character(len=32) :: filename_appendix = '' ! FMS appendix to filename for ensemble runs
 
   Isdq = G%isdB ; Iedq = G%iedB ; Jsdq = G%jsdB ; Jedq = G%jedB
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -402,6 +432,9 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "will be called.  GL_REGULARIZE and GL_COUPLE are exclusive.", &
                  default=.false., do_not_log=CS%GL_regularize)
     if (CS%GL_regularize) CS%GL_couple = .false.
+    if (present(solo_ice_sheet_in)) then
+      if (solo_ice_sheet_in) CS%GL_couple = .false.
+    endif
     if (CS%GL_regularize .and. (CS%n_sub_regularize == 0)) call MOM_error (FATAL, &
       "GROUNDING_LINE_INTERP_SUBGRID_N must be a positive integer if GL regularization is used")
     call get_param(param_file, mdl, "ICE_SHELF_CFL_FACTOR", CS%CFL_factor, &
@@ -482,6 +515,43 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   call get_param(param_file, mdl, "MIN_THICKNESS_SIMPLE_CALVE", CS%min_thickness_simple_calve, &
                  "Min thickness rule for the VERY simple calving law",&
                  units="m", default=0.0, scale=US%m_to_Z)
+
+  !for write_ice_shelf_energy
+      ! Note that the units of CS%Timeunit are the MKS units of [s].
+  call get_param(param_file, mdl, "TIMEUNIT", CS%Timeunit, &
+    "The time unit in seconds a number of input fields", &
+    units="s", default=86400.0)
+  if (CS%Timeunit < 0.0) CS%Timeunit = 86400.0
+  call get_param(param_file, mdl, "ENERGYSAVEDAYS",CS%energysavedays, &
+    "The interval in units of TIMEUNIT between saves of the "//&
+    "energies of the run and other globally summed diagnostics.",&
+    default=set_time(0,days=1), timeunit=CS%Timeunit)
+  call get_param(param_file, mdl, "ENERGYSAVEDAYS_GEOMETRIC",CS%energysavedays_geometric, &
+    "The starting interval in units of TIMEUNIT for the first call "//&
+    "to save the energies of the run and other globally summed diagnostics. "//&
+    "The interval increases by a factor of 2. after each call to write_ice_shelf_energy.",&
+    default=set_time(seconds=0), timeunit=CS%Timeunit)
+  if ((time_type_to_real(CS%energysavedays_geometric) > 0.) .and. &
+    (CS%energysavedays_geometric < CS%energysavedays)) then
+    CS%energysave_geometric = .true.
+  else
+    CS%energysave_geometric = .false.
+  endif
+  CS%Start_time = Input_start_time
+  call get_param(param_file, mdl, "ICE_SHELF_ENERGYFILE", IS_energyfile, &
+                 "The file to use to write the energies and globally "//&
+                 "summed diagnostics.", default="ice_shelf.stats")
+  !query fms_io if there is a filename_appendix (for ensemble runs)
+  call get_filename_appendix(filename_appendix)
+  if (len_trim(filename_appendix) > 0) then
+    IS_energyfile = trim(IS_energyfile) //'.'//trim(filename_appendix)
+  endif
+
+  CS%IS_energyfile = trim(slasher(directory))//trim(IS_energyfile)
+  call log_param(param_file, mdl, "output_path/ENERGYFILE", CS%IS_energyfile)
+#ifdef STATSLABEL
+  CS%IS_energyfile = trim(CS%IS_energyfile)//"."//trim(adjustl(STATSLABEL))
+#endif
 
   ! Allocate memory in the ice shelf dynamics control structure that was not
   ! previously allocated for registration for restarts.
@@ -759,6 +829,7 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, ocean_mass, coupled
     call update_OD_ffrac(CS, G, US, ocean_mass, update_ice_vel)
   elseif (update_ice_vel) then
     call update_OD_ffrac_uncoupled(CS, G, ISS%h_shelf(:,:))
+    CS%GL_couple=.false.
   endif
 
 
@@ -809,6 +880,138 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, ocean_mass, coupled
   endif
 
 end subroutine update_ice_shelf
+
+!>  Writes the total ice shelf kinetic energy and mass to an ascii file
+subroutine write_ice_shelf_energy(CS, G, US, mass, day, time_step)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(inout) :: G  !< The grid structure used by the ice shelf.
+  type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(in)    :: mass !< The mass per unit area of the ice shelf
+                                                !! or sheet [R Z ~> kg m-2]
+  type(time_type),         intent(in)    :: day !< The current model time.
+  type(time_type),  optional, intent(in) :: time_step !< The current time step
+  ! Local variables
+  type(time_type) :: dt ! A time_type version of the timestep.
+  real, dimension(SZDI_(G),SZDJ_(G)) :: tmp1 ! A temporary array used in reproducing sums [various]
+  real :: KE_tot, mass_tot, KE_scale_factor, mass_scale_factor
+  integer :: is, ie, js, je, isr, ier, jsr, jer, i, j
+  character(len=32)  :: mesg_intro, time_units, day_str, n_str, date_str
+  integer :: start_of_day, num_days
+  real    :: reday  ! Time in units given by CS%Timeunit, but often [days]
+
+  ! write_energy_time is the next integral multiple of energysavedays.
+  if (present(time_step)) then
+    dt = time_step
+  else
+    dt = set_time(seconds=2)
+  endif
+
+   !CS%prev_IS_energy_calls tracks the ice sheet step, which is outputted in the energy file.
+  if (CS%prev_IS_energy_calls == 0) then
+    if (CS%energysave_geometric) then
+      if (CS%energysavedays_geometric < CS%energysavedays) then
+        CS%write_energy_time = day + CS%energysavedays_geometric
+        CS%geometric_end_time = CS%Start_time + CS%energysavedays * &
+          (1 + (day - CS%Start_time) / CS%energysavedays)
+      else
+        CS%write_energy_time = CS%Start_time + CS%energysavedays * &
+          (1 + (day - CS%Start_time) / CS%energysavedays)
+      endif
+    else
+      CS%write_energy_time = CS%Start_time + CS%energysavedays * &
+        (1 + (day - CS%Start_time) / CS%energysavedays)
+    endif
+  elseif (day + (dt/2) <= CS%write_energy_time) then
+    CS%prev_IS_energy_calls = CS%prev_IS_energy_calls + 1
+    return  ! Do not write this step
+  else ! Determine the next write time before proceeding
+    if (CS%energysave_geometric) then
+      if (CS%write_energy_time + CS%energysavedays_geometric >= &
+          CS%geometric_end_time) then
+        CS%write_energy_time = CS%geometric_end_time
+        CS%energysave_geometric = .false.  ! stop geometric progression
+      else
+        CS%write_energy_time = CS%write_energy_time + CS%energysavedays_geometric
+      endif
+      CS%energysavedays_geometric = CS%energysavedays_geometric*2
+    else
+      CS%write_energy_time = CS%write_energy_time + CS%energysavedays
+    endif
+  endif
+
+  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
+  isr = is - (G%isd-1) ; ier = ie - (G%isd-1) ; jsr = js - (G%jsd-1) ; jer = je - (G%jsd-1)
+
+  !calculate KE using cell-centered ice shelf velocity
+  tmp1(:,:)=0.0
+  KE_scale_factor = US%L_to_m**2 * US%RZ_to_kg_m2 * US%L_T_to_m_s**2
+  do j=js,je ; do i=is,ie
+    tmp1(i,j) = KE_scale_factor * 0.03125 * G%areaT(i,j) * mass(i,j) * &
+      ((CS%u_shelf(I-1,J-1)+CS%u_shelf(I,J-1)+CS%u_shelf(I,J)+CS%u_shelf(I,J-1))**2 + &
+      (CS%v_shelf(I-1,J-1)+CS%v_shelf(I,J-1)+CS%v_shelf(I,J)+CS%v_shelf(I,J-1))**2)
+  enddo; enddo
+
+  KE_tot = reproducing_sum(tmp1, isr, ier, jsr, jer)
+
+  !calculate mass
+  tmp1(:,:)=0.0
+  mass_scale_factor = US%L_to_m**2 * US%RZ_to_kg_m2
+  do j=js,je ; do i=is,ie
+    tmp1(i,j) =  mass_scale_factor * mass(i,j) * G%areaT(i,j)
+  enddo; enddo
+
+  mass_tot = reproducing_sum(tmp1, isr, ier, jsr, jer)
+
+  if (is_root_pe()) then  ! Only the root PE actually writes anything.
+    if (day > CS%Start_time) then
+      call open_ASCII_file(CS%IS_fileenergy_ascii, trim(CS%IS_energyfile), action=APPEND_FILE)
+    else
+      call open_ASCII_file(CS%IS_fileenergy_ascii, trim(CS%IS_energyfile), action=WRITEONLY_FILE)
+      if (abs(CS%timeunit - 86400.0) < 1.0) then
+        write(CS%IS_fileenergy_ascii,'("  Step,",7x,"Day,"8x,"Energy/Mass,",13x,"Total Mass")')
+        write(CS%IS_fileenergy_ascii,'(12x,"[days]",10x,"[m2 s-2]",17x,"[kg]")')
+      else
+        if ((CS%timeunit >= 0.99) .and. (CS%timeunit < 1.01)) then
+          time_units = "           [seconds]     "
+        elseif ((CS%timeunit >= 3599.0) .and. (CS%timeunit < 3601.0)) then
+          time_units = "            [hours]      "
+        elseif ((CS%timeunit >= 86399.0) .and. (CS%timeunit < 86401.0)) then
+          time_units = "             [days]      "
+        elseif ((CS%timeunit >= 3.0e7) .and. (CS%timeunit < 3.2e7)) then
+          time_units = "            [years]      "
+        else
+          write(time_units,'(9x,"[",es8.2," s]    ")') CS%timeunit
+        endif
+
+        write(CS%IS_fileenergy_ascii,'("  Step,",7x,"Time,"7x,"Energy/Mass,",13x,"Total Mass")')
+        write(CS%IS_fileenergy_ascii,'(A25,3x,"[m2 s-2]",17x,"[kg]")') time_units
+      endif
+    endif
+
+    call get_time(day, start_of_day, num_days)
+
+    if (abs(CS%timeunit - 86400.0) < 1.0) then
+      reday = REAL(num_days)+ (REAL(start_of_day)/86400.0)
+    else
+      reday = REAL(num_days)*(86400.0/CS%timeunit) + REAL(start_of_day)/abs(CS%timeunit)
+    endif
+
+    if (reday < 1.0e8) then ;      write(day_str, '(F12.3)') reday
+    elseif (reday < 1.0e11) then ; write(day_str, '(F15.3)') reday
+    else ;                         write(day_str, '(ES15.9)') reday ; endif
+
+    if     (CS%prev_IS_energy_calls < 1000000)   then ; write(n_str, '(I6)') CS%prev_IS_energy_calls
+    elseif (CS%prev_IS_energy_calls < 10000000)  then ; write(n_str, '(I7)') CS%prev_IS_energy_calls
+    elseif (CS%prev_IS_energy_calls < 100000000) then ; write(n_str, '(I8)') CS%prev_IS_energy_calls
+    else                        ; write(n_str, '(I10)') CS%prev_IS_energy_calls ; endif
+
+    write(CS%IS_fileenergy_ascii,'(A,",",A,", En ",ES22.16,", M ",ES11.5)') &
+      trim(n_str), trim(day_str), KE_tot/mass_tot, mass_tot
+  endif
+
+  CS%prev_IS_energy_calls = CS%prev_IS_energy_calls + 1
+end subroutine write_ice_shelf_energy
 
 !> This subroutine takes the velocity (on the Bgrid) and timesteps h_t = - div (uh) once.
 !! Additionally, it will update the volume of ice in partially-filled cells, and update
@@ -931,8 +1134,8 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   real, dimension(SZDIB_(G),SZDJB_(G)) :: Au, Av ! The retarding lateral stress contributions [R L3 Z T-2 ~> kg m s-2]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: u_last, v_last ! Previous velocities [L T-1 ~> m s-1]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: H_node ! Ice shelf thickness at corners [Z ~> m].
-  real, dimension(SZDI_(G),SZDJ_(G)) :: float_cond ! An array indicating where the ice
-                                                ! shelf is floating: 0 if floating, 1 if not.
+  real, dimension(SZDI_(G),SZDJ_(G)) :: float_cond ! If GL_regularize=true, an array indicating where the ice
+                                                ! shelf is floating: 0 if floating, 1 if not
   real, dimension(SZDIB_(G),SZDJB_(G)) :: Normvec  ! Used for convergence
   character(len=160) :: mesg  ! The text of an error message
   integer :: conv_flag, i, j, k,l, iter
@@ -958,18 +1161,18 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
   ! need to make these conditional on GL interpolation
   float_cond(:,:) = 0.0 ; H_node(:,:) = 0.0
-  CS%ground_frac(:,:) = 0.0
+  !CS%ground_frac(:,:) = 0.0
   allocate(Phisub(nsub,nsub,2,2,2,2), source=0.0)
 
-  do j=G%jsc,G%jec
-    do i=G%isc,G%iec
+  if (.not. CS%GL_couple) then
+    do j=G%jsc,G%jec ; do i=G%isc,G%iec
       if (rhoi_rhow * ISS%h_shelf(i,j) - CS%bed_elev(i,j) > 0) then
-        float_cond(i,j) = 1.0
+        if (CS%GL_regularize) float_cond(i,j) = 1.0
         CS%ground_frac(i,j) = 1.0
         CS%OD_av(i,j) =0.0
       endif
-    enddo
-  enddo
+    enddo ; enddo
+  endif
 
   call calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, CS%OD_av)
   call pass_vector(taudx, taudy, G%domain, TO_ALL, BGRID_NE)
@@ -1019,10 +1222,15 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   if (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") call pass_var(CS%Ee,G%domain)
 
   ! This makes sure basal stress is only applied when it is supposed to be
-  do j=G%jsd,G%jed ; do i=G%isd,G%ied
-!    CS%basal_traction(i,j) = CS%basal_traction(i,j) * CS%ground_frac(i,j)
-    CS%basal_traction(i,j) = CS%basal_traction(i,j) * float_cond(i,j)
-  enddo ; enddo
+  if (CS%GL_regularize) then
+    do j=G%jsd,G%jed ; do i=G%isd,G%ied
+      CS%basal_traction(i,j) = CS%basal_traction(i,j) * float_cond(i,j)
+    enddo ; enddo
+  else
+    do j=G%jsd,G%jed ; do i=G%isd,G%ied
+      CS%basal_traction(i,j) = CS%basal_traction(i,j) * CS%ground_frac(i,j)
+    enddo ; enddo
+  endif
 
   if (CS%nonlin_solve_err_mode == 1) then
     ! call apply_boundary_values(CS, ISS, G, US, time, Phisub, H_node, CS%ice_visc, &
@@ -1094,11 +1302,15 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     if (trim(CS%ice_viscosity_compute) == "MODEL_QUADRATURE") call pass_var(CS%Ee,G%domain)
 
     ! makes sure basal stress is only applied when it is supposed to be
-
-    do j=G%jsd,G%jed ; do i=G%isd,G%ied
-!     CS%basal_traction(i,j) = CS%basal_traction(i,j) * CS%ground_frac(i,j)
-      CS%basal_traction(i,j) = CS%basal_traction(i,j) * float_cond(i,j)
-    enddo ; enddo
+    if (CS%GL_regularize) then
+      do j=G%jsd,G%jed ; do i=G%isd,G%ied
+        CS%basal_traction(i,j) = CS%basal_traction(i,j) * float_cond(i,j)
+      enddo ; enddo
+    else
+      do j=G%jsd,G%jed ; do i=G%isd,G%ied
+        CS%basal_traction(i,j) = CS%basal_traction(i,j) * CS%ground_frac(i,j)
+      enddo ; enddo
+    endif
 
     if (CS%nonlin_solve_err_mode == 1) then
       !u_bdry_cont(:,:) = 0 ; v_bdry_cont(:,:) = 0
@@ -1205,8 +1417,8 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
                           intent(in)    :: H_node !< The ice shelf thickness at nodal (corner)
                                              !! points [Z ~> m].
   real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(in)    :: float_cond !< An array indicating where the ice
-                                                !! shelf is floating: 0 if floating, 1 if not.
+                          intent(in)    :: float_cond !< If GL_regularize=true, an array indicating where the ice
+                                                !! shelf is floating: 0 if floating, 1 if not
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(in)    :: hmask !< A mask indicating which tracer points are
                                              !! partly or fully covered by an ice-shelf
@@ -1949,18 +2161,24 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
   rhoi_rhow = rho/rhow
   ! prelim - go through and calculate S
 
-  S(:,:) = -CS%bed_elev(:,:) + ISS%h_shelf(:,:)
-  ! check whether the ice is floating or grounded
-
-  do j=jsc-G%domain%njhalo,jec+G%domain%njhalo
-    do i=isc-G%domain%nihalo,iec+G%domain%nihalo
-      if (rhoi_rhow * ISS%h_shelf(i,j) - CS%bed_elev(i,j) <= 0) then
-        S(i,j) = (1 - rhoi_rhow)*ISS%h_shelf(i,j)
-      else
-        S(i,j) = ISS%h_shelf(i,j)-CS%bed_elev(i,j)
-      endif
+  if (CS%GL_couple) then
+    do j=jsc-G%domain%njhalo,jec+G%domain%njhalo
+      do i=isc-G%domain%nihalo,iec+G%domain%nihalo
+        S(i,j) = -CS%bed_elev(i,j) + (OD(i,j) + ISS%h_shelf(i,j))
+      enddo
     enddo
-  enddo
+  else
+    ! check whether the ice is floating or grounded
+    do j=jsc-G%domain%njhalo,jec+G%domain%njhalo
+      do i=isc-G%domain%nihalo,iec+G%domain%nihalo
+        if (rhoi_rhow * ISS%h_shelf(i,j) - CS%bed_elev(i,j) <= 0) then
+          S(i,j) = (1 - rhoi_rhow)*ISS%h_shelf(i,j)
+        else
+          S(i,j) = ISS%h_shelf(i,j)-CS%bed_elev(i,j)
+        endif
+      enddo
+    enddo
+  endif
 
   call pass_var(S, G%domain)
 
@@ -2223,8 +2441,8 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
                                                !! flow law [R L4 Z T-1 ~> kg m2 s-1]. The exact form
                                                !!  and units depend on the basal law exponent.
   real, dimension(SZDI_(G),SZDJ_(G)), &
-                         intent(in)    :: float_cond !< An array indicating where the ice
-                                                !! shelf is floating: 0 if floating, 1 if not.
+                         intent(in)    :: float_cond !< If GL_regularize=true, an array indicating where the ice
+                                                !! shelf is floating: 0 if floating, 1 if not
   real, dimension(SZDI_(G),SZDJ_(G)), &
                          intent(in)    :: bathyT !< The depth of ocean bathymetry at tracer points
                                                  !! relative to sea-level [Z ~> m].
@@ -2394,8 +2612,8 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
   type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
   type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
   real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(in)    :: float_cond !< An array indicating where the ice
-                                                !! shelf is floating: 0 if floating, 1 if not.
+                          intent(in)    :: float_cond !< If GL_regularize=true, an array indicating where the ice
+                                                !! shelf is floating: 0 if floating, 1 if not
   real, dimension(SZDIB_(G),SZDJB_(G)), &
                           intent(in)    :: H_node !< The ice shelf thickness at nodal
                                                  !! (corner) points [Z ~> m].
@@ -2925,7 +3143,7 @@ subroutine update_OD_ffrac(CS, G, US, ocean_mass, find_avg)
       CS%ground_frac(i,j) = 1.0 - (CS%ground_frac_rt(i,j) * I_counter)
       CS%OD_av(i,j) = CS%OD_rt(i,j) * I_counter
 
-      CS%OD_rt(i,j) = 0.0 ; CS%ground_frac_rt(i,j) = 0.0
+      CS%OD_rt(i,j) = 0.0 ; CS%ground_frac_rt(i,j) = 0.0; CS%OD_rt_counter = 0
     enddo ; enddo
 
     call pass_var(CS%ground_frac, G%domain, complete=.false.)
