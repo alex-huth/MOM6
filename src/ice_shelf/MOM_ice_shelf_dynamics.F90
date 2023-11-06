@@ -114,6 +114,12 @@ type, public :: ice_shelf_dyn_CS ; private
   real, pointer, dimension(:,:) :: ground_frac => NULL()   !< Fraction of the time a cell is "exposed", i.e. the column
                                !! thickness is below a threshold and interacting with the rock [nondim].  When this
                                !! is 1, the ice-shelf is grounded
+  real, pointer, dimension(:,:,:,:) :: Phi => NULL() ! The gradients of bilinear basis elements at Gaussian
+                                                ! 4 quadrature points surrounding the cell vertices [L-1 ~> m-1].
+  real, pointer, dimension(:,:,:) :: PhiC => NULL()  ! The gradients of bilinear basis elements at 1 cell-centered
+                                                ! quadrature point per cell [L-1 ~> m-1].
+  real, pointer, dimension(:,:,:,:,:,:) :: Phisub => NULL() ! Quadrature structure weights at subgridscale
+                                                !  locations for finite element calculations [nondim]
   integer :: OD_rt_counter = 0 !< A counter of the number of contributions to OD_rt.
 
   real :: velocity_update_time_step !< The time interval over which to update the ice shelf velocity
@@ -328,6 +334,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%u_face_mask_bdry(IsdB:IedB,JsdB:JedB), source=-2.0)
     allocate(CS%v_face_mask_bdry(IsdB:iedB,JsdB:JedB), source=-2.0)
     allocate(CS%h_bdry_val(isd:ied,jsd:jed), source=0.0)
+
    ! additional restarts for ice shelf state
     call register_restart_field(CS%u_shelf, "u_shelf", .false., restart_CS, &
                                 "ice sheet/shelf u-velocity", &
@@ -585,6 +592,24 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
 
     if (CS%calve_to_mask) then
       allocate( CS%calve_mask(isd:ied,jsd:jed), source=0.0)
+    endif
+
+    allocate(CS%Phi(1:8,1:4,isd:ied,jsd:jed), source=0.0)
+      do j=G%jsd,G%jed ; do i=G%isd,G%ied
+        call bilinear_shape_fn_grid(G, i, j, CS%Phi(:,:,i,j))
+      enddo; enddo
+
+    if (CS%GL_regularize) then
+      allocate(CS%Phisub(CS%n_sub_regularize,CS%n_sub_regularize,2,2,2,2), source=0.0)
+      call bilinear_shape_functions_subgrid(CS%Phisub, CS%n_sub_regularize)
+    endif
+
+    if ((trim(CS%ice_viscosity_compute) == "MODEL") .and. CS%visc_qps==1) then
+      !for calculating viscosity and 1 cell-centered quadrature point per cell
+      allocate(CS%PhiC(1:8,G%isc:G%iec,G%jsc:G%jec), source=0.0)
+      do j=G%jsc,G%jec ; do i=G%isc,G%iec
+        call bilinear_shape_fn_grid_1qp(G, i, j, CS%PhiC(:,i,j))
+      enddo; enddo
     endif
 
     CS%elapsed_velocity_time = 0.0
@@ -1151,17 +1176,10 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   real, dimension(SZDIB_(G),SZDJB_(G)) :: Normvec  ! Used for convergence
   character(len=160) :: mesg  ! The text of an error message
   integer :: conv_flag, i, j, k,l, iter
-  integer :: isdq, iedq, jsdq, jedq, isd, ied, jsd, jed, nodefloat, nsub
+  integer :: isdq, iedq, jsdq, jedq, isd, ied, jsd, jed, nodefloat
   real    :: err_max, err_tempu, err_tempv, err_init, max_vel, tempu, tempv, Norm, PrevNorm
   real    :: rhoi_rhow ! The density of ice divided by a typical water density [nondim]
-  real, pointer, dimension(:,:,:,:) :: Phi => NULL() ! The gradients of bilinear basis elements at Gaussian
-                                                ! quadrature points surrounding the cell vertices [L-1 ~> m-1].
-  real, pointer, dimension(:,:,:,:,:,:) :: Phisub => NULL() ! Quadrature structure weights at subgridscale
-                                                !  locations for finite element calculations [nondim]
   integer :: Is_sum, Js_sum, Ie_sum, Je_sum ! Loop bounds for global sums or arrays starting at 1.
-
-  ! for GL interpolation
-  nsub = CS%n_sub_regularize
 
   isdq = G%isdB ; iedq = G%iedB ; jsdq = G%jsdB ; jedq = G%jedB
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -1174,7 +1192,6 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   ! need to make these conditional on GL interpolation
   float_cond(:,:) = 0.0 ; H_node(:,:) = 0.0
   !CS%ground_frac(:,:) = 0.0
-  allocate(Phisub(nsub,nsub,2,2,2,2), source=0.0)
 
   if (.not. CS%GL_couple) then
     do j=G%jsc,G%jec ; do i=G%isc,G%iec
@@ -1216,16 +1233,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
     call pass_var(float_cond, G%Domain, complete=.false.)
 
-    call bilinear_shape_functions_subgrid(Phisub, nsub)
-
   endif
-
-  ! must prepare Phi
-  allocate(Phi(1:8,1:4,isd:ied,jsd:jed), source=0.0)
-
-  do j=jsd,jed ; do i=isd,ied
-    call bilinear_shape_fn_grid(G, i, j, Phi(:,:,i,j))
-  enddo ; enddo
 
   call calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
   call pass_var(CS%basal_traction, G%domain, complete=.true.)
@@ -1244,12 +1252,12 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   endif
 
   if (CS%nonlin_solve_err_mode == 1) then
-    ! call apply_boundary_values(CS, ISS, G, US, time, Phisub, H_node, CS%ice_visc, &
+    ! call apply_boundary_values(CS, ISS, G, US, time, CS%Phi, CS%Phisub, H_node, CS%ice_visc, &
     !                        CS%basal_traction, float_cond, rhoi_rhow, u_bdry_cont, v_bdry_cont)
 
     Au(:,:) = 0.0 ; Av(:,:) = 0.0
 
-    call CG_action(CS, Au, Av, u_shlf, v_shlf, Phi, Phisub, CS%umask, CS%vmask, ISS%hmask, H_node, &
+    call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, H_node, &
                    CS%ice_visc, float_cond, CS%bed_elev, CS%basal_traction, &
                    G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow)
     call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
@@ -1296,7 +1304,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   do iter=1,50
 
     call ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H_node, float_cond, &
-                               ISS%hmask, conv_flag, iters, time, Phi, Phisub)
+                               ISS%hmask, conv_flag, iters, time, CS%Phi, CS%Phisub)
 
     if (CS%debug) then
       call qchksum(u_shlf, "u shelf", G%HI, haloshift=2, scale=US%L_T_to_m_s)
@@ -1325,12 +1333,12 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     if (CS%nonlin_solve_err_mode == 1) then
       !u_bdry_cont(:,:) = 0 ; v_bdry_cont(:,:) = 0
 
-      ! call apply_boundary_values(CS, ISS, G, US, time, Phisub, H_node, CS%ice_visc, &
+      ! call apply_boundary_values(CS, ISS, G, US, time, CS%Phi, CS%Phisub, H_node, CS%ice_visc, &
       !                        CS%basal_traction, float_cond, rhoi_rhow, u_bdry_cont, v_bdry_cont)
 
       Au(:,:) = 0 ; Av(:,:) = 0
 
-      call CG_action(CS, Au, Av, u_shlf, v_shlf, Phi, Phisub, CS%umask, CS%vmask, ISS%hmask, H_node, &
+      call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, H_node, &
                      CS%ice_visc, float_cond, CS%bed_elev, CS%basal_traction, &
                      G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow)
 
@@ -1403,8 +1411,6 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   call MOM_mesg(mesg)
   write(mesg,*) "ice_shelf_solve_outer: exiting nonlinear solve after ",iter," iterations"
   call MOM_mesg(mesg)
-  deallocate(Phi)
-  deallocate(Phisub)
 
 end subroutine ice_shelf_solve_outer
 
@@ -1497,7 +1503,7 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
   ! Include the edge if tile is at the southern bdry;  Should add a test to avoid this if reentrant.
   if (G%jsc+G%jdg_offset==G%jsg) Js_sum = G%JscB + (1-G%JsdB)
 
-  !call apply_boundary_values(CS, ISS, G, US, time, Phisub, H_node, CS%ice_visc, &
+  !call apply_boundary_values(CS, ISS, G, US, time, Phi, Phisub, H_node, CS%ice_visc, &
   !                           CS%basal_traction, float_cond, rhoi_rhow, ubd, vbd)
 
   RHSu(:,:) = taudx(:,:) !- ubd(:,:)
@@ -1506,7 +1512,7 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
   call pass_vector(RHSu, RHSv, G%domain, TO_ALL, BGRID_NE, complete=.false.)
 
   call matrix_diagonal(CS, G, US, float_cond, H_node, CS%ice_visc, CS%basal_traction, &
-                       hmask, rhoi_rhow, Phisub, DIAGu, DIAGv)
+                       hmask, rhoi_rhow, Phi, Phisub, DIAGu, DIAGv)
 
   call pass_vector(DIAGu, DIAGv, G%domain, TO_ALL, BGRID_NE, complete=.false.)
 
@@ -2621,7 +2627,7 @@ end subroutine CG_action_subgrid_basal
 
 !> returns the diagonal entries of the matrix for a Jacobi preconditioning
 subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, hmask, dens_ratio, &
-                           Phisub, u_diagonal, v_diagonal)
+                           Phi, Phisub, u_diagonal, v_diagonal)
 
   type(ice_shelf_dyn_CS), intent(in)    :: CS !< A pointer to the ice shelf control structure
   type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
@@ -2645,6 +2651,9 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
                                              !! partly or fully covered by an ice-shelf
   real,                   intent(in)    :: dens_ratio !< The density of ice divided by the density
                                                      !! of seawater [nondim]
+  real, dimension(8,4,SZDI_(G),SZDJ_(G)), &
+                          intent(in)    :: Phi !< The gradients of bilinear basis elements at Gaussian
+                                             !! quadrature points surrounding the cell vertices [L-1 ~> m-1]
   real, dimension(:,:,:,:,:,:), intent(in) :: Phisub !< Quadrature structure weights at subgridscale
                                             !! locations for finite element calculations [nondim]
   real, dimension(SZDIB_(G),SZDJB_(G)), &
@@ -2659,7 +2668,7 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
 
   real :: ux, uy, vx, vy ! Interpolated weight gradients [L-1 ~> m-1]
   real :: uq, vq
-  real, dimension(8,4) :: Phi ! Weight gradients [L-1 ~> m-1]
+!  real, dimension(8,4) :: Phi ! Weight gradients [L-1 ~> m-1]
   real, dimension(2)   :: xquad
   real, dimension(2,2) :: Hcell, sub_ground
   logical :: visc_qp4
@@ -2678,7 +2687,7 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
 
   do j=jsc-1,jec+1 ; do i=isc-1,iec+1 ; if (hmask(i,j) == 1 .or. hmask(i,j)==3) then
 
-    call bilinear_shape_fn_grid(G, i, j, Phi)
+    !call bilinear_shape_fn_grid(G, i, j, Phi)
 
     ! Phi(2*i-1,j) gives d(Phi_i)/dx at quadrature point j
     ! Phi(2*i,j) gives d(Phi_i)/dy at quadrature point j
@@ -2695,14 +2704,14 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
 
         if (CS%umask(Itgt,Jtgt) == 1) then
 
-          ux = Phi(2*(2*(jphi-1)+iphi)-1, 2*(jq-1)+iq)
-          uy = Phi(2*(2*(jphi-1)+iphi), 2*(jq-1)+iq)
+          ux = Phi(2*(2*(jphi-1)+iphi)-1, 2*(jq-1)+iq, i, j)
+          uy = Phi(2*(2*(jphi-1)+iphi), 2*(jq-1)+iq, i, j)
           vx = 0.
           vy = 0.
 
           u_diagonal(Itgt,Jtgt) = u_diagonal(Itgt,Jtgt) + &
-            0.25 * ice_visc(i,j,qp) * ((4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq) + &
-            (uy+vx) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq))
+            0.25 * ice_visc(i,j,qp) * ((4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq,i,j) + &
+            (uy+vx) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq,i,j))
 
           if (float_cond(i,j) == 0) then
             uq = xquad(ilq) * xquad(jlq)
@@ -2713,14 +2722,14 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
 
         if (CS%vmask(Itgt,Jtgt) == 1) then
 
-          vx = Phi(2*(2*(jphi-1)+iphi)-1, 2*(jq-1)+iq)
-          vy = Phi(2*(2*(jphi-1)+iphi), 2*(jq-1)+iq)
+          vx = Phi(2*(2*(jphi-1)+iphi)-1, 2*(jq-1)+iq,i,j)
+          vy = Phi(2*(2*(jphi-1)+iphi), 2*(jq-1)+iq,i,j)
           ux = 0.
           uy = 0.
 
           v_diagonal(Itgt,Jtgt) = v_diagonal(Itgt,Jtgt) + &
-            0.25 * ice_visc(i,j,qp) * ((uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq) + &
-            (4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq))
+            0.25 * ice_visc(i,j,qp) * ((uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq,i,j) + &
+            (4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq,i,j))
 
           if (float_cond(i,j) == 0) then
             vq = xquad(ilq) * xquad(jlq)
@@ -2783,7 +2792,7 @@ subroutine CG_diagonal_subgrid_basal (Phisub, H_node, bathyT, dens_ratio, sub_gr
 end subroutine CG_diagonal_subgrid_basal
 
 
-subroutine apply_boundary_values(CS, ISS, G, US, time, Phisub, H_node, ice_visc, basal_trac, float_cond, &
+subroutine apply_boundary_values(CS, ISS, G, US, time, Phi, Phisub, H_node, ice_visc, basal_trac, float_cond, &
                                  dens_ratio, u_bdry_contr, v_bdry_contr)
 
   type(ice_shelf_dyn_CS), intent(in)    :: CS !< A pointer to the ice shelf control structure
@@ -2792,6 +2801,9 @@ subroutine apply_boundary_values(CS, ISS, G, US, time, Phisub, H_node, ice_visc,
   type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
   type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
   type(time_type),        intent(in)    :: Time !< The current model time
+  real, dimension(8,4,SZDI_(G),SZDJ_(G)), &
+                          intent(in)    :: Phi !< The gradients of bilinear basis elements at Gaussian
+                                             !! quadrature points surrounding the cell vertices [L-1 ~> m-1]
   real, dimension(:,:,:,:,:,:), &
                           intent(in)    :: Phisub !< Quadrature structure weights at subgridscale
                                             !! locations for finite element calculations [nondim]
@@ -2821,7 +2833,7 @@ subroutine apply_boundary_values(CS, ISS, G, US, time, Phisub, H_node, ice_visc,
 ! this will be a per-setup function. the boundary values of thickness and velocity
 ! (and possibly other variables) will be updated in this function
 
-  real, dimension(8,4)  :: Phi
+!  real, dimension(8,4)  :: Phi
   real, dimension(2) :: xquad
   real :: ux, uy, vx, vy ! Components of velocity shears or divergence [T-1 ~> s-1]
   real :: uq, vq  ! Interpolated velocities [L T-1 ~> m s-1]
@@ -2849,7 +2861,7 @@ subroutine apply_boundary_values(CS, ISS, G, US, time, Phisub, H_node, ice_visc,
       (CS%vmask(I-1,J-1) == 3) .OR. (CS%vmask(I,J-1) == 3) .OR. &
       (CS%vmask(I-1,J) == 3) .OR. (CS%vmask(I,J) == 3)) then
 
-      call bilinear_shape_fn_grid(G, i, j, Phi)
+      !call bilinear_shape_fn_grid(G, i, j, Phi)
 
       ! Phi(2*i-1,j) gives d(Phi_i)/dx at quadrature point j
       ! Phi(2*i,j) gives d(Phi_i)/dy at quadrature point j
@@ -2866,25 +2878,25 @@ subroutine apply_boundary_values(CS, ISS, G, US, time, Phisub, H_node, ice_visc,
              CS%v_bdry_val(I-1,J) * (xquad(3-iq) * xquad(jq)) + &
              CS%v_bdry_val(I,J) * (xquad(iq) * xquad(jq))
 
-        ux = CS%u_bdry_val(I-1,J-1) * Phi(1,2*(jq-1)+iq) + &
-             CS%u_bdry_val(I,J-1) * Phi(3,2*(jq-1)+iq) + &
-             CS%u_bdry_val(I-1,J) * Phi(5,2*(jq-1)+iq) + &
-             CS%u_bdry_val(I,J) * Phi(7,2*(jq-1)+iq)
+        ux = CS%u_bdry_val(I-1,J-1) * Phi(1,2*(jq-1)+iq,i,j) + &
+             CS%u_bdry_val(I,J-1) * Phi(3,2*(jq-1)+iq,i,j) + &
+             CS%u_bdry_val(I-1,J) * Phi(5,2*(jq-1)+iq,i,j) + &
+             CS%u_bdry_val(I,J) * Phi(7,2*(jq-1)+iq,i,j)
 
-        vx = CS%v_bdry_val(I-1,J-1) * Phi(1,2*(jq-1)+iq) + &
-             CS%v_bdry_val(I,J-1) * Phi(3,2*(jq-1)+iq) + &
-             CS%v_bdry_val(I-1,J) * Phi(5,2*(jq-1)+iq) + &
-             CS%v_bdry_val(I,J) * Phi(7,2*(jq-1)+iq)
+        vx = CS%v_bdry_val(I-1,J-1) * Phi(1,2*(jq-1)+iq,i,j) + &
+             CS%v_bdry_val(I,J-1) * Phi(3,2*(jq-1)+iq,i,j) + &
+             CS%v_bdry_val(I-1,J) * Phi(5,2*(jq-1)+iq,i,j) + &
+             CS%v_bdry_val(I,J) * Phi(7,2*(jq-1)+iq,i,j)
 
-        uy = CS%u_bdry_val(I-1,J-1) * Phi(2,2*(jq-1)+iq) + &
-             CS%u_bdry_val(I,J-1) * Phi(4,2*(jq-1)+iq) + &
-             CS%u_bdry_val(I-1,J) * Phi(6,2*(jq-1)+iq) + &
-             CS%u_bdry_val(I,J) * Phi(8,2*(jq-1)+iq)
+        uy = CS%u_bdry_val(I-1,J-1) * Phi(2,2*(jq-1)+iq,i,j) + &
+             CS%u_bdry_val(I,J-1) * Phi(4,2*(jq-1)+iq,i,j) + &
+             CS%u_bdry_val(I-1,J) * Phi(6,2*(jq-1)+iq,i,j) + &
+             CS%u_bdry_val(I,J) * Phi(8,2*(jq-1)+iq,i,j)
 
-        vy = CS%v_bdry_val(I-1,J-1) * Phi(2,2*(jq-1)+iq) + &
-             CS%v_bdry_val(I,J-1) * Phi(4,2*(jq-1)+iq) + &
-             CS%v_bdry_val(I-1,J) * Phi(6,2*(jq-1)+iq) + &
-             CS%v_bdry_val(I,J) * Phi(8,2*(jq-1)+iq)
+        vy = CS%v_bdry_val(I-1,J-1) * Phi(2,2*(jq-1)+iq,i,j) + &
+             CS%v_bdry_val(I,J-1) * Phi(4,2*(jq-1)+iq,i,j) + &
+             CS%v_bdry_val(I-1,J) * Phi(6,2*(jq-1)+iq,i,j) + &
+             CS%v_bdry_val(I,J) * Phi(8,2*(jq-1)+iq,i,j)
 
         if (visc_qp4) qp = 2*(jq-1)+iq !current quad point for viscosity
 
@@ -2894,8 +2906,8 @@ subroutine apply_boundary_values(CS, ISS, G, US, time, Phisub, H_node, ice_visc,
 
           if (CS%umask(Itgt,Jtgt) == 1) then
             u_bdry_contr(Itgt,Jtgt) = u_bdry_contr(Itgt,Jtgt) + &
-               0.25 * ice_visc(i,j,qp) * ( (4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq) + &
-                                            (uy+vx) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq) )
+               0.25 * ice_visc(i,j,qp) * ( (4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq,i,j) + &
+                                            (uy+vx) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq,i,j) )
 
             if (float_cond(i,j) == 0) then
               u_bdry_contr(Itgt,Jtgt) = u_bdry_contr(Itgt,Jtgt) + &
@@ -2905,8 +2917,8 @@ subroutine apply_boundary_values(CS, ISS, G, US, time, Phisub, H_node, ice_visc,
 
           if (CS%vmask(Itgt,Jtgt) == 1) then
             v_bdry_contr(Itgt,Jtgt) = v_bdry_contr(Itgt,Jtgt) + &
-                0.25 *  ice_visc(i,j,qp) * ( (uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq) + &
-                                      (4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq) )
+                0.25 *  ice_visc(i,j,qp) * ( (uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq,i,j) + &
+                                      (4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq,i,j) )
 
             if (float_cond(i,j) == 0) then
               v_bdry_contr(Itgt,Jtgt) = v_bdry_contr(Itgt,Jtgt) + &
@@ -2950,9 +2962,6 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
                           intent(inout) :: u_shlf !< The zonal ice shelf velocity [L T-1 ~> m s-1].
   real, dimension(G%IsdB:G%IedB,G%JsdB:G%JedB), &
                           intent(inout) :: v_shlf !< The meridional ice shelf velocity [L T-1 ~> m s-1].
-  real, pointer, dimension(:,:,:,:) :: Phi => NULL() ! The gradients of bilinear basis elements at Gaussian
-                                                     ! quadrature points surrounding the cell vertices [L-1 ~> m-1].
-  real, pointer, dimension(:,:,:) :: PhiC => NULL()  ! Same as Phi, but 1 quadrature point per cell (rather than 4)
 
 ! update DEPTH_INTEGRATED viscosity, based on horizontal strain rates - this is for bilinear FEM solve
 
@@ -2977,17 +2986,9 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
 
   if (trim(CS%ice_viscosity_compute) == "MODEL") then
     if (CS%visc_qps==1) then
-      allocate(PhiC(1:8,isc:iec,jsc:jec), source=0.0)
-      do j=jsc,jec ; do i=isc,iec
-        call bilinear_shape_fn_grid_1qp(G, i, j, PhiC(:,i,j))
-      enddo; enddo
       model_qp1=.true.
       model_qp4=.false.
     else
-      allocate(Phi(1:8,1:4,isc:iec,jsc:jec), source=0.0)
-      do j=jsc,jec ; do i=isc,iec
-        call bilinear_shape_fn_grid(G, i, j, Phi(:,:,i,j))
-      enddo; enddo
       model_qp1=.false.
       model_qp4=.true.
     endif
@@ -3011,25 +3012,25 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
         Visc_coef = (CS%AGlen_visc(i,j))**(-1./n_g)
         ! Units of Aglen_visc [Pa-(n_g) s-1]
 
-        ux = u_shlf(I-1,J-1) * PhiC(1,i,j) + &
-             u_shlf(I,J) * PhiC(7,i,j) + &
-             u_shlf(I-1,J) * PhiC(5,i,j) + &
-             u_shlf(I,J-1) * PhiC(3,i,j)
+        ux = u_shlf(I-1,J-1) * CS%PhiC(1,i,j) + &
+             u_shlf(I,J) * CS%PhiC(7,i,j) + &
+             u_shlf(I-1,J) * CS%PhiC(5,i,j) + &
+             u_shlf(I,J-1) * CS%PhiC(3,i,j)
 
-        vx = v_shlf(I-1,J-1) * PhiC(1,i,j) + &
-             v_shlf(I,J) * PhiC(7,i,j) + &
-             v_shlf(I-1,J) * PhiC(5,i,j) + &
-             v_shlf(I,J-1) * PhiC(3,i,j)
+        vx = v_shlf(I-1,J-1) * CS%PhiC(1,i,j) + &
+             v_shlf(I,J) * CS%PhiC(7,i,j) + &
+             v_shlf(I-1,J) * CS%PhiC(5,i,j) + &
+             v_shlf(I,J-1) * CS%PhiC(3,i,j)
 
-        uy = u_shlf(I-1,J-1) * PhiC(2,i,j) + &
-             u_shlf(I,J) * PhiC(8,i,j) + &
-             u_shlf(I-1,J) * PhiC(6,i,j) + &
-             u_shlf(I,J-1) * PhiC(4,i,j)
+        uy = u_shlf(I-1,J-1) * CS%PhiC(2,i,j) + &
+             u_shlf(I,J) * CS%PhiC(8,i,j) + &
+             u_shlf(I-1,J) * CS%PhiC(6,i,j) + &
+             u_shlf(I,J-1) * CS%PhiC(4,i,j)
 
-        vy = v_shlf(I-1,J-1) * PhiC(2,i,j) + &
-             v_shlf(I,J) * PhiC(8,i,j) + &
-             v_shlf(I-1,J) * PhiC(6,i,j) + &
-             v_shlf(I,J-1) * PhiC(4,i,j)
+        vy = v_shlf(I-1,J-1) * CS%PhiC(2,i,j) + &
+             v_shlf(I,J) * CS%PhiC(8,i,j) + &
+             v_shlf(I-1,J) * CS%PhiC(6,i,j) + &
+             v_shlf(I,J-1) * CS%PhiC(4,i,j)
 
         CS%ice_visc(i,j,1) = 0.5 * Visc_coef * (G%areaT(i,j) * ISS%h_shelf(i,j)) * &
           (US%s_to_T**2 * (ux**2 + vy**2 + ux*vy + 0.25*(uy+vx)**2 + eps_min**2))**((1.-n_g)/(2.*n_g)) * &
@@ -3041,25 +3042,25 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
 
         do iq=1,2 ; do jq=1,2
 
-          ux = u_shlf(I-1,J-1) * Phi(1,2*(jq-1)+iq,i,j) + &
-               u_shlf(I,J-1) * Phi(3,2*(jq-1)+iq,i,j) + &
-               u_shlf(I-1,J) * Phi(5,2*(jq-1)+iq,i,j) + &
-               u_shlf(I,J) * Phi(7,2*(jq-1)+iq,i,j)
+          ux = u_shlf(I-1,J-1) * CS%Phi(1,2*(jq-1)+iq,i,j) + &
+               u_shlf(I,J-1) * CS%Phi(3,2*(jq-1)+iq,i,j) + &
+               u_shlf(I-1,J) * CS%Phi(5,2*(jq-1)+iq,i,j) + &
+               u_shlf(I,J) * CS%Phi(7,2*(jq-1)+iq,i,j)
 
-          vx = v_shlf(I-1,J-1) * Phi(1,2*(jq-1)+iq,i,j) + &
-               v_shlf(I,J-1) * Phi(3,2*(jq-1)+iq,i,j) + &
-               v_shlf(I-1,J) * Phi(5,2*(jq-1)+iq,i,j) + &
-               v_shlf(I,J) * Phi(7,2*(jq-1)+iq,i,j)
+          vx = v_shlf(I-1,J-1) * CS%Phi(1,2*(jq-1)+iq,i,j) + &
+               v_shlf(I,J-1) * CS%Phi(3,2*(jq-1)+iq,i,j) + &
+               v_shlf(I-1,J) * CS%Phi(5,2*(jq-1)+iq,i,j) + &
+               v_shlf(I,J) * CS%Phi(7,2*(jq-1)+iq,i,j)
 
-          uy = u_shlf(I-1,J-1) * Phi(2,2*(jq-1)+iq,i,j) + &
-               u_shlf(I,J-1) * Phi(4,2*(jq-1)+iq,i,j) + &
-               u_shlf(I-1,J) * Phi(6,2*(jq-1)+iq,i,j) + &
-               u_shlf(I,J) * Phi(8,2*(jq-1)+iq,i,j)
+          uy = u_shlf(I-1,J-1) * CS%Phi(2,2*(jq-1)+iq,i,j) + &
+               u_shlf(I,J-1) * CS%Phi(4,2*(jq-1)+iq,i,j) + &
+               u_shlf(I-1,J) * CS%Phi(6,2*(jq-1)+iq,i,j) + &
+               u_shlf(I,J) * CS%Phi(8,2*(jq-1)+iq,i,j)
 
-          vy = v_shlf(I-1,J-1) * Phi(2,2*(jq-1)+iq,i,j) + &
-               v_shlf(I,J-1) * Phi(4,2*(jq-1)+iq,i,j) + &
-               v_shlf(I-1,J) * Phi(6,2*(jq-1)+iq,i,j) + &
-               v_shlf(I,J) * Phi(8,2*(jq-1)+iq,i,j)
+          vy = v_shlf(I-1,J-1) * CS%Phi(2,2*(jq-1)+iq,i,j) + &
+               v_shlf(I,J-1) * CS%Phi(4,2*(jq-1)+iq,i,j) + &
+               v_shlf(I-1,J) * CS%Phi(6,2*(jq-1)+iq,i,j) + &
+               v_shlf(I,J) * CS%Phi(8,2*(jq-1)+iq,i,j)
 
           CS%ice_visc(i,j,2*(jq-1)+iq) = 0.5 * Visc_coef * (G%areaT(i,j) * ISS%h_shelf(i,j)) * &
             (US%s_to_T**2 * (ux**2 + vy**2 + ux*vy + 0.25*(uy+vx)**2 + eps_min**2))**((1.-n_g)/(2.*n_g)) * &
@@ -3069,8 +3070,6 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
     endif
   enddo ; enddo
 
-  if (model_qp1) deallocate(PhiC)
-  if (model_qp4) deallocate(Phi)
 end subroutine calc_shelf_visc
 
 
