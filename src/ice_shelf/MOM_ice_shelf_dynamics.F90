@@ -114,12 +114,12 @@ type, public :: ice_shelf_dyn_CS ; private
   real, pointer, dimension(:,:) :: ground_frac => NULL()   !< Fraction of the time a cell is "exposed", i.e. the column
                                !! thickness is below a threshold and interacting with the rock [nondim].  When this
                                !! is 1, the ice-shelf is grounded
-  real, pointer, dimension(:,:,:,:) :: Phi => NULL() ! The gradients of bilinear basis elements at Gaussian
-                                                ! 4 quadrature points surrounding the cell vertices [L-1 ~> m-1].
-  real, pointer, dimension(:,:,:) :: PhiC => NULL()  ! The gradients of bilinear basis elements at 1 cell-centered
-                                                ! quadrature point per cell [L-1 ~> m-1].
-  real, pointer, dimension(:,:,:,:,:,:) :: Phisub => NULL() ! Quadrature structure weights at subgridscale
-                                                !  locations for finite element calculations [nondim]
+  real, pointer, dimension(:,:,:,:) :: Phi => NULL() !< The gradients of bilinear basis elements at Gaussian
+                                                !! 4 quadrature points surrounding the cell vertices [L-1 ~> m-1].
+  real, pointer, dimension(:,:,:) :: PhiC => NULL()  !< The gradients of bilinear basis elements at 1 cell-centered
+                                                !! quadrature point per cell [L-1 ~> m-1].
+  real, pointer, dimension(:,:,:,:,:,:) :: Phisub => NULL() !< Quadrature structure weights at subgridscale
+                                                !!  locations for finite element calculations [nondim]
   integer :: OD_rt_counter = 0 !< A counter of the number of contributions to OD_rt.
 
   real :: velocity_update_time_step !< The time interval over which to update the ice shelf velocity
