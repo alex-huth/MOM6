@@ -595,12 +595,12 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     endif
 
     allocate(CS%Phi(1:8,1:4,isd:ied,jsd:jed), source=0.0)
-      do j=G%jsd,G%jed ; do i=G%isd,G%ied
-        call bilinear_shape_fn_grid(G, i, j, CS%Phi(:,:,i,j))
-      enddo; enddo
+    do j=G%jsd,G%jed ; do i=G%isd,G%ied
+      call bilinear_shape_fn_grid(G, i, j, CS%Phi(:,:,i,j))
+    enddo; enddo
 
     if (CS%GL_regularize) then
-      allocate(CS%Phisub(CS%n_sub_regularize,CS%n_sub_regularize,2,2,2,2), source=0.0)
+      allocate(CS%Phisub(2,2,CS%n_sub_regularize,CS%n_sub_regularize,2,2), source=0.0)
       call bilinear_shape_functions_subgrid(CS%Phisub, CS%n_sub_regularize)
     endif
 
@@ -982,11 +982,11 @@ subroutine write_ice_shelf_energy(CS, G, US, mass, day, time_step)
 
   !calculate KE using cell-centered ice shelf velocity
   tmp1(:,:)=0.0
-  KE_scale_factor = US%L_to_m**2 * US%RZ_to_kg_m2 * US%L_T_to_m_s**2
+  KE_scale_factor = US%L_to_m**2 * (US%RZ_to_kg_m2 * US%L_T_to_m_s**2)
   do j=js,je ; do i=is,ie
-    tmp1(i,j) = KE_scale_factor * 0.03125 * G%areaT(i,j) * mass(i,j) * &
-      ((CS%u_shelf(I-1,J-1)+CS%u_shelf(I,J-1)+CS%u_shelf(I,J)+CS%u_shelf(I,J-1))**2 + &
-      (CS%v_shelf(I-1,J-1)+CS%v_shelf(I,J-1)+CS%v_shelf(I,J)+CS%v_shelf(I,J-1))**2)
+    tmp1(i,j) = (KE_scale_factor * 0.03125) * (G%areaT(i,j) * mass(i,j)) * &
+      (((CS%u_shelf(I-1,J-1)+CS%u_shelf(I,J))+(CS%u_shelf(I,J-1)+CS%u_shelf(I-1,J)))**2 + &
+       ((CS%v_shelf(I-1,J-1)+CS%v_shelf(I,J))+(CS%v_shelf(I,J-1)+CS%v_shelf(I-1,J)))**2)
   enddo; enddo
 
   KE_tot = reproducing_sum(tmp1, isr, ier, jsr, jer)
@@ -995,7 +995,7 @@ subroutine write_ice_shelf_energy(CS, G, US, mass, day, time_step)
   tmp1(:,:)=0.0
   mass_scale_factor = US%L_to_m**2 * US%RZ_to_kg_m2
   do j=js,je ; do i=is,ie
-    tmp1(i,j) =  mass_scale_factor * mass(i,j) * G%areaT(i,j)
+    tmp1(i,j) =  mass_scale_factor * (mass(i,j) * G%areaT(i,j))
   enddo; enddo
 
   mass_tot = reproducing_sum(tmp1, isr, ier, jsr, jer)
@@ -1186,7 +1186,6 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   rhoi_rhow = CS%density_ice / CS%density_ocean_avg
 
   taudx(:,:) = 0.0 ; taudy(:,:) = 0.0
-  !u_bdry_cont(:,:) = 0.0 ; v_bdry_cont(:,:) = 0.0
   Au(:,:) = 0.0 ; Av(:,:) = 0.0
 
   ! need to make these conditional on GL interpolation
@@ -1252,8 +1251,6 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   endif
 
   if (CS%nonlin_solve_err_mode == 1) then
-    ! call apply_boundary_values(CS, ISS, G, US, time, CS%Phi, CS%Phisub, H_node, CS%ice_visc, &
-    !                        CS%basal_traction, float_cond, rhoi_rhow, u_bdry_cont, v_bdry_cont)
 
     Au(:,:) = 0.0 ; Av(:,:) = 0.0
 
@@ -1290,8 +1287,8 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     ! Include the edge if tile is at the southern bdry;  Should add a test to avoid this if reentrant.
     if (G%jsc+G%jdg_offset==G%jsg) Js_sum = G%JscB + (1-G%JsdB)
     do J=G%jscB,G%jecB ; do I=G%iscB,G%iecB
-      if (CS%umask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + u_shlf(I,J)**2 * US%L_T_to_m_s**2
-      if (CS%vmask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + v_shlf(I,J)**2 * US%L_T_to_m_s**2
+      if (CS%umask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + (u_shlf(I,J)**2 * US%L_T_to_m_s**2)
+      if (CS%vmask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + (v_shlf(I,J)**2 * US%L_T_to_m_s**2)
     enddo; enddo
     Norm = reproducing_sum( Normvec, Is_sum, Ie_sum, Js_sum, Je_sum )
     Norm = sqrt(Norm)
@@ -1331,10 +1328,6 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     endif
 
     if (CS%nonlin_solve_err_mode == 1) then
-      !u_bdry_cont(:,:) = 0 ; v_bdry_cont(:,:) = 0
-
-      ! call apply_boundary_values(CS, ISS, G, US, time, CS%Phi, CS%Phisub, H_node, CS%ice_visc, &
-      !                        CS%basal_traction, float_cond, rhoi_rhow, u_bdry_cont, v_bdry_cont)
 
       Au(:,:) = 0 ; Av(:,:) = 0
 
@@ -1390,8 +1383,8 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     elseif (CS%nonlin_solve_err_mode == 3) then
       PrevNorm=Norm; Norm=0.0; Normvec=0.0
       do J=G%jscB,G%jecB ; do I=G%iscB,G%iecB
-        if (CS%umask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + u_shlf(I,J)**2 * US%L_T_to_m_s**2
-        if (CS%vmask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + v_shlf(I,J)**2 * US%L_T_to_m_s**2
+        if (CS%umask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + (u_shlf(I,J)**2 * US%L_T_to_m_s**2)
+        if (CS%vmask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + (v_shlf(I,J)**2 * US%L_T_to_m_s**2)
       enddo; enddo
       Norm = reproducing_sum( Normvec, Is_sum, Ie_sum, Js_sum, Je_sum )
       Norm = sqrt(Norm)
@@ -1489,7 +1482,7 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
 
   Zu(:,:) = 0 ; Zv(:,:) = 0 ; DIAGu(:,:) = 0 ; DIAGv(:,:) = 0
   Ru(:,:) = 0 ; Rv(:,:) = 0 ; Au(:,:) = 0 ; Av(:,:) = 0 ; RHSu(:,:) = 0 ; RHSv(:,:) = 0
-  Du(:,:) = 0 ; Dv(:,:) = 0 !; ubd(:,:) = 0 ; vbd(:,:) = 0
+  Du(:,:) = 0 ; Dv(:,:) = 0
   dot_p1 = 0
 
   ! Determine the loop limits for sums, bearing in mind that the arrays will be starting at 1.
@@ -1503,11 +1496,8 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
   ! Include the edge if tile is at the southern bdry;  Should add a test to avoid this if reentrant.
   if (G%jsc+G%jdg_offset==G%jsg) Js_sum = G%JscB + (1-G%JsdB)
 
-  !call apply_boundary_values(CS, ISS, G, US, time, Phi, Phisub, H_node, CS%ice_visc, &
-  !                           CS%basal_traction, float_cond, rhoi_rhow, ubd, vbd)
-
-  RHSu(:,:) = taudx(:,:) !- ubd(:,:)
-  RHSv(:,:) = taudy(:,:) !- vbd(:,:)
+  RHSu(:,:) = taudx(:,:)
+  RHSv(:,:) = taudy(:,:)
 
   call pass_vector(RHSu, RHSv, G%domain, TO_ALL, BGRID_NE, complete=.false.)
 
@@ -1524,9 +1514,8 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
 
   Ru(:,:) = (RHSu(:,:) - Au(:,:))
   Rv(:,:) = (RHSv(:,:) - Av(:,:))
-
-  resid_scale = US%L_to_m**2*US%s_to_T*US%RZ_to_kg_m2*US%L_T_to_m_s**2
-  resid2_scale = (US%RZ_to_kg_m2*US%L_to_m*US%L_T_to_m_s**2)**2
+  resid_scale = (US%L_to_m**2*US%s_to_T)*(US%RZ_to_kg_m2*US%L_T_to_m_s**2)
+  resid2_scale = ((US%RZ_to_kg_m2*US%L_to_m)*US%L_T_to_m_s**2)**2
 
   sum_vec(:,:) = 0.0
   do j=jscq,jecq ; do i=iscq,iecq
@@ -1534,7 +1523,7 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
     if (CS%vmask(I,J) == 1) sum_vec(I,J) = sum_vec(I,J) + resid2_scale*Rv(I,J)**2
   enddo ; enddo
 
-  dot_p1 = reproducing_sum( sum_vec, Js_sum, Ie_sum, Js_sum, Je_sum )
+  dot_p1 = reproducing_sum( sum_vec, Is_sum, Ie_sum, Js_sum, Je_sum )
 
   resid0 = sqrt(dot_p1)
 
@@ -1670,7 +1659,8 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
     dot_p1 = reproducing_sum( sum_vec, Is_sum, Ie_sum, Js_sum, Je_sum )
     dot_p1 = sqrt(dot_p1)
 
-    if (dot_p1 <= CS%cg_tolerance * resid0) then
+
+    if (dot_p1 <= (CS%cg_tolerance * resid0)) then
       iters = iter
       conv_flag = 1
       exit
@@ -2147,7 +2137,7 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
 !    (it is assumed that base_ice = bed + OD)
 
   real, dimension(SIZE(OD,1),SIZE(OD,2))  :: S     ! surface elevation [Z ~> m].
-
+  real, dimension(SZDI_(G),SZDJ_(G)) :: sx_e, sy_e !element contributions to driving stress
   real    :: rho, rhow, rhoi_rhow ! Ice and ocean densities [R ~> kg m-3]
   real    :: sx, sy    ! Ice shelf top slopes [Z L-1 ~> nondim]
   real    :: neumann_val ! [R Z L2 T-2 ~> kg s-2]
@@ -2197,6 +2187,8 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
   endif
 
   call pass_var(S, G%domain)
+
+  sx_e(:,:)=0.0; sy_e(:,:)=0.0
 
   do j=jsc-1,jec+1
     do i=isc-1,iec+1
@@ -2282,26 +2274,8 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
           endif
         endif
 
-        ! SW vertex
-        !if (ISS%hmask(I-1,J-1) == 1)  then
-                taudx(I-1,J-1) = taudx(I-1,J-1) - .25 * rho * grav * ISS%h_shelf(i,j) * sx * G%areaT(i,j)
-                taudy(I-1,J-1) = taudy(I-1,J-1) - .25 * rho * grav * ISS%h_shelf(i,j) * sy * G%areaT(i,j)
-        !endif
-        ! SE vertex
-        !if (ISS%hmask(I,J-1) == 1)  then
-                taudx(I,J-1) = taudx(I,J-1) - .25 * rho * grav * ISS%h_shelf(i,j) * sx * G%areaT(i,j)
-                taudy(I,J-1) = taudy(I,J-1) - .25 * rho * grav * ISS%h_shelf(i,j) * sy * G%areaT(i,j)
-        !endif
-        ! NW vertex
-        !if  (ISS%hmask(I-1,J) == 1)  then
-                taudx(I-1,J) = taudx(I-1,J) - .25 * rho * grav * ISS%h_shelf(i,j) * sx * G%areaT(i,j)
-                taudy(I-1,J) = taudy(I-1,J) - .25 * rho * grav * ISS%h_shelf(i,j) * sy * G%areaT(i,j)
-        !endif
-        ! NE vertex
-        !if  (ISS%hmask(I,J) == 1)  then
-                taudx(I,J) = taudx(I,J) - .25 * rho * grav * ISS%h_shelf(i,j) * sx * G%areaT(i,j)
-                taudy(I,J) = taudy(I,J) - .25 * rho * grav * ISS%h_shelf(i,j) * sy * G%areaT(i,j)
-        !endif
+        sx_e(i,j) = (-.25 * G%areaT(i,j)) * ((rho * grav) * (ISS%h_shelf(i,j) * sx))
+        sy_e(i,j) = (-.25 * G%areaT(i,j)) * ((rho * grav) * (ISS%h_shelf(i,j) * sy))
 
         !Stress (Neumann) boundary conditions
         if (CS%ground_frac(i,j) == 1) then
@@ -2349,6 +2323,10 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
     enddo
   enddo
 
+  do J=jsc-2,jec+1; do I=isc-2,iec+1
+    taudx(I,J) = taudx(I,J) + ((sx_e(i,j)+sx_e(i+1,j+1)) + (sx_e(i+1,j)+sx_e(i,j+1)))
+    taudy(I,J) = taudy(I,J) + ((sy_e(i,j)+sy_e(i+1,j+1)) + (sy_e(i+1,j)+sy_e(i,j+1)))
+  enddo; enddo
 end subroutine calc_shelf_driving_stress
 
 ! Not used? Seems to be only set up to work for a specific test case with u_face_mask==3
@@ -2495,10 +2473,12 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
 
   real :: ux, uy, vx, vy ! Components of velocity shears or divergence [T-1 ~> s-1]
   real :: uq, vq  ! Interpolated velocities [L T-1 ~> m s-1]
-  integer :: iq, jq, iphi, jphi, i, j, ilq, jlq, Itgt, Jtgt, qp
+  integer :: iq, jq, iphi, jphi, i, j, ilq, jlq, Itgt, Jtgt, qp, qpv
   logical :: visc_qp4
   real, dimension(2) :: xquad
   real, dimension(2,2) :: Ucell, Vcell, Hcell, Usub, Vsub
+  real, dimension(2,2,4) :: uret_qp, vret_qp
+  real, dimension(SZDIB_(G),SZDJB_(G),4) :: uret_b, vret_b
 
   xquad(1) = .5 * (1-sqrt(1./3)) ; xquad(2) = .5 * (1+sqrt(1./3))
 
@@ -2506,81 +2486,110 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
     visc_qp4=.true.
   else
     visc_qp4=.false.
-    qp = 1
+    qpv = 1
   endif
+
+  uret(:,:) = 0.0; vret(:,:)=0.0
+  uret_b(:,:,:)=0.0 ; vret_b(:,:,:)=0.0
 
   do j=js,je ; do i=is,ie ; if (hmask(i,j) == 1 .or. hmask(i,j)==3) then
 
+    uret_qp(:,:,:)=0.0; vret_qp(:,:,:)=0.0
+
       do iq=1,2 ; do jq=1,2
 
-        uq = u_shlf(I-1,J-1) * (xquad(3-iq) * xquad(3-jq)) + &
-             u_shlf(I,J-1) * (xquad(iq) * xquad(3-jq)) + &
-             u_shlf(I-1,J) * (xquad(3-iq) * xquad(jq)) + &
-             u_shlf(I,J) * (xquad(iq) * xquad(jq))
+        qp = 2*(jq-1)+iq !current quad point
 
-        vq = v_shlf(I-1,J-1) * (xquad(3-iq) * xquad(3-jq)) + &
-             v_shlf(I,J-1) * (xquad(iq) * xquad(3-jq)) + &
-             v_shlf(I-1,J) * (xquad(3-iq) * xquad(jq)) + &
-             v_shlf(I,J) * (xquad(iq) * xquad(jq))
+        uq = (u_shlf(I-1,J-1) * (xquad(3-iq) * xquad(3-jq)) + &
+             u_shlf(I,J) * (xquad(iq) * xquad(jq))) + &
+             (u_shlf(I,J-1) * (xquad(iq) * xquad(3-jq)) + &
+             u_shlf(I-1,J) * (xquad(3-iq) * xquad(jq)))
 
-        ux = u_shlf(I-1,J-1) * Phi(1,2*(jq-1)+iq,i,j) + &
-             u_shlf(I,J-1) * Phi(3,2*(jq-1)+iq,i,j) + &
-             u_shlf(I-1,J) * Phi(5,2*(jq-1)+iq,i,j) + &
-             u_shlf(I,J) * Phi(7,2*(jq-1)+iq,i,j)
+        vq = (v_shlf(I-1,J-1) * (xquad(3-iq) * xquad(3-jq)) + &
+             v_shlf(I,J) * (xquad(iq) * xquad(jq))) + &
+             (v_shlf(I,J-1) * (xquad(iq) * xquad(3-jq)) + &
+             v_shlf(I-1,J) * (xquad(3-iq) * xquad(jq)))
 
-        vx = v_shlf(I-1,J-1) * Phi(1,2*(jq-1)+iq,i,j) + &
-             v_shlf(I,J-1) * Phi(3,2*(jq-1)+iq,i,j) + &
-             v_shlf(I-1,J) * Phi(5,2*(jq-1)+iq,i,j) + &
-             v_shlf(I,J) * Phi(7,2*(jq-1)+iq,i,j)
+        ux = (u_shlf(I-1,J-1) * Phi(1,qp,i,j) + &
+             u_shlf(I,J) * Phi(7,qp,i,j)) + &
+             (u_shlf(I,J-1) * Phi(3,qp,i,j) + &
+             u_shlf(I-1,J) * Phi(5,qp,i,j))
 
-        uy = u_shlf(I-1,J-1) * Phi(2,2*(jq-1)+iq,i,j) + &
-             u_shlf(I,J-1) * Phi(4,2*(jq-1)+iq,i,j) + &
-             u_shlf(I-1,J) * Phi(6,2*(jq-1)+iq,i,j) + &
-             u_shlf(I,J) * Phi(8,2*(jq-1)+iq,i,j)
+        vx = (v_shlf(I-1,J-1) * Phi(1,qp,i,j) + &
+             v_shlf(I,J) * Phi(7,qp,i,j)) + &
+             (v_shlf(I,J-1) * Phi(3,qp,i,j) + &
+             v_shlf(I-1,J) * Phi(5,qp,i,j))
 
-        vy = v_shlf(I-1,J-1) * Phi(2,2*(jq-1)+iq,i,j) + &
-             v_shlf(I,J-1) * Phi(4,2*(jq-1)+iq,i,j) + &
-             v_shlf(I-1,J) * Phi(6,2*(jq-1)+iq,i,j) + &
-             v_shlf(I,J) * Phi(8,2*(jq-1)+iq,i,j)
+        uy = (u_shlf(I-1,J-1) * Phi(2,qp,i,j) + &
+             u_shlf(I,J) * Phi(8,qp,i,j)) + &
+             (u_shlf(I,J-1) * Phi(4,qp,i,j) + &
+             u_shlf(I-1,J) * Phi(6,qp,i,j))
 
-        if (visc_qp4) qp = 2*(jq-1)+iq !current quad point for viscosity
+        vy = (v_shlf(I-1,J-1) * Phi(2,qp,i,j) + &
+             v_shlf(I,J) * Phi(8,qp,i,j)) + &
+             (v_shlf(I,J-1) * Phi(4,qp,i,j) + &
+             v_shlf(I-1,J) * Phi(6,qp,i,j))
 
-        do iphi=1,2 ; do jphi=1,2 ; Itgt = I-2+iphi ; ;Jtgt = J-2+jphi
-          if (umask(Itgt,Jtgt) == 1) uret(Itgt,Jtgt) = uret(Itgt,Jtgt) + 0.25 * ice_visc(i,j,qp) * &
-                               ((4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq,i,j) + &
-                                    (uy+vx) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq,i,j))
-          if (vmask(Itgt,Jtgt) == 1) vret(Itgt,Jtgt) = vret(Itgt,Jtgt) + 0.25 * ice_visc(i,j,qp) * &
-                                   ((uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq,i,j) + &
-                                (4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq,i,j))
+        if (visc_qp4) qpv = qp !current quad point for viscosity
 
-          if (float_cond(i,j) == 0) then
+        do jphi=1,2 ; Jtgt = J-2+jphi ; do iphi=1,2 ; Itgt = I-2+iphi
+          if (umask(Itgt,Jtgt) == 1) uret_qp(iphi,jphi,qp) = ice_visc(i,j,qpv) * &
+            ((4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
+            (uy+vx) * Phi(2*(2*(jphi-1)+iphi),qp,i,j))
+          if (vmask(Itgt,Jtgt) == 1) vret_qp(iphi,jphi,qp) = ice_visc(i,j,qpv) * &
+            ((uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
+            (4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),qp,i,j))
+
+          if (float_cond(i,j) == 0 .and. basal_trac(i,j)/=0) then
             ilq = 1 ; if (iq == iphi) ilq = 2
             jlq = 1 ; if (jq == jphi) jlq = 2
-            if (umask(Itgt,Jtgt) == 1) uret(Itgt,Jtgt) = uret(Itgt,Jtgt) +  &
-                  0.25 * basal_trac(i,j) * uq * (xquad(ilq) * xquad(jlq))
-            if (vmask(Itgt,Jtgt) == 1) vret(Itgt,Jtgt) = vret(Itgt,Jtgt) +  &
-                  0.25 * basal_trac(i,j) * vq * (xquad(ilq) * xquad(jlq))
+            if (umask(Itgt,Jtgt) == 1) uret_qp(iphi,jphi,qp) = uret_qp(iphi,jphi,qp) +  &
+              (basal_trac(i,j) * uq) * (xquad(ilq) * xquad(jlq))
+            if (vmask(Itgt,Jtgt) == 1) vret_qp(iphi,jphi,qp) = vret_qp(iphi,jphi,qp) +  &
+              (basal_trac(i,j) * vq) * (xquad(ilq) * xquad(jlq))
           endif
         enddo ; enddo
       enddo ; enddo
 
+      !element contribution to SW node (node 1, which sees the current element as element 4)
+      uret_b(I-1,J-1,4) = 0.25*((uret_qp(1,1,1)+uret_qp(1,1,4))+(uret_qp(1,1,2)+uret_qp(1,1,3)))
+      vret_b(I-1,J-1,4) = 0.25*((vret_qp(1,1,1)+vret_qp(1,1,4))+(vret_qp(1,1,2)+vret_qp(1,1,3)))
+
+      !element contribution to NW node (node 3, which sees the current element as element 2)
+      uret_b(I-1,J  ,2) = 0.25*((uret_qp(1,2,1)+uret_qp(1,2,4))+(uret_qp(1,2,2)+uret_qp(1,2,3)))
+      vret_b(I-1,J  ,2) = 0.25*((vret_qp(1,2,1)+vret_qp(1,2,4))+(vret_qp(1,2,2)+vret_qp(1,2,3)))
+
+      !element contribution to SE node (node 2, which sees the current element as element 3)
+      uret_b(I  ,J-1,3) = 0.25*((uret_qp(2,1,1)+uret_qp(2,1,4))+(uret_qp(2,1,2)+uret_qp(2,1,3)))
+      vret_b(I  ,J-1,3) = 0.25*((vret_qp(2,1,1)+vret_qp(2,1,4))+(vret_qp(2,1,2)+vret_qp(2,1,3)))
+
+      !element contribution to NE node (node 4, which sees the current element as element 1)
+      uret_b(I  ,J  ,1) = 0.25*((uret_qp(2,2,1)+uret_qp(2,2,4))+(uret_qp(2,2,2)+uret_qp(2,2,3)))
+      vret_b(I  ,J  ,1) = 0.25*((vret_qp(2,2,1)+vret_qp(2,2,4))+(vret_qp(2,2,2)+vret_qp(2,2,3)))
+
       if (float_cond(i,j) == 1) then
         Ucell(:,:) = u_shlf(I-1:I,J-1:J) ; Vcell(:,:) = v_shlf(I-1:I,J-1:J)
-        Hcell(:,:) = H_node(i-1:i,j-1:j)
-        call CG_action_subgrid_basal(Phisub, Hcell, Ucell, Vcell, bathyT(i,j), dens_ratio, Usub, Vsub)
+        Hcell(:,:) = H_node(I-1:I,J-1:J)
 
-        if (umask(I-1,J-1) == 1) uret(I-1,J-1) = uret(I-1,J-1) + Usub(1,1) * basal_trac(i,j)
-        if (umask(I-1,J) == 1) uret(I-1,J) = uret(I-1,J) + Usub(1,2) * basal_trac(i,j)
-        if (umask(I,J-1) == 1) uret(I,J-1) = uret(I,J-1) + Usub(2,1) * basal_trac(i,j)
-        if (umask(I,J) == 1)   uret(I,J)   = uret(I,J) + Usub(2,2) * basal_trac(i,j)
+        call CG_action_subgrid_basal(Phisub, Hcell, Ucell, Vcell, &
+                                     bathyT(i,j), dens_ratio, Usub, Vsub)
 
-        if (vmask(I-1,J-1) == 1) vret(I-1,J-1) = vret(I-1,J-1) + Vsub(1,1) * basal_trac(i,j)
-        if (vmask(I-1,J) == 1) vret(I-1,J) = vret(I-1,J) + Vsub(1,2) * basal_trac(i,j)
-        if (vmask(I,J-1) == 1) vret(I,J-1) = vret(I,J-1) + Vsub(2,1) * basal_trac(i,j)
-        if (vmask(I,J) == 1)   vret(I,J)   = vret(I,J) + Vsub(2,2) * basal_trac(i,j)
+        if (umask(I-1,J-1) == 1) uret_b(I-1,J-1,4) = uret_b(I-1,J-1,4) + (Usub(1,1) * basal_trac(i,j))
+        if (umask(I-1,J  ) == 1) uret_b(I-1,J  ,2) = uret_b(I-1,J  ,2) + (Usub(1,2) * basal_trac(i,j))
+        if (umask(I  ,J-1) == 1) uret_b(I  ,J-1,3) = uret_b(I  ,J-1,3) + (Usub(2,1) * basal_trac(i,j))
+        if (umask(I  ,J  ) == 1) uret_b(I  ,J  ,1) = uret_b(I  ,J  ,1) + (Usub(2,2) * basal_trac(i,j))
+
+        if (vmask(I-1,J-1) == 1) vret_b(I-1,J-1,4) = vret_b(I-1,J-1,4) + (Vsub(1,1) * basal_trac(i,j))
+        if (vmask(I-1,J  ) == 1) vret_b(I-1,J  ,2) = vret_b(I-1,J  ,2) + (Vsub(1,2) * basal_trac(i,j))
+        if (vmask(I  ,J-1) == 1) vret_b(I  ,J-1,3) = vret_b(I  ,J-1,3) + (Vsub(2,1) * basal_trac(i,j))
+        if (vmask(I  ,J  ) == 1) vret_b(I  ,J  ,1) = vret_b(I  ,J  ,1) + (Vsub(2,2) * basal_trac(i,j))
       endif
-
   endif ; enddo ; enddo
+
+  do J=js-1,je ; do I=is-1,ie
+    uret(I,J) = (uret_b(I,J,1)+uret_b(I,J,4)) + (uret_b(I,J,2)+uret_b(I,J,3))
+    vret(I,J) = (vret_b(I,J,1)+vret_b(I,J,4)) + (vret_b(I,J,2)+vret_b(I,J,3))
+  enddo; enddo
 
 end subroutine CG_action
 
@@ -2600,30 +2609,86 @@ subroutine CG_action_subgrid_basal(Phisub, H, U, V, bathyT, dens_ratio, Ucontr, 
   real, dimension(2,2), intent(out)   :: Vcontr !< The areal average of v-velocities where the ice shelf
                                             !! is grounded, or 0 where it is floating [L T-1 ~> m s-1].
 
+  real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: Ucontr_sub, Vcontr_sub ! The contributions to Ucontr and Vcontr
+                                                                               !! at each sub-cell
+  real, dimension(2,2) :: Ucontr_q, Vcontr_q !Contributions to a node from each quadrature point in a sub-grid cell
   real    :: subarea ! The fractional sub-cell area [nondim]
   real    :: hloc    ! The local sub-cell ice thickness [Z ~> m]
   integer :: nsub, i, j, qx, qy, m, n
 
-  nsub = size(Phisub,1)
+  nsub = size(Phisub,3)
   subarea = 1.0 / (nsub**2)
 
-  do n=1,2 ; do m=1,2
-    Ucontr(m,n) = 0.0 ; Vcontr(m,n) = 0.0
-    do qy=1,2 ; do qx=1,2 ; do j=1,nsub ; do i=1,nsub
-      hloc = (Phisub(i,j,1,1,qx,qy)*H(1,1) + Phisub(i,j,2,2,qx,qy)*H(2,2)) + &
-             (Phisub(i,j,1,2,qx,qy)*H(1,2) + Phisub(i,j,2,1,qx,qy)*H(2,1))
+  do n=1,2 ; do m=1,2 ; do j=1,nsub ; do i=1,nsub
+    do qy=1,2 ; do qx=1,2
+      !calculate quadrature point contributions for the sub-cell, to each node
+      hloc = (Phisub(qx,qy,i,j,1,1)*H(1,1) + Phisub(qx,qy,i,j,2,2)*H(2,2)) + &
+             (Phisub(qx,qy,i,j,1,2)*H(1,2) + Phisub(qx,qy,i,j,2,1)*H(2,1))
+
       if (dens_ratio * hloc - bathyT > 0) then
-        Ucontr(m,n) = Ucontr(m,n) + subarea * 0.25 * Phisub(i,j,m,n,qx,qy) * &
-             ((Phisub(i,j,1,1,qx,qy) * U(1,1) + Phisub(i,j,2,2,qx,qy) * U(2,2)) + &
-              (Phisub(i,j,1,2,qx,qy) * U(1,2) + Phisub(i,j,2,1,qx,qy) * U(2,1)))
-        Vcontr(m,n) = Vcontr(m,n) + subarea * 0.25 * Phisub(i,j,m,n,qx,qy) * &
-             ((Phisub(i,j,1,1,qx,qy) * V(1,1) + Phisub(i,j,2,2,qx,qy) * V(2,2)) + &
-              (Phisub(i,j,1,2,qx,qy) * V(1,2) + Phisub(i,j,2,1,qx,qy) * V(2,1)))
+        Ucontr_q(qx,qy) = Phisub(qx,qy,i,j,m,n) * &
+                        ((Phisub(qx,qy,i,j,1,1) * U(1,1) + Phisub(qx,qy,i,j,2,2) * U(2,2)) + &
+                         (Phisub(qx,qy,i,j,1,2) * U(1,2) + Phisub(qx,qy,i,j,2,1) * U(2,1)))
+        Vcontr_q(qx,qy) = Phisub(qx,qy,i,j,m,n) * &
+                        ((Phisub(qx,qy,i,j,1,1) * V(1,1) + Phisub(qx,qy,i,j,2,2) * V(2,2)) + &
+                         (Phisub(qx,qy,i,j,1,2) * V(1,2) + Phisub(qx,qy,i,j,2,1) * V(2,1)))
+      else
+        Ucontr_q(qx,qy) = 0.0; Vcontr_q(qx,qy) = 0.0
       endif
-    enddo ; enddo ; enddo ; enddo
+    enddo; enddo
+
+    !calculate sub-cell contribution to each node by summing up quadrature point contributions from the sub-cell
+    Ucontr_sub(i,j,m,n) = (subarea * 0.25) * ((Ucontr_q(1,1) + Ucontr_q(2,2)) + (Ucontr_q(1,2)+Ucontr_q(2,1)))
+    Vcontr_sub(i,j,m,n) = (subarea * 0.25) * ((Vcontr_q(1,1) + Vcontr_q(2,2)) + (Vcontr_q(1,2)+Vcontr_q(2,1)))
+  enddo; enddo ; enddo ; enddo
+
+  !sum up the sub-cell contributions to each node
+  do n=1,2 ; do m=1,2
+    call sum_square_matrix(Ucontr(m,n),Ucontr_sub(:,:,m,n),nsub)
+    call sum_square_matrix(Vcontr(m,n),Vcontr_sub(:,:,m,n),nsub)
   enddo ; enddo
 
 end subroutine CG_action_subgrid_basal
+
+
+!! Returns the sum of the elements in a square matrix. This sum is bitwise identical even if the matrices are rotated.
+subroutine sum_square_matrix(sum_out, mat_in, n)
+  integer, intent(in) :: n !> The length and width of each matrix in mat_in
+  real, dimension(n,n), intent(in) :: mat_in !> The four n x n matrices to be summed individually
+  real, intent(out) :: sum_out !< The sums of each of the 4 matrices given in mat_in
+  integer :: s0,e0,s1,e1
+
+  sum_out=0.0
+
+  s0=1; e0=n
+
+  !start by summing elements on outer edges of matrix
+  do while (s0<e0)
+
+    !corners
+    sum_out = sum_out + ( (mat_in(s0,s0) + mat_in(e0,e0)) + (mat_in(e0,s0) + mat_in(s0,e0)) )
+
+    s1=s0+1; e1=e0-1
+
+    do while (s1<e1) !non-corners
+
+      sum_out = sum_out + &
+                ( ( (mat_in(s0,s1) + mat_in(s1,s0)) + (mat_in(e0,e1) + mat_in(e1,e0)) ) + &
+                  ( (mat_in(e1,s0) + mat_in(e0,s1)) + (mat_in(s1,e0) + mat_in(s0,e1)) ) )
+
+      s1=s1+1 ; e1=e1-1
+    enddo
+
+    !center element of an edge
+    if (s1==e1) sum_out = sum_out + ( (mat_in(s1,s0) + mat_in(e1,e0)) + (mat_in(e0,e1) + mat_in(s0,s1)) )
+
+    s0=s0+1 ; e0=e0-1 !next loop iteration using new edges that are one element inward of the current edges
+  enddo
+
+  !center element of entire matrix
+  if (s0==e0) sum_out = sum_out + mat_in(s0,e0)
+
+end subroutine sum_square_matrix
 
 !> returns the diagonal entries of the matrix for a Jacobi preconditioning
 subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, hmask, dens_ratio, &
@@ -2668,11 +2733,12 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
 
   real :: ux, uy, vx, vy ! Interpolated weight gradients [L-1 ~> m-1]
   real :: uq, vq
-!  real, dimension(8,4) :: Phi ! Weight gradients [L-1 ~> m-1]
   real, dimension(2)   :: xquad
   real, dimension(2,2) :: Hcell, sub_ground
+  real, dimension(2,2,4) :: u_diag_qp, v_diag_qp
+  real, dimension(SZDIB_(G),SZDJB_(G),4) :: u_diag_b, v_diag_b
   logical :: visc_qp4
-  integer :: i, j, isc, jsc, iec, jec, iphi, jphi, iq, jq, ilq, jlq, Itgt, Jtgt, qp
+  integer :: i, j, isc, jsc, iec, jec, iphi, jphi, iq, jq, ilq, jlq, Itgt, Jtgt, qp, qpv
 
   isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
 
@@ -2682,81 +2748,107 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
     visc_qp4=.true.
   else
     visc_qp4=.false.
-    qp = 1
+    qpv = 1
   endif
 
-  do j=jsc-1,jec+1 ; do i=isc-1,iec+1 ; if (hmask(i,j) == 1 .or. hmask(i,j)==3) then
+  u_diag_b(:,:,:)=0.0
+  v_diag_b(:,:,:)=0.0
 
-    !call bilinear_shape_fn_grid(G, i, j, Phi)
+  do j=jsc-1,jec+1 ; do i=isc-1,iec+1 ; if (hmask(i,j) == 1 .or. hmask(i,j)==3) then
 
     ! Phi(2*i-1,j) gives d(Phi_i)/dx at quadrature point j
     ! Phi(2*i,j) gives d(Phi_i)/dy at quadrature point j
 
+    u_diag_qp(:,:,:)=0.0; v_diag_qp(:,:,:)=0.0
+
     do iq=1,2 ; do jq=1,2
 
-      if (visc_qp4) qp = 2*(jq-1)+iq !current quad point for viscosity
+      qp = 2*(jq-1)+iq !current quad point
+      if (visc_qp4) qpv = qp !current quad point for viscosity
 
-      do iphi=1,2 ; do jphi=1,2
+      do jphi=1,2 ; Jtgt = J-2+jphi ; do iphi=1,2 ; Itgt = I-2+iphi
 
-        Itgt = I-2+iphi ; Jtgt = J-2+jphi
         ilq = 1 ; if (iq == iphi) ilq = 2
         jlq = 1 ; if (jq == jphi) jlq = 2
 
         if (CS%umask(Itgt,Jtgt) == 1) then
 
-          ux = Phi(2*(2*(jphi-1)+iphi)-1, 2*(jq-1)+iq, i, j)
-          uy = Phi(2*(2*(jphi-1)+iphi), 2*(jq-1)+iq, i, j)
+          ux = Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j)
+          uy = Phi(2*(2*(jphi-1)+iphi),qp,i,j)
           vx = 0.
           vy = 0.
 
-          u_diagonal(Itgt,Jtgt) = u_diagonal(Itgt,Jtgt) + &
-            0.25 * ice_visc(i,j,qp) * ((4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq,i,j) + &
-            (uy+vx) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq,i,j))
+          u_diag_qp(iphi,jphi,qp) = &
+            ice_visc(i,j,qpv) * ((4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
+            (uy+vx) * Phi(2*(2*(jphi-1)+iphi),qp,i,j))
 
-          if (float_cond(i,j) == 0) then
+          if (float_cond(i,j) == 0 .and. basal_trac(i,j)/=0) then
             uq = xquad(ilq) * xquad(jlq)
-            u_diagonal(Itgt,Jtgt) = u_diagonal(Itgt,Jtgt) + &
-              0.25 * basal_trac(i,j) * uq * (xquad(ilq) * xquad(jlq))
+            u_diag_qp(iphi,jphi,qp) = u_diag_qp(iphi,jphi,qp) + &
+              (basal_trac(i,j) * uq) * (xquad(ilq) * xquad(jlq))
           endif
         endif
 
         if (CS%vmask(Itgt,Jtgt) == 1) then
 
-          vx = Phi(2*(2*(jphi-1)+iphi)-1, 2*(jq-1)+iq,i,j)
-          vy = Phi(2*(2*(jphi-1)+iphi), 2*(jq-1)+iq,i,j)
+          vx = Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j)
+          vy = Phi(2*(2*(jphi-1)+iphi),qp,i,j)
           ux = 0.
           uy = 0.
 
-          v_diagonal(Itgt,Jtgt) = v_diagonal(Itgt,Jtgt) + &
-            0.25 * ice_visc(i,j,qp) * ((uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq,i,j) + &
-            (4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq,i,j))
+          v_diag_qp(iphi,jphi,qp) = &
+            ice_visc(i,j,qpv) * ((uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
+            (4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),qp,i,j))
 
-          if (float_cond(i,j) == 0) then
+          if (float_cond(i,j) == 0 .and. basal_trac(i,j)/=0) then
             vq = xquad(ilq) * xquad(jlq)
-            v_diagonal(Itgt,Jtgt) = v_diagonal(Itgt,Jtgt) + &
-              0.25 * basal_trac(i,j) * vq * (xquad(ilq) * xquad(jlq))
+            v_diag_qp(iphi,jphi,qp) = v_diag_qp(iphi,jphi,qp) + &
+              (basal_trac(i,j) * vq) * (xquad(ilq) * xquad(jlq))
           endif
         endif
       enddo ; enddo
     enddo ; enddo
 
+    !element contribution to SW node (node 1, which sees the current element as element 4)
+    u_diag_b(I-1,J-1,4) = 0.25*((u_diag_qp(1,1,1)+u_diag_qp(1,1,4))+(u_diag_qp(1,1,2)+u_diag_qp(1,1,3)))
+    v_diag_b(I-1,J-1,4) = 0.25*((v_diag_qp(1,1,1)+v_diag_qp(1,1,4))+(v_diag_qp(1,1,2)+v_diag_qp(1,1,3)))
+
+    !element contribution to NW node (node 3, which sees the current element as element 2)
+    u_diag_b(I-1,J  ,2) = 0.25*((u_diag_qp(1,2,1)+u_diag_qp(1,2,4))+(u_diag_qp(1,2,2)+u_diag_qp(1,2,3)))
+    v_diag_b(I-1,J  ,2) = 0.25*((v_diag_qp(1,2,1)+v_diag_qp(1,2,4))+(v_diag_qp(1,2,2)+v_diag_qp(1,2,3)))
+
+    !element contribution to SE node (node 2, which sees the current element as element 3)
+    u_diag_b(I  ,J-1,3) = 0.25*((u_diag_qp(2,1,1)+u_diag_qp(2,1,4))+(u_diag_qp(2,1,2)+u_diag_qp(2,1,3)))
+    v_diag_b(I  ,J-1,3) = 0.25*((v_diag_qp(2,1,1)+v_diag_qp(2,1,4))+(v_diag_qp(2,1,2)+v_diag_qp(2,1,3)))
+
+    !element contribution to NE node (node 4, which sees the current element as element 1)
+    u_diag_b(I  ,J  ,1) = 0.25*((u_diag_qp(2,2,1)+u_diag_qp(2,2,4))+(u_diag_qp(2,2,2)+u_diag_qp(2,2,3)))
+    v_diag_b(I  ,J  ,1) = 0.25*((v_diag_qp(2,2,1)+v_diag_qp(2,2,4))+(v_diag_qp(2,2,2)+v_diag_qp(2,2,3)))
+
     if (float_cond(i,j) == 1) then
       Hcell(:,:) = H_node(i-1:i,j-1:j)
       call CG_diagonal_subgrid_basal(Phisub, Hcell, CS%bed_elev(i,j), dens_ratio, sub_ground)
-      do iphi=1,2 ; do jphi=1,2 ; Itgt = I-2+iphi ; Jtgt = J-2+jphi
-        if (CS%umask(Itgt,Jtgt) == 1) then
-          u_diagonal(Itgt,Jtgt) = u_diagonal(Itgt,Jtgt) + sub_ground(iphi,jphi) * basal_trac(i,j)
-        endif
-        if (CS%vmask(Itgt,Jtgt) == 1) then
-          v_diagonal(Itgt,Jtgt) = v_diagonal(Itgt,Jtgt) + sub_ground(iphi,jphi) * basal_trac(i,j)
-        endif
-      enddo ; enddo
+
+        if (CS%umask(I-1,J-1) == 1) u_diag_b(I-1,J-1,4) = u_diag_b(I-1,J-1,4) + sub_ground(1,1) * basal_trac(i,j)
+        if (CS%umask(I-1,J  ) == 1) u_diag_b(I-1,J  ,2) = u_diag_b(I-1,J  ,2) + sub_ground(1,2) * basal_trac(i,j)
+        if (CS%umask(I  ,J-1) == 1) u_diag_b(I  ,J-1,3) = u_diag_b(I  ,J-1,3) + sub_ground(2,1) * basal_trac(i,j)
+        if (CS%umask(I  ,J  ) == 1) u_diag_b(I  ,J  ,1) = u_diag_b(I  ,J  ,1) + sub_ground(2,2) * basal_trac(i,j)
+
+        if (CS%vmask(I-1,J-1) == 1) v_diag_b(I-1,J-1,4) = v_diag_b(I-1,J-1,4) + sub_ground(1,1) * basal_trac(i,j)
+        if (CS%vmask(I-1,J  ) == 1) v_diag_b(I-1,J  ,2) = v_diag_b(I-1,J  ,2) + sub_ground(1,2) * basal_trac(i,j)
+        if (CS%vmask(I  ,J-1) == 1) v_diag_b(I  ,J-1,3) = v_diag_b(I  ,J-1,3) + sub_ground(2,1) * basal_trac(i,j)
+        if (CS%vmask(I  ,J  ) == 1) v_diag_b(I  ,J  ,1) = v_diag_b(I  ,J  ,1) + sub_ground(2,2) * basal_trac(i,j)
     endif
   endif ; enddo ; enddo
 
+  do J=jsc-2,jec+1 ; do I=isc-2,iec+1
+    u_diagonal(I,J) = (u_diag_b(I,J,1)+u_diag_b(I,J,4)) + (u_diag_b(I,J,2)+u_diag_b(I,J,3))
+    v_diagonal(I,J) = (v_diag_b(I,J,1)+v_diag_b(I,J,4)) + (v_diag_b(I,J,2)+v_diag_b(I,J,3))
+  enddo ; enddo
+
 end subroutine matrix_diagonal
 
-subroutine CG_diagonal_subgrid_basal (Phisub, H_node, bathyT, dens_ratio, sub_grnd)
+subroutine CG_diagonal_subgrid_basal (Phisub, H_node, bathyT, dens_ratio, f_grnd)
   real, dimension(:,:,:,:,:,:), &
                         intent(in) :: Phisub !< Quadrature structure weights at subgridscale
                                              !! locations for finite element calculations [nondim]
@@ -2765,190 +2857,41 @@ subroutine CG_diagonal_subgrid_basal (Phisub, H_node, bathyT, dens_ratio, sub_gr
   real,              intent(in)    :: bathyT !< The depth of ocean bathymetry at tracer points [Z ~> m].
   real,              intent(in)    :: dens_ratio !< The density of ice divided by the density
                                                  !! of seawater [nondim]
-  real, dimension(2,2), intent(out) :: sub_grnd !< The weighted fraction of the sub-cell where the ice shelf
-                                                !! is grounded [nondim]
+  real, dimension(2,2), intent(out) :: f_grnd !< The weighted fraction of the sub-cell where the ice shelf
+                                              !! is grounded [nondim]
 
-  ! bathyT = cellwise-constant bed elevation
-
+  real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: f_grnd_sub ! The contributions to nodal f_grnd
+                                                                   !! from each sub-cell
+  real, dimension(2,2) :: f_grnd_q  !Contributions to a node from each quadrature point in a sub-grid cell
   real    :: subarea ! The fractional sub-cell area [nondim]
   real    :: hloc    ! The local sub-region thickness [Z ~> m]
   integer :: nsub, i, j, qx, qy, m, n
 
-  nsub = size(Phisub,1)
+  nsub = size(Phisub,3)
   subarea = 1.0 / (nsub**2)
 
-  sub_grnd(:,:) = 0.0
-  do m=1,2 ; do n=1,2 ; do j=1,nsub ; do i=1,nsub ; do qx=1,2 ; do qy = 1,2
+  do n=1,2 ; do m=1,2 ; do j=1,nsub ; do i=1,nsub
+    do qy=1,2 ; do qx = 1,2
+      !calculate quadrature point contributions for the sub-cell, to each node
+      hloc = (Phisub(qx,qy,i,j,1,1)*H_node(1,1) + Phisub(qx,qy,i,j,2,2)*H_node(2,2)) + &
+             (Phisub(qx,qy,i,j,1,2)*H_node(1,2) + Phisub(qx,qy,i,j,2,1)*H_node(2,1))
 
-    hloc = (Phisub(i,j,1,1,qx,qy)*H_node(1,1) + Phisub(i,j,2,2,qx,qy)*H_node(2,2)) + &
-           (Phisub(i,j,1,2,qx,qy)*H_node(1,2) + Phisub(i,j,2,1,qx,qy)*H_node(2,1))
+      if (dens_ratio * hloc - bathyT > 0) then
+        f_grnd_q(qx,qy) = Phisub(qx,qy,i,j,m,n)**2
+      else
+        f_grnd_q(qx,qy) = 0.0
+      endif
+    enddo ; enddo
+    !calculate sub-cell contribution to each node by summing up quadrature point contributions from the sub-cell
+    f_grnd_sub(i,j,m,n) = (subarea * 0.25) * ((f_grnd_q(1,1) + f_grnd_q(2,2)) + (f_grnd_q(1,2)+f_grnd_q(2,1)))
+  enddo ; enddo ; enddo ; enddo
 
-    if (dens_ratio * hloc - bathyT > 0) then
-      sub_grnd(m,n) = sub_grnd(m,n) + subarea * 0.25 * Phisub(i,j,m,n,qx,qy)**2
-    endif
-
-  enddo ; enddo ; enddo ; enddo ; enddo ; enddo
+  !sum up the sub-cell contributions to each node
+  do n=1,2 ; do m=1,2
+   call sum_square_matrix(f_grnd(m,n),f_grnd_sub(:,:,m,n),nsub)
+  enddo ; enddo
 
 end subroutine CG_diagonal_subgrid_basal
-
-
-subroutine apply_boundary_values(CS, ISS, G, US, time, Phi, Phisub, H_node, ice_visc, basal_trac, float_cond, &
-                                 dens_ratio, u_bdry_contr, v_bdry_contr)
-
-  type(ice_shelf_dyn_CS), intent(in)    :: CS !< A pointer to the ice shelf control structure
-  type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe
-                                               !! the ice-shelf state
-  type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
-  type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
-  type(time_type),        intent(in)    :: Time !< The current model time
-  real, dimension(8,4,SZDI_(G),SZDJ_(G)), &
-                          intent(in)    :: Phi !< The gradients of bilinear basis elements at Gaussian
-                                             !! quadrature points surrounding the cell vertices [L-1 ~> m-1]
-  real, dimension(:,:,:,:,:,:), &
-                          intent(in)    :: Phisub !< Quadrature structure weights at subgridscale
-                                            !! locations for finite element calculations [nondim]
-  real, dimension(SZDIB_(G),SZDJB_(G)), &
-                          intent(in)    :: H_node !< The ice shelf thickness at nodal
-                                                 !! (corner) points [Z ~> m].
-  real, dimension(SZDI_(G),SZDJ_(G),CS%visc_qps), &
-                          intent(in)    :: ice_visc !< A field related to the ice viscosity from Glen's
-                                                !! flow law. The exact form and units depend on the
-                                                !! basal law exponent.  [R L4 Z T-1 ~> kg m2 s-1].
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(in)    :: basal_trac !< Area-integrated taub_beta field related to the nonlinear
-                                                !! part of the "linearized" basal stress [R L3 T-1 ~> kg s-1].
-
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(in)    :: float_cond !< An array indicating where the ice
-                                                !! shelf is floating: 0 if floating, 1 if not.
-  real,                   intent(in)    :: dens_ratio !< The density of ice divided by the density
-                                                     !! of seawater, nondimensional
-  real, dimension(SZDIB_(G),SZDJB_(G)), &
-                          intent(inout) :: u_bdry_contr !< Zonal force contributions due to the
-                                                        !! open boundaries [R L3 Z T-2 ~> kg m s-2]
-  real, dimension(SZDIB_(G),SZDJB_(G)), &
-                          intent(inout) :: v_bdry_contr !< Meridional force contributions due to the
-                                                        !! open boundaries [R L3 Z T-2 ~> kg m s-2]
-
-! this will be a per-setup function. the boundary values of thickness and velocity
-! (and possibly other variables) will be updated in this function
-
-!  real, dimension(8,4)  :: Phi
-  real, dimension(2) :: xquad
-  real :: ux, uy, vx, vy ! Components of velocity shears or divergence [T-1 ~> s-1]
-  real :: uq, vq  ! Interpolated velocities [L T-1 ~> m s-1]
-  real, dimension(2,2) :: Ucell,Vcell,Hcell,Usubcontr,Vsubcontr
-  logical :: visc_qp4
-  integer :: i, j, isc, jsc, iec, jec, iq, jq, iphi, jphi, ilq, jlq, Itgt, Jtgt, qp
-
-  isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
-
-  xquad(1) = .5 * (1-sqrt(1./3)) ; xquad(2) = .5 * (1+sqrt(1./3))
-
-  if (CS%visc_qps == 4) then
-    visc_qp4=.true.
-  else
-    visc_qp4=.false.
-    qp = 1
-  endif
-
-  do j=jsc-1,jec+1 ; do i=isc-1,iec+1 ; if (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3) then
-
-    ! process this cell if any corners have umask set to non-dirichlet bdry.
-
-    if ((CS%umask(I-1,J-1) == 3) .OR. (CS%umask(I,J-1) == 3) .OR. &
-      (CS%umask(I-1,J) == 3) .OR. (CS%umask(I,J) == 3) .OR. &
-      (CS%vmask(I-1,J-1) == 3) .OR. (CS%vmask(I,J-1) == 3) .OR. &
-      (CS%vmask(I-1,J) == 3) .OR. (CS%vmask(I,J) == 3)) then
-
-      !call bilinear_shape_fn_grid(G, i, j, Phi)
-
-      ! Phi(2*i-1,j) gives d(Phi_i)/dx at quadrature point j
-      ! Phi(2*i,j) gives d(Phi_i)/dy at quadrature point j
-
-      do iq=1,2 ; do jq=1,2
-
-        uq = CS%u_bdry_val(I-1,J-1) * (xquad(3-iq) * xquad(3-jq)) + &
-             CS%u_bdry_val(I,J-1) * (xquad(iq) * xquad(3-jq)) + &
-             CS%u_bdry_val(I-1,J) * (xquad(3-iq) * xquad(jq)) + &
-             CS%u_bdry_val(I,J) * (xquad(iq) * xquad(jq))
-
-        vq = CS%v_bdry_val(I-1,J-1) * (xquad(3-iq) * xquad(3-jq)) + &
-             CS%v_bdry_val(I,J-1) * (xquad(iq) * xquad(3-jq)) + &
-             CS%v_bdry_val(I-1,J) * (xquad(3-iq) * xquad(jq)) + &
-             CS%v_bdry_val(I,J) * (xquad(iq) * xquad(jq))
-
-        ux = CS%u_bdry_val(I-1,J-1) * Phi(1,2*(jq-1)+iq,i,j) + &
-             CS%u_bdry_val(I,J-1) * Phi(3,2*(jq-1)+iq,i,j) + &
-             CS%u_bdry_val(I-1,J) * Phi(5,2*(jq-1)+iq,i,j) + &
-             CS%u_bdry_val(I,J) * Phi(7,2*(jq-1)+iq,i,j)
-
-        vx = CS%v_bdry_val(I-1,J-1) * Phi(1,2*(jq-1)+iq,i,j) + &
-             CS%v_bdry_val(I,J-1) * Phi(3,2*(jq-1)+iq,i,j) + &
-             CS%v_bdry_val(I-1,J) * Phi(5,2*(jq-1)+iq,i,j) + &
-             CS%v_bdry_val(I,J) * Phi(7,2*(jq-1)+iq,i,j)
-
-        uy = CS%u_bdry_val(I-1,J-1) * Phi(2,2*(jq-1)+iq,i,j) + &
-             CS%u_bdry_val(I,J-1) * Phi(4,2*(jq-1)+iq,i,j) + &
-             CS%u_bdry_val(I-1,J) * Phi(6,2*(jq-1)+iq,i,j) + &
-             CS%u_bdry_val(I,J) * Phi(8,2*(jq-1)+iq,i,j)
-
-        vy = CS%v_bdry_val(I-1,J-1) * Phi(2,2*(jq-1)+iq,i,j) + &
-             CS%v_bdry_val(I,J-1) * Phi(4,2*(jq-1)+iq,i,j) + &
-             CS%v_bdry_val(I-1,J) * Phi(6,2*(jq-1)+iq,i,j) + &
-             CS%v_bdry_val(I,J) * Phi(8,2*(jq-1)+iq,i,j)
-
-        if (visc_qp4) qp = 2*(jq-1)+iq !current quad point for viscosity
-
-        do iphi=1,2 ; do jphi=1,2 ; Itgt = I-2+iphi ; Jtgt = J-2+jphi
-          ilq = 1 ; if (iq == iphi) ilq = 2
-          jlq = 1 ; if (jq == jphi) jlq = 2
-
-          if (CS%umask(Itgt,Jtgt) == 1) then
-            u_bdry_contr(Itgt,Jtgt) = u_bdry_contr(Itgt,Jtgt) + &
-               0.25 * ice_visc(i,j,qp) * ( (4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq,i,j) + &
-                                            (uy+vx) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq,i,j) )
-
-            if (float_cond(i,j) == 0) then
-              u_bdry_contr(Itgt,Jtgt) = u_bdry_contr(Itgt,Jtgt) + &
-                0.25 * basal_trac(i,j) * uq * (xquad(ilq) * xquad(jlq))
-            endif
-          endif
-
-          if (CS%vmask(Itgt,Jtgt) == 1) then
-            v_bdry_contr(Itgt,Jtgt) = v_bdry_contr(Itgt,Jtgt) + &
-                0.25 *  ice_visc(i,j,qp) * ( (uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,2*(jq-1)+iq,i,j) + &
-                                      (4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),2*(jq-1)+iq,i,j) )
-
-            if (float_cond(i,j) == 0) then
-              v_bdry_contr(Itgt,Jtgt) = v_bdry_contr(Itgt,Jtgt) + &
-                  0.25 * basal_trac(i,j) * vq * (xquad(ilq) * xquad(jlq))
-            endif
-          endif
-        enddo ; enddo
-      enddo ; enddo
-
-      if (float_cond(i,j) == 1) then
-        Ucell(:,:) = CS%u_bdry_val(i-1:i,j-1:j) ; Vcell(:,:) = CS%v_bdry_val(i-1:i,j-1:j)
-        Hcell(:,:) = H_node(i-1:i,j-1:j)
-        call CG_action_subgrid_basal(Phisub, Hcell, Ucell, Vcell, CS%bed_elev(i,j), &
-                                     dens_ratio, Usubcontr, Vsubcontr)
-
-        if (CS%umask(I-1,J-1) == 1) u_bdry_contr(I-1,J-1) = u_bdry_contr(I-1,J-1) + Usubcontr(1,1) * basal_trac(i,j)
-        if (CS%umask(I-1,J) == 1) u_bdry_contr(I-1,J) = u_bdry_contr(I-1,J) + Usubcontr(1,2) * basal_trac(i,j)
-        if (CS%umask(I,J-1) == 1) u_bdry_contr(I,J-1) = u_bdry_contr(I,J-1) + Usubcontr(2,1) * basal_trac(i,j)
-        if (CS%umask(I,J) == 1)   u_bdry_contr(I,J)   = u_bdry_contr(I,J) + Usubcontr(2,2) * basal_trac(i,j)
-
-        if (CS%vmask(I-1,J-1) == 1) v_bdry_contr(I-1,J-1) = v_bdry_contr(I-1,J-1) + Vsubcontr(1,1) * basal_trac(i,j)
-        if (CS%vmask(I-1,J) == 1) v_bdry_contr(I-1,J) = v_bdry_contr(I-1,J) + Vsubcontr(1,2) * basal_trac(i,j)
-        if (CS%vmask(I,J-1) == 1) v_bdry_contr(I,J-1) = v_bdry_contr(I,J-1) + Vsubcontr(2,1) * basal_trac(i,j)
-        if (CS%vmask(I,J) == 1)   v_bdry_contr(I,J)   = v_bdry_contr(I,J) + Vsubcontr(2,2) * basal_trac(i,j)
-      endif
-    endif
-  endif ; enddo ; enddo
-
-  call pass_vector(u_bdry_contr, v_bdry_contr, G%domain, TO_ALL, BGRID_NE)
-end subroutine apply_boundary_values
 
 
 !> Update depth integrated viscosity, based on horizontal strain rates
@@ -3001,7 +2944,7 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
     if ((ISS%hmask(i,j) == 1) .OR. (ISS%hmask(i,j) == 3)) then
 
       if (trim(CS%ice_viscosity_compute) == "CONSTANT") then
-        CS%ice_visc(i,j,1) = 1e15 * US%kg_m3_to_R*US%m_to_L*US%m_s_to_L_T * (G%areaT(i,j) * ISS%h_shelf(i,j))
+        CS%ice_visc(i,j,1) = 1e15 * (US%kg_m3_to_R*US%m_to_L*US%m_s_to_L_T) * (G%areaT(i,j) * ISS%h_shelf(i,j))
         ! constant viscocity for debugging
       elseif (trim(CS%ice_viscosity_compute) == "OBS") then
         if (CS%AGlen_visc(i,j) >0) CS%ice_visc(i,j,1) = CS%AGlen_visc(i,j) * (G%areaT(i,j) * ISS%h_shelf(i,j))
@@ -3012,28 +2955,28 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
         Visc_coef = (CS%AGlen_visc(i,j))**(-1./n_g)
         ! Units of Aglen_visc [Pa-(n_g) s-1]
 
-        ux = u_shlf(I-1,J-1) * CS%PhiC(1,i,j) + &
-             u_shlf(I,J) * CS%PhiC(7,i,j) + &
-             u_shlf(I-1,J) * CS%PhiC(5,i,j) + &
-             u_shlf(I,J-1) * CS%PhiC(3,i,j)
+        ux = (u_shlf(I-1,J-1) * CS%PhiC(1,i,j) + &
+             u_shlf(I,J) * CS%PhiC(7,i,j)) + &
+             (u_shlf(I-1,J) * CS%PhiC(5,i,j) + &
+             u_shlf(I,J-1) * CS%PhiC(3,i,j))
 
-        vx = v_shlf(I-1,J-1) * CS%PhiC(1,i,j) + &
-             v_shlf(I,J) * CS%PhiC(7,i,j) + &
-             v_shlf(I-1,J) * CS%PhiC(5,i,j) + &
-             v_shlf(I,J-1) * CS%PhiC(3,i,j)
+        vx = (v_shlf(I-1,J-1) * CS%PhiC(1,i,j) + &
+             v_shlf(I,J) * CS%PhiC(7,i,j)) + &
+             (v_shlf(I-1,J) * CS%PhiC(5,i,j) + &
+             v_shlf(I,J-1) * CS%PhiC(3,i,j))
 
-        uy = u_shlf(I-1,J-1) * CS%PhiC(2,i,j) + &
-             u_shlf(I,J) * CS%PhiC(8,i,j) + &
-             u_shlf(I-1,J) * CS%PhiC(6,i,j) + &
-             u_shlf(I,J-1) * CS%PhiC(4,i,j)
+        uy = (u_shlf(I-1,J-1) * CS%PhiC(2,i,j) + &
+             u_shlf(I,J) * CS%PhiC(8,i,j)) + &
+             (u_shlf(I-1,J) * CS%PhiC(6,i,j) + &
+             u_shlf(I,J-1) * CS%PhiC(4,i,j))
 
-        vy = v_shlf(I-1,J-1) * CS%PhiC(2,i,j) + &
-             v_shlf(I,J) * CS%PhiC(8,i,j) + &
-             v_shlf(I-1,J) * CS%PhiC(6,i,j) + &
-             v_shlf(I,J-1) * CS%PhiC(4,i,j)
+        vy = (v_shlf(I-1,J-1) * CS%PhiC(2,i,j) + &
+             v_shlf(I,J) * CS%PhiC(8,i,j)) + &
+             (v_shlf(I-1,J) * CS%PhiC(6,i,j) + &
+             v_shlf(I,J-1) * CS%PhiC(4,i,j))
 
         CS%ice_visc(i,j,1) = 0.5 * Visc_coef * (G%areaT(i,j) * ISS%h_shelf(i,j)) * &
-          (US%s_to_T**2 * (ux**2 + vy**2 + ux*vy + 0.25*(uy+vx)**2 + eps_min**2))**((1.-n_g)/(2.*n_g)) * &
+          (US%s_to_T**2 * ((ux**2 + vy**2) + (ux*vy + 0.25*(uy+vx)**2) + eps_min**2))**((1.-n_g)/(2.*n_g)) * &
           (US%Pa_to_RL2_T2*US%s_to_T)
       elseif (model_qp4) then
         !calculate viscosity at 4 quadrature points per cell
@@ -3042,28 +2985,28 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
 
         do iq=1,2 ; do jq=1,2
 
-          ux = u_shlf(I-1,J-1) * CS%Phi(1,2*(jq-1)+iq,i,j) + &
-               u_shlf(I,J-1) * CS%Phi(3,2*(jq-1)+iq,i,j) + &
-               u_shlf(I-1,J) * CS%Phi(5,2*(jq-1)+iq,i,j) + &
-               u_shlf(I,J) * CS%Phi(7,2*(jq-1)+iq,i,j)
+          ux = (u_shlf(I-1,J-1) * CS%Phi(1,2*(jq-1)+iq,i,j) + &
+               u_shlf(I,J) * CS%Phi(7,2*(jq-1)+iq,i,j)) + &
+               (u_shlf(I,J-1) * CS%Phi(3,2*(jq-1)+iq,i,j) + &
+               u_shlf(I-1,J) * CS%Phi(5,2*(jq-1)+iq,i,j))
 
-          vx = v_shlf(I-1,J-1) * CS%Phi(1,2*(jq-1)+iq,i,j) + &
-               v_shlf(I,J-1) * CS%Phi(3,2*(jq-1)+iq,i,j) + &
-               v_shlf(I-1,J) * CS%Phi(5,2*(jq-1)+iq,i,j) + &
-               v_shlf(I,J) * CS%Phi(7,2*(jq-1)+iq,i,j)
+          vx = (v_shlf(I-1,J-1) * CS%Phi(1,2*(jq-1)+iq,i,j) + &
+               v_shlf(I,J) * CS%Phi(7,2*(jq-1)+iq,i,j)) + &
+               (v_shlf(I,J-1) * CS%Phi(3,2*(jq-1)+iq,i,j) + &
+               v_shlf(I-1,J) * CS%Phi(5,2*(jq-1)+iq,i,j))
 
-          uy = u_shlf(I-1,J-1) * CS%Phi(2,2*(jq-1)+iq,i,j) + &
-               u_shlf(I,J-1) * CS%Phi(4,2*(jq-1)+iq,i,j) + &
-               u_shlf(I-1,J) * CS%Phi(6,2*(jq-1)+iq,i,j) + &
-               u_shlf(I,J) * CS%Phi(8,2*(jq-1)+iq,i,j)
+          uy = (u_shlf(I-1,J-1) * CS%Phi(2,2*(jq-1)+iq,i,j) + &
+               u_shlf(I,J) * CS%Phi(8,2*(jq-1)+iq,i,j)) + &
+               (u_shlf(I,J-1) * CS%Phi(4,2*(jq-1)+iq,i,j) + &
+               u_shlf(I-1,J) * CS%Phi(6,2*(jq-1)+iq,i,j))
 
-          vy = v_shlf(I-1,J-1) * CS%Phi(2,2*(jq-1)+iq,i,j) + &
-               v_shlf(I,J-1) * CS%Phi(4,2*(jq-1)+iq,i,j) + &
-               v_shlf(I-1,J) * CS%Phi(6,2*(jq-1)+iq,i,j) + &
-               v_shlf(I,J) * CS%Phi(8,2*(jq-1)+iq,i,j)
+          vy = (v_shlf(I-1,J-1) * CS%Phi(2,2*(jq-1)+iq,i,j) + &
+               v_shlf(I,J) * CS%Phi(8,2*(jq-1)+iq,i,j)) + &
+               (v_shlf(I,J-1) * CS%Phi(4,2*(jq-1)+iq,i,j) + &
+               v_shlf(I-1,J) * CS%Phi(6,2*(jq-1)+iq,i,j))
 
           CS%ice_visc(i,j,2*(jq-1)+iq) = 0.5 * Visc_coef * (G%areaT(i,j) * ISS%h_shelf(i,j)) * &
-            (US%s_to_T**2 * (ux**2 + vy**2 + ux*vy + 0.25*(uy+vx)**2 + eps_min**2))**((1.-n_g)/(2.*n_g)) * &
+            (US%s_to_T**2 * ((ux**2 + vy**2) + (ux*vy + 0.25*(uy+vx)**2) + eps_min**2))**((1.-n_g)/(2.*n_g)) * &
             (US%Pa_to_RL2_T2*US%s_to_T)
         enddo; enddo
       endif
@@ -3120,20 +3063,20 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
       if ((ISS%hmask(i,j) == 1) .OR. (ISS%hmask(i,j) == 3)) then
         umid = ((u_shlf(I,J) + u_shlf(I-1,J-1)) + (u_shlf(I,J-1) + u_shlf(I-1,J))) * 0.25
         vmid = ((v_shlf(I,J) + v_shlf(I-1,J-1)) + (v_shlf(I,J-1) + v_shlf(I-1,J))) * 0.25
-        unorm = US%L_T_to_m_s*sqrt(umid**2 + vmid**2 + eps_min**2*(G%dxT(i,j)**2 + G%dyT(i,j)**2))
+        unorm = US%L_T_to_m_s*sqrt((umid**2 + vmid**2) + eps_min**2*(G%dxT(i,j)**2 + G%dyT(i,j)**2))
 
         !Coulomb friction (Schoof 2005, Gagliardini et al 2007)
         if (CS%CoulombFriction) then
           !Effective pressure
-          Hf = max(CS%density_ocean_avg * CS%bed_elev(i,j)/CS%density_ice, 0.0)
-          fN = max(CS%density_ice * CS%g_Earth * (ISS%h_shelf(i,j) - Hf),CS%CF_MinN)
+          Hf = max((CS%density_ocean_avg/CS%density_ice) * CS%bed_elev(i,j), 0.0)
+          fN = max((CS%density_ice * CS%g_Earth) * (ISS%h_shelf(i,j) - Hf),CS%CF_MinN)
 
           fB = alpha * (CS%C_basal_friction(i,j) / (CS%CF_Max * fN))**(CS%CF_PostPeak/CS%n_basal_fric)
-          CS%basal_traction(i,j) = G%areaT(i,j) * CS%C_basal_friction(i,j) * &
-            unorm**(CS%n_basal_fric-1.0) / (1.0 + fB * unorm**CS%CF_PostPeak)**(CS%n_basal_fric)
+          CS%basal_traction(i,j) = (G%areaT(i,j) * CS%C_basal_friction(i,j)) * &
+            (unorm**(CS%n_basal_fric-1.0) / (1.0 + fB * unorm**CS%CF_PostPeak)**(CS%n_basal_fric))
         else
           !linear (CS%n_basal_fric=1) or "Weertman"/power-law (CS%n_basal_fric .ne. 1)
-          CS%basal_traction(i,j) = G%areaT(i,j) * CS%C_basal_friction(i,j) * unorm**(CS%n_basal_fric-1)
+          CS%basal_traction(i,j) = G%areaT(i,j) * (CS%C_basal_friction(i,j) * unorm**(CS%n_basal_fric-1))
         endif
       endif
     enddo
@@ -3382,8 +3325,8 @@ subroutine bilinear_shape_fn_grid(G, i, j, Phi)
         xexp = xquad(qpoint)
       endif
 
-      Phi(2*node-1,qpoint) = ( d * (2 * xnode - 3) * yexp ) / (a*d)
-      Phi(2*node,qpoint)   = ( a * (2 * ynode - 3) * xexp ) / (a*d)
+      Phi(2*node-1,qpoint) = ( (d * (2 * xnode - 3)) * yexp ) / (a*d)
+      Phi(2*node,qpoint)   = ( (a * (2 * ynode - 3)) * xexp ) / (a*d)
 
     enddo
   enddo
@@ -3429,15 +3372,15 @@ subroutine bilinear_shape_fn_grid_1qp(G, i, j, Phi)
 
     do node=1,4
       xnode = 2-mod(node,2) ; ynode = ceiling(REAL(node)/2)
-      Phi(2*node-1) = ( d * (2 * xnode - 3) * yexp ) / (a*d)
-      Phi(2*node)   = ( a * (2 * ynode - 3) * xexp ) / (a*d)
+      Phi(2*node-1) = ( (d * (2 * xnode - 3)) * yexp ) / (a*d)
+      Phi(2*node)   = ( (a * (2 * ynode - 3)) * xexp ) / (a*d)
     enddo
 end subroutine bilinear_shape_fn_grid_1qp
 
 
 subroutine bilinear_shape_functions_subgrid(Phisub, nsub)
   integer, intent(in)    :: nsub   !< The number of subgridscale quadrature locations in each direction
-  real, dimension(nsub,nsub,2,2,2,2), &
+  real, dimension(2,2,nsub,nsub,2,2), &
            intent(inout) :: Phisub !< Quadrature structure weights at subgridscale
                                    !! locations for finite element calculations [nondim]
 
@@ -3449,13 +3392,13 @@ subroutine bilinear_shape_functions_subgrid(Phisub, nsub)
   ! i think this general approach may not work for nonrectangular elements...
   !
 
-  ! Phisub(i,j,k,l,q1,q2)
+  ! Phisub(q1,q2,i,j,k,l)
+  !  q1: quad point x-index
+  !  q2: quad point y-index
   !  i: subgrid index in x-direction
   !  j: subgrid index in y-direction
   !  k: basis function x-index
   !  l: basis function y-index
-  !  q1: quad point x-index
-  !  q2: quad point y-index
 
   ! e.g. k=1,l=1 => node 1
   !      q1=2,q2=1 => quad point 2
@@ -3476,10 +3419,10 @@ subroutine bilinear_shape_functions_subgrid(Phisub, nsub)
     do qy=1,2 ; do qx=1,2
       x = x0 + fracx*xquad(qx)
       y = y0 + fracx*xquad(qy)
-      Phisub(i,j,1,1,qx,qy) = (1.0-x) * (1.0-y)
-      Phisub(i,j,1,2,qx,qy) = (1.0-x) * y
-      Phisub(i,j,2,1,qx,qy) = x * (1.0-y)
-      Phisub(i,j,2,2,qx,qy) = x * y
+      Phisub(qx,qy,i,j,1,1) = (1.0-x) * (1.0-y)
+      Phisub(qx,qy,i,j,1,2) = (1.0-x) * y
+      Phisub(qx,qy,i,j,2,1) = x * (1.0-y)
+      Phisub(qx,qy,i,j,2,2) = x * y
     enddo ; enddo
   enddo ; enddo
 
@@ -3652,8 +3595,8 @@ subroutine interpolate_H_to_B(G, h_shelf, hmask, H_node)
                          intent(inout) :: H_node !< The ice shelf thickness at nodal (corner)
                                              !! points [Z ~> m].
 
-  integer :: i, j, isc, iec, jsc, jec, num_h, k, l
-  real    :: summ
+  integer :: i, j, isc, iec, jsc, jec, num_h, k, l, ic, jc
+  real    :: h_arr(2,2)
 
   isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
 
@@ -3664,19 +3607,18 @@ subroutine interpolate_H_to_B(G, h_shelf, hmask, H_node)
 
   do j=jsc-1,jec
     do i=isc-1,iec
-      summ = 0.0
       num_h = 0
-      do k=0,1
-        do l=0,1
-          if (hmask(i+k,j+l) == 1.0 .or. hmask(i+k,j+l) == 3.0) then
-            summ = summ + h_shelf(i+k,j+l)
-            num_h = num_h + 1
-          endif
-        enddo
-      enddo
-      if (num_h > 0) then
-        H_node(i,j) = summ / num_h
-      endif
+      do l=1,2; jc=j-1+l; do k=1,2; ic=i-1+k
+        if (hmask(ic,jc) == 1.0 .or. hmask(ic,jc) == 3.0) then
+          h_arr(k,l)=h_shelf(ic,jc)
+          num_h = num_h + 1
+        else
+          h_arr(k,l)=0.0
+        endif
+        if (num_h > 0) then
+          H_node(i,j) = ((h_arr(1,1)+h_arr(2,2))+(h_arr(1,2)+h_arr(2,1))) / num_h
+        endif
+      enddo; enddo
     enddo
   enddo
 
