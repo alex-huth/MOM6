@@ -318,9 +318,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%u_shelf(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%v_shelf(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%t_shelf(isd:ied,jsd:jed), source=T_shelf_missing) ! [C ~> degC]
-    !allocate(CS%ice_visc(isd:ied,jsd:jed), source=0.0)
     allocate(CS%ice_visc(isd:ied,jsd:jed,CS%visc_qps), source=0.0)
-    !allocate(CS%Ee(isd:ied,jsd:jed,4), source=0.0)
     allocate(CS%AGlen_visc(isd:ied,jsd:jed), source=2.261e-25) ! [Pa-3 s-1]
     allocate(CS%basal_traction(isd:ied,jsd:jed), source=0.0)   ! [R L3 T-1 ~> kg s-1]
     allocate(CS%C_basal_friction(isd:ied,jsd:jed), source=5.0e10) ! [Pa (m-1 s)^n_sliding]
@@ -1171,8 +1169,8 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   real, dimension(SZDIB_(G),SZDJB_(G)) :: Au, Av ! The retarding lateral stress contributions [R L3 Z T-2 ~> kg m s-2]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: u_last, v_last ! Previous velocities [L T-1 ~> m s-1]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: H_node ! Ice shelf thickness at corners [Z ~> m].
-  real, dimension(SZDI_(G),SZDJ_(G)) :: float_cond ! If GL_regularize=true, an array indicating where the ice
-                                                ! shelf is floating: 0 if floating, 1 if not
+  real, dimension(SZDI_(G),SZDJ_(G)) :: float_cond ! If GL_regularize=true, indicates cells containing
+                                                ! the grounding line (float_cond=1) or not (float_cond=0)
   real, dimension(SZDIB_(G),SZDJB_(G)) :: Normvec  ! Used for convergence
   character(len=160) :: mesg  ! The text of an error message
   integer :: conv_flag, i, j, k,l, iter
@@ -1195,7 +1193,6 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   if (.not. CS%GL_couple) then
     do j=G%jsc,G%jec ; do i=G%isc,G%iec
       if (rhoi_rhow * ISS%h_shelf(i,j) - CS%bed_elev(i,j) > 0) then
-        if (CS%GL_regularize) float_cond(i,j) = 1.0
         CS%ground_frac(i,j) = 1.0
         CS%OD_av(i,j) =0.0
       endif
@@ -1242,7 +1239,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   ! This makes sure basal stress is only applied when it is supposed to be
   if (CS%GL_regularize) then
     do j=G%jsd,G%jed ; do i=G%isd,G%ied
-      CS%basal_traction(i,j) = CS%basal_traction(i,j) * float_cond(i,j)
+      if (CS%ground_frac(i,j)/=1.0) CS%basal_traction(i,j) = 0.0
     enddo ; enddo
   else
     do j=G%jsd,G%jed ; do i=G%isd,G%ied
@@ -1262,12 +1259,10 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     err_init = 0 ; err_tempu = 0 ; err_tempv = 0
     do J=G%IscB,G%JecB ; do I=G%IscB,G%IecB
       if (CS%umask(I,J) == 1) then
-        !err_tempu = ABS(Au(I,J) + u_bdry_cont(I,J) - taudx(I,J))
         err_tempu = ABS(Au(I,J) - taudx(I,J))
         if (err_tempu >= err_init) err_init = err_tempu
       endif
       if (CS%vmask(I,J) == 1) then
-        !err_tempv = ABS(Av(I,J) + v_bdry_cont(I,J) - taudy(I,J))
         err_tempv = ABS(Av(I,J) - taudy(I,J))
         if (err_tempv >= err_init) err_init = err_tempv
       endif
@@ -1319,7 +1314,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     ! makes sure basal stress is only applied when it is supposed to be
     if (CS%GL_regularize) then
       do j=G%jsd,G%jed ; do i=G%isd,G%ied
-        CS%basal_traction(i,j) = CS%basal_traction(i,j) * float_cond(i,j)
+        if (CS%ground_frac(i,j)/=1.0) CS%basal_traction(i,j) = 0.0
       enddo ; enddo
     else
       do j=G%jsd,G%jed ; do i=G%isd,G%ied
@@ -1341,12 +1336,10 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
       do J=G%jscB,G%jecB ; do I=G%jscB,G%iecB
         if (CS%umask(I,J) == 1) then
-          !err_tempu = ABS(Au(I,J) + u_bdry_cont(I,J) - taudx(I,J))
           err_tempu = ABS(Au(I,J) - taudx(I,J))
           if (err_tempu >= err_max) err_max = err_tempu
         endif
         if (CS%vmask(I,J) == 1) then
-          !err_tempv = ABS(Av(I,J) + v_bdry_cont(I,J) - taudy(I,J))
           err_tempv = ABS(Av(I,J) - taudy(I,J))
           if (err_tempv >= err_max) err_max = err_tempv
         endif
@@ -1426,8 +1419,8 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
                           intent(in)    :: H_node !< The ice shelf thickness at nodal (corner)
                                              !! points [Z ~> m].
   real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(in)    :: float_cond !< If GL_regularize=true, an array indicating where the ice
-                                                !! shelf is floating: 0 if floating, 1 if not
+                          intent(in)    :: float_cond !< If GL_regularize=true, indicates cells containing
+                                                !! the grounding line (float_cond=1) or not (float_cond=0)
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(in)    :: hmask !< A mask indicating which tracer points are
                                              !! partly or fully covered by an ice-shelf
@@ -1989,7 +1982,7 @@ subroutine shelf_advance_front(CS, ISS, G, hmask, uh_ice, vh_ice)
               partial_vol = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) + tot_flux
 
               if ((partial_vol / G%areaT(i,j)) == h_reference) then ! cell is exactly covered, no overflow
-                if (ISS%hmask(i,j).ne.3) ISS%hmask(i,j) = 1
+                if (ISS%hmask(i,j)/=3) ISS%hmask(i,j) = 1
                 ISS%h_shelf(i,j) = h_reference
                 ISS%area_shelf_h(i,j) = G%areaT(i,j)
               elseif ((partial_vol / G%areaT(i,j)) < h_reference) then
@@ -1999,7 +1992,7 @@ subroutine shelf_advance_front(CS, ISS, G, hmask, uh_ice, vh_ice)
                 ISS%h_shelf(i,j) = h_reference
               else
 
-                if (ISS%hmask(i,j).ne.3) ISS%hmask(i,j) = 1
+                if (ISS%hmask(i,j)/=3) ISS%hmask(i,j) = 1
                 ISS%area_shelf_h(i,j) = G%areaT(i,j)
                 !h_temp(i,j) = h_reference
                 partial_vol = partial_vol - h_reference * G%areaT(i,j)
@@ -2284,7 +2277,7 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
           neumann_val = (.5 * grav * (1-rho/rhow) * rho * ISS%h_shelf(i,j)**2)
         endif
         if ((CS%u_face_mask_bdry(I-1,j) == 2) .OR. &
-          ((ISS%hmask(i-1,j) == 0 .OR. ISS%hmask(i-1,j) == 2) .AND. (i+i_off .ne. gisc))) then
+          ((ISS%hmask(i-1,j) == 0 .OR. ISS%hmask(i-1,j) == 2) .AND. (i+i_off /= gisc))) then
           ! left face of the cell is at a stress boundary
           ! the depth-integrated longitudinal stress is equal to the difference of depth-integrated
           ! pressure on either side of the face
@@ -2299,21 +2292,21 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
         endif
 
         if ((CS%u_face_mask_bdry(I,j) == 2) .OR. &
-          ((ISS%hmask(i+1,j) == 0 .OR. ISS%hmask(i+1,j) == 2) .and. (i+i_off .ne. giec))) then
+          ((ISS%hmask(i+1,j) == 0 .OR. ISS%hmask(i+1,j) == 2) .and. (i+i_off /= giec))) then
           ! east face of the cell is at a stress boundary
           taudx(I,J-1) = taudx(I,J-1) + .5 * dyh * neumann_val
           taudx(I,J) = taudx(I,J) + .5 * dyh * neumann_val
         endif
 
         if ((CS%v_face_mask_bdry(i,J-1) == 2) .OR. &
-          ((ISS%hmask(i,j-1) == 0 .OR. ISS%hmask(i,j-1) == 2) .and. (j+j_off .ne. gjsc))) then
+          ((ISS%hmask(i,j-1) == 0 .OR. ISS%hmask(i,j-1) == 2) .and. (j+j_off /= gjsc))) then
           ! south face of the cell is at a stress boundary
           taudy(I-1,J-1) = taudy(I-1,J-1) - .5 * dxh * neumann_val
           taudy(I,J-1) = taudy(I,J-1) - .5 * dxh * neumann_val
         endif
 
         if ((CS%v_face_mask_bdry(i,J) == 2) .OR. &
-          ((ISS%hmask(i,j+1) == 0 .OR. ISS%hmask(i,j+1) == 2) .and. (j+j_off .ne. gjec))) then
+          ((ISS%hmask(i,j+1) == 0 .OR. ISS%hmask(i,j+1) == 2) .and. (j+j_off /= gjec))) then
           ! north face of the cell is at a stress boundary
           taudy(I-1,J) = taudy(I-1,J) + .5 * dxh * neumann_val
           taudy(I,J) = taudy(I,J) + .5 * dxh * neumann_val
@@ -2540,7 +2533,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
             ((uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
             (4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),qp,i,j))
 
-          if (float_cond(i,j) == 0 .and. basal_trac(i,j)/=0) then
+          if (float_cond(i,j) == 0) then
             ilq = 1 ; if (iq == iphi) ilq = 2
             jlq = 1 ; if (jq == jphi) jlq = 2
             if (umask(Itgt,Jtgt) == 1) uret_qp(iphi,jphi,qp) = uret_qp(iphi,jphi,qp) +  &
@@ -2653,8 +2646,8 @@ end subroutine CG_action_subgrid_basal
 
 !! Returns the sum of the elements in a square matrix. This sum is bitwise identical even if the matrices are rotated.
 subroutine sum_square_matrix(sum_out, mat_in, n)
-  integer, intent(in) :: n !> The length and width of each matrix in mat_in
-  real, dimension(n,n), intent(in) :: mat_in !> The four n x n matrices to be summed individually
+  integer, intent(in) :: n !< The length and width of each matrix in mat_in
+  real, dimension(n,n), intent(in) :: mat_in !< The four n x n matrices to be summed individually
   real, intent(out) :: sum_out !< The sums of each of the 4 matrices given in mat_in
   integer :: s0,e0,s1,e1
 
@@ -2698,8 +2691,8 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
   type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
   type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
   real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(in)    :: float_cond !< If GL_regularize=true, an array indicating where the ice
-                                                !! shelf is floating: 0 if floating, 1 if not
+                          intent(in)    :: float_cond !< If GL_regularize=true, indicates cells containing
+                                                !! the grounding line (float_cond=1) or not (float_cond=0)
   real, dimension(SZDIB_(G),SZDJB_(G)), &
                           intent(in)    :: H_node !< The ice shelf thickness at nodal
                                                  !! (corner) points [Z ~> m].
@@ -2782,7 +2775,7 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
             ice_visc(i,j,qpv) * ((4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
             (uy+vx) * Phi(2*(2*(jphi-1)+iphi),qp,i,j))
 
-          if (float_cond(i,j) == 0 .and. basal_trac(i,j)/=0) then
+          if (float_cond(i,j) == 0) then
             uq = xquad(ilq) * xquad(jlq)
             u_diag_qp(iphi,jphi,qp) = u_diag_qp(iphi,jphi,qp) + &
               (basal_trac(i,j) * uq) * (xquad(ilq) * xquad(jlq))
@@ -2800,7 +2793,7 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
             ice_visc(i,j,qpv) * ((uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
             (4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),qp,i,j))
 
-          if (float_cond(i,j) == 0 .and. basal_trac(i,j)/=0) then
+          if (float_cond(i,j) == 0) then
             vq = xquad(ilq) * xquad(jlq)
             v_diag_qp(iphi,jphi,qp) = v_diag_qp(iphi,jphi,qp) + &
               (basal_trac(i,j) * vq) * (xquad(ilq) * xquad(jlq))
@@ -3051,7 +3044,7 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
   eps_min = CS%eps_glen_min
 
   if (CS%CoulombFriction) then
-    if (CS%CF_PostPeak.ne.1.0) THEN
+    if (CS%CF_PostPeak/=1.0) THEN
       alpha = (CS%CF_PostPeak-1.0)**(CS%CF_PostPeak-1.0) / CS%CF_PostPeak**CS%CF_PostPeak ![nondim]
     else
       alpha = 1.0
@@ -3075,7 +3068,7 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
           CS%basal_traction(i,j) = (G%areaT(i,j) * CS%C_basal_friction(i,j)) * &
             (unorm**(CS%n_basal_fric-1.0) / (1.0 + fB * unorm**CS%CF_PostPeak)**(CS%n_basal_fric))
         else
-          !linear (CS%n_basal_fric=1) or "Weertman"/power-law (CS%n_basal_fric .ne. 1)
+          !linear (CS%n_basal_fric=1) or "Weertman"/power-law (CS%n_basal_fric /= 1)
           CS%basal_traction(i,j) = G%areaT(i,j) * (CS%C_basal_friction(i,j) * unorm**(CS%n_basal_fric-1))
         endif
       endif
