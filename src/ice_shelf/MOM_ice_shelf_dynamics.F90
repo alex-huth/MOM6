@@ -164,7 +164,7 @@ type, public :: ice_shelf_dyn_CS ; private
   real :: eps_glen_min      !< Min. strain rate to avoid infinite Glen's law viscosity, [T-1 ~> s-1].
   real :: n_basal_fric      !< Exponent in sliding law tau_b = C u^(m_slide) [nondim]
   logical :: CoulombFriction !< Use Coulomb friction law (Schoof 2005, Gagliardini et al 2007)
-  real :: CF_MinN           !< Minimum Coulomb friction effective pressure [R L2 T-2 ~> Pa]
+  real :: CF_MinN           !< Minimum Coulomb friction effective pressure [Pa]
   real :: CF_PostPeak       !< Coulomb friction post peak exponent [nondim]
   real :: CF_Max            !< Coulomb friction maximum coefficient [nondim]
   real :: density_ocean_avg !< A typical ocean density [R ~> kg m-3].  This does not affect ocean
@@ -500,7 +500,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  units="none", default=.false., fail_if_missing=.false.)
     call get_param(param_file, mdl, "CF_MinN", CS%CF_MinN, &
                  "Minimum Coulomb friction effective pressure", &
-                 units="Pa", default=1.0, scale=US%Pa_to_RL2_T2, fail_if_missing=.false.)
+                 units="Pa", default=1.0, fail_if_missing=.false.)
     call get_param(param_file, mdl, "CF_PostPeak", CS%CF_PostPeak, &
                  "Coulomb friction post peak exponent", &
                  units="none", default=1.0, fail_if_missing=.false.)
@@ -754,11 +754,10 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
        'x-velocity of ice', 'm yr-1', conversion=365.0*86400.0*US%L_T_to_m_s)
     CS%id_v_shelf = register_diag_field('ice_shelf_model','v_shelf',CS%diag%axesB1, Time, &
        'y-velocity of ice', 'm yr-1', conversion=365.0*86400.0*US%L_T_to_m_s)
-    ! I think that the conversion factors for the next two diagnostics are wrong. - RWH
     CS%id_taudx_shelf = register_diag_field('ice_shelf_model','taudx_shelf',CS%diag%axesB1, Time, &
-       'x-driving stress of ice', 'kPa', conversion=1.e-3*US%RL2_T2_to_Pa)
+       'x-driving stress of ice', 'kPa', conversion=1.e-3*US%RLZ_T2_to_Pa)
     CS%id_taudy_shelf = register_diag_field('ice_shelf_model','taudy_shelf',CS%diag%axesB1, Time, &
-       'y-driving stress of ice', 'kPa', conversion=1.e-3*US%RL2_T2_to_Pa)
+       'y-driving stress of ice', 'kPa', conversion=1.e-3*US%RLZ_T2_to_Pa)
     CS%id_u_mask = register_diag_field('ice_shelf_model','u_mask',CS%diag%axesB1, Time, &
        'mask for u-nodes', 'none')
     CS%id_v_mask = register_diag_field('ice_shelf_model','v_mask',CS%diag%axesB1, Time, &
@@ -3064,11 +3063,12 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
 
   integer :: i, j, iscq, iecq, jscq, jecq, isd, jsd, ied, jed, iegq, jegq
   integer :: giec, gjec, gisc, gjsc, isc, jsc, iec, jec, is, js
-  real :: umid, vmid, unorm, eps_min ! Velocities [L T-1 ~> m s-1]
+  real :: umid, vmid, unorm ! Velocities [L T-1 ~> m s-1]
   real :: alpha !Coulomb coefficient [nondim]
   real :: Hf !"floatation thickness" for Coulomb friction [Z ~> m]
   real :: fN !Effective pressure (ice pressure - ocean pressure) for Coulomb friction [R L2 T-2 ~> Pa]
-  real :: fB !for Coulomb Friction [(L T-1)^CS%CF_PostPeak ~> (m s-1)^CS%CF_PostPeak]
+  real :: fB !for Coulomb Friction [(T L-1)^CS%CF_PostPeak ~> (s m-1)^CS%CF_PostPeak]
+  real :: fN_scale !To convert effective pressure to mks units during Coulomb friction
 
   isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
   iscq = G%iscB ; iecq = G%iecB ; jscq = G%jscB ; jecq = G%jecB
@@ -3078,14 +3078,13 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
   giec = G%domain%niglobal+gisc ; gjec = G%domain%njglobal+gjsc
   is = iscq - 1; js = jscq - 1
 
-  eps_min = CS%eps_glen_min
-
   if (CS%CoulombFriction) then
     if (CS%CF_PostPeak/=1.0) THEN
       alpha = (CS%CF_PostPeak-1.0)**(CS%CF_PostPeak-1.0) / CS%CF_PostPeak**CS%CF_PostPeak ![nondim]
     else
       alpha = 1.0
     endif
+    fN_scale = US%R_to_kg_m3 * US%L_T_to_m_s**2
   endif
 
   do j=jsd+1,jed
@@ -3093,20 +3092,22 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
       if ((ISS%hmask(i,j) == 1) .OR. (ISS%hmask(i,j) == 3)) then
         umid = ((u_shlf(I,J) + u_shlf(I-1,J-1)) + (u_shlf(I,J-1) + u_shlf(I-1,J))) * 0.25
         vmid = ((v_shlf(I,J) + v_shlf(I-1,J-1)) + (v_shlf(I,J-1) + v_shlf(I-1,J))) * 0.25
-        unorm = US%L_T_to_m_s*sqrt((umid**2 + vmid**2) + eps_min**2*(G%dxT(i,j)**2 + G%dyT(i,j)**2))
+        unorm = US%L_T_to_m_s*sqrt(umid**2 + vmid**2)
 
         !Coulomb friction (Schoof 2005, Gagliardini et al 2007)
         if (CS%CoulombFriction) then
           !Effective pressure
           Hf = max((CS%density_ocean_avg/CS%density_ice) * CS%bed_elev(i,j), 0.0)
-          fN = max((CS%density_ice * CS%g_Earth) * (ISS%h_shelf(i,j) - Hf),CS%CF_MinN)
-
+          fN = max(fN_scale*((CS%density_ice * CS%g_Earth) * (ISS%h_shelf(i,j) - Hf)),CS%CF_MinN)
           fB = alpha * (CS%C_basal_friction(i,j) / (CS%CF_Max * fN))**(CS%CF_PostPeak/CS%n_basal_fric)
-          CS%basal_traction(i,j) = (G%areaT(i,j) * CS%C_basal_friction(i,j)) * &
-            (unorm**(CS%n_basal_fric-1.0) / (1.0 + fB * unorm**CS%CF_PostPeak)**(CS%n_basal_fric))
+
+          CS%basal_traction(i,j) = ((G%areaT(i,j) * CS%C_basal_friction(i,j)) * &
+            (unorm**(CS%n_basal_fric-1.0) / (1.0 + fB * unorm**CS%CF_PostPeak)**(CS%n_basal_fric))) * &
+            (US%Pa_to_RLZ_T2*US%L_T_to_m_s)
         else
           !linear (CS%n_basal_fric=1) or "Weertman"/power-law (CS%n_basal_fric /= 1)
-          CS%basal_traction(i,j) = (G%areaT(i,j) * CS%C_basal_friction(i,j)) * (unorm**(CS%n_basal_fric-1))
+          CS%basal_traction(i,j) = ((G%areaT(i,j) * CS%C_basal_friction(i,j)) * (unorm**(CS%n_basal_fric-1))) * &
+                                   (US%Pa_to_RLZ_T2*US%L_T_to_m_s)
         endif
       endif
     enddo

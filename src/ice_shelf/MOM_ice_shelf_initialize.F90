@@ -574,7 +574,7 @@ subroutine initialize_ice_C_basal_friction(C_basal_friction, G, US, PF)
 
   if (trim(config)=="CONSTANT") then
     call get_param(PF, mdl, "BASAL_FRICTION_COEFF", C_friction, &
-                 "Coefficient in sliding law.", units="Pa (m s-1)^(n_basal_fric)", default=5.e10)
+                 "Coefficient in sliding law.", units="Pa (s m-1)^(n_basal_fric)", default=5.e10)
 
     C_basal_friction(:,:) = C_friction
   elseif (trim(config)=="FILE") then
