@@ -274,8 +274,7 @@ end subroutine initialize_ice_thickness_channel
 !> Initialize ice shelf boundary conditions for a channel configuration
 subroutine initialize_ice_shelf_boundary_channel(u_face_mask_bdry, v_face_mask_bdry, &
                 u_flux_bdry_val, v_flux_bdry_val, u_bdry_val, v_bdry_val, u_shelf, v_shelf, h_bdry_val, &
-                thickness_bdry_val, hmask,  h_shelf, G,&
-                US, PF )
+                hmask,  h_shelf, G, US, PF )
 
   type(ocean_grid_type), intent(in)    :: G    !< The ocean's grid structure
   real, dimension(SZIB_(G),SZJB_(G)), &
@@ -299,10 +298,6 @@ subroutine initialize_ice_shelf_boundary_channel(u_face_mask_bdry, v_face_mask_b
                          intent(inout) :: u_shelf !< The zonal ice shelf velocity  [L T-1 ~> m s-1].
   real, dimension(SZIB_(G),SZJB_(G)), &
                          intent(inout) :: v_shelf !< The meridional ice shelf velocity  [L T-1 ~> m s-1].
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                         intent(inout) :: thickness_bdry_val !< The ice shelf thickness at open boundaries [Z ~> m]
-                                                         !! boundary vertices [L T-1 ~> m s-1].
-
   real, dimension(SZDI_(G),SZDJ_(G)), &
                          intent(inout) :: h_bdry_val !< The ice shelf thickness at open boundaries [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)), &
@@ -350,8 +345,13 @@ subroutine initialize_ice_shelf_boundary_channel(u_face_mask_bdry, v_face_mask_b
 
       if (G%geoLonBu(i,j) == westlon) then
         hmask(i+1,j) = 3.0
-        h_bdry_val(i+1,j) = h_shelf(i+1,j)
-        thickness_bdry_val(i+1,j) = h_bdry_val(i+0*1,j)
+        !---
+        !OLD: thickness_bdry_val was used for ice dynamics, and h_bdry_val was not used anywhere except here:
+        !h_bdry_val(i+1,j) = h_shelf(i+1,j) ; thickness_bdry_val(i+1,j) = h_bdry_val(i+0*1,j)
+        !---
+        !NEW: h_bdry_val is used for ice dynamics instead of thickness_bdry_val, which was removed
+        h_bdry_val(i+1,j) = h_shelf(i+0*1,j) !why 0*1
+        !---
         u_face_mask_bdry(i+1,j) = 5.0
         u_bdry_val(i+1,j) = input_vel*(1-16.0*((G%geoLatBu(i-1,j)/lenlat-0.5))**4) !velocity distribution
       endif
@@ -453,7 +453,7 @@ end subroutine initialize_ice_flow_from_file
 
 !> Initialize ice shelf b.c.s from file
 subroutine initialize_ice_shelf_boundary_from_file(u_face_mask_bdry, v_face_mask_bdry, &
-                u_bdry_val, v_bdry_val, umask, vmask, h_bdry_val, thickness_bdry_val, &
+                u_bdry_val, v_bdry_val, umask, vmask, h_bdry_val, &
                 hmask,  h_shelf, G, US, PF )
 
   type(ocean_grid_type), intent(in)    :: G    !< The ocean's grid structure
@@ -471,8 +471,6 @@ subroutine initialize_ice_shelf_boundary_from_file(u_face_mask_bdry, v_face_mask
                          intent(inout) :: umask !< A mask for ice shelf velocity [nondim]
   real, dimension(SZDIB_(G),SZDJB_(G)), &
                          intent(inout) :: vmask !< A mask for ice shelf velocity [nondim]
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                         intent(inout) :: thickness_bdry_val !< The ice shelf thickness at open boundaries [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)), &
                          intent(inout) :: h_bdry_val !< The ice shelf thickness at open boundaries [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)), &
@@ -492,7 +490,6 @@ subroutine initialize_ice_shelf_boundary_from_file(u_face_mask_bdry, v_face_mask
   integer :: i, j, isc, jsc, iec, jec
 
   h_bdry_val(:,:) = 0.
-  thickness_bdry_val(:,:) = 0.
 
   call MOM_mesg("  MOM_ice_shelf_init_profile.F90, initialize_b_c_s_from_file: reading b.c.s")
 
@@ -548,7 +545,6 @@ subroutine initialize_ice_shelf_boundary_from_file(u_face_mask_bdry, v_face_mask
   do j=jsc,jec
     do i=isc,iec
       if (hmask(i,j) == 3.) then
-        thickness_bdry_val(i,j) = h_shelf(i,j)
         h_bdry_val(i,j) = h_shelf(i,j)
       endif
     enddo

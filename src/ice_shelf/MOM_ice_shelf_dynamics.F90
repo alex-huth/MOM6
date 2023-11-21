@@ -89,7 +89,6 @@ type, public :: ice_shelf_dyn_CS ; private
                                                        !!  at either 1 (cell-centered) or 4 quadrature points per cell
   real, pointer, dimension(:,:) :: AGlen_visc => NULL() !< Ice-stiffness parameter in Glen's law ice viscosity,
                                                       !! often in [Pa-3 s-1] if n_Glen is 3.
-  real, pointer, dimension(:,:) :: thickness_bdry_val => NULL() !< The ice thickness at an inflowing boundary [Z ~> m].
   real, pointer, dimension(:,:) :: u_bdry_val => NULL() !< The zonal ice velocity at inflowing boundaries
                                        !! [L yr-1 ~> m yr-1]
   real, pointer, dimension(:,:) :: v_bdry_val => NULL() !< The meridional ice velocity at inflowing boundaries
@@ -114,6 +113,8 @@ type, public :: ice_shelf_dyn_CS ; private
   real, pointer, dimension(:,:) :: ground_frac => NULL()   !< Fraction of the time a cell is "exposed", i.e. the column
                                !! thickness is below a threshold and interacting with the rock [nondim].  When this
                                !! is 1, the ice-shelf is grounded
+  real, pointer, dimension(:,:) :: float_cond => NULL()   !< If GL_regularize=true, indicates cells containing
+                                                !! the grounding line (float_cond=1) or not (float_cond=0)
   real, pointer, dimension(:,:,:,:) :: Phi => NULL() !< The gradients of bilinear basis elements at Gaussian
                                                 !! 4 quadrature points surrounding the cell vertices [L-1 ~> m-1].
   real, pointer, dimension(:,:,:) :: PhiC => NULL()  !< The gradients of bilinear basis elements at 1 cell-centered
@@ -134,6 +135,12 @@ type, public :: ice_shelf_dyn_CS ; private
   real :: density_ice  !< A typical density of ice [R ~> kg m-3].
 
   logical :: advect_shelf !< If true (default), advect ice shelf and evolve thickness
+  logical :: alternate_first_direction_IS !< If true, alternate whether the x- or y-direction
+                                          !! updates occur first in directionally split parts of the calculation.
+  integer :: first_direction_IS !< An integer that indicates which direction is
+                                !! to be updated first in directionally split
+                                !! parts of the ice sheet calculation (e.g. advection).
+  real    :: first_dir_restart_IS = -1.0 !< A real copy of CS%first_direction_IS for use in restart files
   integer :: visc_qps !< The number of quadrature points per cell (1 or 4) on which to calculate ice viscosity.
   character(len=40) :: ice_viscosity_compute !< Specifies whether the ice viscosity is computed internally
                                    !! according to Glen's flow law; is constant (for debugging purposes)
@@ -209,7 +216,7 @@ type, public :: ice_shelf_dyn_CS ; private
   !>@{ Diagnostic handles
   integer :: id_u_shelf = -1, id_v_shelf = -1, id_t_shelf = -1, &
              id_taudx_shelf = -1, id_taudy_shelf = -1, id_bed_elev = -1, &
-             id_ground_frac = -1, id_col_thick = -1, id_OD_av = -1, &
+             id_ground_frac = -1, id_col_thick = -1, id_OD_av = -1, id_float_cond = -1, &
              id_u_mask = -1, id_v_mask = -1, id_ufb_mask =-1, id_vfb_mask = -1, id_t_mask = -1
   !>@}
   ! ids for outputting intermediate thickness in advection subroutine (debugging)
@@ -315,6 +322,17 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     if (CS%visc_qps/=1 .and. CS%visc_qps/=4) call MOM_error (FATAL, &
       "NUMBER OF ICE_VISCOSITY_QUADRATURE_POINTS must be 1 or 4")
 
+    call get_param(param_file, mdl, "FIRST_DIRECTION_IS", CS%first_direction_IS, &
+                 "An integer that indicates which direction goes first "//&
+                 "in parts of the code that use directionally split "//&
+                 "updates (e.g. advection), with even numbers (or 0) used for x- first "//&
+                 "and odd numbers used for y-first.", default=0)
+    call get_param(param_file, mdl, "ALTERNATE_FIRST_DIRECTION_IS", CS%alternate_first_direction_IS, &
+                 "If true, after every advection call, alternate whether the x- or y- "//&
+                 "direction advection updates occur first. "//&
+                 "If this is true, FIRST_DIRECTION applies at the start of a new run or if "//&
+                 "the next first direction can not be found in the restart file.", default=.false.)
+
     allocate(CS%u_shelf(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%v_shelf(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%t_shelf(isd:ied,jsd:jed), source=T_shelf_missing) ! [C ~> degC]
@@ -363,6 +381,8 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
                                 "ice thickness at the boundary", "m", conversion=US%Z_to_m)
     call register_restart_field(CS%bed_elev, "bed elevation", .true., restart_CS, &
                                 "bed elevation", "m", conversion=US%Z_to_m)
+    call register_restart_field(CS%first_dir_restart_IS, "first_direction_IS", .false., restart_CS, &
+                                "Indicator of the first direction in split ice shelf calculations.", "nondim")
   endif
 
 end subroutine register_ice_shelf_dyn_restarts
@@ -575,7 +595,6 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
 
   if (active_shelf_dynamics) then
     allocate( CS%t_bdry_val(isd:ied,jsd:jed), source=T_shelf_bdry) ! [C ~> degC]
-    allocate( CS%thickness_bdry_val(isd:ied,jsd:jed), source=0.0)
     allocate( CS%u_face_mask(Isdq:Iedq,Jsdq:Jedq), source=0.0)
     allocate( CS%v_face_mask(Isdq:Iedq,Jsdq:Jedq), source=0.0)
     allocate( CS%u_flux_bdry_val(Isdq:Iedq,jsd:jed), source=0.0)
@@ -583,6 +602,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     allocate( CS%umask(Isdq:Iedq,Jsdq:Jedq), source=-1.0)
     allocate( CS%vmask(Isdq:Iedq,Jsdq:Jedq), source=-1.0)
     allocate( CS%tmask(Isdq:Iedq,Jsdq:Jedq), source=-1.0)
+    allocate( CS%float_cond(isd:ied,jsd:jed))
 
     CS%OD_rt_counter = 0
     allocate( CS%OD_rt(isd:ied,jsd:jed), source=0.0)
@@ -662,8 +682,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     call pass_var(CS%AGlen_visc, G%domain, complete=.false.)
     call pass_var(CS%bed_elev, G%domain, complete=.false.)
     call pass_var(CS%C_basal_friction, G%domain, complete=.false.)
-    call pass_var(CS%h_bdry_val, G%domain, complete=.false.)
-    call pass_var(CS%thickness_bdry_val, G%domain, complete=.true.)
+    call pass_var(CS%h_bdry_val, G%domain, complete=.true.)
     call pass_var(CS%ice_visc, G%domain)
 
     call pass_vector(CS%u_shelf, CS%v_shelf, G%domain, TO_ALL, BGRID_NE, complete=.false.)
@@ -673,6 +692,12 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   endif
 
   if (active_shelf_dynamics) then
+    if (CS%first_dir_restart_IS > -1.0) then
+      CS%first_direction_IS = modulo(NINT(CS%first_dir_restart_IS), 2)
+    else
+      CS%first_dir_restart_IS = real(modulo(CS%first_direction_IS, 2))
+    endif
+
     ! If we are calving to a mask, i.e. if a mask exists where a shelf cannot, read the mask from a file.
     if (CS%calve_to_mask) then
       call MOM_mesg("  MOM_ice_shelf.F90, initialize_ice_shelf: reading calving_mask")
@@ -710,10 +735,9 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       !initialize boundary conditions
       call initialize_ice_shelf_boundary_from_file(CS%u_face_mask_bdry, CS%v_face_mask_bdry, &
                   CS%u_bdry_val, CS%v_bdry_val, CS%umask, CS%vmask, CS%h_bdry_val, &
-                  CS%thickness_bdry_val, ISS%hmask,  ISS%h_shelf, G, US, param_file )
+                  ISS%hmask,  ISS%h_shelf, G, US, param_file )
       call pass_var(ISS%hmask, G%domain, complete=.false.)
-      call pass_var(CS%h_bdry_val, G%domain, complete=.false.)
-      call pass_var(CS%thickness_bdry_val, G%domain, complete=.true.)
+      call pass_var(CS%h_bdry_val, G%domain, complete=.true.)
       call pass_vector(CS%u_bdry_val, CS%v_bdry_val, G%domain, TO_ALL, BGRID_NE, complete=.false.)
       call pass_vector(CS%u_face_mask_bdry, CS%v_face_mask_bdry, G%domain, TO_ALL, BGRID_NE, complete=.false.)
 
@@ -741,6 +765,8 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
        'mask for v-nodes', 'none')
     CS%id_ground_frac = register_diag_field('ice_shelf_model','ice_ground_frac',CS%diag%axesT1, Time, &
        'fraction of cell that is grounded', 'none')
+    CS%id_float_cond = register_diag_field('ice_shelf_model','float_cond',CS%diag%axesT1, Time, &
+       'sub-cell grounding cells', 'none')
     CS%id_col_thick = register_diag_field('ice_shelf_model','col_thick',CS%diag%axesT1, Time, &
        'ocean column thickness passed to ice model', 'm', conversion=US%Z_to_m)
     CS%id_visc_shelf = register_diag_field('ice_shelf_model','ice_visc',CS%diag%axesT1, Time, &
@@ -750,7 +776,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     CS%id_OD_av = register_diag_field('ice_shelf_model','OD_av',CS%diag%axesT1, Time, &
        'intermediate ocean column thickness passed to ice model', 'm', conversion=US%Z_to_m)
   endif
-  call MOM_mesg("MOM_ice_shelf.F90, initialize_ice_shelf: initialize ice velocity.")
+
   if (new_sim) then
     call update_OD_ffrac_uncoupled(CS, G, ISS%h_shelf(:,:))
   endif
@@ -855,6 +881,10 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, ocean_mass, coupled
 !
   if (CS%advect_shelf) then
     call ice_shelf_advect(CS, ISS, G, time_step, Time)
+    if (CS%alternate_first_direction_IS) then
+      CS%first_direction_IS = modulo(CS%first_direction_IS+1,2)
+      CS%first_dir_restart_IS = real(CS%first_direction_IS)
+    endif
   endif
   CS%elapsed_velocity_time = CS%elapsed_velocity_time + time_step
   if (CS%elapsed_velocity_time >= CS%velocity_update_time_step) update_ice_vel = .true.
@@ -865,7 +895,6 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, ocean_mass, coupled
     call update_OD_ffrac_uncoupled(CS, G, ISS%h_shelf(:,:))
     CS%GL_couple=.false.
   endif
-
 
   if (update_ice_vel) then
     call ice_shelf_solve_outer(CS, ISS, G, US, CS%u_shelf, CS%v_shelf,CS%taudx_shelf,CS%taudy_shelf, iters, Time)
@@ -888,11 +917,12 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, ocean_mass, coupled
       call post_data(CS%id_taudy_shelf, taud_y, CS%diag)
     endif
     if (CS%id_ground_frac > 0) call post_data(CS%id_ground_frac, CS%ground_frac, CS%diag)
+    if (CS%id_float_cond > 0) call post_data(CS%id_float_cond, CS%float_cond, CS%diag)
     if (CS%id_OD_av >0) call post_data(CS%id_OD_av, CS%OD_av,CS%diag)
     if (CS%id_visc_shelf > 0) then
       if (CS%visc_qps==4) then
-        ice_visc(:,:) = &
-          0.25 * (CS%ice_visc(:,:,1) + CS%ice_visc(:,:,2) + CS%ice_visc(:,:,3) + CS%ice_visc(:,:,4)) * G%IareaT(:,:)
+        ice_visc(:,:) = (0.25 * G%IareaT(:,:)) * &
+          ((CS%ice_visc(:,:,1) + CS%ice_visc(:,:,4)) + (CS%ice_visc(:,:,2) + CS%ice_visc(:,:,3)))
       else
         ice_visc(:,:) = CS%ice_visc(:,:,1)*G%IareaT(:,:)
       endif
@@ -1069,7 +1099,7 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time)
 !    The flux overflows are included here. That is because they will be used to advect 3D scalars
 !    into partial cells
 
-  real, dimension(SZDI_(G),SZDJ_(G))   :: h_after_uflux, h_after_vflux ! Ice thicknesses [Z ~> m].
+  real, dimension(SZDI_(G),SZDJ_(G))   :: h_after_flux1, h_after_flux2 ! Ice thicknesses [Z ~> m].
   real, dimension(SZDIB_(G),SZDJ_(G))  :: uh_ice  ! The accumulated zonal ice volume flux [Z L2 ~> m3]
   real, dimension(SZDI_(G),SZDJB_(G))  :: vh_ice  ! The accumulated meridional ice volume flux [Z L2 ~> m3]
   type(loop_bounds_type) :: LB
@@ -1081,37 +1111,39 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time)
   uh_ice(:,:) = 0.0
   vh_ice(:,:) = 0.0
 
-  h_after_uflux(:,:) = 0.0
-  h_after_vflux(:,:) = 0.0
+  h_after_flux1(:,:) = 0.0
+  h_after_flux2(:,:) = 0.0
   ! call MOM_mesg("MOM_ice_shelf.F90: ice_shelf_advect called")
 
-  do j=jsd,jed ; do i=isd,ied ; if (CS%thickness_bdry_val(i,j) /= 0.0) then
-    ISS%h_shelf(i,j) = CS%thickness_bdry_val(i,j)
+  do j=jsd,jed ; do i=isd,ied ; if (CS%h_bdry_val(i,j) /= 0.0) then
+    ISS%h_shelf(i,j) = CS%h_bdry_val(i,j)
   endif ; enddo ; enddo
 
   stencil = 2
-  LB%ish = G%isc ; LB%ieh = G%iec ; LB%jsh = G%jsc-stencil ; LB%jeh = G%jec+stencil
-  if (LB%jsh < jsd) call MOM_error(FATAL, &
-    "ice_shelf_advect:  Halo is too small for the ice thickness advection stencil.")
-
-  call ice_shelf_advect_thickness_x(CS, G, LB, time_step, ISS%hmask, ISS%h_shelf, h_after_uflux, uh_ice)
-
-!  call enable_averages(time_step, Time, CS%diag)
-  call pass_var(h_after_uflux, G%domain)
-!  if (CS%id_h_after_uflux > 0) call post_data(CS%id_h_after_uflux, h_after_uflux, CS%diag)
-!  call disable_averaging(CS%diag)
-
-  LB%ish = G%isc ; LB%ieh = G%iec ; LB%jsh = G%jsc ; LB%jeh = G%jec
-  call ice_shelf_advect_thickness_y(CS, G, LB, time_step, ISS%hmask, h_after_uflux, h_after_vflux, vh_ice)
-
-!  call enable_averages(time_step, Time, CS%diag)
-  call pass_var(h_after_vflux, G%domain)
-!  if (CS%id_h_after_vflux > 0) call post_data(CS%id_h_after_vflux, h_after_vflux, CS%diag)
-!  call disable_averaging(CS%diag)
+  if (modulo(CS%first_direction_IS,2)==0) then
+    !x first
+    LB%ish = G%isc ; LB%ieh = G%iec ; LB%jsh = G%jsc-stencil ; LB%jeh = G%jec+stencil
+    if (LB%jsh < jsd) call MOM_error(FATAL, &
+      "ice_shelf_advect:  Halo is too small for the ice thickness advection stencil.")
+    call ice_shelf_advect_thickness_x(CS, G, LB, time_step, ISS%hmask, ISS%h_shelf, h_after_flux1, uh_ice)
+    call pass_var(h_after_flux1, G%domain)
+    LB%ish = G%isc ; LB%ieh = G%iec ; LB%jsh = G%jsc ; LB%jeh = G%jec
+    call ice_shelf_advect_thickness_y(CS, G, LB, time_step, ISS%hmask, h_after_flux1, h_after_flux2, vh_ice)
+  else
+    ! y first
+    LB%ish = G%isc-stencil ; LB%ieh = G%iec+stencil ; LB%jsh = G%jsc ; LB%jeh = G%jec
+    if (LB%ish < isd) call MOM_error(FATAL, &
+      "ice_shelf_advect:  Halo is too small for the ice thickness advection stencil.")
+    call ice_shelf_advect_thickness_y(CS, G, LB, time_step, ISS%hmask, ISS%h_shelf, h_after_flux1, vh_ice)
+    call pass_var(h_after_flux1, G%domain)
+    LB%ish = G%isc ; LB%ieh = G%iec ; LB%jsh = G%jsc ; LB%jeh = G%jec
+    call ice_shelf_advect_thickness_x(CS, G, LB, time_step, ISS%hmask, h_after_flux1, h_after_flux2, uh_ice)
+  endif
+  call pass_var(h_after_flux2, G%domain)
 
   do j=jsd,jed
     do i=isd,ied
-      if (ISS%hmask(i,j) == 1) ISS%h_shelf(i,j) = h_after_vflux(i,j)
+      if (ISS%hmask(i,j) == 1) ISS%h_shelf(i,j) = h_after_flux2(i,j)
     enddo
   enddo
 
@@ -1127,19 +1159,13 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time)
   endif
 
   do j=jsc,jec; do i=isc,iec
-    ISS%mass_shelf(i,j) = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) * G%IareaT(i,j) * CS%density_ice
+    ISS%mass_shelf(i,j) = (ISS%h_shelf(i,j) * CS%density_ice) * (ISS%area_shelf_h(i,j) * G%IareaT(i,j))
   enddo; enddo
 
   call pass_var(ISS%mass_shelf, G%domain, complete=.false.)
   call pass_var(ISS%h_shelf, G%domain, complete=.false.)
   call pass_var(ISS%area_shelf_h, G%domain, complete=.false.)
   call pass_var(ISS%hmask, G%domain, complete=.true.)
-
-  !call enable_averages(time_step, Time, CS%diag)
-  !if (CS%id_h_after_adv > 0) call post_data(CS%id_h_after_adv, ISS%h_shelf, CS%diag)
-  !call disable_averaging(CS%diag)
-
-  !call change_thickness_using_melt(ISS, G, time_step, fluxes, CS%density_ice)
 
   call update_velocity_masks(CS, G, ISS%hmask, CS%umask, CS%vmask, CS%u_face_mask, CS%v_face_mask)
 
@@ -1187,7 +1213,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   Au(:,:) = 0.0 ; Av(:,:) = 0.0
 
   ! need to make these conditional on GL interpolation
-  float_cond(:,:) = 0.0 ; H_node(:,:) = 0.0
+  CS%float_cond(:,:) = 0.0 ; H_node(:,:) = 0.0
   !CS%ground_frac(:,:) = 0.0
 
   if (.not. CS%GL_couple) then
@@ -1222,12 +1248,12 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
         endif
       enddo ; enddo
       if ((nodefloat > 0) .and. (nodefloat < 4)) then
-        float_cond(i,j) = 1.0
+        CS%float_cond(i,j) = 1.0
         CS%ground_frac(i,j) = 1.0
       endif
     enddo ; enddo
 
-    call pass_var(float_cond, G%Domain, complete=.false.)
+    call pass_var(CS%float_cond, G%Domain, complete=.false.)
 
   endif
 
@@ -1252,7 +1278,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     Au(:,:) = 0.0 ; Av(:,:) = 0.0
 
     call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, H_node, &
-                   CS%ice_visc, float_cond, CS%bed_elev, CS%basal_traction, &
+                   CS%ice_visc, CS%float_cond, CS%bed_elev, CS%basal_traction, &
                    G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow)
     call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
 
@@ -1295,7 +1321,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
   do iter=1,50
 
-    call ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H_node, float_cond, &
+    call ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H_node, CS%float_cond, &
                                ISS%hmask, conv_flag, iters, time, CS%Phi, CS%Phisub)
 
     if (CS%debug) then
@@ -1327,7 +1353,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
       Au(:,:) = 0 ; Av(:,:) = 0
 
       call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, H_node, &
-                     CS%ice_visc, float_cond, CS%bed_elev, CS%basal_traction, &
+                     CS%ice_visc, CS%float_cond, CS%bed_elev, CS%basal_traction, &
                      G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow)
 
       call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
@@ -1731,37 +1757,39 @@ subroutine ice_shelf_advect_thickness_x(CS, G, LB, time_step, hmask, h0, h_after
 
   do j=jsh,jeh ; do I=ish-1,ieh
     if (CS%u_face_mask(I,j) == 4.) then ! The flux itself is a specified boundary condition.
-      uh_ice(I,j) = time_step * G%dyCu(I,j) * CS%u_flux_bdry_val(I,j)
+      uh_ice(I,j) = (time_step * G%dyCu(I,j)) * CS%u_flux_bdry_val(I,j)
     elseif ((hmask(i,j) == 1 .or. hmask(i,j) == 3) .or. (hmask(i+1,j) == 1 .or. hmask(i+1,j) == 3)) then
       u_face = 0.5 * (CS%u_shelf(I,J-1) + CS%u_shelf(I,J))
       h_face = 0.0 ! This will apply when the source cell is iceless or not fully ice covered.
 
       if (u_face > 0) then
         if (hmask(i,j) == 3) then ! This is a open boundary inflow from the west
-          h_face = CS%thickness_bdry_val(i,j)
+          h_face = CS%h_bdry_val(i,j)
         elseif (hmask(i,j) == 1) then ! There can be eastward flow through this face.
-          if ((hmask(i-1,j) == 1) .and. (hmask(i+1,j) == 1)) then
+          if ((hmask(i-1,j) == 1 .or. hmask(i-1,j) == 3) .and. &
+            (hmask(i+1,j) == 1 .or. hmask(i+1,j) == 3)) then
             slope_lim = slope_limiter(h0(i,j)-h0(i-1,j), h0(i+1,j)-h0(i,j))
             ! This is a 2nd-order centered scheme with a slope limiter.  We could try PPM here.
-            h_face = h0(i,j) - slope_lim * 0.5 * (h0(i,j)-h0(i+1,j))
+            h_face = h0(i,j) - slope_lim * (0.5 * (h0(i,j)-h0(i+1,j)))
           else
             h_face = h0(i,j)
           endif
         endif
       else
         if (hmask(i+1,j) == 3) then ! This is a open boundary inflow from the east
-          h_face = CS%thickness_bdry_val(i+1,j)
+          h_face = CS%h_bdry_val(i+1,j)
         elseif (hmask(i+1,j) == 1) then
-          if ((hmask(i,j) == 1) .and. (hmask(i+2,j) == 1)) then
+          if ((hmask(i,j) == 1 .or. hmask(i,j) == 3) .and. &
+            (hmask(i+2,j) == 1 .or. hmask(i+2,j) == 3)) then
             slope_lim = slope_limiter(h0(i+1,j)-h0(i,j), h0(i+2,j)-h0(i+1,j))
-            h_face = h0(i+1,j) - slope_lim * 0.5 * (h0(i+1,j)-h0(i,j))
+            h_face = h0(i+1,j) - slope_lim * (0.5 * (h0(i+2,j)-h0(i+1,j)))
           else
             h_face = h0(i+1,j)
           endif
         endif
       endif
 
-      uh_ice(I,j) = time_step * G%dyCu(I,j) * u_face * h_face
+      uh_ice(I,j) = (time_step * G%dyCu(I,j)) * (u_face * h_face)
     else
       uh_ice(I,j) = 0.0
     endif
@@ -1810,37 +1838,39 @@ subroutine ice_shelf_advect_thickness_y(CS, G, LB, time_step, hmask, h0, h_after
 
   do J=jsh-1,jeh ; do i=ish,ieh
     if (CS%v_face_mask(i,J) == 4.) then ! The flux itself is a specified boundary condition.
-      vh_ice(i,J) = time_step * G%dxCv(i,J) * CS%v_flux_bdry_val(i,J)
+      vh_ice(i,J) = (time_step * G%dxCv(i,J)) * CS%v_flux_bdry_val(i,J)
     elseif ((hmask(i,j) == 1 .or. hmask(i,j) == 3) .or. (hmask(i,j+1) == 1 .or. hmask(i,j+1) == 3)) then
       v_face = 0.5 * (CS%v_shelf(I-1,J) + CS%v_shelf(I,J))
       h_face = 0.0 ! This will apply when the source cell is iceless or not fully ice covered.
 
       if (v_face > 0) then
         if (hmask(i,j) == 3) then ! This is a open boundary inflow from the south
-          h_face = CS%thickness_bdry_val(i,j)
-        elseif (hmask(i,j) == 1) then ! There can be northtward flow through this face.
-          if ((hmask(i,j-1) == 1) .and. (hmask(i,j+1) == 1)) then
+          h_face = CS%h_bdry_val(i,j)
+        elseif (hmask(i,j) == 1) then ! There can be northward flow through this face.
+          if ((hmask(i,j-1) == 1 .or. hmask(i,j-1) == 3) .and. &
+            (hmask(i,j+1) == 1 .or. hmask(i,j+1) == 3)) then
             slope_lim = slope_limiter(h0(i,j)-h0(i,j-1), h0(i,j+1)-h0(i,j))
             ! This is a 2nd-order centered scheme with a slope limiter.  We could try PPM here.
-            h_face = h0(i,j) - slope_lim * 0.5 * (h0(i,j)-h0(i,j+1))
+            h_face = h0(i,j) - slope_lim * (0.5 * (h0(i,j)-h0(i,j+1)))
           else
             h_face = h0(i,j)
           endif
         endif
       else
         if (hmask(i,j+1) == 3) then ! This is a open boundary inflow from the north
-          h_face = CS%thickness_bdry_val(i,j+1)
+          h_face = CS%h_bdry_val(i,j+1)
         elseif (hmask(i,j+1) == 1) then
-          if ((hmask(i,j) == 1) .and. (hmask(i,j+2) == 1)) then
+          if ((hmask(i,j) == 1 .or. hmask(i,j) == 3) .and. &
+            (hmask(i,j+2) == 1 .or. hmask(i,j+2) == 3)) then
             slope_lim = slope_limiter(h0(i,j+1)-h0(i,j), h0(i,j+2)-h0(i,j+1))
-            h_face = h0(i,j+1) - slope_lim * 0.5 * (h0(i,j+1)-h0(i,j))
+            h_face = h0(i,j+1) - slope_lim * (0.5 * (h0(i,j+2)-h0(i,j+1)))
           else
             h_face = h0(i,j+1)
           endif
         endif
       endif
 
-      vh_ice(i,J) = time_step * G%dxCv(i,J) * v_face * h_face
+      vh_ice(i,J) = (time_step * G%dxCv(i,J)) * (v_face * h_face)
     else
       vh_ice(i,J) = 0.0
     endif
@@ -1901,7 +1931,11 @@ subroutine shelf_advance_front(CS, ISS, G, hmask, uh_ice, vh_ice)
   integer :: iter_flag
 
   real :: h_reference ! A reference thicknesss based on neighboring cells [Z ~> m]
+  real :: h_reference_ew !contribution to reference thickness from east + west cells [Z ~> m]
+  real :: h_reference_ns !contribution to reference thickness from north + south cells [Z ~> m]
   real :: tot_flux    ! The total ice mass flux [Z L2 ~> m3]
+  real :: tot_flux_ew ! The contribution to total ice mass flux from east + west cells [Z L2 ~> m3]
+  real :: tot_flux_ns ! The contribution to total ice mass flux from north + south cells [Z L2 ~> m3]
   real :: partial_vol ! The volume covered by ice shelf [Z L2 ~> m3]
   real :: dxdyh       ! Cell area [L2 ~> m2]
   character(len=160) :: mesg  ! The text of an error message
@@ -1952,15 +1986,17 @@ subroutine shelf_advance_front(CS, ISS, G, hmask, uh_ice, vh_ice)
               ((i+i_off) >= 1)) then
             ! first get reference thickness by averaging over cells that are fluxing into this cell
             n_flux = 0
-            h_reference = 0.0
-            tot_flux = 0.0
+            h_reference_ew = 0.0
+            h_reference_ns = 0.0
+            tot_flux_ew = 0.0
+            tot_flux_ns = 0.0
 
             do k=1,2
               if (flux_enter(i,j,k) > 0) then
                 n_flux = n_flux + 1
-                h_reference = h_reference + flux_enter(i,j,k) * ISS%h_shelf(i+2*k-3,j)
+                h_reference_ew = h_reference_ew + flux_enter(i,j,k) * ISS%h_shelf(i+2*k-3,j)
                 !h_reference = h_reference + ISS%h_shelf(i+2*k-3,j)
-                tot_flux = tot_flux + flux_enter(i,j,k)
+                tot_flux_ew = tot_flux_ew + flux_enter(i,j,k)
                 flux_enter(i,j,k) = 0.0
               endif
             enddo
@@ -1968,12 +2004,15 @@ subroutine shelf_advance_front(CS, ISS, G, hmask, uh_ice, vh_ice)
             do k=1,2
               if (flux_enter(i,j,k+2) > 0) then
                 n_flux = n_flux + 1
-                h_reference = h_reference + flux_enter(i,j,k+2) * ISS%h_shelf(i,j+2*k-3)
+                h_reference_ns = h_reference_ns + flux_enter(i,j,k+2) * ISS%h_shelf(i,j+2*k-3)
                 !h_reference = h_reference + ISS%h_shelf(i,j+2*k-3)
-                tot_flux = tot_flux + flux_enter(i,j,k+2)
+                tot_flux_ns = tot_flux_ns + flux_enter(i,j,k+2)
                 flux_enter(i,j,k+2) = 0.0
               endif
             enddo
+
+            h_reference = h_reference_ew + h_reference_ns
+            tot_flux = tot_flux_ew + tot_flux_ns
 
             if (n_flux > 0) then
               dxdyh = G%areaT(i,j)
@@ -2142,15 +2181,14 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
   integer :: i_off, j_off
 
   isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
-  iscq = G%iscB ; iecq = G%iecB ; jscq = G%jscB ; jecq = G%jecB
-  isd = G%isd ; jsd = G%jsd
+!  iscq = G%iscB ; iecq = G%iecB ; jscq = G%jscB ; jecq = G%jecB
   isd = G%isd ; jsd = G%jsd ; ied = G%ied ; jed = G%jed
-  iegq = G%iegB ; jegq = G%jegB
+!  iegq = G%iegB ; jegq = G%jegB
 !  gisc = G%domain%nihalo+1 ; gjsc = G%domain%njhalo+1
   gisc = 1 ; gjsc = 1
 !  giec = G%domain%niglobal+G%domain%nihalo ; gjec = G%domain%njglobal+G%domain%njhalo
   giec = G%domain%niglobal ; gjec = G%domain%njglobal
-  is = iscq - 1; js = jscq - 1
+!  is = iscq - 1; js = jscq - 1
   i_off = G%idg_offset ; j_off = G%jdg_offset
 
 
@@ -2211,14 +2249,14 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
         else ! interior
           if (ISS%hmask(i+1,j) == 1 .or. ISS%hmask(i+1,j) == 3) then
             cnt = cnt+1
-            Dx =dxh+ G%dxT(i+1,j)
+            Dx = dxh + G%dxT(i+1,j)
             sx = S(i+1,j)
           else
             sx = S(i,j)
           endif
           if (ISS%hmask(i-1,j) == 1 .or. ISS%hmask(i-1,j) == 3) then
             cnt = cnt+1
-            Dx =dxh+ G%dxT(i-1,j)
+            Dx = dxh + G%dxT(i-1,j)
             sx = sx - S(i-1,j)
           else
             sx = sx - S(i,j)
@@ -2226,7 +2264,7 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
           if (cnt == 0) then
             sx = 0
           else
-            sx = sx / ( Dx)
+            sx = sx / Dx
           endif
         endif
 
@@ -2248,22 +2286,22 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
         else ! interior
           if (ISS%hmask(i,j+1) == 1 .or. ISS%hmask(i,j+1) == 3) then
             cnt = cnt+1
-            Dy =dyh+ G%dyT(i,j+1)
+            Dy = dyh + G%dyT(i,j+1)
             sy = S(i,j+1)
           else
             sy = S(i,j)
           endif
           if (ISS%hmask(i,j-1) == 1 .or. ISS%hmask(i,j-1) == 3) then
             cnt = cnt+1
+            Dy = dyh + G%dyT(i,j-1)
             sy = sy - S(i,j-1)
-            Dy =dyh+ G%dyT(i,j-1)
           else
             sy = sy - S(i,j)
           endif
           if (cnt == 0) then
             sy = 0
           else
-            sy = sy / (Dy)
+            sy = sy / Dy
           endif
         endif
 
@@ -2272,9 +2310,9 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
 
         !Stress (Neumann) boundary conditions
         if (CS%ground_frac(i,j) == 1) then
-          neumann_val = (.5 * grav * (rho * ISS%h_shelf(i,j)**2 - rhow * CS%bed_elev(i,j)**2))
+          neumann_val = ((.5 * grav) * (rho * ISS%h_shelf(i,j)**2 - rhow * CS%bed_elev(i,j)**2))
         else
-          neumann_val = (.5 * grav * (1-rho/rhow) * rho * ISS%h_shelf(i,j)**2)
+          neumann_val = (.5 * grav) * ((1-rho/rhow) * (rho * ISS%h_shelf(i,j)**2))
         endif
         if ((CS%u_face_mask_bdry(I-1,j) == 2) .OR. &
           ((ISS%hmask(i-1,j) == 0 .OR. ISS%hmask(i-1,j) == 2) .AND. (i+i_off /= gisc))) then
@@ -2311,7 +2349,6 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
           taudy(I-1,J) = taudy(I-1,J) + .5 * dxh * neumann_val
           taudy(I,J) = taudy(I,J) + .5 * dxh * neumann_val
         endif
-
       endif
     enddo
   enddo
@@ -2356,7 +2393,7 @@ subroutine init_boundary_values(CS, G, time, hmask, input_flux, input_thick, new
     do i=isd,ied
 
       if (hmask(i,j) == 3) then
-        CS%thickness_bdry_val(i,j) = input_thick
+        CS%h_bdry_val(i,j) = input_thick
       endif
 
       if ((hmask(i,j) == 0) .or. (hmask(i,j) == 1) .or. (hmask(i,j) == 2)) then
@@ -3069,7 +3106,7 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
             (unorm**(CS%n_basal_fric-1.0) / (1.0 + fB * unorm**CS%CF_PostPeak)**(CS%n_basal_fric))
         else
           !linear (CS%n_basal_fric=1) or "Weertman"/power-law (CS%n_basal_fric /= 1)
-          CS%basal_traction(i,j) = G%areaT(i,j) * (CS%C_basal_friction(i,j) * unorm**(CS%n_basal_fric-1))
+          CS%basal_traction(i,j) = (G%areaT(i,j) * CS%C_basal_friction(i,j)) * (unorm**(CS%n_basal_fric-1))
         endif
       endif
     enddo
@@ -3631,6 +3668,9 @@ subroutine ice_shelf_dyn_end(CS)
   deallocate(CS%u_bdry_val, CS%v_bdry_val)
   deallocate(CS%u_face_mask, CS%v_face_mask)
   deallocate(CS%umask, CS%vmask)
+  deallocate(CS%u_face_mask_bdry, CS%v_face_mask_bdry)
+  deallocate(CS%h_bdry_val)
+  deallocate(CS%float_cond)
 
   deallocate(CS%ice_visc, CS%AGlen_visc)
   deallocate(CS%basal_traction,CS%C_basal_friction)
