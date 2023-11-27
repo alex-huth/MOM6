@@ -3063,7 +3063,7 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
 
   integer :: i, j, iscq, iecq, jscq, jecq, isd, jsd, ied, jed, iegq, jegq
   integer :: giec, gjec, gisc, gjsc, isc, jsc, iec, jec, is, js
-  real :: umid, vmid, unorm ! Velocities [L T-1 ~> m s-1]
+  real :: umid, vmid, unorm, eps_min ! Velocities [L T-1 ~> m s-1]
   real :: alpha !Coulomb coefficient [nondim]
   real :: Hf !"floatation thickness" for Coulomb friction [Z ~> m]
   real :: fN !Effective pressure (ice pressure - ocean pressure) for Coulomb friction [R L2 T-2 ~> Pa]
@@ -3077,6 +3077,8 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
   gisc = G%domain%nihalo+1 ; gjsc = G%domain%njhalo+1
   giec = G%domain%niglobal+gisc ; gjec = G%domain%njglobal+gjsc
   is = iscq - 1; js = jscq - 1
+
+  eps_min = CS%eps_glen_min
 
   if (CS%CoulombFriction) then
     if (CS%CF_PostPeak/=1.0) THEN
@@ -3092,7 +3094,7 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
       if ((ISS%hmask(i,j) == 1) .OR. (ISS%hmask(i,j) == 3)) then
         umid = ((u_shlf(I,J) + u_shlf(I-1,J-1)) + (u_shlf(I,J-1) + u_shlf(I-1,J))) * 0.25
         vmid = ((v_shlf(I,J) + v_shlf(I-1,J-1)) + (v_shlf(I,J-1) + v_shlf(I-1,J))) * 0.25
-        unorm = US%L_T_to_m_s*sqrt(umid**2 + vmid**2)
+        unorm = US%L_T_to_m_s * sqrt( (umid**2 + vmid**2) + (eps_min**2 * (G%dxT(i,j)**2 + G%dyT(i,j)**2)) )
 
         !Coulomb friction (Schoof 2005, Gagliardini et al 2007)
         if (CS%CoulombFriction) then
