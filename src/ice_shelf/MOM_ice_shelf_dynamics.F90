@@ -133,6 +133,7 @@ type, public :: ice_shelf_dyn_CS ; private
 
   real :: g_Earth      !< The gravitational acceleration [L2 Z-1 T-2 ~> m s-2].
   real :: density_ice  !< A typical density of ice [R ~> kg m-3].
+  real :: Cp_ice       !< The heat capacity of fresh ice [Q C-1 ~> J kg-1 degC-1].
 
   logical :: advect_shelf !< If true (default), advect ice shelf and evolve thickness
   logical :: alternate_first_direction_IS !< If true, alternate whether the x- or y-direction
@@ -388,7 +389,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
 end subroutine register_ice_shelf_dyn_restarts
 
 !> Initializes shelf model data, parameters and diagnostics
-subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_sim, &
+subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_sim, Cp_ice, &
                                     Input_start_time, directory, solo_ice_sheet_in)
   type(param_file_type),   intent(in)    :: param_file !< A structure to parse for run-time parameters
   type(time_type),         intent(inout) :: Time !< The clock that that will indicate the model time
@@ -400,6 +401,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   type(diag_ctrl), target, intent(in)    :: diag !< A structure that is used to regulate the diagnostic output.
   logical,                 intent(in)    :: new_sim !< If true this is a new simulation, otherwise
                                                  !! has been started from a restart file.
+  real,                    intent(in)    :: Cp_ice !< Heat capacity of ice (J kg-1 K-1)
   type(time_type),         intent(in)    :: Input_start_time !< The start time of the simulation.
   character(len=*),        intent(in)    :: directory  !< The directory where the ice sheet energy file goes.
   logical,       optional, intent(in)    :: solo_ice_sheet_in !< If present, this indicates whether
@@ -552,7 +554,8 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   call get_param(param_file, mdl, "MIN_THICKNESS_SIMPLE_CALVE", CS%min_thickness_simple_calve, &
                  "Min thickness rule for the VERY simple calving law",&
                  units="m", default=0.0, scale=US%m_to_Z)
-
+  CS%Cp_ice = Cp_ice !Heat capacity of ice (J kg-1 K-1), needed for heat flux of any bergs calved from
+                     !the ice shelf and for ice sheet temperature solver
   !for write_ice_shelf_energy
       ! Note that the units of CS%Timeunit are the MKS units of [s].
   call get_param(param_file, mdl, "TIMEUNIT", CS%Timeunit, &
@@ -850,7 +853,8 @@ end function ice_time_step_CFL
 
 !> This subroutine updates the ice shelf velocities, mass, stresses and properties due to the
 !! ice shelf dynamics.
-subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, ocean_mass, coupled_grounding, must_update_vel)
+subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_bergs, &
+                            ocean_mass, coupled_grounding, must_update_vel)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
   type(ice_shelf_state),  intent(inout) :: ISS !< A structure with elements that describe
                                               !! the ice-shelf state
@@ -858,6 +862,8 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, ocean_mass, coupled
   type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
   real,                   intent(in)    :: time_step !< time step [T ~> s]
   type(time_type),        intent(in)    :: Time !< The current model time
+  logical,                intent(in)    :: calve_ice_shelf_bergs !< To convert ice flux through front
+                                                                 !! to bergs
   real, dimension(SZDI_(G),SZDJ_(G)), &
                 optional, intent(in)    :: ocean_mass !< If present this is the mass per unit area
                                               !! of the ocean [R Z ~> kg m-2].
@@ -879,7 +885,7 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, ocean_mass, coupled
   if (present(ocean_mass) .and. present(coupled_grounding)) coupled_GL = coupled_grounding
 !
   if (CS%advect_shelf) then
-    call ice_shelf_advect(CS, ISS, G, time_step, Time)
+    call ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
     if (CS%alternate_first_direction_IS) then
       CS%first_direction_IS = modulo(CS%first_direction_IS+1,2)
       CS%first_dir_restart_IS = real(CS%first_direction_IS)
@@ -1080,14 +1086,15 @@ end subroutine write_ice_shelf_energy
 !> This subroutine takes the velocity (on the Bgrid) and timesteps h_t = - div (uh) once.
 !! Additionally, it will update the volume of ice in partially-filled cells, and update
 !! hmask accordingly
-subroutine ice_shelf_advect(CS, ISS, G, time_step, Time)
+subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
   type(ice_shelf_state),  intent(inout) :: ISS !< A structure with elements that describe
                                                !! the ice-shelf state
   type(ocean_grid_type),  intent(inout) :: G  !< The grid structure used by the ice shelf.
   real,                   intent(in)    :: time_step !< time step [T ~> s]
   type(time_type),        intent(in)    :: Time !< The current model time
-
+  logical,                intent(in)    :: calve_ice_shelf_bergs !< If true, track ice shelf flux through a
+                                               !! static ice shelf, so that it can be converted into icebergs
 
 ! 3/8/11 DNG
 !
@@ -1155,6 +1162,27 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time)
     if (CS%calve_to_mask) then
       call calve_to_mask(G, ISS%h_shelf, ISS%area_shelf_h, ISS%hmask, CS%calve_mask)
     endif
+  elseif (calve_ice_shelf_bergs) then
+    !advect the front to create partially-filled cells
+    call shelf_advance_front(CS, ISS, G, ISS%hmask, uh_ice, vh_ice)
+    !add mass of the partially-filled cells to calving field, which is used to initialize icebergs
+    !Then, remove the partially-filled cells from the ice shelf
+    !Note that the ocean_public_type calving and calving_hflx point
+    !to ISS%calving and ISS%calving_hflx, repectively
+    do j=jsc,jec; do i=isc,iec
+      if (ISS%hmask(i,j)==2) then
+        ISS%calving(i,j) = ISS%calving(i,j) + &
+          ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) * CS%density_ice / (G%areaT(i,j) * time_step) !kg/m2s
+        !is this correct (which Cp and T do you use?) See river definition of calving_hflx?
+        !see MOM_forcing_type.F90...why use heat capacity of seawater there.
+        !here, we use Cp_ice of freshwater, and dT is the shelf temperature (maybe should be
+        !shelf temperature - local seawater temperature?)
+        ISS%calving_hflx(i,j) = ISS%calving_hflx(i,j) + &
+          CS%Cp_ice * ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) * &
+          CS%density_ice * abs(CS%t_shelf(i,j)) / G%areaT(i,j)  !W/m2
+        ISS%h_shelf(i,j) = 0.0; ISS%area_shelf_h(i,j) = 0.0; ISS%hmask(i,j) = 0.0
+      endif
+    enddo; enddo
   endif
 
   do j=jsc,jec; do i=isc,iec
