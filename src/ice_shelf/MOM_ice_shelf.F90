@@ -75,6 +75,7 @@ implicit none ; private
 public shelf_calc_flux, initialize_ice_shelf, ice_shelf_end, ice_shelf_query
 public ice_shelf_save_restart, solo_step_ice_shelf, add_shelf_forces
 public initialize_ice_shelf_fluxes, initialize_ice_shelf_forces
+public ice_sheet_calving_to_ocean_sfc
 
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
 ! consistency testing. These are noted in comments with units like Z, H, L, and T, along with
@@ -151,6 +152,8 @@ type, public :: ice_shelf_CS ; private
                             !! will be called (note: GL_regularize and GL_couple
                             !! should be exclusive)
   logical :: calve_to_mask  !< If true, calve any ice that passes outside of a masked area
+  logical :: calve_ice_shelf_bergs=.false. !< If true, flux through a static ice front is converted
+                                           !! to point bergs
   real :: min_thickness_simple_calve !< min. ice shelf thickness criteria for calving [Z ~> m].
   real :: T0                !< temperature at ocean surface in the restoring region [C ~> degC]
   real :: S0                !< Salinity at ocean surface in the restoring region [S ~> ppt].
@@ -778,7 +781,7 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
 
     ! advect the ice shelf, and advance the front. Calving will be in here somewhere as well..
     ! when we decide on how to do it
-    call update_ice_shelf(CS%dCS, ISS, G, US, time_step, Time, &
+    call update_ice_shelf(CS%dCS, ISS, G, US, time_step, Time, CS%calve_ice_shelf_bergs, &
                           sfc_state%ocean_mass, coupled_GL)
 
     Itime_step = 1./time_step
@@ -830,6 +833,31 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
   if (CS%debug) call MOM_forcing_chksum("End of shelf calc flux", fluxes, G, CS%US, haloshift=0)
 
 end subroutine shelf_calc_flux
+
+!> Converts the ice-shelf-to-ocean calving and calving_hflx variables from the ice-shelf state (ISS) type
+!! to the ocean public type
+subroutine ice_sheet_calving_to_ocean_sfc(CS,US,calving,calving_hflx)
+  type(ice_shelf_CS),      pointer :: CS        !< A pointer to the ice shelf control structure
+  type(unit_scale_type), intent(in)    :: US   !< A dimensional unit scaling type
+  real, dimension(:,:), intent(inout) :: calving      !< The mass per unit area of the ice shelf
+                                                      !! to convert to bergs [R Z ~> kg m-2].
+  real, dimension(:,:), intent(inout) :: calving_hflx !< Calving heat flux [Q R Z T-1 ~> W m-2].
+  ! Local variables
+  type(ice_shelf_state), pointer :: ISS => NULL() !< A structure with elements that describe
+                                                  !! the ice-shelf state
+  type(ocean_grid_type), pointer :: G => NULL()   !< A pointer to the ocean grid metric.
+  integer :: is, ie, js, je
+
+  G=>CS%Grid
+  ISS => CS%ISS
+  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
+
+  calving = US%RZ_to_kg_m2 * ISS%calving(is:ie, js:je)
+  calving_hflx = US%QRZ_T_to_W_m2 * ISS%calving_hflx(is:ie,js:je)
+
+  CS%calve_ice_shelf_bergs=.true.
+
+end subroutine ice_sheet_calving_to_ocean_sfc
 
 !> Changes the thickness (mass) of the ice shelf based on sub-ice-shelf melting
 subroutine change_thickness_using_melt(ISS, G, US, time_step, fluxes, density_ice, debug)
@@ -1814,7 +1842,7 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
   endif
 
   if (CS%shelf_mass_is_dynamic) &
-    call initialize_ice_shelf_dyn(param_file, Time, ISS, CS%dCS, G, US, CS%diag, new_sim, &
+    call initialize_ice_shelf_dyn(param_file, Time, ISS, CS%dCS, G, US, CS%diag, new_sim, CS%Cp_ice, &
     Time_init, directory, solo_ice_sheet_in)
 
   call fix_restart_unit_scaling(US, unscaled=.true.)
@@ -2284,7 +2312,8 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
     update_ice_vel = ((time_step > min_time_step) .or. (remaining_time > 0.0))
     coupled_GL = .false.
 
-    call update_ice_shelf(CS%dCS, ISS, G, US, time_step, Time, must_update_vel=update_ice_vel)
+    call update_ice_shelf(CS%dCS, ISS, G, US, time_step, Time, CS%calve_ice_shelf_bergs, &
+                          must_update_vel=update_ice_vel)
 
   enddo
 
