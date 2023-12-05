@@ -34,7 +34,7 @@ implicit none ; private
 
 #include <MOM_memory.h>
 
-public register_ice_shelf_dyn_restarts, initialize_ice_shelf_dyn, update_ice_shelf
+public register_ice_shelf_dyn_restarts, initialize_ice_shelf_dyn, update_ice_shelf, IS_dynamics_post_data
 public ice_time_step_CFL, ice_shelf_dyn_end, change_in_draft, write_ice_shelf_energy
 public shelf_advance_front, ice_shelf_min_thickness_calve, calve_to_mask
 
@@ -133,6 +133,7 @@ type, public :: ice_shelf_dyn_CS ; private
 
   real :: g_Earth      !< The gravitational acceleration [L2 Z-1 T-2 ~> m s-2].
   real :: density_ice  !< A typical density of ice [R ~> kg m-3].
+  real :: Cp_ice       !< The heat capacity of fresh ice [Q C-1 ~> J kg-1 degC-1].
 
   logical :: advect_shelf !< If true (default), advect ice shelf and evolve thickness
   logical :: alternate_first_direction_IS !< If true, alternate whether the x- or y-direction
@@ -388,7 +389,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
 end subroutine register_ice_shelf_dyn_restarts
 
 !> Initializes shelf model data, parameters and diagnostics
-subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_sim, &
+subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_sim, Cp_ice, &
                                     Input_start_time, directory, solo_ice_sheet_in)
   type(param_file_type),   intent(in)    :: param_file !< A structure to parse for run-time parameters
   type(time_type),         intent(inout) :: Time !< The clock that that will indicate the model time
@@ -400,6 +401,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   type(diag_ctrl), target, intent(in)    :: diag !< A structure that is used to regulate the diagnostic output.
   logical,                 intent(in)    :: new_sim !< If true this is a new simulation, otherwise
                                                  !! has been started from a restart file.
+  real,                    intent(in)    :: Cp_ice !< Heat capacity of ice (J kg-1 K-1)
   type(time_type),         intent(in)    :: Input_start_time !< The start time of the simulation.
   character(len=*),        intent(in)    :: directory  !< The directory where the ice sheet energy file goes.
   logical,       optional, intent(in)    :: solo_ice_sheet_in !< If present, this indicates whether
@@ -552,7 +554,8 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   call get_param(param_file, mdl, "MIN_THICKNESS_SIMPLE_CALVE", CS%min_thickness_simple_calve, &
                  "Min thickness rule for the VERY simple calving law",&
                  units="m", default=0.0, scale=US%m_to_Z)
-
+  CS%Cp_ice = Cp_ice !Heat capacity of ice (J kg-1 K-1), needed for heat flux of any bergs calved from
+                     !the ice shelf and for ice sheet temperature solver
   !for write_ice_shelf_energy
       ! Note that the units of CS%Timeunit are the MKS units of [s].
   call get_param(param_file, mdl, "TIMEUNIT", CS%Timeunit, &
@@ -774,6 +777,15 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
        'taub', 'MPa s m-1', conversion=1e-6*US%RL2_T2_to_Pa/(365.0*86400.0*US%L_T_to_m_s))
     CS%id_OD_av = register_diag_field('ice_shelf_model','OD_av',CS%diag%axesT1, Time, &
        'intermediate ocean column thickness passed to ice model', 'm', conversion=US%Z_to_m)
+
+    !Update these variables so that they are nonzero in case
+    !IS_dynamics_post_data is called before update_ice_shelf
+    if (CS%id_taudx_shelf>0 .or. CS%id_taudy_shelf>0) &
+      call calc_shelf_driving_stress(CS, ISS, G, US, CS%taudx_shelf, CS%taudy_shelf, CS%OD_av)
+    if (CS%id_taub>0) &
+      call calc_shelf_taub(CS, ISS, G, US, CS%u_shelf, CS%v_shelf)
+    if (CS%id_visc_shelf>0) &
+      call calc_shelf_visc(CS, ISS, G, US, CS%u_shelf, CS%v_shelf)
   endif
 
   if (new_sim) then
@@ -850,7 +862,8 @@ end function ice_time_step_CFL
 
 !> This subroutine updates the ice shelf velocities, mass, stresses and properties due to the
 !! ice shelf dynamics.
-subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, ocean_mass, coupled_grounding, must_update_vel)
+subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_bergs, &
+                            ocean_mass, coupled_grounding, must_update_vel)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
   type(ice_shelf_state),  intent(inout) :: ISS !< A structure with elements that describe
                                               !! the ice-shelf state
@@ -858,17 +871,14 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, ocean_mass, coupled
   type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
   real,                   intent(in)    :: time_step !< time step [T ~> s]
   type(time_type),        intent(in)    :: Time !< The current model time
+  logical,                intent(in)    :: calve_ice_shelf_bergs !< To convert ice flux through front
+                                                                 !! to bergs
   real, dimension(SZDI_(G),SZDJ_(G)), &
                 optional, intent(in)    :: ocean_mass !< If present this is the mass per unit area
                                               !! of the ocean [R Z ~> kg m-2].
   logical,      optional, intent(in)    :: coupled_grounding !< If true, the grounding line is
                                               !! determined by coupled ice-ocean dynamics
   logical,      optional, intent(in)    :: must_update_vel !< Always update the ice velocities if true.
-  real, dimension(SZDIB_(G),SZDJB_(G))  :: taud_x, taud_y  !<area-averaged driving stress [R L2 T-2 ~> Pa]
-  real, dimension(SZDI_(G),SZDJ_(G))  :: ice_visc !< area-averaged vertically integrated ice viscosity
-                                              !! [R L2 Z T-1 ~> Pa s m]
-  real, dimension(SZDI_(G),SZDJ_(G))  :: basal_tr !< area-averaged taub_beta field related to basal traction,
-                                              !! [R L1 T-1 ~> Pa s m-1]
   integer :: iters
   logical :: update_ice_vel, coupled_GL
 
@@ -879,7 +889,7 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, ocean_mass, coupled
   if (present(ocean_mass) .and. present(coupled_grounding)) coupled_GL = coupled_grounding
 !
   if (CS%advect_shelf) then
-    call ice_shelf_advect(CS, ISS, G, time_step, Time)
+    call ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
     if (CS%alternate_first_direction_IS) then
       CS%first_direction_IS = modulo(CS%first_direction_IS+1,2)
       CS%first_dir_restart_IS = real(CS%first_direction_IS)
@@ -897,12 +907,25 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, ocean_mass, coupled
 
   if (update_ice_vel) then
     call ice_shelf_solve_outer(CS, ISS, G, US, CS%u_shelf, CS%v_shelf,CS%taudx_shelf,CS%taudy_shelf, iters, Time)
+    CS%elapsed_velocity_time = 0.0
   endif
 
 ! call ice_shelf_temp(CS, ISS, G, US, time_step, ISS%water_flux, Time)
 
-  if (CS%elapsed_velocity_time >= CS%velocity_update_time_step) then
-    call enable_averages(CS%elapsed_velocity_time, Time, CS%diag)
+end subroutine update_ice_shelf
+
+!> Ice shelf dynamics post_data calls
+subroutine IS_dynamics_post_data(time_step, Time, CS, G)
+  real :: time_step !< Length of time for post data averaging [T ~> s].
+  type(time_type),        intent(in)    :: Time !< The current model time
+  type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in) :: G  !< The grid structure used by the ice shelf.
+  real, dimension(SZDIB_(G),SZDJB_(G))  :: taud_x, taud_y  !<area-averaged driving stress [R L2 T-2 ~> Pa]
+  real, dimension(SZDI_(G),SZDJ_(G))  :: ice_visc !< area-averaged vertically integrated ice viscosity
+                                                  !! [R L2 Z T-1 ~> Pa s m]
+  real, dimension(SZDI_(G),SZDJ_(G))  :: basal_tr !< area-averaged taub_beta field related to basal traction,
+                                                  !! [R L1 T-1 ~> Pa s m-1]
+    call enable_averages(time_step, Time, CS%diag)
     if (CS%id_col_thick > 0) call post_data(CS%id_col_thick, CS%OD_av, CS%diag)
     if (CS%id_u_shelf > 0) call post_data(CS%id_u_shelf, CS%u_shelf, CS%diag)
     if (CS%id_v_shelf > 0) call post_data(CS%id_v_shelf, CS%v_shelf, CS%diag)
@@ -931,7 +954,6 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, ocean_mass, coupled
       basal_tr(:,:) = CS%basal_traction(:,:)*G%IareaT(:,:)
       call post_data(CS%id_taub, basal_tr, CS%diag)
     endif
-!!
     if (CS%id_u_mask > 0) call post_data(CS%id_u_mask, CS%umask, CS%diag)
     if (CS%id_v_mask > 0) call post_data(CS%id_v_mask, CS%vmask, CS%diag)
     if (CS%id_ufb_mask > 0) call post_data(CS%id_ufb_mask, CS%u_face_mask_bdry, CS%diag)
@@ -939,11 +961,7 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, ocean_mass, coupled
 !   if (CS%id_t_mask > 0) call post_data(CS%id_t_mask, CS%tmask, CS%diag)
 
     call disable_averaging(CS%diag)
-
-    CS%elapsed_velocity_time = 0.0
-  endif
-
-end subroutine update_ice_shelf
+end subroutine IS_dynamics_post_data
 
 !>  Writes the total ice shelf kinetic energy and mass to an ascii file
 subroutine write_ice_shelf_energy(CS, G, US, mass, day, time_step)
@@ -1080,14 +1098,15 @@ end subroutine write_ice_shelf_energy
 !> This subroutine takes the velocity (on the Bgrid) and timesteps h_t = - div (uh) once.
 !! Additionally, it will update the volume of ice in partially-filled cells, and update
 !! hmask accordingly
-subroutine ice_shelf_advect(CS, ISS, G, time_step, Time)
+subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
   type(ice_shelf_state),  intent(inout) :: ISS !< A structure with elements that describe
                                                !! the ice-shelf state
   type(ocean_grid_type),  intent(inout) :: G  !< The grid structure used by the ice shelf.
   real,                   intent(in)    :: time_step !< time step [T ~> s]
   type(time_type),        intent(in)    :: Time !< The current model time
-
+  logical,                intent(in)    :: calve_ice_shelf_bergs !< If true, track ice shelf flux through a
+                                               !! static ice shelf, so that it can be converted into icebergs
 
 ! 3/8/11 DNG
 !
@@ -1155,6 +1174,23 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time)
     if (CS%calve_to_mask) then
       call calve_to_mask(G, ISS%h_shelf, ISS%area_shelf_h, ISS%hmask, CS%calve_mask)
     endif
+  elseif (calve_ice_shelf_bergs) then
+    !advect the front to create partially-filled cells
+    call shelf_advance_front(CS, ISS, G, ISS%hmask, uh_ice, vh_ice)
+    !add mass of the partially-filled cells to calving field, which is used to initialize icebergs
+    !Then, remove the partially-filled cells from the ice shelf
+    ISS%calving(:,:)=0.0
+    ISS%calving_hflx(:,:)=0.0
+    do j=jsc,jec; do i=isc,iec
+      if (ISS%hmask(i,j)==2) then
+        ISS%calving(i,j) = (ISS%h_shelf(i,j) * CS%density_ice) * &
+                           (ISS%area_shelf_h(i,j) * G%IareaT(i,j)) / time_step
+        ISS%calving_hflx(i,j) = (CS%Cp_ice * CS%t_shelf(i,j)) * &
+                                ((ISS%h_shelf(i,j) * CS%density_ice) * &
+                                (ISS%area_shelf_h(i,j) * G%IareaT(i,j)))
+        ISS%h_shelf(i,j) = 0.0; ISS%area_shelf_h(i,j) = 0.0; ISS%hmask(i,j) = 0.0
+      endif
+    enddo; enddo
   endif
 
   do j=jsc,jec; do i=isc,iec
