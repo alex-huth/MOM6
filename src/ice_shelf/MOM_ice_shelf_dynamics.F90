@@ -34,7 +34,7 @@ implicit none ; private
 
 #include <MOM_memory.h>
 
-public register_ice_shelf_dyn_restarts, initialize_ice_shelf_dyn, update_ice_shelf
+public register_ice_shelf_dyn_restarts, initialize_ice_shelf_dyn, update_ice_shelf, IS_dynamics_post_data
 public ice_time_step_CFL, ice_shelf_dyn_end, change_in_draft, write_ice_shelf_energy
 public shelf_advance_front, ice_shelf_min_thickness_calve, calve_to_mask
 
@@ -777,6 +777,15 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
        'taub', 'MPa s m-1', conversion=1e-6*US%RL2_T2_to_Pa/(365.0*86400.0*US%L_T_to_m_s))
     CS%id_OD_av = register_diag_field('ice_shelf_model','OD_av',CS%diag%axesT1, Time, &
        'intermediate ocean column thickness passed to ice model', 'm', conversion=US%Z_to_m)
+
+    !Update these variables so that they are nonzero in case
+    !IS_dynamics_post_data is called before update_ice_shelf
+    if (CS%id_taudx_shelf>0 .or. CS%id_taudy_shelf>0) &
+      call calc_shelf_driving_stress(CS, ISS, G, US, CS%taudx_shelf, CS%taudy_shelf, CS%OD_av)
+    if (CS%id_taub>0) &
+      call calc_shelf_taub(CS, ISS, G, US, CS%u_shelf, CS%v_shelf)
+    if (CS%id_visc_shelf>0) &
+      call calc_shelf_visc(CS, ISS, G, US, CS%u_shelf, CS%v_shelf)
   endif
 
   if (new_sim) then
@@ -870,11 +879,6 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
   logical,      optional, intent(in)    :: coupled_grounding !< If true, the grounding line is
                                               !! determined by coupled ice-ocean dynamics
   logical,      optional, intent(in)    :: must_update_vel !< Always update the ice velocities if true.
-  real, dimension(SZDIB_(G),SZDJB_(G))  :: taud_x, taud_y  !<area-averaged driving stress [R L2 T-2 ~> Pa]
-  real, dimension(SZDI_(G),SZDJ_(G))  :: ice_visc !< area-averaged vertically integrated ice viscosity
-                                              !! [R L2 Z T-1 ~> Pa s m]
-  real, dimension(SZDI_(G),SZDJ_(G))  :: basal_tr !< area-averaged taub_beta field related to basal traction,
-                                              !! [R L1 T-1 ~> Pa s m-1]
   integer :: iters
   logical :: update_ice_vel, coupled_GL
 
@@ -903,12 +907,25 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
 
   if (update_ice_vel) then
     call ice_shelf_solve_outer(CS, ISS, G, US, CS%u_shelf, CS%v_shelf,CS%taudx_shelf,CS%taudy_shelf, iters, Time)
+    CS%elapsed_velocity_time = 0.0
   endif
 
 ! call ice_shelf_temp(CS, ISS, G, US, time_step, ISS%water_flux, Time)
 
-  if (CS%elapsed_velocity_time >= CS%velocity_update_time_step) then
-    call enable_averages(CS%elapsed_velocity_time, Time, CS%diag)
+end subroutine update_ice_shelf
+
+!> Ice shelf dynamics post_data calls
+subroutine IS_dynamics_post_data(time_step, Time, CS, G)
+  real :: time_step !< Length of time for post data averaging [T ~> s].
+  type(time_type),        intent(in)    :: Time !< The current model time
+  type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in) :: G  !< The grid structure used by the ice shelf.
+  real, dimension(SZDIB_(G),SZDJB_(G))  :: taud_x, taud_y  !<area-averaged driving stress [R L2 T-2 ~> Pa]
+  real, dimension(SZDI_(G),SZDJ_(G))  :: ice_visc !< area-averaged vertically integrated ice viscosity
+                                                  !! [R L2 Z T-1 ~> Pa s m]
+  real, dimension(SZDI_(G),SZDJ_(G))  :: basal_tr !< area-averaged taub_beta field related to basal traction,
+                                                  !! [R L1 T-1 ~> Pa s m-1]
+    call enable_averages(time_step, Time, CS%diag)
     if (CS%id_col_thick > 0) call post_data(CS%id_col_thick, CS%OD_av, CS%diag)
     if (CS%id_u_shelf > 0) call post_data(CS%id_u_shelf, CS%u_shelf, CS%diag)
     if (CS%id_v_shelf > 0) call post_data(CS%id_v_shelf, CS%v_shelf, CS%diag)
@@ -937,7 +954,6 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
       basal_tr(:,:) = CS%basal_traction(:,:)*G%IareaT(:,:)
       call post_data(CS%id_taub, basal_tr, CS%diag)
     endif
-!!
     if (CS%id_u_mask > 0) call post_data(CS%id_u_mask, CS%umask, CS%diag)
     if (CS%id_v_mask > 0) call post_data(CS%id_v_mask, CS%vmask, CS%diag)
     if (CS%id_ufb_mask > 0) call post_data(CS%id_ufb_mask, CS%u_face_mask_bdry, CS%diag)
@@ -945,11 +961,7 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
 !   if (CS%id_t_mask > 0) call post_data(CS%id_t_mask, CS%tmask, CS%diag)
 
     call disable_averaging(CS%diag)
-
-    CS%elapsed_velocity_time = 0.0
-  endif
-
-end subroutine update_ice_shelf
+end subroutine IS_dynamics_post_data
 
 !>  Writes the total ice shelf kinetic energy and mass to an ascii file
 subroutine write_ice_shelf_energy(CS, G, US, mass, day, time_step)
