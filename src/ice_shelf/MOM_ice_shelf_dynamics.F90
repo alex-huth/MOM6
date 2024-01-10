@@ -1179,19 +1179,12 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
     call shelf_advance_front(CS, ISS, G, ISS%hmask, uh_ice, vh_ice)
     !add mass of the partially-filled cells to calving field, which is used to initialize icebergs
     !Then, remove the partially-filled cells from the ice shelf
-    !Note that the ocean_public_type calving and calving_hflx point
-    !to ISS%calving and ISS%calving_hflx, repectively
     do j=jsc,jec; do i=isc,iec
       if (ISS%hmask(i,j)==2) then
-        ISS%calving(i,j) = ISS%calving(i,j) + &
-          ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) * CS%density_ice / (G%areaT(i,j) * time_step) !kg/m2s
-        !is this correct (which Cp and T do you use?) See river definition of calving_hflx?
-        !see MOM_forcing_type.F90...why use heat capacity of seawater there.
-        !here, we use Cp_ice of freshwater, and dT is the shelf temperature (maybe should be
-        !shelf temperature - local seawater temperature?)
-        ISS%calving_hflx(i,j) = ISS%calving_hflx(i,j) + &
-          CS%Cp_ice * ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) * &
-          CS%density_ice * abs(CS%t_shelf(i,j)) / G%areaT(i,j)  !W/m2
+        ISS%calving(i,j) = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) * &
+                           CS%density_ice / (G%areaT(i,j) * time_step)
+        ISS%calving_hflx(i,j) = CS%Cp_ice * ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) * &
+                                CS%density_ice * CS%t_shelf(i,j) / G%areaT(i,j)
         ISS%h_shelf(i,j) = 0.0; ISS%area_shelf_h(i,j) = 0.0; ISS%hmask(i,j) = 0.0
       endif
     enddo; enddo
@@ -3111,10 +3104,9 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
   real :: umid, vmid, unorm, eps_min ! Velocities [L T-1 ~> m s-1]
   real :: alpha !Coulomb coefficient [nondim]
   real :: Hf !"floatation thickness" for Coulomb friction [Z ~> m]
-
-  real :: fN !Effective pressure (ice pressure - ocean pressure) for Coulomb friction [R L2 T-2 ~> Pa]
+  real :: fN !Effective pressure (ice pressure - ocean pressure) for Coulomb friction [Pa]
   real :: fB !for Coulomb Friction [(T L-1)^CS%CF_PostPeak ~> (s m-1)^CS%CF_PostPeak]
-  real :: fN_scale !To convert effective pressure to mks units during Coulomb friction
+  real :: fN_scale !To convert effective pressure to mks units during Coulomb friction [Pa T2 R-1 L-2 ~> 1]
 
 
   isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
