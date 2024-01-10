@@ -1179,19 +1179,12 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
     call shelf_advance_front(CS, ISS, G, ISS%hmask, uh_ice, vh_ice)
     !add mass of the partially-filled cells to calving field, which is used to initialize icebergs
     !Then, remove the partially-filled cells from the ice shelf
-    !Note that the ocean_public_type calving and calving_hflx point
-    !to ISS%calving and ISS%calving_hflx, repectively
     do j=jsc,jec; do i=isc,iec
       if (ISS%hmask(i,j)==2) then
-        ISS%calving(i,j) = ISS%calving(i,j) + &
-          ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) * CS%density_ice / (G%areaT(i,j) * time_step) !kg/m2s
-        !is this correct (which Cp and T do you use?) See river definition of calving_hflx?
-        !see MOM_forcing_type.F90...why use heat capacity of seawater there.
-        !here, we use Cp_ice of freshwater, and dT is the shelf temperature (maybe should be
-        !shelf temperature - local seawater temperature?)
-        ISS%calving_hflx(i,j) = ISS%calving_hflx(i,j) + &
-          CS%Cp_ice * ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) * &
-          CS%density_ice * abs(CS%t_shelf(i,j)) / G%areaT(i,j)  !W/m2
+        ISS%calving(i,j) = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) * &
+                           CS%density_ice / (G%areaT(i,j) * time_step)
+        ISS%calving_hflx(i,j) = CS%Cp_ice * ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) * &
+                                CS%density_ice * CS%t_shelf(i,j) / G%areaT(i,j)
         ISS%h_shelf(i,j) = 0.0; ISS%area_shelf_h(i,j) = 0.0; ISS%hmask(i,j) = 0.0
       endif
     enddo; enddo

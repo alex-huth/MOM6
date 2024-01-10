@@ -854,7 +854,7 @@ subroutine ice_sheet_calving_to_ocean_sfc(CS,US,calving,calving_hflx)
   ISS => CS%ISS
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
 
-  calving = US%RZ_to_kg_m2 * ISS%calving(is:ie, js:je)
+  calving = US%RZ_T_to_kg_m2s * ISS%calving(is:ie,js:je)
   calving_hflx = US%QRZ_T_to_W_m2 * ISS%calving_hflx(is:ie,js:je)
 
   CS%calve_ice_shelf_bergs=.true.
