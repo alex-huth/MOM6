@@ -50,7 +50,7 @@ type, public :: ice_shelf_state
                                !! at the ice-ocean interface [C ~> degC].
 
     !only active when calve_point_bergs_from_static_shelf_front=.true.:
-    calving => NULL(), &       !< The mass per unit area of the ice shelf to convert to
+    calving => NULL(), &       !< The mass flux per unit area of the ice shelf to convert to
                                !!bergs [RZ_T ~> kg m-2 s-1].
     calving_hflx => NULL()     !< Calving heat flux [Q R Z T-1 ~> W m-2].
 end type ice_shelf_state
