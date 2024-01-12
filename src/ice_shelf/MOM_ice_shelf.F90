@@ -77,7 +77,7 @@ implicit none ; private
 public shelf_calc_flux, initialize_ice_shelf, ice_shelf_end, ice_shelf_query
 public ice_shelf_save_restart, solo_step_ice_shelf, add_shelf_forces
 public initialize_ice_shelf_fluxes, initialize_ice_shelf_forces
-public ice_sheet_calving_to_ocean_sfc
+public ice_sheet_calving_to_ocean_sfc, get_ice_shelf_mass_stock, get_ice_shelf_heat_stock
 
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
 ! consistency testing. These are noted in comments with units like Z, H, L, and T, along with
@@ -1299,6 +1299,7 @@ subroutine add_shelf_flux(G, US, CS, sfc_state, fluxes, time_step)
         call change_in_draft(CS%dCS, G, last_h_shelf, ISS%h_shelf, delta_draft)
 
         !this currently assumes area_shelf_h is constant over the time step
+        !should area in each of these global_area_integral calls actually be G%areaT?
         delta_mass_shelf = global_area_integral(delta_draft, G, tmp_scale=US%RZ_to_kg_m2, &
                                                 area=ISS%area_shelf_h) &
                                                 * CS%Rho_ocn / CS%time_step
@@ -2419,6 +2420,32 @@ subroutine update_shelf_mass(G, US, CS, ISS, Time)
   call pass_var(ISS%mass_shelf, G%domain, complete=.true.)
 
 end subroutine update_shelf_mass
+
+!> Return globally-integrated ice-sheet mass
+function get_ice_shelf_mass_stock(CS, G, US, on_PE_only)
+  type(ice_shelf_CS),    intent(in)    :: CS  !< A pointer to the ice shelf control structure
+  type(ocean_grid_type), intent(inout) :: G   !< The ocean's grid structure.
+  type(unit_scale_type), intent(in)    :: US  !< A dimensional unit scaling type
+  logical, optional, intent(in)  :: on_PE_only !< If present and true, only sum on the local PE.
+  real :: get_ice_shelf_mass_stock !< The globally integrated ice-sheet mass
+
+  get_ice_shelf_mass_stock = global_area_integral(CS%ISS%mass_shelf, G, tmp_scale=US%RZ_to_kg_m2, &
+                                                  on_PE_only=on_PE_only)
+end function get_ice_shelf_mass_stock
+
+!> Return globally-integrated ice-sheet heat
+function get_ice_shelf_heat_stock(CS, G, US, on_PE_only)
+  type(ice_shelf_CS),    intent(in)    :: CS  !< A pointer to the ice shelf control structure
+  type(ocean_grid_type), intent(inout) :: G   !< The ocean's grid structure.
+  type(unit_scale_type), intent(in)    :: US  !< A dimensional unit scaling type
+  logical, optional, intent(in)  :: on_PE_only !< If present and true, only sum on the local PE.
+  real :: get_ice_shelf_heat_stock !< The globally integrated ice-sheet heat
+
+  get_ice_shelf_heat_stock = US%Q_to_J_kg * CS%Cp_ice *
+                             global_area_integral(CS%ISS_mass_shelf*CS%t_shelf, G, &
+                                                  tmp_scale=US%RZ_to_kg_m2 * US%C_to_degC, &
+                                                  on_PE_only=on_PE_only)
+end function get_ice_shelf_heat_stock
 
 !> Save the ice shelf restart file
 subroutine ice_shelf_query(CS, G, frac_shelf_h, mass_shelf, data_override_shelf_fluxes)

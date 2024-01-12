@@ -169,6 +169,7 @@ use MOM_offline_main,          only : offline_redistribute_residual, offline_dia
 use MOM_offline_main,          only : offline_fw_fluxes_into_ocean, offline_fw_fluxes_out_ocean
 use MOM_offline_main,          only : offline_advection_layer, offline_transport_end
 use MOM_ice_shelf,             only : ice_shelf_CS, ice_shelf_query, initialize_ice_shelf
+use MOM_ice_shelf,             only : get_ice_shelf_mass_stock, get_ice_shelf_heat_stock
 use MOM_particles_mod,         only : particles, particles_init, particles_run, particles_save_restart, particles_end
 use MOM_particles_mod,         only : particles_to_k_space, particles_to_z_space
 implicit none ; private
@@ -4133,11 +4134,12 @@ subroutine get_MOM_state_elements(CS, G, GV, US, C_p, C_p_scaled, use_temp)
 end subroutine get_MOM_state_elements
 
 !> Find the global integrals of various quantities.
-subroutine get_ocean_stocks(CS, mass, heat, salt, on_PE_only)
+subroutine get_ocean_stocks(CS, mass, heat, salt, ice_shelf_CSp, on_PE_only)
   type(MOM_control_struct), intent(inout) :: CS !< MOM control structure
   real,    optional, intent(out) :: heat  !< The globally integrated integrated ocean heat [J].
   real,    optional, intent(out) :: salt  !< The globally integrated integrated ocean salt [kg].
   real,    optional, intent(out) :: mass  !< The globally integrated integrated ocean mass [kg].
+  type(ice_shelf_CS), optional,     pointer :: ice_shelf_CSp !< A pointer to an ice shelf control structure
   logical, optional, intent(in)  :: on_PE_only !< If present and true, only sum on the local PE.
 
   if (present(mass)) &
@@ -4148,6 +4150,12 @@ subroutine get_ocean_stocks(CS, mass, heat, salt, on_PE_only)
   if (present(salt)) &
     salt = 1.0e-3 * global_mass_integral(CS%h, CS%G, CS%GV, CS%tv%S, on_PE_only=on_PE_only, unscale=CS%US%S_to_ppt)
 
+  if (present(ice_shelf_CSp)) then !add ice shelf contribution
+    if (present(mass)) &
+      mass = mass + get_ice_shelf_mass_stock(ice_shelf_CSp, G, CS%US, on_PE_only)
+    if (present(heat)) &
+      heat = heat + get_ice_shelf_heat_stock(ice_shelf_CSp, G, CS%US, on_PE_only)
+  endif
 end subroutine get_ocean_stocks
 
 

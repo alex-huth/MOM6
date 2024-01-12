@@ -1040,15 +1040,15 @@ subroutine Ocean_stock_pe(OS, index, value, time_index)
   select case (index)
     case (ISTOCK_WATER)  ! Return the mass of fresh water in the ocean in [kg].
       if (OS%GV%Boussinesq) then
-        call get_ocean_stocks(OS%MOM_CSp, mass=value, on_PE_only=.true.)
+        call get_ocean_stocks(OS%MOM_CSp, mass=value, ice_shelf_CSp=OS%ice_shelf_CSp, on_PE_only=.true.)
       else  ! In non-Boussinesq mode, the mass of salt needs to be subtracted.
-        call get_ocean_stocks(OS%MOM_CSp, mass=value, salt=salt, on_PE_only=.true.)
+        call get_ocean_stocks(OS%MOM_CSp, mass=value, ice_shelf_CSp=OS%ice_shelf_CSp, salt=salt, on_PE_only=.true.)
         value = value - salt
       endif
     case (ISTOCK_HEAT)  ! Return the heat content of the ocean in [J].
-      call get_ocean_stocks(OS%MOM_CSp, heat=value, on_PE_only=.true.)
+      call get_ocean_stocks(OS%MOM_CSp, heat=value, ice_shelf_CSp=OS%ice_shelf_CSp, on_PE_only=.true.)
     case (ISTOCK_SALT)  ! Return the mass of the salt in the ocean in [kg].
-      call get_ocean_stocks(OS%MOM_CSp, salt=value, on_PE_only=.true.)
+      call get_ocean_stocks(OS%MOM_CSp, salt=value, ice_shelf_CSp=OS%ice_shelf_CSp, on_PE_only=.true.)
     case default ; value = 0.0
   end select
   ! If the FMS coupler is changed so that Ocean_stock_PE is only called on

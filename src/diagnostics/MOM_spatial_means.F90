@@ -155,7 +155,7 @@ end function global_area_mean_u
 
 !> Return the global area integral of a variable, by default using the masked area from the
 !! grid, but an alternate could be used instead.  This uses reproducing sums.
-function global_area_integral(var, G, scale, area, tmp_scale, unscale)
+function global_area_integral(var, G, scale, area, tmp_scale, unscale, on_PE_only)
   type(ocean_grid_type),            intent(in)  :: G     !< The ocean's grid structure
   real, dimension(SZI_(G),SZJ_(G)), intent(in)  :: var   !< The variable to integrate in
                                                          !! arbitrary, possibly rescaled units [A ~> a]
@@ -173,13 +173,15 @@ function global_area_integral(var, G, scale, area, tmp_scale, unscale)
                                                          !! is preferred and takes precedence if both are present.
   real :: global_area_integral !< The returned area integral, usually in the units of var times an area,
                                !! [a m2] or [A m2 ~> a m2] depending on which optional arguments are provided
-
+  logical,       optional, intent(in)  :: on_PE_only  !< If present and true, the sum is only done
+                                                      !! on the local PE, and it is _not_ order invariant.
   ! Local variables
   ! In the following comments, [A] is used to indicate the arbitrary, possibly rescaled units of the
   ! input array while [a] indicates the unscaled (e.g., mks) units that can be used with the reproducing sums
   real, dimension(SZI_(G),SZJ_(G)) :: tmpForSumming ! An unscaled cell integral [a m2]
   real :: scalefac  ! An overall scaling factor for the areas and variable, perhaps in [m2 a A-1 L-2 ~> 1]
   real :: temp_scale ! A temporary scaling factor [a A-1 ~> 1] or [1]
+  logical :: global_sum ! If true do the sum globally, but if false only do the sum on the current PE.
   integer :: i, j, is, ie, js, je
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
 
@@ -199,7 +201,15 @@ function global_area_integral(var, G, scale, area, tmp_scale, unscale)
     enddo ; enddo
   endif
 
-  global_area_integral = reproducing_sum(tmpForSumming)
+  global_sum = .true. ; if (present(on_PE_only)) global_sum = .not.on_PE_only
+  if (global_sum) then
+    global_area_integral = reproducing_sum(tmpForSumming)
+  else
+    global_area_integral = 0.0
+    do j=js,je ; do i=is,ie
+      global_area_integral = global_area_integral + tmpForSumming(i,j)
+    enddo ; enddo
+  endif
 
   if ((temp_scale /= 0.0) .and. (temp_scale /= 1.0)) &
     global_area_integral = global_area_integral / temp_scale
