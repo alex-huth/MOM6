@@ -658,7 +658,6 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     call pass_var(CS%h_bdry_val, G%domain, complete=.true.)
     call pass_var(CS%ice_visc, G%domain)
 
-    call pass_vector(CS%u_shelf, CS%v_shelf, G%domain, TO_ALL, BGRID_NE, complete=.false.)
     call pass_vector(CS%u_bdry_val, CS%v_bdry_val, G%domain, TO_ALL, BGRID_NE, complete=.false.)
     call pass_vector(CS%u_face_mask_bdry, CS%v_face_mask_bdry, G%domain, TO_ALL, BGRID_NE, complete=.true.)
     call update_velocity_masks(CS, G, ISS%hmask, CS%umask, CS%vmask, CS%u_face_mask, CS%v_face_mask)
@@ -700,6 +699,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         endif
       enddo ; enddo
     endif
+    call pass_vector(CS%u_shelf, CS%v_shelf, G%domain, TO_ALL, BGRID_NE)
   endif
 
   if (active_shelf_dynamics) then
@@ -759,7 +759,21 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       call pass_var(CS%ground_frac, G%domain, complete=.false.)
       call pass_var(CS%bed_elev, G%domain, complete=.true.)
       call update_velocity_masks(CS, G, ISS%hmask, CS%umask, CS%vmask, CS%u_face_mask, CS%v_face_mask)
+
+      do J=Jsdq,Jedq ; do I=Isdq,Iedq
+        if (CS%umask(I,J) == 3) then
+          CS%u_shelf(I,J) = CS%u_bdry_val(I,J)
+        elseif (CS%umask(I,J) == 0) then
+          CS%u_shelf(I,J) = 0
+        endif
+        if (CS%vmask(I,J) == 3) then
+          CS%v_shelf(I,J) = CS%v_bdry_val(I,J)
+        elseif (CS%vmask(I,J) == 0) then
+          CS%v_shelf(I,J) = 0
+        endif
+      enddo ; enddo
     endif
+
   ! Register diagnostics.
     CS%id_u_shelf = register_diag_field('ice_shelf_model','u_shelf',CS%diag%axesB1, Time, &
        'x-velocity of ice', 'm yr-1', conversion=365.0*86400.0*US%L_T_to_m_s)
@@ -1298,6 +1312,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     enddo ; enddo
 
     call pass_var(CS%float_cond, G%Domain, complete=.false.)
+    call pass_var(CS%ground_frac, G%domain, complete=.false.)
 
   endif
 
