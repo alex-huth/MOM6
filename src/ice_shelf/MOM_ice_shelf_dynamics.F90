@@ -1679,7 +1679,7 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
       if (CS%vmask(I,J) == 1) then
         v_shlf(I,J) = v_shlf(I,J) + alpha_k * Dv(I,J)
         Rv(I,J) = Rv(I,J) - alpha_k * Av(I,J)
-        if (DIAGu(I,J)/=0) Zv(I,J) = Rv(I,J) / DIAGv(I,J)
+        if (DIAGv(I,J)/=0) Zv(I,J) = Rv(I,J) / DIAGv(I,J)
       endif
     enddo; enddo
 
