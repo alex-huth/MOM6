@@ -54,6 +54,7 @@ use MOM_ice_shelf_dynamics, only : register_ice_shelf_dyn_restarts, initialize_i
 use MOM_ice_shelf_dynamics, only : ice_shelf_min_thickness_calve, change_in_draft
 use MOM_ice_shelf_dynamics, only : ice_time_step_CFL, ice_shelf_dyn_end, IS_dynamics_post_data
 use MOM_ice_shelf_dynamics, only : volume_above_floatation, masked_var_grounded
+use MOM_ice_shelf_dynamics, only : global_area_integral_IS_heat
 use MOM_ice_shelf_initialize, only : initialize_ice_thickness
 !MJH use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary
 use MOM_ice_shelf_state, only : ice_shelf_state, ice_shelf_state_end, ice_shelf_state_init
@@ -77,7 +78,8 @@ implicit none ; private
 public shelf_calc_flux, initialize_ice_shelf, ice_shelf_end, ice_shelf_query
 public ice_shelf_save_restart, solo_step_ice_shelf, add_shelf_forces
 public initialize_ice_shelf_fluxes, initialize_ice_shelf_forces
-public ice_sheet_calving_to_ocean_sfc, get_ice_shelf_mass_stock, get_ice_shelf_heat_stock
+public ice_sheet_calving_to_ocean_sfc, get_ice_shelf_mass_stock
+public get_ice_shelf_heat_stock
 
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
 ! consistency testing. These are noted in comments with units like Z, H, L, and T, along with
@@ -2441,10 +2443,7 @@ function get_ice_shelf_heat_stock(CS, G, US, on_PE_only)
   logical, optional, intent(in)  :: on_PE_only !< If present and true, only sum on the local PE.
   real :: get_ice_shelf_heat_stock !< The globally integrated ice-sheet heat
 
-  get_ice_shelf_heat_stock = US%Q_to_J_kg * CS%Cp_ice *
-                             global_area_integral(CS%ISS_mass_shelf*CS%t_shelf, G, &
-                                                  tmp_scale=US%RZ_to_kg_m2 * US%C_to_degC, &
-                                                  on_PE_only=on_PE_only)
+  get_ice_shelf_heat_stock = global_area_integral_IS_heat(CS%dCS, CS%ISS, G, US, on_PE_only=on_PE_only)
 end function get_ice_shelf_heat_stock
 
 !> Save the ice shelf restart file

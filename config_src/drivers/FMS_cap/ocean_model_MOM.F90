@@ -42,7 +42,7 @@ use MOM_string_functions, only : uppercase
 use MOM_surface_forcing_gfdl, only : surface_forcing_init, convert_IOB_to_fluxes
 use MOM_surface_forcing_gfdl, only : convert_IOB_to_forces, ice_ocn_bnd_type_chksum
 use MOM_surface_forcing_gfdl, only : ice_ocean_boundary_type, surface_forcing_CS
-use MOM_surface_forcing_gfdl, only : forcing_save_restart
+use MOM_surface_forcing_gfdl, only : forcing_save_restart, land_ocean_boundary_type
 use MOM_time_manager, only : time_type, operator(>), operator(+), operator(-)
 use MOM_time_manager, only : operator(*), operator(/), operator(/=)
 use MOM_time_manager, only : operator(<=), operator(>=), operator(<)
@@ -70,7 +70,7 @@ implicit none ; private
 
 public ocean_model_init, ocean_model_end, update_ocean_model
 public ocean_model_save_restart, Ocean_stock_pe
-public ice_ocean_boundary_type
+public ice_ocean_boundary_type, land_ocean_boundary_type
 public ocean_model_init_sfc, ocean_model_flux_init
 public ocean_model_restart
 public ice_ocn_bnd_type_chksum
@@ -437,7 +437,8 @@ end subroutine ocean_model_init
 !! storing the new ocean properties in Ocean_state.
 subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_update, &
                               Ocean_coupling_time_step, update_dyn, update_thermo, &
-                              Ocn_fluxes_used, start_cycle, end_cycle, cycle_length)
+                              Ocn_fluxes_used, start_cycle, end_cycle, cycle_length,&
+                              Land_ocean_boundary)
   type(ice_ocean_boundary_type), &
                      intent(in)    :: Ice_ocean_boundary !< A structure containing the various
                                               !! forcing fields coming from the ice and atmosphere.
@@ -465,7 +466,9 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
                                               !! treated as the last call to step_MOM in a
                                               !! time-stepping cycle; missing is like true.
   real,    optional, intent(in)    :: cycle_length !< The duration of a coupled time stepping cycle [s].
-
+  type(land_ocean_boundary_type), &
+           optional, intent(in)    :: Land_ocean_boundary !< A structure containing the surface fluxes
+                                              !! between the land and the ice sheet
   ! Local variables
   type(time_type) :: Time_seg_start ! Stores the dynamic or thermodynamic ocean model time at the
                             ! start of this call to allow step_MOM to temporarily change the time
@@ -538,7 +541,7 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
   if (do_thermo) then
     if (OS%fluxes%fluxes_used) then
       call convert_IOB_to_fluxes(Ice_ocean_boundary, OS%fluxes, index_bnds, OS%Time, dt_coupling, &
-                                 OS%grid, OS%US, OS%forcing_CSp, OS%sfc_state)
+                                 OS%grid, OS%US, OS%forcing_CSp, OS%sfc_state, Land_ocean_boundary)
 
       ! Add ice shelf fluxes
       if (OS%use_ice_shelf) &
@@ -557,7 +560,7 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
       ! into a temporary type and then accumulate them in about 20 lines.
       OS%flux_tmp%C_p = OS%fluxes%C_p
       call convert_IOB_to_fluxes(Ice_ocean_boundary, OS%flux_tmp, index_bnds, OS%Time, dt_coupling, &
-                                 OS%grid, OS%US, OS%forcing_CSp, OS%sfc_state)
+                                 OS%grid, OS%US, OS%forcing_CSp, OS%sfc_state, Land_ocean_boundary)
 
       if (OS%use_ice_shelf) &
         call shelf_calc_flux(OS%sfc_state, OS%flux_tmp, OS%Time,dt_coupling, OS%Ice_shelf_CSp)

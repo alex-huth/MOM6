@@ -30,6 +30,7 @@ use MOM_checksums, only : hchksum, qchksum
 use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary_channel,initialize_ice_flow_from_file
 use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary_from_file,initialize_ice_C_basal_friction
 use MOM_ice_shelf_initialize, only : initialize_ice_AGlen
+use MOM_spatial_means, only : global_area_integral
 implicit none ; private
 
 #include <MOM_memory.h>
@@ -37,7 +38,7 @@ implicit none ; private
 public register_ice_shelf_dyn_restarts, initialize_ice_shelf_dyn, update_ice_shelf, IS_dynamics_post_data
 public ice_time_step_CFL, ice_shelf_dyn_end, change_in_draft, write_ice_shelf_energy
 public shelf_advance_front, ice_shelf_min_thickness_calve, calve_to_mask, volume_above_floatation
-public masked_var_grounded
+public masked_var_grounded, global_area_integral_IS_heat
 
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
 ! consistency testing. These are noted in comments with units like Z, H, L, and T, along with
@@ -4165,5 +4166,21 @@ subroutine ice_shelf_advect_temp_y(CS, G, time_step, hmask, h_after_uflux, h_aft
   enddo ! i loop
 
 end subroutine ice_shelf_advect_temp_y
+
+!> Return globally-integrated ice-sheet heat
+function global_area_integral_IS_heat(CS, ISS, G, US, on_PE_only)
+  type(ice_shelf_dyn_CS),    intent(in)    :: CS  !< A pointer to the ice shelf dynamics control structure
+  type(ice_shelf_state),  intent(inout) :: ISS !< A structure with elements that describe
+                                               !! the ice-shelf state
+  type(ocean_grid_type), intent(inout) :: G   !< The ocean's grid structure.
+  type(unit_scale_type), intent(in)    :: US  !< A dimensional unit scaling type
+  logical, optional, intent(in)  :: on_PE_only !< If present and true, only sum on the local PE.
+  real :: global_area_integral_IS_heat !< The globally integrated ice-sheet heat
+
+  global_area_integral_IS_heat = US%Q_to_J_kg * CS%Cp_ice * &
+                                 global_area_integral(ISS%mass_shelf*CS%t_shelf, G, &
+                                                      tmp_scale=US%RZ_to_kg_m2 * US%C_to_degC, &
+                                                      on_PE_only=on_PE_only)
+end function global_area_integral_IS_heat
 
 end module MOM_ice_shelf_dynamics
