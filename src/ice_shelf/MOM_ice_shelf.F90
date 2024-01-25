@@ -841,8 +841,8 @@ end subroutine shelf_calc_flux
 subroutine ice_sheet_calving_to_ocean_sfc(CS,US,calving,calving_hflx)
   type(ice_shelf_CS),      pointer :: CS        !< A pointer to the ice shelf control structure
   type(unit_scale_type), intent(in)    :: US   !< A dimensional unit scaling type
-  real, dimension(:,:), intent(inout) :: calving      !< The mass per unit area of the ice shelf
-                                                      !! to convert to bergs [R Z ~> kg m-2].
+  real, dimension(:,:), intent(inout) :: calving      !< The mass flux per unit area of the ice shelf
+                                                      !! to convert to bergs [R Z T-1 ~> kg m-2 s-1].
   real, dimension(:,:), intent(inout) :: calving_hflx !< Calving heat flux [Q R Z T-1 ~> W m-2].
   ! Local variables
   type(ice_shelf_state), pointer :: ISS => NULL() !< A structure with elements that describe
