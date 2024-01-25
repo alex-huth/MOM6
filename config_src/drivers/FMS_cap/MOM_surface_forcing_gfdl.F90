@@ -188,12 +188,14 @@ type, public :: ice_ocean_boundary_type
   real, pointer, dimension(:,:) :: fprec           =>NULL() !< mass flux of frozen precip [kg m-2 s-1]
   real, pointer, dimension(:,:) :: runoff          =>NULL() !< mass flux of liquid runoff [kg m-2 s-1]
   real, pointer, dimension(:,:) :: calving         =>NULL() !< mass flux of frozen runoff [kg m-2 s-1]
+!!$  real, pointer, dimension(:,:) :: shelf_sfc_mass_flux =>NULL() !< surface mass flux to ice sheet  [kg m-2 s-1]
   real, pointer, dimension(:,:) :: stress_mag      =>NULL() !< The time-mean magnitude of the stress on the ocean [Pa]
   real, pointer, dimension(:,:) :: ustar_berg      =>NULL() !< frictional velocity beneath icebergs [m s-1]
   real, pointer, dimension(:,:) :: area_berg       =>NULL() !< fractional area covered by icebergs [m2 m-2]
   real, pointer, dimension(:,:) :: mass_berg       =>NULL() !< mass of icebergs per unit ocean area [kg m-2]
   real, pointer, dimension(:,:) :: runoff_hflx     =>NULL() !< heat content of liquid runoff [W m-2]
   real, pointer, dimension(:,:) :: calving_hflx    =>NULL() !< heat content of frozen runoff [W m-2]
+!!$  real, pointer, dimension(:,:) :: shelf_sfc_mass_hflx =>NULL() !< heat content of surface mass flux to ice sheet [W m-2]
   real, pointer, dimension(:,:) :: p               =>NULL() !< pressure of overlying ice and atmosphere
                                                             !< on ocean surface [Pa]
   real, pointer, dimension(:,:) :: mi              =>NULL() !< mass of ice per unit ocean area [kg m-2]
@@ -210,6 +212,13 @@ type, public :: ice_ocean_boundary_type
                                       !! the surface_forcing_CS is used.
 end type ice_ocean_boundary_type
 
+!> land_ocean_boundary_type is a structure corresponding to forcing, but with the elements, units,
+!! and conventions that exactly conform to the use for MOM6-based coupled models.
+type, public :: land_ocean_boundary_type
+  real, pointer, dimension(:,:) :: shelf_sfc_mass_flux =>NULL() !< surface mass flux to ice sheet  [kg m-2 s-1]
+  real, pointer, dimension(:,:) :: shelf_sfc_mass_hflx =>NULL() !< heat content of surface mass flux to ice sheet [W m-2]
+end type land_ocean_boundary_type
+
 integer :: id_clock_forcing !< A CPU time clock
 
 contains
@@ -217,7 +226,9 @@ contains
 !> This subroutine translates the Ice_ocean_boundary_type into a MOM
 !! thermodynamic forcing type, including changes of units, sign conventions,
 !! and putting the fields into arrays with MOM-standard halos.
-subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G, US, CS, sfc_state)
+!! Optionally, a similar conversion of the Land_ocean_boundary_type ice-sheet surface flux fields
+!! can also be performed.
+subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G, US, CS, sfc_state, LOB)
   type(ice_ocean_boundary_type), &
                    target, intent(in)    :: IOB    !< An ice-ocean boundary type with fluxes to drive
                                                    !! the ocean in a coupled model
@@ -235,7 +246,9 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
                                                    !! previous call to surface_forcing_init.
   type(surface),           intent(in)    :: sfc_state !< A structure containing fields that describe the
                                                    !! surface state of the ocean.
-
+  type(land_ocean_boundary_type), optional, &
+                   target, intent(in)    :: LOB    !< A land-ocean boundary type with fluxes to drive
+                                                   !! the ice sheet in a coupled model
   real, dimension(SZI_(G),SZJ_(G)) :: &
     data_restore,  & ! The surface value toward which to restore [S ~> ppt] or [C ~> degC]
     SST_anom,      & ! Instantaneous sea surface temperature anomalies from a target value [C ~> degC]
@@ -549,6 +562,15 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
     else
       fluxes%sw(i,j) = (fluxes%sw_vis_dir(i,j) + fluxes%sw_vis_dif(i,j)) + &
                        (fluxes%sw_nir_dir(i,j) + fluxes%sw_nir_dif(i,j))
+    endif
+
+    if (present(LOB)) then
+      if (associated(LOB%shelf_sfc_mass_flux)) then
+        fluxes%shelf_sfc_mass_flux(i,j) = kg_m2_s_conversion * LOB%shelf_sfc_mass_flux(i-i0,j-j0)
+      endif
+      if (associated(LOB%shelf_sfc_mass_hflx)) then
+        fluxes%heat_content_shelf_sfc_mass(i,j) = US%W_m2_to_QRZ_T * LOB%shelf_sfc_mass_hflx(i-i0,j-j0)
+      endif
     endif
 
   enddo ; enddo

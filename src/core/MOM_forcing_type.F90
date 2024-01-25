@@ -188,6 +188,8 @@ type, public :: forcing
                                  !! or freezing (negative) [R Z T-1 ~> kg m-2 s-1]
   real, pointer, dimension(:,:) :: shelf_sfc_mass_flux => NULL() !< Ice shelf surface mass flux
                                  !! deposition from the atmosphere. [R Z T-1 ~> kg m-2 s-1]
+  real, pointer, dimension(:,:) :: heat_content_shelf_sfc_mass => NULL() !< heat content for ice sheet
+                                 !! surface mass flux [Q R Z T-1 ~> W m-2]
 
   ! Scalars set by surface forcing modules
   real :: vPrecGlobalAdj = 0.     !< adjustment to restoring vprec to zero out global net [kg m-2 s-1]
@@ -2337,6 +2339,12 @@ subroutine fluxes_accumulate(flux_tmp, fluxes, G, wt2, forces)
       fluxes%shelf_sfc_mass_flux(i,j)  = flux_tmp%shelf_sfc_mass_flux(i,j)
     enddo ; enddo
   endif
+  if (associated(fluxes%heat_content_shelf_sfc_mass) &
+                 .and. associated(flux_tmp%heat_content_shelf_sfc_mass)) then
+    do i=isd,ied ; do j=jsd,jed
+      fluxes%heat_content_shelf_sfc_mass(i,j)  = flux_tmp%heat_content_shelf_sfc_mass(i,j)
+    enddo ; enddo
+  endif
   if (associated(fluxes%frac_shelf_h) .and. associated(flux_tmp%frac_shelf_h)) then
     do i=isd,ied ; do j=jsd,jed
       fluxes%frac_shelf_h(i,j)  = flux_tmp%frac_shelf_h(i,j)
@@ -3284,7 +3292,10 @@ subroutine allocate_forcing_by_group(G, fluxes, water, heat, ustar, press, &
     call myAlloc(fluxes%frac_shelf_h,isd,ied,jsd,jed, shelf)
     call myAlloc(fluxes%ustar_shelf,isd,ied,jsd,jed, shelf)
     call myAlloc(fluxes%iceshelf_melt,isd,ied,jsd,jed, shelf)
-    if (shelf_sfc_acc) call myAlloc(fluxes%shelf_sfc_mass_flux,isd,ied,jsd,jed, shelf_sfc_acc)
+    if (shelf_sfc_acc) then
+      call myAlloc(fluxes%shelf_sfc_mass_flux,isd,ied,jsd,jed, shelf_sfc_acc)
+      call myAlloc(fluxes%heat_content_shelf_sfc_mass,isd,ied,jsd,jed, shelf_sfc_acc)
+    endif
   endif; endif
 
   !These fields should only on allocated when iceberg area is being passed through the coupler.
@@ -3550,8 +3561,9 @@ subroutine deallocate_forcing_type(fluxes)
   if (associated(fluxes%ustar_tidal))          deallocate(fluxes%ustar_tidal)
   if (associated(fluxes%ustar_shelf))          deallocate(fluxes%ustar_shelf)
   if (associated(fluxes%iceshelf_melt))        deallocate(fluxes%iceshelf_melt)
-  if (associated(fluxes%shelf_sfc_mass_flux)) &
-                                               deallocate(fluxes%shelf_sfc_mass_flux)
+  if (associated(fluxes%shelf_sfc_mass_flux))  deallocate(fluxes%shelf_sfc_mass_flux)
+  if (associated(fluxes%heat_content_shelf_sfc_mass)) &
+                                               deallocate(fluxes%heat_content_shelf_sfc_mass)
   if (associated(fluxes%frac_shelf_h))         deallocate(fluxes%frac_shelf_h)
   if (associated(fluxes%ustar_berg))           deallocate(fluxes%ustar_berg)
   if (associated(fluxes%area_berg))            deallocate(fluxes%area_berg)
@@ -3659,6 +3671,7 @@ subroutine rotate_forcing(fluxes_in, fluxes, turns)
     call rotate_array(fluxes_in%ustar_shelf, turns, fluxes%ustar_shelf)
     call rotate_array(fluxes_in%iceshelf_melt, turns, fluxes%iceshelf_melt)
     call rotate_array(fluxes_in%shelf_sfc_mass_flux, turns, fluxes%shelf_sfc_mass_flux)
+    call rotate_array(fluxes_in%heat_content_shelf_sfc_mass, turns, fluxes%heat_content_shelf_sfc_mass)
   endif
 
   if (do_iceberg) then
@@ -3919,6 +3932,7 @@ subroutine homogenize_forcing(fluxes, G, GV, US)
     call homogenize_field_t(fluxes%ustar_shelf, G, tmp_scale=US%Z_to_m*US%s_to_T)
     call homogenize_field_t(fluxes%iceshelf_melt, G, tmp_scale=US%RZ_T_to_kg_m2s)
     call homogenize_field_t(fluxes%shelf_sfc_mass_flux, G, tmp_scale=US%RZ_T_to_kg_m2s)
+    call homogenize_field_t(fluxes%heat_content_shelf_sfc_mass, G, tmp_scale=US%RZ_T_to_kg_m2s)
   endif
 
   if (do_iceberg) then

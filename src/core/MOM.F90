@@ -167,7 +167,8 @@ use MOM_offline_main,          only : offline_redistribute_residual, offline_dia
 use MOM_offline_main,          only : offline_fw_fluxes_into_ocean, offline_fw_fluxes_out_ocean
 use MOM_offline_main,          only : offline_advection_layer, offline_transport_end
 use MOM_ice_shelf,             only : ice_shelf_CS, ice_shelf_query, initialize_ice_shelf
-use MOM_ice_shelf,             only : get_ice_shelf_mass_stock, get_ice_shelf_heat_stock
+use MOM_ice_shelf,             only : get_ice_shelf_mass_stock
+use MOM_ice_shelf,             only : get_ice_shelf_heat_stock
 use MOM_particles_mod,         only : particles, particles_init, particles_run, particles_save_restart, particles_end
 use MOM_particles_mod,         only : particles_to_k_space, particles_to_z_space
 implicit none ; private
@@ -4093,9 +4094,9 @@ subroutine get_ocean_stocks(CS, mass, heat, salt, ice_shelf_CSp, on_PE_only)
 
   if (present(ice_shelf_CSp)) then !add ice shelf contribution
     if (present(mass)) &
-      mass = mass + get_ice_shelf_mass_stock(ice_shelf_CSp, G, CS%US, on_PE_only)
+      mass = mass + get_ice_shelf_mass_stock(ice_shelf_CSp, CS%G, CS%US, on_PE_only)
     if (present(heat)) &
-      heat = heat + get_ice_shelf_heat_stock(ice_shelf_CSp, G, CS%US, on_PE_only)
+      heat = heat + get_ice_shelf_heat_stock(ice_shelf_CSp, CS%G, CS%US, on_PE_only)
   endif
 end subroutine get_ocean_stocks
 
