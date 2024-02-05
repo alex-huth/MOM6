@@ -4154,8 +4154,8 @@ subroutine get_ocean_stocks(CS, mass, heat, salt, ice_shelf_CSp, on_PE_only)
   if (present(ice_shelf_CSp)) then !add ice shelf contribution
     if (present(mass)) &
       mass = mass + get_ice_shelf_mass_stock(ice_shelf_CSp, CS%G, CS%US, on_PE_only)
-    if (present(heat)) &
-      heat = heat + get_ice_shelf_heat_stock(ice_shelf_CSp, CS%G, CS%US, on_PE_only)
+    !if (present(heat)) &
+    !  heat = heat + get_ice_shelf_heat_stock(ice_shelf_CSp, CS%G, CS%US, on_PE_only)
   endif
 end subroutine get_ocean_stocks
 
