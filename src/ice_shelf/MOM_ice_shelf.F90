@@ -199,6 +199,7 @@ type, public :: ice_shelf_CS ; private
   logical :: buoy_flux_itt_bug           !< If true, fixes buoyancy iteration bug
   logical :: salt_flux_itt_bug           !< If true, fixes salt iteration bug
   real :: buoy_flux_itt_threshold        !< Buoyancy iteration threshold for convergence
+  logical :: calve_tabular_bergs         !< If true, calve tabular iKID icebergs according to a calving mask file
 
   !>@{ Diagnostic handles
   integer :: id_melt = -1, id_exch_vel_s = -1, id_exch_vel_t = -1, &
@@ -790,6 +791,8 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
       ISS%dhdt_shelf(i,j) = (ISS%h_shelf(i,j) - ISS%dhdt_shelf(i,j))*Itime_step
     enddo; enddo
 
+if (CS%calve_tabular_bergs) call calve_bonded_bergs(G, CS%Grid, CS%TC, Time)
+
     call IS_dynamics_post_data(time_step, Time, CS%dCS, G)
   endif
 
@@ -1041,7 +1044,11 @@ subroutine add_shelf_pressure(Ocn_grid, US, CS, fluxes)
     call MOM_error(FATAL,"add_shelf_pressure: Incompatible ocean and ice shelf grids.")
 
   do j=js,je ; do i=is,ie
-    press_ice = (CS%ISS%area_shelf_h(i,j) * G%IareaT(i,j)) * (CS%g_Earth * CS%ISS%mass_shelf(i,j))
+    press_ice = (CS%ISS%area_shelf_h(i,j) * G%IareaT(i,j)) * (CS%g_Earth * CS%ISS%mass_shelf(i,j)) * &
+                (1.0-fluxes%KID_IS_ratio(i,j))
+    !pressure of nascent tabular berg is already added to fluxes%p_surf within ice model,
+    !which will be added to the pressure
+    !here as long as fluxes%accumulate_p_surf==.true.
     if (associated(fluxes%p_surf)) then
       if (.not.fluxes%accumulate_p_surf) fluxes%p_surf(i,j) = 0.0
       fluxes%p_surf(i,j) = fluxes%p_surf(i,j) + press_ice
@@ -1613,6 +1620,10 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
                  "Convergence criterion of Newton's method for ice shelf "//&
                  "buoyancy iteration.", units="nondim", default=1.0e-4)
 
+  call get_param(param_file, mdl, "CALVE_TABULAR_BERGS", CS%calve_tabular_bergs, &
+                 "If true, calve tabular iKID icebergs according to a calving mask file.",&
+                 default=.false.)
+
   if (PRESENT(sfc_state_in)) then
     allocate(sfc_state)
     ! assuming frazil is enabled in ocean. This could break some configurations?
@@ -1746,6 +1757,8 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
     !                                      ISS%hmask, G, param_file)
 
   endif
+
+  if (CS%calve_tabular_bergs) call initialize_tabular_calving(param_file, CS%TC, G)
 
   ! Set up the restarts.
 

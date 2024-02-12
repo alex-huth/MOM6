@@ -1,0 +1,638 @@
+!> Tabular calving routines for MOM6-IS.
+module MOM_ice_shelf_tabular_calving
+
+  ! This file is part of MOM6. See LICENSE.md for the license.
+
+use MOM_array_transform, only : rotate_array
+use mpp_mod, only : mpp_npes, mpp_pe, mpp_root_pe, NULL_PE
+use MOM_coms, only : max_across_PEs, min_across_PEs
+!use mpp_domains_mod, only: mpp_get_neighbor_pe, NORTH, SOUTH, EAST, WEST
+use MOM_cpu_clock, only : cpu_clock_id, cpu_clock_begin, cpu_clock_end
+use MOM_cpu_clock, only : CLOCK_COMPONENT, CLOCK_ROUTINE
+use MOM_dyn_horgrid, only : dyn_horgrid_type, create_dyn_horgrid, destroy_dyn_horgrid
+use MOM_error_handler, only : MOM_error, MOM_mesg, FATAL, WARNING, is_root_pe
+use MOM_file_parser, only : read_param, get_param, log_param, log_version, param_file_type
+use MOM_grid, only : MOM_grid_init, ocean_grid_type
+use MOM_get_input, only : directories, Get_MOM_input
+use MOM_coms, only : reproducing_sum
+use MOM_checksums, only : hchksum, qchksum, chksum, uchksum, vchksum, uvchksum
+use mpp_mod, only : mpp_sync_self
+use MOM_file_parser, only : read_param, get_param, log_param, log_version, param_file_type
+use MOM_io, only : slasher
+use MOM_interpolate, only : init_external_field
+
+  implicit none ; private
+
+public ice_shelf_state_end, ice_shelf_state_init
+
+!> Structure that describes the ice shelf calving state
+type, public :: tabular_calving_state
+  integer, pointer, dimension(:,:) :: &
+    calve_mask => NULL()       !< Mask used to indicate cells ready to be calved and
+                               !! converted to bonded-particle tabular icebergs
+                               !! 0: not ready to calve
+                               !! >1: ready to calve
+
+  integer, pointer, dimension(:,:) :: &
+    c_id => NULL()             !! integer field to identify each unique tabular iceberg
+
+  real, allocatable, dimension(:,:) :: &
+    berg_list                  !< list of each berg on the current PE, the other PEs it also
+                               !!overlaps, and the min and max coords of the berg on those PEs
+  integer :: berg_pe_count = 0 !< the sum of the number of PEs that each tabular berg on the
+                               !! current PE overlaps. Equals the length of berg_list
+  real :: tabular_rad          !< The radius of tabular iceberg particles upon calving (m)
+
+  logical :: tabular_calving_from_file !< If true, read in tabular calving mask from a file
+
+  logical :: debug             !< If true, write verbose output
+
+  type(external_field) :: calving_mask_handle
+  !< Handle for reading the time interpolated ice shelf tabular calving mask from a file
+end type tabular_calving_state
+
+contains
+
+
+!> Initializes ice shelf tabular calving data, parameters, and diagnostics
+subroutine initialize_tabular_calving(param_file, TC, G)
+  type(param_file_type),        intent(in)    :: param_file !< A structure to parse for run-time parameters
+  type(tabular_calving_state), pointer    :: TC !< A pointer to the tabular calving structure
+  type(ocean_grid_type), intent(in) :: G   !< The grid structure used by the ice shelf.
+  character(len=40) :: mdl = "MOM_ice_shelf_tabular_calving" ! This module's name
+  character(len=240) :: inputdir, TC_file, filename
+  character(len=120) :: TC_mask_var  ! The name of shelf mass in the file.
+  integer :: isd, ied, jsd, jed
+  isd = G%isd ; jsd = G%jsd ; ied = G%ied ; jed = G%jed
+
+  if (associated(TC)) then
+    call MOM_error(FATAL, "MOM_ice_shelf_calving.F90, initialize_tabular_calving: "// &
+                          "called with an associated tabular_calving pointer.")
+    return
+  endif
+
+  allocate(TC%c_id(isd:ied,jsd:jed), source=0.0 )
+  allocate(TC%calve_mask(isd:ied,jsd:jed), source=0.0 )
+
+  call get_param(param_file, mdl, "DEBUG", TC%debug, default=.false.)
+  call get_param(param_file, mdl, "TABULAR_BERG_PARTICLE_RADIUS", CS%tabular_rad, &
+                 "particle radius for iKID particles that calve from ice shelves",&
+                 units="m", default=1000.0, scale=US%m_to_L)
+
+  !In lieu of a tabular calving law or rifting model, we can currently only read in the tabular
+  !calving mask from a file
+  call get_param(param_file, mdl, "TABULAR_CALVING_MASK_FROM_FILE", &
+                 TC%tabular_calving_from_file, "Read the mass of the "//&
+                 "ice shelf (every time step) from a file.", default=.true.)
+
+  if (TC%tabular_calving_from_file) then
+
+    call time_interp_external_init()
+
+    call get_param(param_file, mdl, "INPUTDIR", inputdir, default=".")
+
+    inputdir = slasher(inputdir)
+
+    call get_param(param_file, mdl, "TABULAR_CALVING_MASK_FILE", TC_file, &
+            "If TABULAR_CALVING_MASK_FROM_FILE = True, this is the file from "//&
+            "which to read the tabular calving mask.", &
+            default="tabular_calving_mask.nc")
+
+    call get_param(param_file, mdl, "TABULAR_CALVING_MASK_VAR", TC_mask_var, &
+               "The variable in TABULAR_CALVING_MASK_FILE with the tabular calving mask.", &
+               default="tabular_calving_mask")
+
+    filename = trim(slasher(inputdir))//trim(TC_file)
+    call log_param(param_file, mdl, "INPUTDIR/TABULAR_CALVING_MASK_FILE", filename)
+
+    if (.not.file_exists(filename, G%Domain)) call MOM_error(FATAL, &
+         "initialize_tabular_calving: Unable to open "//trim(filename))
+
+    TC%calving_mask_handle = init_external_field(filename, TC_mask_var, &
+                          MOM_domain=G%Domain, verbose=TC%debug)
+  endif
+
+end subroutine initialize_tabular_calving
+
+!> Updates the ice shelf tabular calving mask using data from a file.
+subroutine update_tabular_calving_mask(G, G_in, TC, Time)
+  type(ocean_grid_type), intent(inout) :: G   !< The ocean's grid structure.
+  type(ocean_grid_type), intent(in)    :: G_in    !< The ocean's unrotated grid structure
+  type(ice_shelf_state), intent(inout) :: TC  !< The ice shelf tabular calving state type that is being updated
+  type(time_type),       intent(in)    :: Time !< The current model time
+
+  ! local variables
+  integer :: i, j, is, ie, js, je
+  real, allocatable, dimension(:,:)   :: tmp2d ! Temporary array for storing ice shelf input data
+
+
+  if (TC%tabular_calving_from_file) then
+    is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
+
+    if (CS%rotate_index) then
+      allocate(tmp1_2d(G_in%isd:G_in%ied,G_in%jsd:G_in%jed), source=0.0)
+    else
+      allocate(tmp2d(is:ie,js:je), source=0.0)
+    endif
+
+    call time_interp_external(CS%tabular_calving_handle, Time, tmp2d)
+    call rotate_array(tmp2d, CS%turns, TC%calve_mask)
+    deallocate(tmp2d)
+
+    !only calve where there is ice present.
+    do j=js,je ; do i=is,ie
+      if (area_shelf_h(i,j)<=0) TC%calve_mask(i,j)=0
+    enddo; enddo
+
+  else
+    !TODO: implement a tabular calving law here.
+    call MOM_error(FATAL, "Tabular calving is currently only possible by reading in the tabular calving mask "//&
+                   "from a file (see subourinte initialize_tabular_calving), i.e. there is not yet a tabular "//&
+                   "calving law."
+  endif
+
+  call pass_var(TC%calve_mask, G%domain, complete=.true.)
+end subroutine update_tabular_calving_mask
+
+!> Deallocates all memory associated with this module
+subroutine ice_shelf_calving_end(TC)
+  type(tabular_calving_state), pointer :: TC !< A pointer to the ice shelf calving structure
+
+  if (.not.associated(TC)) return
+
+  if (allocated(TC%berg_list)) deallocate(TC%berg_list)
+  deallocate(TC%calve_mask)
+  deallocate(TC%c_id)
+  deallocate(TC)
+end subroutine ice_shelf_calving_end
+
+!> Initialize iKID icebergs from a tabular calving mask.
+subroutine calve_bonded_bergs(bergs, G, G_in, TC, Time, h_shelf, frac_shelf_h)
+  ! Arguments
+  type(icebergs), pointer :: bergs !< Container for all types and memory
+  type(ocean_grid_type), intent(in) :: G   !< The grid structure used by the ice shelf.
+  type(ocean_grid_type), intent(in)    :: G_in    !< The ocean's unrotated grid structure
+  type(tabular_calving_state), pointer :: TC !< A pointer to the tabular calving structure
+  type(time_type),       intent(in)    :: Time !< The current model time
+
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                         intent(in)    :: h_shelf !< ice shelf thickness field
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                         intent(in)    :: frac_shelf_h !< The fraction of each grid cell covered by
+                                                       !! the ice shelf [L2 ~> m2].
+  ! Local variables
+  integer :: max_TC_mask, i,j
+
+  TC%c_id(:,:) = 0
+
+  !First, update the tabular calving mask
+  call update_tabular_calving_mask(G, G_in, TC, Time)
+
+  max_TC_mask = maxval(TC%calve_mask)
+  call max_across_PEs(max_TC_mask)
+  if (max_TC_mask<=0) then !no calving
+     if (allocated(TC%berg_list)) deallocate(TC%berg_list)
+     return
+   endif
+
+  !There may be multiple bergs to calve in the domain,
+  !which may overlap multiple cells and PEs
+
+  !"berg cells" indicate the presence of tabular berg(s) on the grid, as indicated
+  !where mask>0, which we aim to calve (initialize).
+  !We want to initialize a set of bonded particles that covers the "berg cells"
+  !of each berg on the grid, which may overlap multiple PEs. The approach is to create
+  !a field with unique IDs for each (non-connected) tabular berg. This ID is the same on
+  !all PEs that the corresponding berg may overlap. Then, the max/min coordinates of
+  !each berg are passed between the PEs that the berg overlaps. These coords are used to
+  !initialize an (initially) rectangular array of bonded particles that covers the domain
+  !of the berg, and which is defined identically and redundantly for each PE that the
+  !berg overlaps. Then, excess particles which do not overlap any berg cell in a PE are
+  !trimmed off. When the bonded-particles of a berg are connected across PE boundaries, the
+  !full bonded-berg is initialized.
+
+  !TODO: Note that the code here assumes that any two neighboring cells, each with mask>0, must
+  !be part of the same berg. If we want to allow multiple, adjacent bergs, to calve on a single
+  !time step, then we could assign different (positive, non-zero) mask values to differentiate the
+  !bergs. After the single berg is calved, we can break bonds where the mask is different (we would
+  !not break over halo cells unless the mask indicated, though the mask values may differ on other PEs).
+  !In other words, we would initialize the multiple and adjacent bergs as a single berg, which is
+  !which is subsequently broken up into the multiple adjecent bergs. This approach guarantees that
+  !the adjacent bergs are initialized without inter-berg particle overlap/separation.
+
+  !Alternatively, we could just have a "background" set of bonded particles that are
+  !kept constant over time, and initialize bergs by copying over a subset of these bonded
+  !particles as needed to represent the new bergs. However, this approach is not
+  !as versatile for controlling particle size. Also, it is not simple to guarantee that
+  !the particles extents of the (meridionally-aligned) first and last column would align (zonally).
+
+  !comment out halo-filling of calve_mask for now. If there are multiple, adjacent calving events, we
+  !may define them with different calve_mask>0 on each PE, so that the value of calve_mask may
+  !differ between PEs for the same berg. However, we make sure each PE calculates its own calve_mask
+  !in its own halo cells, and then make a copy of the resulting calve_mask. Then pass_var the original
+  !calve_mask and compare to the copy to backcalculate a consistent value for calve_mask for each berg
+  !that can be shared between each PE later.
+  !call pass_var(TC%calve_mask, G%domain)
+
+  !1) Generate a unique label (TC%c_id) for each berg on the computational domain of a PE
+  call initialize_tabular_calving_labels_1PE(G, TC%calve_mask, TC%c_id)
+
+  !2) fill halos with the unique berg labels. Find connected berg cells, and update them
+  !   with the lowest berg label (TC%c_id) of all of the connected berg cells. Repeat until no changes.
+  call update_tabular_calving_labels_over_pes(G, mask, TC%c_id)
+
+  !3) Make a list of each of the i bergs on the local PE domain (TC%berg_list(i,1)), their
+  !   min (TC%berg_list(i,2)) max longitude (TC%berg_list(i,3)), and their
+  !   min (TC%berg_list(i,4)) max latitude (TC%berg_list(i,5))
+  call tabular_berg_info(G, TC)
+
+  !4) Initialize iKID icebergs over these bounds, and remove excess particles. Call this from SIS2?
+  call initialize_bonded_bergs_from_shelf(bergs, TC, h_shelf, frac_shelf_h)
+
+end subroutine calve_bonded_bergs
+
+
+!> Initializes labels for the grid cells that comprise a tabular iceberg that is about to calve from an ice
+!! shelf (i.e. a group of all neighboring grid cells where calving mask > 0). Considers the current PE only.
+subroutine initialize_tabular_calving_labels_1PE(G, mask, c_id)
+  type(ocean_grid_type), intent(in) :: G   !< The grid structure used by the ice shelf.
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                         intent(in)    :: mask !< A mask that is greater than zero where a
+                                               !! tabular berg should calve from a shelf
+  integer, dimension(SZDI_(G),SZDJ_(G)), &
+                         intent(in)    :: c_id !< unique ID assigned to all cells
+                                               !! of a calving tabular berg
+  integer :: i, j
+
+  do j=G%jsc,G%jec; do i=G%isc,G%iec
+    if (mask(i,j) .gt. 0 .and. (c_id(i,j) .eq. 0)) then
+      c_id(i,j) = generate_cell_id(G,i,j)
+      call label_tabular_bergs(G, i, j, mask, c_id)
+    endif
+  enddo; enddo
+end subroutine initialize_tabular_calving_labels_1PE
+
+!> Assigns the same label to all grid cells that comprise a tabular iceberg that is about to calve
+!! from an ice shelf (i.e. a group of all neighboring grid cells where calving mask > 0).
+recursive subroutine label_tabular_bergs(G, ic, jc, mask, c_id)
+  type(ocean_grid_type), intent(in) :: G   !< The grid structure used by the ice shelf.
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                         intent(in)    :: mask !< A mask that is greater than zero where a
+                                               !! tabular berg should calve from a shelf
+  integer, dimension(SZDI_(G),SZDJ_(G)), &
+                         intent(in)    :: c_id !< unique ID assigned to all cells
+                                               !! of a calving tabular berg
+  integer,               intent(in)    :: ic  !< The i-index of the input cell
+  integer,               intent(in)    :: jc  !< The j-index of the input cell
+
+  integer :: i, j
+
+  do j=max(jc-1,G%jsd),min(jc+1,G%jed); do i=max(ic-1,G%isd),min(ic+1,G%ied)
+
+    if ((mask(i,j) > 0) .and. (c_id(i,j) .ne. c_id(ic,jc)) then
+
+      c_id(i,j) = min(c_id(ic,jc),c_id(i,j))
+      call label_tabular_bergs(G, i, j, mask, c_id)
+    endif
+  enddo
+end subroutine label_tabular_bergs
+
+!> Adjusts labels of tabular icebergs on the grid so that they are consistent between all PEs that
+!! the tabular bergs may overlap
+subroutine update_tabular_calving_labels_over_pes(G, mask, c_id)
+  type(ocean_grid_type), intent(in) :: G   !< The grid structure used by the ice shelf.
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                         intent(in)    :: mask !< A mask that is greater than zero where a
+                                               !! tabular berg should calve from a shelf
+  integer, dimension(SZDI_(G),SZDJ_(G)), &
+                         intent(in)    :: c_id !< unique ID assigned to all cells
+                                               !! of a calving tabular berg
+  integer :: i, j, k, i2, j2
+  integer :: change
+
+  change=0
+  do while (change==0)
+    change=1
+    call pass_var(c_id, G%domain)
+
+    do k=1,2
+      if (k==1) then
+        i=G%isc; i2=i-1
+      else
+        i=G%iec; i2=i+1
+      endif
+
+      do j=G%jsc,G%jec
+        if (c_id(i,j) .ne. 0) then
+          if ((c_id(i2,j) .ne. 0) .and. (c_id(i2,j) .ne. c_id(i,j))) then
+            c_id(i,j) = min(c_id(i,j), c_id(i2,j))
+            change=0
+            call label_tabular_bergs(G, i, j, mask, c_id)
+          endif
+        endif
+      enddo
+
+      if (k==1) then
+        j=G%jsc; j2=j-1
+      else
+        j=G%iec; j2=j+1
+      endif
+
+      do i=G%isc,G%iec
+        if (c_id(i,j) .ne. 0) then
+          if ((c_id(i,j2) .ne. 0) .and. (c_id(i,j2) .ne. c_id(i,j))) then
+            c_id(i,j) = min(c_id(i,j), c_id(i,j2))
+            change=0
+            call label_tabular_bergs(G, i, j, mask, c_id)
+          endif
+        endif
+      enddo
+    enddo
+    call min_across_PEs(change)
+  enddo
+
+!  call mpp_sync_self()
+end subroutine update_tabular_calving_labels_over_pes
+
+!> Finds the unique bergs of a computational domain field, and their global extent
+!! (min and max latitude and longitude)
+subroutine tabular_berg_info(G, TC)
+  type(ocean_grid_type), intent(in) :: G    !< The ocean's grid structure.
+  type(tabular_calving_state), pointer, intent(inout) :: TC !< A pointer to the tabular calving structure
+  integer, intent(out) :: bcount !< number of unique bergs
+  ! local variables
+  real, dimension(:), allocatable :: tmp
+  integer, pointer :: c_id(:,:)
+  integer :: n, i
+  real :: min_val, max_val
+  integer :: pe_N,pe_S,pe_E,pe_W
+
+  c_id=>TC%cid
+  n=(G%iec-G%isc) * (G%jec-G%jsc)
+  allocate(tmp(n))
+  tmp(:) = 0.
+  min_val = minval(c_id(G%isc:G%iec,G%jsc:G%jec))-1
+  max_val = maxval(c_id(G%isc:G%iec,G%jsc:G%jec))
+  bcount = 0
+  do while (min_val<max_val)
+    bcount = bcount+1
+    min_val = minval(c_id(G%isc:G%iec,G%jsc:G%jec), mask=c_id(G%isc:G%iec,G%jsc:G%jec)>min_val)
+    tmp(bcount) = real(min_val)
+  enddo
+
+  if (allocated(TC%berg_list)) deallocate(TC%berg_list)
+
+  allocate(TC%berg_list(bcount,5))
+
+  do i = 1,bcount
+
+    !the unique berg
+    TC%berg_list(i,1) = float(tmp(i))
+
+    !minlon
+    TC%berg_list(i,2) = minval(G%geoloncu(G%isc-1:G%iec-1,G%jsc:G%jec), &
+      mask=c_id(G%isc:G%iec,G%jsc:G%jec)==tmp(i))
+    !maxlon
+    TC%berg_list(i,3) = maxval(G%geoloncu(G%isc:G%iec,G%jsc:G%jec), &
+      mask=c_id(G%isc:G%iec,G%jsc:G%jec)==tmp(i))
+    !minlat
+    TC%berg_list(i,4) = minval(G%geolatcu(G%isc:G%iec,G%jsc-1:G%jec-1), &
+      mask=c_id(G%isc:G%iec,G%jsc:G%jec)==tmp(i))
+    !maxlat
+    TC%berg_list(i,5) = maxval(G%geolatcu(G%isc:G%iec,G%jsc:G%jec), &
+      mask=c_id(G%isc:G%iec,G%jsc:G%jec)==tmp(i))
+  enddo
+
+  ! call mpp_get_neighbor_pe(grd%domain, NORTH, grd%pe_N)
+  ! call mpp_get_neighbor_pe(grd%domain, SOUTH, grd%pe_S)
+  ! call mpp_get_neighbor_pe(grd%domain, EAST, grd%pe_E)
+  ! call mpp_get_neighbor_pe(grd%domain, WEST, grd%pe_W)
+
+  TC%berg_pe_count=bcount
+
+  !update the local coordinate bounds for each berg in TC%berg_list with the
+  !global coordinate bounds for each berg across all PEs
+  call update_berg_lists_on_all_pes(G, TC)
+
+  deallocate(tmp)
+end subroutine tabular_berg_info
+
+!> Updates TC%berg_list
+recursive subroutine update_berg_lists_on_all_pes(G, TC)
+  type(ocean_grid_type), intent(in) :: G    !< The ocean's grid structure.
+  type(tabular_calving_state), pointer, intent(inout) :: TC !< A pointer to the tabular calving structure
+  integer :: i1(4), i2(4), j1(4), j2(4), nbergs(4)
+  integer, allocatable :: tracker(:,:)
+  real, allocatable :: buffer(:)
+  integer :: n,k
+  integer :: changes, localchanges, nbergs_rcvd
+  real, pointer :: c_id(:,:), pebl(:,:)
+
+
+  !Halo range for each cardinal direction
+
+  i1(1)=G%iec+1; i2(1)=G%ied;   j1(1)=G%jsd;   j2(1)=G%jed   !E
+  i1(2)=G%isd;   i2(2)=G%isc-1; j1(2)=G%jsd;   j2(2)=G%jed   !W
+  i1(3)=G%isd;   i2(3)=G%ied;   j1(3)=G%jec+1; j2(3)=G%jed   !N
+  i1(4)=G%isd;   i2(4)=G%ied;   j1(4)=G%jsd;   j2(4)=G%jsc-1 !S
+
+  c_id=>TC%cid
+  pebl=>TC%berg_list
+
+  !each row of tracker is a berg on the PE, and each column corresponds to a cardinal direction
+  !where tracker == 1, the berg in that row is to be sent to the PE in the corresponding direction
+  allocate(tracker(TC%berg_pe_count,4); tracker=0
+
+  do n = 1,TC%berg_pe_count
+    do k=1,4
+      if (any(c_id(i1(k):i2(k),j1(k):j2(k))==pebl(n,1))) tracker(n,k)=1
+      if (any(c_id(i1(k):i2(k),j1(k):j2(k))==pebl(n,1))) tracker(n,k)=1
+    enddo
+  enddo
+
+  !number of bergs to send to each direction
+  nbergs(1:4)=sum(tracker,2)
+
+  changes = 1
+  localchanges = 1
+  do while (changes.ne.0)
+
+    changes=0
+
+    !send bergs east/west
+    if (G%pe_E.ne.NULL_PE) then
+      if (localchanges>0) then
+        call mpp_send(nbergs(1)*5, plen=1, to_pe=G%pe_E, tag=COMM_TAG_1)
+        if (nbergs(1).gt.0) then
+          allocate(buffer(nbergs(1)*5)
+          call pack_tabular_buffer(TC%berg_pe_count, nbergs(1)*5, 1, pebl, tracker, buffer)
+          call mpp_send(buffer, nbergs(1)*5, G%pe_E, tag=COMM_TAG_2)
+          deallocate(buffer)
+        endif
+      else
+        call mpp_send(0, plen=1, to_pe=G%pe_E, tag=COMM_TAG_1)
+      endif
+    endif
+    if (G%pe_W.ne.NULL_PE) then
+      if (localchanges>0) then
+        call mpp_send(nbergs(2)*5, plen=1, to_pe=G%pe_W, tag=COMM_TAG_1)
+        if (nbergs(2).gt.0) then
+          allocate(buffer(nbergs(2)*5)
+          call pack_tabular_buffer(TC%berg_pe_count, nbergs(2)*5, 2, pebl, tracker, buffer)
+          call mpp_send(buffer, nbergs(2)*5, G%pe_W, tag=COMM_TAG_2)
+          deallocate(buffer)
+        endif
+      else
+        call mpp_send(0, plen=1, to_pe=G%pe_W, tag=COMM_TAG_1)
+      endif
+    endif
+
+    !receive bergs from west/east
+    if (grd%pe_W.ne.NULL_PE) then
+      data_rcvd=0
+      call mpp_recv(data_rcvd, glen=1, from_pe=grd%pe_W, tag=COMM_TAG_1)
+      if (data_rcvd.gt.0) then
+        allocate(buffer(data_rcvd))
+        call mpp_recv(buffer, data_rcvd, grd%pe_W, tag=COMM_TAG_2)
+        call unpack_tabular_buffer_and_update_bounds(TC%berg_pe_count, data_rcvd, pebl, buffer. changes)
+        deallocate(buffer)
+      endif
+    endif
+    if (grd%pe_E.ne.NULL_PE) then
+      data_rcvd=0
+      call mpp_recv(data_rcvd, glen=1, from_pe=grd%pe_E, tag=COMM_TAG_1)
+      if (data_rcvd.gt.0) then
+        allocate(buffer(data_rcvd))
+        call mpp_recv(buffer, data_rcvd, grd%pe_E, tag=COMM_TAG_2)
+        call unpack_tabular_buffer_and_update_bounds(TC%berg_pe_count, data_rcvd, pebl, buffer. changes)
+        deallocate(buffer)
+      endif
+    endif
+
+    localchanges=max(localchanges,changes)
+
+    !send bergs north/south
+    if (G%pe_N.ne.NULL_PE) then
+      if (localchanges>0) then
+        call mpp_send(nbergs(3)*5, plen=1, to_pe=G%pe_N, tag=COMM_TAG_1)
+        if (nbergs(3).gt.0) then
+          allocate(buffer(nbergs(3)*5)
+          call pack_tabular_buffer(TC%berg_pe_count, nbergs(3)*5, 3, pebl, tracker, buffer)
+          call mpp_send(buffer, nbergs(3)*5, G%pe_N, tag=COMM_TAG_2)
+          deallocate(buffer)
+        endif
+      endif
+    else
+      call mpp_send(0, plen=1, to_pe=G%pe_N, tag=COMM_TAG_1)
+    endif
+    if (G%pe_S.ne.NULL_PE) then
+      if (localchanges>0) then
+        call mpp_send(nbergs(4)*5, plen=1, to_pe=G%pe_S, tag=COMM_TAG_1)
+        if (nbergs(4).gt.0) then
+          allocate(buffer(nbergs(4)*5)
+          call pack_tabular_buffer(TC%berg_pe_count, nbergs(4)*5, 4, pebl, tracker, buffer)
+          call mpp_send(buffer, nbergs(4)*5, G%pe_S, tag=COMM_TAG_2)
+          deallocate(buffer)
+        endif
+      endif
+    else
+      call mpp_send(0, plen=1, to_pe=G%pe_S, tag=COMM_TAG_1)
+    endif
+
+    !receive bergs north/south
+    if (grd%pe_S.ne.NULL_PE) then
+      data_rcvd=0
+      call mpp_recv(data_rcvd, glen=1, from_pe=grd%pe_S, tag=COMM_TAG_1)
+      if (data_rcvd.gt.0) then
+        allocate(buffer(data_rcvd))
+        call mpp_recv(buffer, data_rcvd, grd%pe_S, tag=COMM_TAG_2)
+        call unpack_tabular_buffer_and_update_bounds(TC%berg_pe_count, data_rcvd, pebl, buffer. changes)
+        deallocate(buffer)
+      endif
+    endif
+    if (grd%pe_N.ne.NULL_PE) then
+      data_rcvd=0
+      call mpp_recv(data_rcvd, glen=1, from_pe=grd%pe_N, tag=COMM_TAG_1)
+      if (data_rcvd.gt.0) then
+        allocate(buffer(data_rcvd))
+        call mpp_recv(buffer, data_rcvd, grd%pe_N, tag=COMM_TAG_2)
+        call unpack_tabular_buffer_and_update_bounds(TC%berg_pe_count, data_rcvd, pebl, buffer. changes)
+        deallocate(buffer)
+      endif
+    endif
+
+    localchanges=changes
+    call max_across_PEs(changes)
+  enddo
+
+end subroutine update_berg_lists_on_all_pes
+
+!> pack the buffer with the info for the bergs in the c_id array being sent to another PE
+subroutine pack_tabular_buffer(lbergs, bberg_data, dir, pebl, tracker, buffer)
+  integer :: lbergs !< number of local bergs on the current PE
+  integer :: bberg_data !< count of berg data being sent in the buffer to another PE
+  integer :: dir !< direction the bergs are being sent
+  real, pointer :: pebl(:,:) !< array of bergs on the current PE and their lat/lon bounds
+  integer :: tracker(totbergs,4) !< tracks the direction to send bergs from the current PE
+  real :: buffer(bberg_data) !< the buffer being packed with bergs to send to another PE
+  integer :: k, i
+
+  i=1
+  do k=1,lbergs
+    if (tracker(k,dir)==1) then
+      buffer(i:i+4)=pebl(k,1:5)
+      i=i+5
+    endif
+  enddo
+
+end subroutine pack_tabular_buffer
+
+!> Unpack the buffer with the info for the bergs in the c_id array being sent from another PE
+!! if unpacked berg has more extreme bounds than the same berg in the current PE, update the
+!! bounds of the current PE berg to match
+subroutine unpack_tabular_buffer_and_update_bounds(lbergs, bberg_data, pebl, buffer, changes)
+  integer :: lbergs !< number of local bergs on the current PE
+  integer :: bberg_data !< count of berg data being received in the buffer from another PE
+  real, pointer :: pebl !< array of bergs on the current PE and their lat/lon bounds
+  real :: buffer(bberg_data) !< the buffer of bergs being received on the current PE
+  real :: buffer2(bberg_data/5,5)
+  integer :: m, n, changes
+
+  !reshape the buffer
+  do n=1,bberg_data/5
+    buffer2(n,1:5) = buffer((n-1)*5+1:(n-1)*5+5)
+  enddo
+
+  do m=1,lbergs
+    do n=1,bbergs
+      if (pebl(m,1)==buffer2(n,1)) then
+        !same berg ID detected in current PE berg list and berg buffer from other PE
+        !extend current berg bounds if needed, to reflect more extensive bounds from other PE
+        if (pebl(m,2)>buffer2(n,2)) then; pebl(m,2)=buffer2(n,2); changes=changes+1; endif
+        if (pebl(m,3)<buffer2(n,3)) then; pebl(m,3)=buffer2(n,3); changes=changes+1; endif
+        if (pebl(m,4)>buffer2(n,4)) then; pebl(m,4)=buffer2(n,4); changes=changes+1; endif
+        if (pebl(m,5)<buffer2(n,5)) then; pebl(m,5)=buffer2(n,5); changes=changes+1; endif
+      endif
+    enddo
+  enddo
+
+end subroutine unpack_tabular_buffer_and_update_bounds
+
+!> Calculate cell_id, a unique integer for each grid cell.
+integer function generate_cell_id(G, i, j)
+  type(ocean_grid_type), intent(in) :: G   !< The grid structure used by the ice shelf.
+  integer,                intent(in) :: i   !< i-index of grid cell
+  integer,                intent(in) :: j   !< j-index of grid cell
+  ! Local variables
+  integer :: iNg ! Zonal size of the global grid
+
+  ! Using the current grid shape maximizes the numbers of IDs that can be represented
+  ! allowing up to 30-minute uniform global resolution, or potentially finer if non-uniform.
+  iNg = G%ieg - G%isg + 1
+
+  ! ij_component_of_id is unique number for each grid cell
+  !(32-bit integers allow for ~1/100th degree global resolution)
+  generate_cell_id = i + ( iNg * ( j - 1 ) )
+end function generate_cell_id
+
+end module MOM_ice_shelf_tabular_calving
