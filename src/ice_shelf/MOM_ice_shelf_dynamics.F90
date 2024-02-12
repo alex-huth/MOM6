@@ -1203,12 +1203,15 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
     call shelf_advance_front(CS, ISS, G, ISS%hmask, uh_ice, vh_ice)
     !add mass of the partially-filled cells to calving field, which is used to initialize icebergs
     !Then, remove the partially-filled cells from the ice shelf
+    ISS%calving(:,:)=0.0
+    ISS%calving_hflx(:,:)=0.0
     do j=jsc,jec; do i=isc,iec
       if (ISS%hmask(i,j)==2) then
-        ISS%calving(i,j) = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) * &
-                           CS%density_ice / (G%areaT(i,j) * time_step)
-        ISS%calving_hflx(i,j) = CS%Cp_ice * ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) * &
-                                CS%density_ice * CS%t_shelf(i,j) / G%areaT(i,j)
+        ISS%calving(i,j) = (ISS%h_shelf(i,j) * CS%density_ice) * &
+                           (ISS%area_shelf_h(i,j) * G%IareaT(i,j)) / time_step
+        ISS%calving_hflx(i,j) = (CS%Cp_ice * CS%t_shelf(i,j)) * &
+                                ((ISS%h_shelf(i,j) * CS%density_ice) * &
+                                (ISS%area_shelf_h(i,j) * G%IareaT(i,j)))
         ISS%h_shelf(i,j) = 0.0; ISS%area_shelf_h(i,j) = 0.0; ISS%hmask(i,j) = 0.0
       endif
     enddo; enddo
