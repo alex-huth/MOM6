@@ -62,6 +62,7 @@ use MOM_spatial_means, only : global_area_integral
 use MOM_checksums, only : hchksum, qchksum, chksum, uchksum, vchksum, uvchksum
 use MOM_interpolate, only : init_external_field, time_interp_external, time_interp_external_init
 use MOM_interpolate, only : external_field
+use MOM_ice_shelf_tabular_calving, only: tabular_calving_state, initialize_tabular_calving, process_tabular_calving
 
 implicit none ; private
 
@@ -791,7 +792,7 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
       ISS%dhdt_shelf(i,j) = (ISS%h_shelf(i,j) - ISS%dhdt_shelf(i,j))*Itime_step
     enddo; enddo
 
-if (CS%calve_tabular_bergs) call calve_bonded_bergs(G, CS%Grid, CS%TC, Time)
+    if (CS%calve_tabular_bergs) call process_tabular_calving(G, CS, ISS, CS%TC, Time)
 
     call IS_dynamics_post_data(time_step, Time, CS%dCS, G)
   endif
@@ -983,6 +984,7 @@ subroutine add_shelf_forces(Ocn_grid, US, CS, forces, do_shelf_area, external_ca
 
   do j=js,je ; do i=is,ie
     press_ice = (ISS%area_shelf_h(i,j) * G%IareaT(i,j)) * (CS%g_Earth * ISS%mass_shelf(i,j))
+    if (allocated(CS%TC%frac_cberg)) press_ice = press_ice * CS%TC%frac_cberg(i,j)
     if (associated(forces%p_surf)) then
       if (.not.forces%accumulate_p_surf) forces%p_surf(i,j) = 0.0
       forces%p_surf(i,j) = forces%p_surf(i,j) + press_ice
@@ -1000,13 +1002,23 @@ subroutine add_shelf_forces(Ocn_grid, US, CS, forces, do_shelf_area, external_ca
   kv_rho_ice = CS%kv_ice / CS%density_ice
   do j=js,je ; do I=is-1,ie
     if (.not.forces%accumulate_rigidity) forces%rigidity_ice_u(I,j) = 0.0
-    forces%rigidity_ice_u(I,j) = forces%rigidity_ice_u(I,j) + &
-            kv_rho_ice * min(ISS%mass_shelf(i,j), ISS%mass_shelf(i+1,j))
+    if (allocated(CS%TC%frac_cberg)) then
+      forces%rigidity_ice_u(I,j) = forces%rigidity_ice_u(I,j) + &
+        kv_rho_ice * min(ISS%mass_shelf(i,j)*CS%TC%frac_cberg(i,j), ISS%mass_shelf(i+1,j)*CS%TC%frac_cberg(i+1,j))
+    else
+      forces%rigidity_ice_u(I,j) = forces%rigidity_ice_u(I,j) + &
+        kv_rho_ice * min(ISS%mass_shelf(i,j), ISS%mass_shelf(i+1,j))
+    endif
   enddo ; enddo
   do J=js-1,je ; do i=is,ie
     if (.not.forces%accumulate_rigidity) forces%rigidity_ice_v(i,J) = 0.0
-    forces%rigidity_ice_v(i,J) = forces%rigidity_ice_v(i,J) + &
-            kv_rho_ice * min(ISS%mass_shelf(i,j), ISS%mass_shelf(i,j+1))
+    if (allocated(CS%TC%frac_cberg)) then
+      forces%rigidity_ice_v(i,J) = forces%rigidity_ice_v(i,J) + &
+        kv_rho_ice * min(ISS%mass_shelf(i,j)*CS%TC%frac_cberg(i,j), ISS%mass_shelf(i,j+1)*CS%TC%frac_cberg(i+1,j))
+    else
+      forces%rigidity_ice_v(i,J) = forces%rigidity_ice_v(i,J) + &
+        kv_rho_ice * min(ISS%mass_shelf(i,j), ISS%mass_shelf(i,j+1))
+    endif
   enddo ; enddo
 
   if (CS%debug) then
@@ -1046,6 +1058,7 @@ subroutine add_shelf_pressure(Ocn_grid, US, CS, fluxes)
   do j=js,je ; do i=is,ie
     press_ice = (CS%ISS%area_shelf_h(i,j) * G%IareaT(i,j)) * (CS%g_Earth * CS%ISS%mass_shelf(i,j)) * &
                 (1.0-fluxes%KID_IS_ratio(i,j))
+    if (associated(CS%TC%frac_cberg)) press_ice = press_ice * CS%TC%frac_cberg(i,j)
     !pressure of nascent tabular berg is already added to fluxes%p_surf within ice model,
     !which will be added to the pressure
     !here as long as fluxes%accumulate_p_surf==.true.
@@ -2254,6 +2267,8 @@ subroutine ice_shelf_end(CS)
   call ice_shelf_state_end(CS%ISS)
 
   if (CS%active_shelf_dynamics) call ice_shelf_dyn_end(CS%dCS)
+
+  if (CS%calve_tabular_bergs) call ice_shelf_calving_end(CS%TC)
 
   call MOM_IS_diag_mediator_end(CS%diag)
   deallocate(CS)
