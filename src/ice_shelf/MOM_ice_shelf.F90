@@ -966,25 +966,43 @@ subroutine add_shelf_forces(Ocn_grid, US, CS, forces, do_shelf_area, external_ca
   find_area = .true. ; if (present(do_shelf_area)) find_area = do_shelf_area
 
   if (find_area) then
-    ! The frac_shelf is set over the widest possible area. Could it be smaller?
-    do j=jsd,jed ; do I=isd,ied-1
-      forces%frac_shelf_u(I,j) = 0.0
-      if ((G%areaT(i,j) + G%areaT(i+1,j) > 0.0)) & ! .and. (G%areaCu(I,j) > 0.0)) &
-        forces%frac_shelf_u(I,j) = (ISS%area_shelf_h(i,j) + ISS%area_shelf_h(i+1,j)) / &
-                                   (G%areaT(i,j) + G%areaT(i+1,j))
-    enddo ; enddo
-    do J=jsd,jed-1 ; do i=isd,ied
-      forces%frac_shelf_v(i,J) = 0.0
-      if ((G%areaT(i,j) + G%areaT(i,j+1) > 0.0)) & ! .and. (G%areaCv(i,J) > 0.0)) &
-        forces%frac_shelf_v(i,J) = (ISS%area_shelf_h(i,j) + ISS%area_shelf_h(i,j+1)) / &
-                                   (G%areaT(i,j) + G%areaT(i,j+1))
-    enddo ; enddo
+    if (associated(forces%frac_cberg)) then
+      ! The frac_shelf is set over the widest possible area. Could it be smaller?
+      do j=jsd,jed ; do I=isd,ied-1
+        forces%frac_shelf_u(I,j) = 0.0
+        if ((G%areaT(i,j)*(1-forces%frac_cberg(i,j) + G%areaT(i+1,j)*(1-forces%frac_cberg(i+1,j) > 0.0)) &
+          forces%frac_shelf_u(I,j) = (ISS%area_shelf_h(i,j)*(1-forces%frac_cberg(i,j)) + &
+                                      ISS%area_shelf_h(i+1,j)*(1-forces%frac_cberg(i+1,j))) / &
+                                     (G%areaT(i,j) + G%areaT(i+1,j))
+      enddo ; enddo
+      do J=jsd,jed-1 ; do i=isd,ied
+        forces%frac_shelf_v(i,J) = 0.0
+        if ((G%areaT(i,j)*(1-forces%frac_cberg(i,j) + G%areaT(i,j+1)*(1-forces%frac_cberg(i,j+1) > 0.0)) &
+          forces%frac_shelf_v(i,J) = (ISS%area_shelf_h(i,j)*(1-forces%frac_cberg(i,j)) + &
+                                      ISS%area_shelf_h(i,j+1)*(1-forces%frac_cberg(i+1,j))) / &
+                                     (G%areaT(i,j) + G%areaT(i,j+1))
+      enddo; enddo
+    else
+      ! The frac_shelf is set over the widest possible area. Could it be smaller?
+      do j=jsd,jed ; do I=isd,ied-1
+        forces%frac_shelf_u(I,j) = 0.0
+        if ((G%areaT(i,j) + G%areaT(i+1,j) > 0.0)) & ! .and. (G%areaCu(I,j) > 0.0)) &
+          forces%frac_shelf_u(I,j) = (ISS%area_shelf_h(i,j) + ISS%area_shelf_h(i+1,j)) / &
+                                     (G%areaT(i,j) + G%areaT(i+1,j))
+      enddo ; enddo
+      do J=jsd,jed-1 ; do i=isd,ied
+        forces%frac_shelf_v(i,J) = 0.0
+        if ((G%areaT(i,j) + G%areaT(i,j+1) > 0.0)) & ! .and. (G%areaCv(i,J) > 0.0)) &
+          forces%frac_shelf_v(i,J) = (ISS%area_shelf_h(i,j) + ISS%area_shelf_h(i,j+1)) / &
+                                     (G%areaT(i,j) + G%areaT(i,j+1))
+      enddo; enddo
+    endif
     call pass_vector(forces%frac_shelf_u, forces%frac_shelf_v, G%domain, TO_ALL, CGRID_NE)
   endif
 
   do j=js,je ; do i=is,ie
     press_ice = (ISS%area_shelf_h(i,j) * G%IareaT(i,j)) * (CS%g_Earth * ISS%mass_shelf(i,j))
-    if (allocated(CS%TC%frac_cberg)) press_ice = press_ice * CS%TC%frac_cberg(i,j)
+    if (associated(forces%frac_cberg)) press_ice = press_ice * (1-forces%frac_cberg(i,j))
     if (associated(forces%p_surf)) then
       if (.not.forces%accumulate_p_surf) forces%p_surf(i,j) = 0.0
       forces%p_surf(i,j) = forces%p_surf(i,j) + press_ice
@@ -1000,26 +1018,29 @@ subroutine add_shelf_forces(Ocn_grid, US, CS, forces, do_shelf_area, external_ca
   ! contributions from icebergs and the sea-ice pack added subsequently.
   !### THE RIGIDITY SHOULD ALSO INCORPORATE AREAL-COVERAGE INFORMATION.
   kv_rho_ice = CS%kv_ice / CS%density_ice
-  do j=js,je ; do I=is-1,ie
-    if (.not.forces%accumulate_rigidity) forces%rigidity_ice_u(I,j) = 0.0
-    if (allocated(CS%TC%frac_cberg)) then
-      forces%rigidity_ice_u(I,j) = forces%rigidity_ice_u(I,j) + &
-        kv_rho_ice * min(ISS%mass_shelf(i,j)*CS%TC%frac_cberg(i,j), ISS%mass_shelf(i+1,j)*CS%TC%frac_cberg(i+1,j))
-    else
+  if (associated(forces%frac_cberg)) then
+    do j=js,je ; do I=is-1,ie
+      if (.not.forces%accumulate_rigidity) forces%rigidity_ice_u(I,j) = 0.0
+      forces%rigidity_ice_u(I,j) = forces%rigidity_ice_u(I,j) + kv_rho_ice * &
+        min(ISS%mass_shelf(i,j)*(1-forces%frac_cberg(i,j)), ISS%mass_shelf(i+1,j)*(1-forces%frac_cberg(i+1,j)))
+    enddo ; enddo
+    do J=js-1,je ; do i=is,ie
+      if (.not.forces%accumulate_rigidity) forces%rigidity_ice_v(i,J) = 0.0
+      forces%rigidity_ice_v(i,J) = forces%rigidity_ice_v(i,J) + kv_rho_ice * &
+          min(ISS%mass_shelf(i,j)*(1-forces%frac_cberg(i,j)), ISS%mass_shelf(i,j+1)*(1-forces%frac_cberg(i+1,j)))
+    enddo ; enddo
+  else
+    do j=js,je ; do I=is-1,ie
+      if (.not.forces%accumulate_rigidity) forces%rigidity_ice_u(I,j) = 0.0
       forces%rigidity_ice_u(I,j) = forces%rigidity_ice_u(I,j) + &
         kv_rho_ice * min(ISS%mass_shelf(i,j), ISS%mass_shelf(i+1,j))
-    endif
-  enddo ; enddo
-  do J=js-1,je ; do i=is,ie
-    if (.not.forces%accumulate_rigidity) forces%rigidity_ice_v(i,J) = 0.0
-    if (allocated(CS%TC%frac_cberg)) then
-      forces%rigidity_ice_v(i,J) = forces%rigidity_ice_v(i,J) + &
-        kv_rho_ice * min(ISS%mass_shelf(i,j)*CS%TC%frac_cberg(i,j), ISS%mass_shelf(i,j+1)*CS%TC%frac_cberg(i+1,j))
-    else
+    enddo ; enddo
+    do J=js-1,je ; do i=is,ie
+      if (.not.forces%accumulate_rigidity) forces%rigidity_ice_v(i,J) = 0.0
       forces%rigidity_ice_v(i,J) = forces%rigidity_ice_v(i,J) + &
         kv_rho_ice * min(ISS%mass_shelf(i,j), ISS%mass_shelf(i,j+1))
-    endif
-  enddo ; enddo
+    enddo ; enddo
+  endif
 
   if (CS%debug) then
     call uvchksum("rigidity_ice_[uv]", forces%rigidity_ice_u, &
@@ -1056,9 +1077,8 @@ subroutine add_shelf_pressure(Ocn_grid, US, CS, fluxes)
     call MOM_error(FATAL,"add_shelf_pressure: Incompatible ocean and ice shelf grids.")
 
   do j=js,je ; do i=is,ie
-    press_ice = (CS%ISS%area_shelf_h(i,j) * G%IareaT(i,j)) * (CS%g_Earth * CS%ISS%mass_shelf(i,j)) * &
-                (1.0-fluxes%KID_IS_ratio(i,j))
-    if (associated(CS%TC%frac_cberg)) press_ice = press_ice * CS%TC%frac_cberg(i,j)
+    press_ice = (CS%ISS%area_shelf_h(i,j) * G%IareaT(i,j)) * (CS%g_Earth * CS%ISS%mass_shelf(i,j))
+    if (associated(fluxes%frac_cberg)) press_ice = press_ice * (1-fluxes%frac_cberg(i,j))
     !pressure of nascent tabular berg is already added to fluxes%p_surf within ice model,
     !which will be added to the pressure
     !here as long as fluxes%accumulate_p_surf==.true.

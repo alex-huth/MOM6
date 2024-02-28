@@ -176,6 +176,10 @@ type, public :: ice_ocean_boundary_type
   real, pointer, dimension(:,:) :: ustar_berg        =>NULL() !< frictional velocity beneath icebergs [m/s]
   real, pointer, dimension(:,:) :: area_berg         =>NULL() !< area covered by icebergs[m2/m2]
   real, pointer, dimension(:,:) :: mass_berg         =>NULL() !< mass of icebergs(kg/m2)
+  real, pointer, dimension(:,:) :: frac_cberg      =>NULL() !< cell fraction of partially-calved bonded bergs
+                                                            !! from the ice sheet [nondim]
+  real, pointer, dimension(:,:) :: frac_cberg_calved =>NULL() !< cell fraction of fully-calved bonded bergs
+                                                              !! from the ice sheet [nondim]
   real, pointer, dimension(:,:) :: hrofl             =>NULL() !< heat content from liquid runoff [W/m2]
   real, pointer, dimension(:,:) :: hrofi             =>NULL() !< heat content from frozen runoff [W/m2]
   real, pointer, dimension(:,:) :: hrain             =>NULL() !< heat content from liquid precipitation [W/m2]
@@ -339,6 +343,10 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
     .or. (associated(IOB%mass_berg) .and. (.not.associated(fluxes%mass_berg)))) &
     call allocate_forcing_type(G, fluxes, iceberg=.true.)
 
+  if (((associated(IOB%frac_cberg) .and. (.not.associated(fluxes%frac_cberg))) &
+    .or. (associated(IOB%frac_cberg_calved) .and. (.not.associated(fluxes%frac_cberg_calved)))) &
+    call allocate_forcing_type(G, fluxes, tabular_calving=.true.)
+
   if ((.not.coupler_type_initialized(fluxes%tr_fluxes)) .and. &
       coupler_type_initialized(IOB%fluxes)) &
     call coupler_type_spawn(IOB%fluxes, fluxes%tr_fluxes, &
@@ -480,6 +488,12 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
 
     if (associated(IOB%mass_berg)) &
       fluxes%mass_berg(i,j) = US%m_to_Z*US%kg_m3_to_R * IOB%mass_berg(i-i0,j-j0) * G%mask2dT(i,j)
+
+    if (associated(IOB%frac_cberg)) &
+      fluxes%frac_cberg(i,j) = IOB%frac_cberg(i-i0,j-j0) * G%mask2dT(i,j)
+
+    if (associated(IOB%frac_cberg_calved)) &
+      fluxes%frac_cberg_calved(i,j) = IOB%frac_cberg_calved(i-i0,j-j0) * G%mask2dT(i,j)
 
     if (associated(IOB%lw_flux)) &
       fluxes%lw(i,j) = US%W_m2_to_QRZ_T * IOB%lw_flux(i-i0,j-j0) * G%mask2dT(i,j)

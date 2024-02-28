@@ -175,7 +175,9 @@ type, public :: forcing
   real, pointer, dimension(:,:) :: &
     ustar_berg => NULL(), &   !< iceberg contribution to top ustar [Z T-1 ~> m s-1].
     area_berg  => NULL(), &   !< fractional area of ocean surface covered by icebergs [nondim]
-    mass_berg  => NULL()      !< mass of icebergs [R Z ~> kg m-2]
+    mass_berg  => NULL(), &   !< mass of icebergs [R Z ~> kg m-2]
+    frac_cberg => NULL(), &   !< cell fraction of partially-calved bonded bergs from the ice sheet [nondim]
+    frac_cberg_calved => NULL() !< cell fraction of fully-calved bonded bergs from the ice sheet [nondim]
 
   ! land ice-shelf related inputs
   real, pointer, dimension(:,:) :: ustar_shelf => NULL()  !< Friction velocity under ice-shelves [Z T-1 ~> m s-1].
@@ -258,7 +260,9 @@ type, public :: mech_forcing
   ! iceberg related inputs
   real, pointer, dimension(:,:) :: &
     area_berg  => NULL(), &    !< fractional area of ocean surface covered by icebergs [nondim]
-    mass_berg  => NULL()       !< mass of icebergs per unit ocean area [R Z ~> kg m-2]
+    mass_berg  => NULL(), &    !< mass of icebergs per unit ocean area [R Z ~> kg m-2]
+    frac_cberg => NULL(), &   !< cell fraction of partially-calved bonded bergs from the ice sheet [nondim]
+    frac_cberg_calved => NULL() !< cell fraction of fully-calved bonded bergs from the ice sheet [nondim]
 
   ! land ice-shelf related inputs
   real, pointer, dimension(:,:) :: frac_shelf_u  => NULL() !< Fractional ice shelf coverage of u-cells,
@@ -391,6 +395,8 @@ type, public :: forcing_diags
   integer :: id_ustar_berg = -1
   integer :: id_area_berg = -1
   integer :: id_mass_berg = -1
+  integer :: id_frac_cberg = -1
+  integer :: id_frac_cberg_calved = -1
 
   ! Iceberg + Ice shelf diagnostic handles
   integer :: id_ustar_ice_cover = -1
@@ -1518,6 +1524,12 @@ subroutine register_forcing_type_diags(Time, diag, US, use_temperature, handles,
 
       handles%id_mass_berg = register_diag_field('ocean_model', 'mass_berg', diag%axesT1, Time, &
           'Mass of icebergs ', 'kg m-2', conversion=US%RZ_to_kg_m2)
+
+      handles%id_frac_cberg = register_diag_field('ocean_model', 'frac_cberg', diag%axesT1, Time, &
+          'Grid cell fraction covered by partially-calved tabular icebergs ', 'none')
+
+      handles%id_frac_cberg_calved = register_diag_field('ocean_model', 'frac_cberg_calved', diag%axesT1, Time, &
+          'Grid cell fraction covered by fully-calved tabular icebergs ', 'none')
 
       handles%id_ustar_ice_cover = register_diag_field('ocean_model', 'ustar_ice_cover', diag%axesT1, Time, &
           'Friction velocity below iceberg and ice shelf together', 'm s-1', conversion=US%Z_to_m*US%s_to_T)
@@ -3174,6 +3186,12 @@ subroutine forcing_diagnostics(fluxes_in, sfc_state, G_in, US, time_end, diag, h
     if ((handles%id_ustar_berg > 0) .and. associated(fluxes%ustar_berg)) &
       call post_data(handles%id_ustar_berg, fluxes%ustar_berg, diag)
 
+    if ((handles%id_frac_cberg > 0) .and. associated(fluxes%frac_cberg)) &
+      call post_data(handles%id_frac_cberg, fluxes%frac_cberg, diag)
+
+    if ((handles%id_frac_cberg_calved > 0) .and. associated(fluxes%frac_cberg_calved)) &
+      call post_data(handles%id_frac_cberg_calved, fluxes%frac_cberg_calved, diag)
+
     if ((handles%id_frac_ice_cover > 0) .and. associated(fluxes%frac_shelf_h)) &
       call post_data(handles%id_frac_ice_cover, fluxes%frac_shelf_h, diag)
 
@@ -3198,7 +3216,7 @@ end subroutine forcing_diagnostics
 
 !> Conditionally allocate fields within the forcing type
 subroutine allocate_forcing_by_group(G, fluxes, water, heat, ustar, press, &
-                                  shelf, iceberg, salt, fix_accum_bug, cfc, waves, &
+                                  shelf, iceberg, tabular_calving, salt, fix_accum_bug, cfc, waves, &
                                   shelf_sfc_accumulation, lamult, hevap, tau_mag)
   type(ocean_grid_type), intent(in) :: G       !< Ocean grid structure
   type(forcing),      intent(inout) :: fluxes  !< A structure containing thermodynamic forcing fields
@@ -3208,6 +3226,7 @@ subroutine allocate_forcing_by_group(G, fluxes, water, heat, ustar, press, &
   logical, optional,     intent(in) :: press   !< If present and true, allocate p_surf and related fields
   logical, optional,     intent(in) :: shelf   !< If present and true, allocate fluxes for ice-shelf
   logical, optional,     intent(in) :: iceberg !< If present and true, allocate fluxes for icebergs
+  logical, optional,     intent(in) :: tabular_calving !< If present and true, allocate fluxes for tabular calving
   logical, optional,     intent(in) :: salt    !< If present and true, allocate salt fluxes
   logical, optional,     intent(in) :: fix_accum_bug !< If present and true, avoid using a bug in
                                                !! accumulation of ustar_gustless
@@ -3292,6 +3311,9 @@ subroutine allocate_forcing_by_group(G, fluxes, water, heat, ustar, press, &
   call myAlloc(fluxes%area_berg,isd,ied,jsd,jed, iceberg)
   call myAlloc(fluxes%mass_berg,isd,ied,jsd,jed, iceberg)
 
+  call myAlloc(fluxes%frac_cberg,isd,ied,jsd,jed, tabular_calving)
+  call myAlloc(fluxes%frac_cberg_calving,isd,ied,jsd,jed, tabular_calving)
+
   !These fields should only on allocated when USE_CFC_CAP is activated.
   call myAlloc(fluxes%ice_fraction,isd,ied,jsd,jed, cfc)
   call myAlloc(fluxes%u10_sqr,isd,ied,jsd,jed, cfc)
@@ -3310,13 +3332,13 @@ subroutine allocate_forcing_by_ref(fluxes_ref, G, fluxes)
   type(forcing),         intent(out) :: fluxes     !< Target fluxes
 
   logical :: do_ustar, do_taumag, do_water, do_heat, do_salt, do_press, do_shelf
-  logical :: do_iceberg, do_heat_added, do_buoy
+  logical :: do_iceberg, do_tabular_calving, do_heat_added, do_buoy
 
   call get_forcing_groups(fluxes_ref, do_water, do_heat, do_ustar, do_taumag, do_press, &
-      do_shelf, do_iceberg, do_salt, do_heat_added, do_buoy)
+      do_shelf, do_iceberg, do_tabular_calving, do_salt, do_heat_added, do_buoy)
 
   call allocate_forcing_type(G, fluxes, do_water, do_heat, do_ustar, &
-      do_press, do_shelf, do_iceberg, do_salt, tau_mag=do_taumag)
+      do_press, do_shelf, do_iceberg, do_tabular_calving, do_salt, tau_mag=do_taumag)
 
   ! The following fluxes would typically be allocated by the driver
   call myAlloc(fluxes%sw_vis_dir, G%isd, G%ied, G%jsd, G%jed, &
@@ -3355,7 +3377,7 @@ end subroutine allocate_forcing_by_ref
 !> Conditionally allocate fields within the mechanical forcing type using
 !! control flags.
 subroutine allocate_mech_forcing_by_group(G, forces, stress, ustar, shelf, &
-                                          press, iceberg, waves, num_stk_bands, tau_mag)
+                                          press, iceberg, tabular_calving, waves, num_stk_bands, tau_mag)
   type(ocean_grid_type), intent(in) :: G       !< Ocean grid structure
   type(mech_forcing), intent(inout) :: forces  !< Forcing fields structure
 
@@ -3364,6 +3386,7 @@ subroutine allocate_mech_forcing_by_group(G, forces, stress, ustar, shelf, &
   logical, optional,     intent(in) :: shelf   !< If present and true, allocate forces for ice-shelf
   logical, optional,     intent(in) :: press   !< If present and true, allocate p_surf and related fields
   logical, optional,     intent(in) :: iceberg !< If present and true, allocate forces for icebergs
+  logical, optional,     intent(in) :: tabular_calving !< If present and true, allocate fluxes for tabular calving
   logical, optional,     intent(in) :: waves   !< If present and true, allocate wave fields
   integer, optional,     intent(in) :: num_stk_bands !< Number of Stokes bands to allocate
   logical, optional,     intent(in) :: tau_mag !< If present and true, allocate tau_mag
@@ -3395,6 +3418,9 @@ subroutine allocate_mech_forcing_by_group(G, forces, stress, ustar, shelf, &
   call myAlloc(forces%area_berg,isd,ied,jsd,jed, iceberg)
   call myAlloc(forces%mass_berg,isd,ied,jsd,jed, iceberg)
 
+  call myAlloc(forces%frac_cberg,isd,ied,jsd,jed, tabular_calving)
+  call myAlloc(forces%frac_cberg_calving,isd,ied,jsd,jed, tabular_calving)
+
   !These fields should only be allocated when waves
   if (present(waves)) then; if (waves) then;
     if (.not. present(num_stk_bands)) then
@@ -3420,20 +3446,20 @@ subroutine allocate_mech_forcing_from_ref(forces_ref, G, forces)
   type(ocean_grid_type), intent(in) :: G      !< Grid metric of target forcing
   type(mech_forcing), intent(out) :: forces   !< Mechanical forcing fields
 
-  logical :: do_stress, do_ustar, do_tau_mag, do_shelf, do_press, do_iceberg
+  logical :: do_stress, do_ustar, do_tau_mag, do_shelf, do_press, do_iceberg, do_tabular_calving
 
   ! Identify the active fields in the reference forcing
   call get_mech_forcing_groups(forces_ref, do_stress, do_ustar, do_tau_mag, do_shelf, &
-                               do_press, do_iceberg)
+                               do_press, do_iceberg, do_tabular_calving)
 
   call allocate_mech_forcing(G, forces, do_stress, do_ustar, do_shelf, &
-                             do_press, do_iceberg, tau_mag=do_tau_mag)
+                             do_press, do_iceberg, do_tabular_calving, tau_mag=do_tau_mag)
 end subroutine allocate_mech_forcing_from_ref
 
 
 !> Return flags indicating which groups of forcings are allocated
 subroutine get_forcing_groups(fluxes, water, heat, ustar, tau_mag, press, shelf, &
-                             iceberg, salt, heat_added, buoy)
+                             iceberg, tabular_calving, salt, heat_added, buoy)
   type(forcing), intent(in) :: fluxes  !< Reference flux fields
   logical, intent(out) :: water   !< True if fluxes contains water-based fluxes
   logical, intent(out) :: heat    !< True if fluxes contains heat-based fluxes
@@ -3442,6 +3468,7 @@ subroutine get_forcing_groups(fluxes, water, heat, ustar, tau_mag, press, shelf,
   logical, intent(out) :: press   !< True if fluxes contains surface pressure
   logical, intent(out) :: shelf   !< True if fluxes contains ice shelf fields
   logical, intent(out) :: iceberg !< True if fluxes contains iceberg fluxes
+  logical, intent(out) :: tabular_calving !< True if fluxes contains tabular iceberg calving fluxes
   logical, intent(out) :: salt    !< True if fluxes contains salt flux
   logical, intent(out) :: heat_added !< True if fluxes contains explicit heat
   logical, intent(out) :: buoy    !< True if fluxes contains buoyancy fluxes
@@ -3459,6 +3486,7 @@ subroutine get_forcing_groups(fluxes, water, heat, ustar, tau_mag, press, shelf,
   press = associated(fluxes%p_surf)
   shelf = associated(fluxes%frac_shelf_h)
   iceberg = associated(fluxes%ustar_berg)
+  tabular_calving = associated(fluxes%frac_cberg)
   heat_added = associated(fluxes%heat_added)
   buoy = associated(fluxes%buoy)
 end subroutine get_forcing_groups
@@ -3473,6 +3501,7 @@ subroutine get_mech_forcing_groups(forces, stress, ustar, tau_mag, shelf, press,
   logical, intent(out) :: shelf   !< True if forces contains ice shelf fields
   logical, intent(out) :: press   !< True if forces contains pressure fields
   logical, intent(out) :: iceberg !< True if forces contains iceberg fields
+  logical, intent(out) :: tabular_calving !< True if forces contains tabular iceberg calving fluxes
 
   stress = associated(forces%taux) &
       .and. associated(forces%tauy)
@@ -3487,6 +3516,8 @@ subroutine get_mech_forcing_groups(forces, stress, ustar, tau_mag, shelf, press,
       .and. associated(forces%net_mass_src)
   iceberg = associated(forces%area_berg) &
       .and. associated(forces%mass_berg)
+  tabular_calving = associated(forces%frac_cberg &
+      .and. associated(forces%frac_cberg_calved)
 end subroutine get_mech_forcing_groups
 
 
@@ -3556,6 +3587,8 @@ subroutine deallocate_forcing_type(fluxes)
   if (associated(fluxes%ustar_berg))           deallocate(fluxes%ustar_berg)
   if (associated(fluxes%area_berg))            deallocate(fluxes%area_berg)
   if (associated(fluxes%mass_berg))            deallocate(fluxes%mass_berg)
+  if (associated(fluxes%frac_cberg))           deallocate(fluxes%frac_cberg)
+  if (associated(fluxes%frac_cberg_calved))    deallocate(fluxes%frac_cberg_calved)
   if (associated(fluxes%ice_fraction))         deallocate(fluxes%ice_fraction)
   if (associated(fluxes%u10_sqr))              deallocate(fluxes%u10_sqr)
 
@@ -3582,6 +3615,8 @@ subroutine deallocate_mech_forcing(forces)
   if (associated(forces%frac_shelf_v))   deallocate(forces%frac_shelf_v)
   if (associated(forces%area_berg))      deallocate(forces%area_berg)
   if (associated(forces%mass_berg))      deallocate(forces%mass_berg)
+  if (associated(forces%frac_cberg))     deallocate(forces%frac_cberg)
+  if (associated(forces%frac_cberg_calved)) deallocate(forces%frac_cberg_calved)
 
 end subroutine deallocate_mech_forcing
 
@@ -3593,10 +3628,10 @@ subroutine rotate_forcing(fluxes_in, fluxes, turns)
   integer, intent(in) :: turns                !< Number of quarter turns
 
   logical :: do_ustar, do_taumag, do_water, do_heat, do_salt, do_press, do_shelf, &
-      do_iceberg, do_heat_added, do_buoy
+      do_iceberg, do_tabular_calving, do_heat_added, do_buoy
 
   call get_forcing_groups(fluxes_in, do_water, do_heat, do_ustar, do_taumag, do_press, &
-      do_shelf, do_iceberg, do_salt, do_heat_added, do_buoy)
+      do_shelf, do_iceberg, do_tabular_calving, do_salt, do_heat_added, do_buoy)
 
   if (associated(fluxes_in%ustar)) &
     call rotate_array(fluxes_in%ustar, turns, fluxes%ustar)
@@ -3668,6 +3703,11 @@ subroutine rotate_forcing(fluxes_in, fluxes, turns)
     call rotate_array(fluxes_in%iceshelf_melt, turns, fluxes%iceshelf_melt)
   endif
 
+  if (do_tabular_calving) then
+    call rotate_array(fluxes_in%frac_cberg, turns, fluxes%frac_cberg)
+    call rotate_array(fluxes_in%frac_cberg_calved, turns, fluxes%frac_cberg_calved)
+  endif
+
   if (do_heat_added) then
     call rotate_array(fluxes_in%heat_added, turns, fluxes%heat_added)
   endif
@@ -3727,10 +3767,10 @@ subroutine rotate_mech_forcing(forces_in, turns, forces)
   integer, intent(in) :: turns                  !< Number of quarter-turns
   type(mech_forcing), intent(inout) :: forces   !< Forcing on the rotated domain
 
-  logical :: do_stress, do_ustar, do_tau_mag, do_shelf, do_press, do_iceberg
+  logical :: do_stress, do_ustar, do_tau_mag, do_shelf, do_press, do_iceberg, do_tabular_calving
 
   call get_mech_forcing_groups(forces_in, do_stress, do_ustar, do_tau_mag, do_shelf, &
-                              do_press, do_iceberg)
+                              do_press, do_iceberg, do_tabular_calving)
 
   if (do_stress) &
     call rotate_vector(forces_in%taux, forces_in%tauy, turns, &
@@ -3764,6 +3804,11 @@ subroutine rotate_mech_forcing(forces_in, turns, forces)
     call rotate_array(forces_in%mass_berg, turns, forces%mass_berg)
   endif
 
+  if (do_tabular_calving) then
+    call rotate_array(forces_in%frac_cberg, turns, forces%frac_cberg)
+    call rotate_array(forces_in%frac_cberg_calved, turns, forces%frac_cberg_calved)
+  endif
+
   ! Copy fields
   forces%dt_force_accum = forces_in%dt_force_accum
   forces%net_mass_src_set = forces_in%net_mass_src_set
@@ -3785,7 +3830,7 @@ subroutine homogenize_mech_forcing(forces, G, US, Rho0, UpdateUstar)
   real :: tx_mean, ty_mean ! Mean wind stresses [R L Z T-2 ~> Pa]
   real :: tau_mag      ! The magnitude of the wind stresses [R L Z T-2 ~> Pa]
   real :: Irho0        ! Inverse of the mean density rescaled to [Z L-1 R-1 ~> m3 kg-1]
-  logical :: do_stress, do_ustar, do_taumag, do_shelf, do_press, do_iceberg, tau2ustar
+  logical :: do_stress, do_ustar, do_taumag, do_shelf, do_press, do_iceberg, do_tabular_calving, tau2ustar
   integer :: i, j, is, ie, js, je, isB, ieB, jsB, jeB
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
   isB = G%iscB ; ieB = G%iecB ; jsB = G%jscB ; jeB = G%jecB
@@ -3796,7 +3841,7 @@ subroutine homogenize_mech_forcing(forces, G, US, Rho0, UpdateUstar)
   if (present(UpdateUstar)) tau2ustar = UpdateUstar
 
   call get_mech_forcing_groups(forces, do_stress, do_ustar, do_taumag, do_shelf, &
-                              do_press, do_iceberg)
+                              do_press, do_iceberg, do_tabular_calving)
 
   if (do_stress) then
     tx_mean = global_area_mean_u(forces%taux, G, tmp_scale=US%RLZ_T2_to_Pa)
@@ -3847,6 +3892,11 @@ subroutine homogenize_mech_forcing(forces, G, US, Rho0, UpdateUstar)
     call homogenize_field_t(forces%mass_berg, G, tmp_scale=US%RZ_to_kg_m2)
   endif
 
+  if (do_tabular_calving) then
+    call homogenize_field_t(forces%frac_cberg, G)
+    call homogenize_field_t(forces%frac_cberg_calved, G)
+  endif
+
 end subroutine homogenize_mech_forcing
 
 !< Homogenize the fluxes
@@ -3857,10 +3907,10 @@ subroutine homogenize_forcing(fluxes, G, GV, US)
   type(unit_scale_type),   intent(in)    :: US     !< A dimensional unit scaling type
 
   logical :: do_ustar, do_taumag, do_water, do_heat, do_salt, do_press, do_shelf
-  logical :: do_iceberg, do_heat_added, do_buoy
+  logical :: do_iceberg, do_tabular_calving, do_heat_added, do_buoy
 
   call get_forcing_groups(fluxes, do_water, do_heat, do_ustar, do_taumag, do_press, &
-      do_shelf, do_iceberg, do_salt, do_heat_added, do_buoy)
+      do_shelf, do_iceberg, do_tabular_calving, do_salt, do_heat_added, do_buoy)
 
   if (associated(fluxes%ustar)) &
     call homogenize_field_t(fluxes%ustar, G, tmp_scale=US%Z_to_m*US%s_to_T)
@@ -3924,6 +3974,11 @@ subroutine homogenize_forcing(fluxes, G, GV, US)
   if (do_iceberg) then
     call homogenize_field_t(fluxes%ustar_berg, G, tmp_scale=US%Z_to_m*US%s_to_T)
     call homogenize_field_t(fluxes%area_berg, G)
+  endif
+
+  if (do_tabular_calving) then
+    call homogenize_field_t(fluxes%frac_cberg, G)
+    call homogenize_field_t(fluxes%frac_cberg_calved, G)
   endif
 
   if (do_heat_added) then

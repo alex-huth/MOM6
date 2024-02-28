@@ -192,6 +192,10 @@ type, public :: ice_ocean_boundary_type
   real, pointer, dimension(:,:) :: ustar_berg      =>NULL() !< frictional velocity beneath icebergs [m s-1]
   real, pointer, dimension(:,:) :: area_berg       =>NULL() !< fractional area covered by icebergs [m2 m-2]
   real, pointer, dimension(:,:) :: mass_berg       =>NULL() !< mass of icebergs per unit ocean area [kg m-2]
+  real, pointer, dimension(:,:) :: frac_cberg      =>NULL() !< cell fraction of partially-calved bonded bergs
+                                                            !! from the ice sheet [nondim]
+  real, pointer, dimension(:,:) :: frac_cberg_calved =>NULL() !< cell fraction of fully-calved bonded bergs
+                                                              !! from the ice sheet [nondim]
   real, pointer, dimension(:,:) :: runoff_hflx     =>NULL() !< heat content of liquid runoff [W m-2]
   real, pointer, dimension(:,:) :: calving_hflx    =>NULL() !< heat content of frozen runoff [W m-2]
   real, pointer, dimension(:,:) :: p               =>NULL() !< pressure of overlying ice and atmosphere
@@ -323,6 +327,10 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
     .or. (associated(IOB%area_berg) .and. (.not.associated(fluxes%area_berg)))) &
     .or. (associated(IOB%mass_berg) .and. (.not.associated(fluxes%mass_berg)))) &
     call allocate_forcing_type(G, fluxes, iceberg=.true.)
+
+  if (((associated(IOB%frac_cberg) .and. (.not.associated(fluxes%frac_cberg))) &
+    .or. (associated(IOB%frac_cberg_calved) .and. (.not.associated(fluxes%frac_cberg_calved)))) &
+    call allocate_forcing_type(G, fluxes, tabular_calving=.true.)
 
   if ((.not.coupler_type_initialized(fluxes%tr_fluxes)) .and. &
       coupler_type_initialized(IOB%fluxes)) &
@@ -480,6 +488,18 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
       fluxes%mass_berg(i,j) = US%m_to_Z*US%kg_m3_to_R * IOB%mass_berg(i-i0,j-j0) * G%mask2dT(i,j)
       if (CS%check_no_land_fluxes) &
         call check_mask_val_consistency(IOB%mass_berg(i-i0,j-j0), G%mask2dT(i,j), i, j, 'mass_berg', G)
+    endif
+
+    if (associated(IOB%frac_cberg)) then
+      fluxes%frac_cberg(i,j) = IOB%frac_cberg(i-i0,j-j0) * G%mask2dT(i,j)
+      if (CS%check_no_land_fluxes) &
+        call check_mask_val_consistency(IOB%frac_cberg(i-i0,j-j0), G%mask2dT(i,j), i, j, 'frac_cberg', G)
+    endif
+
+    if (associated(IOB%frac_cberg_calved)) then
+      fluxes%frac_cberg_calved(i,j) = IOB%frac_cberg_calved(i-i0,j-j0) * G%mask2dT(i,j)
+      if (CS%check_no_land_fluxes) &
+        call check_mask_val_consistency(IOB%frac_cberg_calved(i-i0,j-j0), G%mask2dT(i,j), i, j, 'frac_cberg_calved', G)
     endif
 
     if (associated(IOB%runoff_hflx)) then
@@ -741,6 +761,10 @@ subroutine convert_IOB_to_forces(IOB, forces, index_bounds, Time, G, US, CS, dt_
   if ( (associated(IOB%area_berg) .and. (.not. associated(forces%area_berg))) .or. &
        (associated(IOB%mass_berg) .and. (.not. associated(forces%mass_berg))) ) &
     call allocate_mech_forcing(G, forces, iceberg=.true.)
+
+  if (((associated(IOB%frac_cberg) .and. (.not.associated(forces%frac_cberg))) &
+    .or. (associated(IOB%frac_cberg_calved) .and. (.not.associated(forces%frac_cberg_calved)))) &
+    call allocate_mech_forcing(G, forces, tabular_calving=.true.)
 
   if (associated(IOB%ice_rigidity)) then
     rigidity_at_h(:,:) = 0.0
@@ -1787,6 +1811,12 @@ subroutine ice_ocn_bnd_type_chksum(id, timestep, iobt)
   endif
   if (associated(iobt%excess_salt)) then
     chks = field_chksum( iobt%excess_salt    ) ; if (root) write(outunit,100) 'iobt%excess_salt    ', chks
+  endif
+  if (associated(iobt%frac_cberg)) then
+    chks = field_chksum( iobt%frac_cberg ) ; if (root) write(outunit,100) 'iobt%frac_cberg     ', chks
+  endif
+  if (associated(iobt%frac_cberg_calved)) then
+    chks = field_chksum( iobt%frac_cberg_calved ) ; if (root) write(outunit,100) 'iobt%frac_cberg_calved     ', chks
   endif
 100 FORMAT("   CHECKSUM::",A20," = ",Z20)
 
