@@ -857,7 +857,7 @@ subroutine ice_sheet_calving_to_ocean_sfc(CS,US,calving,calving_hflx)
   calving = US%RZ_T_to_kg_m2s * ISS%calving(is:ie,js:je)
   calving_hflx = US%QRZ_T_to_W_m2 * ISS%calving_hflx(is:ie,js:je)
 
-  CS%calve_ice_shelf_bergs=.true.
+  !CS%calve_ice_shelf_bergs=.true.
 
 end subroutine ice_sheet_calving_to_ocean_sfc
 
@@ -1273,7 +1273,7 @@ end subroutine add_shelf_flux
 
 !> Initializes shelf model data, parameters and diagnostics
 subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init, directory, forces_in, &
-                                fluxes_in, sfc_state_in, solo_ice_sheet_in)
+                                fluxes_in, sfc_state_in, solo_ice_sheet_in, calve_ice_shelf_bergs)
   type(param_file_type),        intent(in)    :: param_file !< A structure to parse for run-time parameters
   type(ocean_grid_type),        pointer       :: ocn_grid   !< The calling ocean model's horizontal grid structure
   type(time_type),              intent(inout) :: Time !< The clock that that will indicate the model time
@@ -1291,6 +1291,8 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
                                                 !! intent is only inout to allow for halo updates.
   logical,            optional, intent(in)    :: solo_ice_sheet_in !< If present, this indicates whether
                                                    !! a solo ice-sheet driver.
+  logical, optional :: calve_ice_shelf_bergs !< If true, will add point iceberg calving variables to the ice
+                                             !! shelf restart
 
   type(ocean_grid_type), pointer :: G  => NULL(), OG  => NULL() ! Pointers to grids for convenience.
   type(unit_scale_type), pointer :: US => NULL() ! Pointer to a structure containing
@@ -1701,6 +1703,8 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
                  units="m s-1", default=-1.0, scale=US%m_to_Z*US%T_to_s, &
                  do_not_log=CS%ustar_shelf_from_vel)
 
+  if (present(calve_ice_shelf_bergs)) CS%calve_ice_shelf_bergs=calve_ice_shelf_bergs
+
   ! Allocate and initialize state variables to default values
   call ice_shelf_state_init(CS%ISS, CS%grid)
   ISS => CS%ISS
@@ -1756,6 +1760,14 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
                               "Ice shelf area in cell", "m2", conversion=US%L_to_m**2)
   call register_restart_field(ISS%h_shelf, "h_shelf", .true., CS%restart_CSp, &
                               "ice sheet/shelf thickness", "m", conversion=US%Z_to_m)
+
+  if (CS%calve_ice_shelf_bergs) then
+    call register_restart_field(ISS%calving, "shelf_calving", .true., CS%restart_CSp, &
+                                "Calving flux from ice shelf into icebergs", "kg m-2", conversion=US%RZ_to_kg_m2)
+    call register_restart_field(ISS%calving_hflx, "shelf_calving_hflx", .true., CS%restart_CSp, &
+                                "Calving heat flux from ice shelf into icebergs", "W m-2", conversion=US%QRZ_T_to_W_m2)
+  endif
+
   if (PRESENT(sfc_state_in)) then
     if (allocated(sfc_state%taux_shelf) .and. allocated(sfc_state%tauy_shelf)) then
       u_desc = var_desc("taux_shelf", "Pa", "the zonal stress on the ocean under ice shelves", &

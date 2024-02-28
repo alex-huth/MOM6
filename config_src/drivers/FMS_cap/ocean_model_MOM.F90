@@ -255,6 +255,7 @@ subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, wind_stagger, gas
                       !! min(HFrz, OBLD), where OBLD is the boundary layer depth.
                       !! If HFrz <= 0 (default), melt potential will not be computed.
   logical :: use_melt_pot !< If true, allocate melt_potential array
+  logical :: point_calving ! Equals calve_ice_shelf_bergs if calve_ice_shelf_bergs is present
 
   ! This include declares and sets the variable "version".
 # include "version_variable.h"
@@ -282,11 +283,11 @@ subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, wind_stagger, gas
   OS%Time = Time_in ; OS%Time_dyn = Time_in
   ! Call initialize MOM with an optional Ice Shelf CS which, if present triggers
   ! initialization of ice shelf parameters and arrays.
-
+  point_calving=.false.; if (present(calve_ice_shelf_bergs)) point_calving=calve_ice_shelf_bergs
   call initialize_MOM(OS%Time, Time_init, param_file, OS%dirs, OS%MOM_CSp, &
                       Time_in, offline_tracer_mode=OS%offline_tracer_mode, &
                       diag_ptr=OS%diag, count_calls=.true., ice_shelf_CSp=OS%ice_shelf_CSp, &
-                      waves_CSp=OS%Waves)
+                      waves_CSp=OS%Waves, calve_ice_shelf_bergs=point_calving)
   call get_MOM_state_elements(OS%MOM_CSp, G=OS%grid, GV=OS%GV, US=OS%US, C_p=OS%C_p, &
                               C_p_scaled=OS%fluxes%C_p, use_temp=use_temperature)
 
