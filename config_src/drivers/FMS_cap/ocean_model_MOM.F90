@@ -56,6 +56,7 @@ use MOM_ice_shelf, only : initialize_ice_shelf, shelf_calc_flux, ice_shelf_CS
 use MOM_ice_shelf, only : initialize_ice_shelf_fluxes, initialize_ice_shelf_forces
 use MOM_ice_shelf, only : add_shelf_forces, ice_shelf_end, ice_shelf_save_restart
 use MOM_ice_shelf, only : ice_sheet_calving_to_ocean_sfc
+use MOM_ice_shelf, only : ice_sheet_bonded_calving_to_ocean_sfc
 use MOM_wave_interface, only: wave_parameters_CS, MOM_wave_interface_init
 use MOM_wave_interface, only: Update_Surface_Waves
 use iso_fortran_env, only : int64
@@ -125,7 +126,11 @@ type, public ::  ocean_public_type
     area => NULL(),   & !< cell area of the ocean surface [m2].
     calving => NULL(), &!< The mass per unit area of the ice shelf to convert to
                         !!bergs [R Z ~> kg m-2].
-    calving_hflx => NULL() !< Calving heat flux [Q R Z T-1 ~> W m-2].
+    calving_hflx => NULL(), & !< Calving heat flux [Q R Z T-1 ~> W m-2].
+    tabular_calve_mask => NULL(), & !< Mask used to indicate cells ready to be calved and converted
+                        !!to bonded-particle tabular icebergs. 0: not ready to calve,  >1: ready to calve
+    mass_shelf => NULL(), & !< The mass per unit area of the ice shelf or sheet [R Z ~> kg m-2].
+    area_shelf_h => NULL() !< The area per cell covered by the ice shelf [L2 ~> m2].
   type(coupler_2d_bc_type) :: fields    !< A structure that may contain named
                                         !! arrays of tracer-related surface fields.
   integer                  :: avg_kount !< A count of contributions to running
@@ -161,8 +166,11 @@ type, public :: ocean_state_type ; private
                               !! ocean dynamics and forcing fluxes.
   real :: press_to_z          !< A conversion factor between pressure and ocean depth,
                               !! usually 1/(rho_0*g) [Z T2 R-1 L-2 ~> m Pa-1].
-  logical :: calve_ice_shelf_bergs = .false. !< If true, bergs are initialized according to
-                              !! ice shelf flux through the ice front
+  character(len=6) :: calve_ice_shelf_bergs = 'NONE' !< If 'POINT', convert ice shelf flux through
+                             !! a static ice shelf front into point-particle icebergs. If 'BONDED',
+                             !! convert ice shelf into bonded-particle tabular bergs where tabular
+                             !! calving mask exceeds zero. If 'MIXED', use 'POINT' for N Hemisphere
+                             !! and 'BONDED' for S Hemisphere. If 'NONE', no calving.
   real :: C_p                 !< The heat capacity of seawater [J degC-1 kg-1].
   logical :: offline_tracer_mode = .false. !< If false, use the model in prognostic mode
                               !! with the barotropic and baroclinic dynamics, thermodynamics,
@@ -227,7 +235,8 @@ contains
 !!   This subroutine initializes both the ocean state and the ocean surface type.
 !! Because of the way that indices and domains are handled, Ocean_sfc must have
 !! been used in a previous call to initialize_ocean_type.
-subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, wind_stagger, gas_fields_ocn, calve_ice_shelf_bergs)
+  subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, wind_stagger, gas_fields_ocn, &
+                              calve_ice_shelf_bergs)
   type(ocean_public_type), target, &
                        intent(inout) :: Ocean_sfc !< A structure containing various publicly
                                 !! visible ocean surface properties after initialization,
@@ -245,8 +254,11 @@ subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, wind_stagger, gas
                                               !! in the calculation of additional gas or other
                                               !! tracer fluxes, and can be used to spawn related
                                               !! internal variables in the ice model.
-  logical, optional,   intent(in)    :: calve_ice_shelf_bergs !< If true, track ice shelf flux through a
-                                              !! static ice shelf, so that it can be converted into icebergs
+  character(len=*), optional, intent(in) :: calve_ice_shelf_bergs !< If 'POINT', convert ice shelf flux through
+                                              !! a static ice shelf front into point-particle icebergs. If 'BONDED',
+                                              !! convert ice shelf into bonded-particle tabular bergs where tabular
+                                              !! calving mask exceeds zero. If 'MIXED', use 'POINT' for N Hemisphere
+                                              !! and 'BONDED' for S Hemisphere. If 'NONE', no calving.
   ! Local variables
   real :: Rho0        ! The Boussinesq ocean density [R ~> kg m-3]
   real :: G_Earth     ! The gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
@@ -286,7 +298,7 @@ subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, wind_stagger, gas
   call initialize_MOM(OS%Time, Time_init, param_file, OS%dirs, OS%MOM_CSp, &
                       Time_in, offline_tracer_mode=OS%offline_tracer_mode, &
                       diag_ptr=OS%diag, count_calls=.true., ice_shelf_CSp=OS%ice_shelf_CSp, &
-                      waves_CSp=OS%Waves)
+                      waves_CSp=OS%Waves, calve_ice_shelf_bergs=calve_ice_shelf_bergs)
   call get_MOM_state_elements(OS%MOM_CSp, G=OS%grid, GV=OS%GV, US=OS%US, C_p=OS%C_p, &
                               C_p_scaled=OS%fluxes%C_p, use_temp=use_temperature)
 
@@ -415,9 +427,9 @@ subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, wind_stagger, gas
   endif
 
   if (present(calve_ice_shelf_bergs)) then
-    if (calve_ice_shelf_bergs) then
-      call convert_shelf_state_to_ocean_type(Ocean_sfc, OS%Ice_shelf_CSp, OS%US)
-      OS%calve_ice_shelf_bergs=.true.
+    if (trim(calve_ice_shelf_bergs) /= 'NONE') then
+      call convert_shelf_state_to_ocean_type(Ocean_sfc, OS%grid, OS%Ice_shelf_CSp, OS%US, calve_ice_shelf_bergs)
+      OS%calve_ice_shelf_bergs=trim(calve_ice_shelf_bergs)
     endif
   endif
 
@@ -683,7 +695,8 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
 !  call convert_state_to_ocean_type(OS%sfc_state, Ocean_sfc, OS%grid, OS%US, &
 !                                   OS%fluxes%p_surf_full, OS%press_to_z)
   call convert_state_to_ocean_type(OS%sfc_state, Ocean_sfc, OS%grid, OS%US)
-  if (OS%calve_ice_shelf_bergs) call convert_shelf_state_to_ocean_type(Ocean_sfc,OS%Ice_shelf_CSp, OS%US)
+  if (trim(OS%calve_ice_shelf_bergs)/='NONE') &
+    call convert_shelf_state_to_ocean_type(Ocean_sfc, OS%grid, OS%Ice_shelf_CSp, OS%US, OS%calve_ice_shelf_bergs)
   Time1 = OS%Time ; if (do_dyn) Time1 = OS%Time_dyn
   call coupler_type_send_data(Ocean_sfc%fields, Time1)
 
@@ -807,6 +820,9 @@ subroutine initialize_ocean_public_type(input_domain, Ocean_sfc, diag, gas_field
              Ocean_sfc%sea_lev(isc:iec,jsc:jec), &
              Ocean_sfc%calving(isc:iec,jsc:jec), &
              Ocean_sfc%calving_hflx(isc:iec,jsc:jec), &
+             Ocean_sfc%tabular_calve_mask(isc:iec,jsc:jec), &
+             Ocean_sfc%mass_shelf(isc:iec,jsc:jec), &
+             Ocean_sfc%area_shelf_h(isc:iec,jsc:jec), &
              Ocean_sfc%area   (isc:iec,jsc:jec), &
              Ocean_sfc%melt_potential(isc:iec,jsc:jec), &
              Ocean_sfc%OBLD   (isc:iec,jsc:jec), &
@@ -819,6 +835,10 @@ subroutine initialize_ocean_public_type(input_domain, Ocean_sfc, diag, gas_field
   Ocean_sfc%sea_lev(:,:) = 0.0  ! time averaged thickness of top model grid cell (m) plus patm/rho0/grav
   Ocean_sfc%calving(:,:)  = 0.0  ! time accumulated ice sheet calving (kg m-2) passed to ice model
   Ocean_sfc%calving_hflx(:,:) = 0.0 ! time accumulated ice sheet calving heat flux (W m-2) passed to ice model
+  Ocean_sfc%tabular_calve_mask(:,:) = 0.0 ! mask for converting ice shelf into bonded-particle bergs,
+                                          ! passed to ice model
+  Ocean_sfc%mass_shelf(:,:) = 0.0 ! mass per unit area of the ice shelf or sheet (kg m-2), passed to ice model
+  Ocean_sfc%area_shelf_h(:,:) = 0.0 ! area of ice shelf (m2), passed to ice model
   Ocean_sfc%frazil(:,:)  = 0.0  ! time accumulated frazil (J/m^2) passed to ice model
   Ocean_sfc%melt_potential(:,:)  = 0.0  ! time accumulated melt potential (J/m^2) passed to ice model
   Ocean_sfc%OBLD(:,:)    = 0.0  ! ocean boundary layer depth (m)
@@ -954,19 +974,31 @@ end subroutine convert_state_to_ocean_type
 
 !> Converts the ice-shelf-to-ocean calving and calving_hflx variables from the ice-shelf state (ISS) type
 !! to the ocean public type
-subroutine convert_shelf_state_to_ocean_type(Ocean_sfc, CS, US)
+subroutine convert_shelf_state_to_ocean_type(Ocean_sfc, G, CS, US, calve_ice_shelf_bergs)
   type(ocean_public_type), &
                target, intent(inout) :: Ocean_sfc !< A structure containing various publicly
                                                   !! visible ocean surface fields, whose elements
                                                   !! have their data set here.
-  type(ice_shelf_CS),      pointer :: CS        !< A pointer to the ice shelf control structure
-  type(unit_scale_type), intent(in)    :: US   !< A dimensional unit scaling type
+  type(ocean_grid_type) :: G                      !< The ocean's grid structure
+  type(ice_shelf_CS),      pointer :: CS          !< A pointer to the ice shelf control structure
+  type(unit_scale_type), intent(in)    :: US      !< A dimensional unit scaling type
+  character(len=*), intent(in) :: calve_ice_shelf_bergs !< If 'POINT', convert ice shelf flux through
+                                              !! a static ice shelf front into point-particle icebergs. If 'BONDED',
+                                              !! convert ice shelf into bonded-particle tabular bergs where tabular
+                                              !! calving mask exceeds zero. If 'MIXED', use 'POINT' for N Hemisphere
+                                              !! and 'BONDED' for S Hemisphere. If 'NONE', no calving.
   integer :: isc_bnd, iec_bnd, jsc_bnd, jec_bnd, i, j
 
   call get_domain_extent(Ocean_sfc%Domain, isc_bnd, iec_bnd, jsc_bnd, jec_bnd)
 
-  call ice_sheet_calving_to_ocean_sfc(CS,US,Ocean_sfc%calving(isc_bnd:iec_bnd,jsc_bnd:jec_bnd),&
-    Ocean_sfc%calving_hflx(isc_bnd:iec_bnd,jsc_bnd:jec_bnd))
+  if ( trim(calve_ice_shelf_bergs) == 'POINT' .or. &
+      (trim(calve_ice_shelf_bergs) == 'MIXED' .and. minval(G%geoLatCv(:,:))>0) ) then
+    call ice_sheet_calving_to_ocean_sfc(CS,US,Ocean_sfc%calving(isc_bnd:iec_bnd,jsc_bnd:jec_bnd),&
+      Ocean_sfc%calving_hflx(isc_bnd:iec_bnd,jsc_bnd:jec_bnd))
+  elseif (trim(calve_ice_shelf_bergs) == 'BONDED' .or. trim(calve_ice_shelf_bergs) == 'MIXED') then
+    call ice_sheet_bonded_calving_to_ocean_sfc(CS,US,Ocean_sfc%tabular_calve_mask(isc_bnd:iec_bnd,jsc_bnd:jec_bnd),&
+      Ocean_sfc%mass_shelf(isc_bnd:iec_bnd,jsc_bnd:jec_bnd),Ocean_sfc%area_shelf_h(isc_bnd:iec_bnd,jsc_bnd:jec_bnd))
+  endif
 
 end subroutine convert_shelf_state_to_ocean_type
 

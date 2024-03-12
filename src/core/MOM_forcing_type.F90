@@ -3312,7 +3312,7 @@ subroutine allocate_forcing_by_group(G, fluxes, water, heat, ustar, press, &
   call myAlloc(fluxes%mass_berg,isd,ied,jsd,jed, iceberg)
 
   call myAlloc(fluxes%frac_cberg,isd,ied,jsd,jed, tabular_calving)
-  call myAlloc(fluxes%frac_cberg_calving,isd,ied,jsd,jed, tabular_calving)
+  call myAlloc(fluxes%frac_cberg_calved,isd,ied,jsd,jed, tabular_calving)
 
   !These fields should only on allocated when USE_CFC_CAP is activated.
   call myAlloc(fluxes%ice_fraction,isd,ied,jsd,jed, cfc)
@@ -3419,7 +3419,7 @@ subroutine allocate_mech_forcing_by_group(G, forces, stress, ustar, shelf, &
   call myAlloc(forces%mass_berg,isd,ied,jsd,jed, iceberg)
 
   call myAlloc(forces%frac_cberg,isd,ied,jsd,jed, tabular_calving)
-  call myAlloc(forces%frac_cberg_calving,isd,ied,jsd,jed, tabular_calving)
+  call myAlloc(forces%frac_cberg_calved,isd,ied,jsd,jed, tabular_calving)
 
   !These fields should only be allocated when waves
   if (present(waves)) then; if (waves) then;
@@ -3493,7 +3493,7 @@ end subroutine get_forcing_groups
 
 
 !> Return flags indicating which groups of mechanical forcings are allocated
-subroutine get_mech_forcing_groups(forces, stress, ustar, tau_mag, shelf, press, iceberg)
+subroutine get_mech_forcing_groups(forces, stress, ustar, tau_mag, shelf, press, iceberg, tabular_calving)
   type(mech_forcing), intent(in) :: forces  !< Reference forcing fields
   logical, intent(out) :: stress  !< True if forces contains wind stress fields
   logical, intent(out) :: ustar   !< True if forces contains ustar field
@@ -3516,7 +3516,7 @@ subroutine get_mech_forcing_groups(forces, stress, ustar, tau_mag, shelf, press,
       .and. associated(forces%net_mass_src)
   iceberg = associated(forces%area_berg) &
       .and. associated(forces%mass_berg)
-  tabular_calving = associated(forces%frac_cberg &
+  tabular_calving = associated(forces%frac_cberg) &
       .and. associated(forces%frac_cberg_calved)
 end subroutine get_mech_forcing_groups
 

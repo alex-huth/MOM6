@@ -328,7 +328,7 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
     .or. (associated(IOB%mass_berg) .and. (.not.associated(fluxes%mass_berg)))) &
     call allocate_forcing_type(G, fluxes, iceberg=.true.)
 
-  if (((associated(IOB%frac_cberg) .and. (.not.associated(fluxes%frac_cberg))) &
+  if ((associated(IOB%frac_cberg) .and. (.not.associated(fluxes%frac_cberg))) &
     .or. (associated(IOB%frac_cberg_calved) .and. (.not.associated(fluxes%frac_cberg_calved)))) &
     call allocate_forcing_type(G, fluxes, tabular_calving=.true.)
 
@@ -762,7 +762,7 @@ subroutine convert_IOB_to_forces(IOB, forces, index_bounds, Time, G, US, CS, dt_
        (associated(IOB%mass_berg) .and. (.not. associated(forces%mass_berg))) ) &
     call allocate_mech_forcing(G, forces, iceberg=.true.)
 
-  if (((associated(IOB%frac_cberg) .and. (.not.associated(forces%frac_cberg))) &
+  if ((associated(IOB%frac_cberg) .and. (.not.associated(forces%frac_cberg))) &
     .or. (associated(IOB%frac_cberg_calved) .and. (.not.associated(forces%frac_cberg_calved)))) &
     call allocate_mech_forcing(G, forces, tabular_calving=.true.)
 

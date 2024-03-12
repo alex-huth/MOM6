@@ -62,7 +62,7 @@ use MOM_spatial_means, only : global_area_integral
 use MOM_checksums, only : hchksum, qchksum, chksum, uchksum, vchksum, uvchksum
 use MOM_interpolate, only : init_external_field, time_interp_external, time_interp_external_init
 use MOM_interpolate, only : external_field
-use MOM_ice_shelf_tabular_calving, only: tabular_calving_state, initialize_tabular_calving, process_tabular_calving
+use MOM_ice_shelf_tabular_calving, only: tabular_calving_state, initialize_tabular_calving, tabular_calving_end
 
 implicit none ; private
 
@@ -76,7 +76,7 @@ implicit none ; private
 public shelf_calc_flux, initialize_ice_shelf, ice_shelf_end, ice_shelf_query
 public ice_shelf_save_restart, solo_step_ice_shelf, add_shelf_forces
 public initialize_ice_shelf_fluxes, initialize_ice_shelf_forces
-public ice_sheet_calving_to_ocean_sfc
+public ice_sheet_calving_to_ocean_sfc, ice_sheet_bonded_calving_to_ocean_sfc
 
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
 ! consistency testing. These are noted in comments with units like Z, H, L, and T, along with
@@ -106,6 +106,7 @@ type, public :: ice_shelf_CS ; private
   type(ice_shelf_state), pointer :: ISS => NULL() !< A structure with elements that describe
                                           !! the ice-shelf state
   type(ice_shelf_dyn_CS), pointer :: dCS => NULL() !< The control structure for the ice-shelf dynamics.
+  type(tabular_calving_state), pointer :: TC => NULL() !< A pointer to the tabular calving structure
 
   real, pointer, dimension(:,:) :: &
     utide   => NULL()  !< An unresolved tidal velocity [L T-1 ~> m s-1]
@@ -153,8 +154,11 @@ type, public :: ice_shelf_CS ; private
                             !! will be called (note: GL_regularize and GL_couple
                             !! should be exclusive)
   logical :: calve_to_mask  !< If true, calve any ice that passes outside of a masked area
-  logical :: calve_ice_shelf_bergs=.false. !< If true, flux through a static ice front is converted
-                                           !! to point bergs
+  character(len=6) :: calve_ice_shelf_bergs = 'NONE'  !< If 'POINT', convert ice shelf flux through
+                                              !! a static ice shelf front into point-particle icebergs. If 'BONDED',
+                                              !! convert ice shelf into bonded-particle tabular bergs where tabular
+                                              !! calving mask exceeds zero. If 'MIXED', use 'POINT' for N Hemisphere
+                                              !! and 'BONDED' for S Hemisphere. If 'NONE', no calving.
   real :: min_thickness_simple_calve !< min. ice shelf thickness criteria for calving [Z ~> m].
   real :: T0                !< temperature at ocean surface in the restoring region [C ~> degC]
   real :: S0                !< Salinity at ocean surface in the restoring region [S ~> ppt].
@@ -200,7 +204,6 @@ type, public :: ice_shelf_CS ; private
   logical :: buoy_flux_itt_bug           !< If true, fixes buoyancy iteration bug
   logical :: salt_flux_itt_bug           !< If true, fixes salt iteration bug
   real :: buoy_flux_itt_threshold        !< Buoyancy iteration threshold for convergence
-  logical :: calve_tabular_bergs         !< If true, calve tabular iKID icebergs according to a calving mask file
 
   !>@{ Diagnostic handles
   integer :: id_melt = -1, id_exch_vel_s = -1, id_exch_vel_t = -1, &
@@ -792,7 +795,11 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
       ISS%dhdt_shelf(i,j) = (ISS%h_shelf(i,j) - ISS%dhdt_shelf(i,j))*Itime_step
     enddo; enddo
 
-    if (CS%calve_tabular_bergs) call process_tabular_calving(G, CS, ISS, CS%TC, Time)
+    if ( trim(CS%calve_ice_shelf_bergs)=='BONDED' .or. &
+        (trim(CS%calve_ice_shelf_bergs)=='MIXED' .and. maxval(G%geolonCv(:,:))<0) ) then
+      call process_tabular_calving(G, CS, ISS, CS%TC, fluxes%frac_cberg_calved, Time)
+      !TODO: make sure forces%frac_cberg_calved matches appropriately
+    endif
 
     call IS_dynamics_post_data(time_step, Time, CS%dCS, G)
   endif
@@ -861,9 +868,35 @@ subroutine ice_sheet_calving_to_ocean_sfc(CS,US,calving,calving_hflx)
   calving = US%RZ_T_to_kg_m2s * ISS%calving(is:ie,js:je)
   calving_hflx = US%QRZ_T_to_W_m2 * ISS%calving_hflx(is:ie,js:je)
 
-  CS%calve_ice_shelf_bergs=.true.
-
 end subroutine ice_sheet_calving_to_ocean_sfc
+
+!> Converts the ice-shelf-to-ocean bonded-particle tabular calving variables from the ice-shelf state (ISS)
+!! type to the ocean public type
+subroutine ice_sheet_bonded_calving_to_ocean_sfc(CS,US,tabular_calve_mask,mass_shelf,area_shelf_h)
+  type(ice_shelf_CS),      pointer :: CS        !< A pointer to the ice shelf control structure
+  type(unit_scale_type), intent(in)    :: US   !< A dimensional unit scaling type
+  real, dimension(:,:), intent(inout) :: mass_shelf !< The mass per unit area of the ice shelf [R Z ~> kg m-2].
+  real, dimension(:,:), intent(inout) :: area_shelf_h !<  The area per cell covered by the ice shelf [L2 ~> m2].
+  real, dimension(:,:), intent(inout) :: tabular_calve_mask !< Mask used to indicate cells ready to be calved and
+                                            !! converted to bonded-particle tabular icebergs
+                                            !! 0: not ready to calve
+                                            !! >1: ready to calve
+  ! Local variables
+  type(tabular_calving_state), pointer :: TC => NULL() !< A pointer to the tabular calving structure
+  type(ice_shelf_state), pointer :: ISS => NULL()    !< A structure with elements that describe
+                                                       !! the ice-shelf state
+  type(ocean_grid_type), pointer :: G => NULL()   !< A pointer to the ocean grid metric.
+  integer :: is, ie, js, je
+
+  G=>CS%Grid
+  TC => CS%TC
+  ISS => CS%ISS
+  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
+
+  tabular_calve_mask = TC%tabular_calve_mask(is:ie,js:je)
+  mass_shelf = ISS%mass_shelf(is:ie,js:je)*US%RZ_to_kg_m2
+  area_shelf_h = ISS%area_shelf_h(is:ie,js:je)*US%L_to_m**2
+end subroutine ice_sheet_bonded_calving_to_ocean_sfc
 
 !> Changes the thickness (mass) of the ice shelf based on sub-ice-shelf melting
 subroutine change_thickness_using_melt(ISS, G, US, time_step, fluxes, density_ice, debug)
@@ -970,14 +1003,14 @@ subroutine add_shelf_forces(Ocn_grid, US, CS, forces, do_shelf_area, external_ca
       ! The frac_shelf is set over the widest possible area. Could it be smaller?
       do j=jsd,jed ; do I=isd,ied-1
         forces%frac_shelf_u(I,j) = 0.0
-        if ((G%areaT(i,j)*(1-forces%frac_cberg(i,j) + G%areaT(i+1,j)*(1-forces%frac_cberg(i+1,j) > 0.0)) &
+        if ((G%areaT(i,j)*(1-forces%frac_cberg(i,j) + G%areaT(i+1,j)*(1-forces%frac_cberg(i+1,j)))) > 0.0) &
           forces%frac_shelf_u(I,j) = (ISS%area_shelf_h(i,j)*(1-forces%frac_cberg(i,j)) + &
                                       ISS%area_shelf_h(i+1,j)*(1-forces%frac_cberg(i+1,j))) / &
                                      (G%areaT(i,j) + G%areaT(i+1,j))
       enddo ; enddo
       do J=jsd,jed-1 ; do i=isd,ied
         forces%frac_shelf_v(i,J) = 0.0
-        if ((G%areaT(i,j)*(1-forces%frac_cberg(i,j) + G%areaT(i,j+1)*(1-forces%frac_cberg(i,j+1) > 0.0)) &
+        if ((G%areaT(i,j)*(1-forces%frac_cberg(i,j) + G%areaT(i,j+1)*(1-forces%frac_cberg(i,j+1)))) > 0.0) &
           forces%frac_shelf_v(i,J) = (ISS%area_shelf_h(i,j)*(1-forces%frac_cberg(i,j)) + &
                                       ISS%area_shelf_h(i,j+1)*(1-forces%frac_cberg(i+1,j))) / &
                                      (G%areaT(i,j) + G%areaT(i,j+1))
@@ -1313,7 +1346,7 @@ end subroutine add_shelf_flux
 
 !> Initializes shelf model data, parameters and diagnostics
 subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init, directory, forces_in, &
-                                fluxes_in, sfc_state_in, solo_ice_sheet_in)
+                                fluxes_in, sfc_state_in, solo_ice_sheet_in, calve_ice_shelf_bergs)
   type(param_file_type),        intent(in)    :: param_file !< A structure to parse for run-time parameters
   type(ocean_grid_type),        pointer       :: ocn_grid   !< The calling ocean model's horizontal grid structure
   type(time_type),              intent(inout) :: Time !< The clock that that will indicate the model time
@@ -1331,6 +1364,11 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
                                                 !! intent is only inout to allow for halo updates.
   logical,            optional, intent(in)    :: solo_ice_sheet_in !< If present, this indicates whether
                                                    !! a solo ice-sheet driver.
+  character(len=*), optional, intent(in) :: calve_ice_shelf_bergs !< If 'POINT', convert ice shelf flux through
+                                              !! a static ice shelf front into point-particle icebergs. If 'BONDED',
+                                              !! convert ice shelf into bonded-particle tabular bergs where tabular
+                                              !! calving mask exceeds zero. If 'MIXED', use 'POINT' for N Hemisphere
+                                              !! and 'BONDED' for S Hemisphere. If 'NONE', no calving.
 
   type(ocean_grid_type), pointer :: G  => NULL(), OG  => NULL() ! Pointers to grids for convenience.
   type(unit_scale_type), pointer :: US => NULL() ! Pointer to a structure containing
@@ -1653,10 +1691,6 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
                  "Convergence criterion of Newton's method for ice shelf "//&
                  "buoyancy iteration.", units="nondim", default=1.0e-4)
 
-  call get_param(param_file, mdl, "CALVE_TABULAR_BERGS", CS%calve_tabular_bergs, &
-                 "If true, calve tabular iKID icebergs according to a calving mask file.",&
-                 default=.false.)
-
   if (PRESENT(sfc_state_in)) then
     allocate(sfc_state)
     ! assuming frazil is enabled in ocean. This could break some configurations?
@@ -1745,6 +1779,8 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
                  units="m s-1", default=-1.0, scale=US%m_to_Z*US%T_to_s, &
                  do_not_log=CS%ustar_shelf_from_vel)
 
+  if (present(calve_ice_shelf_bergs)) CS%calve_ice_shelf_bergs=calve_ice_shelf_bergs
+
   ! Allocate and initialize state variables to default values
   call ice_shelf_state_init(CS%ISS, CS%grid)
   ISS => CS%ISS
@@ -1791,7 +1827,10 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
 
   endif
 
-  if (CS%calve_tabular_bergs) call initialize_tabular_calving(param_file, CS%TC, G)
+  if ( trim(CS%calve_ice_shelf_bergs)=='BONDED' .or. &
+      (trim(CS%calve_ice_shelf_bergs)=='MIXED' .and. maxval(G%geolonCv(:,:))<0) ) then
+    call initialize_tabular_calving(param_file, CS%TC, G)
+  endif
 
   ! Set up the restarts.
 
@@ -2288,12 +2327,109 @@ subroutine ice_shelf_end(CS)
 
   if (CS%active_shelf_dynamics) call ice_shelf_dyn_end(CS%dCS)
 
-  if (CS%calve_tabular_bergs) call ice_shelf_calving_end(CS%TC)
+  call tabular_calving_end(CS%TC)
 
   call MOM_IS_diag_mediator_end(CS%diag)
   deallocate(CS)
 
 end subroutine ice_shelf_end
+
+!> Removes ice shelf where tabular calving has occurred. Updates tabular calving mask.
+subroutine process_tabular_calving(G, CS, ISS, TC, frac_cberg_calved, Time)
+  ! Arguments
+  type(ocean_grid_type), intent(in) :: G   !< The grid structure used by the ice shelf.
+  type(ice_shelf_CS),    pointer    :: CS   !< A pointer to the control structure returned
+                                            !! by a previous call to initialize_ice_shelf.
+  type(ice_shelf_state), pointer :: ISS     !< A structure with elements that describe
+                                            !! the ice-shelf state
+  type(tabular_calving_state), pointer :: TC !< A pointer to the tabular calving structure
+  real, dimension(:,:), intent(inout) :: frac_cberg_calved !< cell fraction of fully-calved bonded bergs
+                                                           !! from the ice sheet [nondim]
+  type(time_type),       intent(in)    :: Time !< The current model time
+  ! Local variables
+  integer :: max_TC_mask
+  integer :: i, j, is, ie, js, je, m, n
+  real, allocatable, dimension(:,:)   :: tmp2d ! Temporary array for storing ice shelf input data
+
+
+  !First, remove any ice that has fully calved
+  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
+  do j=js,je ; do i=is,ie
+    if (frac_cberg_calved(i,j)>=1) then
+      TC%tabular_calve_mask(i,j)    = 0
+      ISS%mass_shelf(i,j)   = 0
+      ISS%area_shelf_h(i,j) = 0
+      ISS%hmask(i,j)        = 0
+      ISS%h_shelf(i,j)      = 0
+    elseif (frac_cberg_calved(i,j)>0 .and. frac_cberg_calved(i,j)<1) then
+      ISS%mass_shelf(i,j)   = (1-frac_cberg_calved(i,j))*ISS%mass_shelf(i,j)
+      ISS%area_shelf_h(i,j) = (1-frac_cberg_calved(i,j))*ISS%area_shelf_h(i,j)
+      ISS%hmask(i,j)=2
+    endif
+    !reset frac_cberg_calved
+    frac_cberg_calved(i,j)=0
+  enddo; enddo
+
+  call pass_var(ISS%mass_shelf,   G%domain, complete=.false.)
+  call pass_var(ISS%area_shelf_h, G%domain, complete=.false.)
+  call pass_var(ISS%hmask,        G%domain, complete=.false.)
+  call pass_var(ISS%h_shelf,      G%domain, complete=.true.)
+
+  if (TC%tabular_calving_from_file) then
+
+    if (CS%rotate_index) then
+      allocate(tmp2d(CS%Grid_in%isd:CS%Grid_in%ied,CS%Grid_in%jsd:CS%Grid_in%jed), source=0.0)
+    else
+      allocate(tmp2d(is:ie,js:je), source=0.0)
+    endif
+
+    call time_interp_external(TC%calving_mask_handle, Time, tmp2d)
+    call rotate_array(tmp2d, CS%turns, TC%tabular_calve_mask)
+    deallocate(tmp2d)
+
+    !for now, only calve where there is ice present.
+    do j=js,je ; do i=is,ie
+      if (ISS%area_shelf_h(i,j)<=0) TC%tabular_calve_mask(i,j)=0
+    enddo; enddo
+
+  else
+
+    !TODO: implement a tabular calving law here, e.g.
+    !call update_tabular_calving_mask(G, CS, TC, Time)
+    
+    call MOM_error(FATAL, "Tabular calving is currently only possible by reading in the tabular calving mask "//&
+                   "from a file (see subroutine initialize_tabular_calving), i.e. there is not yet a tabular "//&
+                   "calving law.")
+  endif
+
+  call pass_var(TC%tabular_calve_mask, G%domain, complete=.true.)
+
+  !Adjust mask to make sure it extends 2 cells past the calving front. The mask will not change until the
+  !transition period for the gradual transition between ice shelf and iceberg is complete, so this
+  !extension should account for any ice that advects into these cells over this time period.
+  !TODO: If for some strange reason, 2 cells is not enough, you may need to just calve excess ice as
+  !non-interactive bergs.
+
+  !start by set calving mask to zero wherever there is no ice. This probably will not be necessary when
+  !a calving law is implemented, but may be helpful when reading in calving masks from file, which
+  !could extend into the ocean as a safeguard to make sure that the ice front is calved regardless of
+  !any ice front advection.
+  do j=js,je ; do i=is,ie
+    if (ISS%area_shelf_h(i,j)<=0) TC%tabular_calve_mask(i,j)=0
+  enddo; enddo
+
+  !then set calving mask to one wherever non-ice cells are within 2 cells of a calving cell
+  do j=js,je; do i=is,ie
+    if (TC%tabular_calve_mask(i,j)>0 .and. ISS%area_shelf_h(i,j)>0) then
+      do m=j-2,j+2; do n=i-2,i+2
+        if (ISS%area_shelf_h(m,n)<=0) TC%tabular_calve_mask(i,j)=1.0
+      enddo; enddo
+    endif
+  enddo; enddo
+
+  call pass_var(TC%tabular_calve_mask, G%domain, complete=.true.)
+
+end subroutine process_tabular_calving
 
 !> This routine is for stepping a stand-alone ice shelf model without an ocean.
 subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in, fluxes_in)

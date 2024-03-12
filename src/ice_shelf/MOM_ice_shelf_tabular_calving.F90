@@ -18,37 +18,31 @@ use MOM_coms, only : reproducing_sum
 use MOM_checksums, only : hchksum, qchksum, chksum, uchksum, vchksum, uvchksum
 use mpp_mod, only : mpp_sync_self
 use MOM_file_parser, only : read_param, get_param, log_param, log_version, param_file_type
-use MOM_io, only : slasher
+use MOM_io, only : slasher, file_exists
 use MOM_interpolate, only : init_external_field, time_interp_external, time_interp_external_init
+use MOM_interpolate, only : external_field
+use MOM_unit_scaling, only : unit_scale_type
+use MOM_ice_shelf_state, only : ice_shelf_state
+use MOM_time_manager, only : time_type
 
   implicit none ; private
 
-public initialize_tabular_calving, process_tabular_calving
+public initialize_tabular_calving, tabular_calving_end
 
 !> Structure that describes the ice shelf calving state
 type, public :: tabular_calving_state
-  integer, pointer, dimension(:,:) :: &
-    calve_mask => NULL()       !< Mask used to indicate cells ready to be calved and
-                               !! converted to bonded-particle tabular icebergs
-                               !! 0: not ready to calve
-                               !! >1: ready to calve
-
-!  real, pointer, dimension(:,:) :: &
-  ! integer, pointer, dimension(:,:) :: &
-  !   c_id => NULL()             !! integer field to identify each unique tabular iceberg
-
-  real, allocatable, dimension(:,:) :: &
-    berg_list                  !< list of each berg on the current PE, the other PEs it also
-                               !!overlaps, and the min and max coords of the berg on those PEs
-  ! integer :: berg_pe_count = 0 !< the sum of the number of PEs that each tabular berg on the
-  !                              !! current PE overlaps. Equals the length of berg_list
+  real, pointer, dimension(:,:) :: &
+    tabular_calve_mask => NULL() !< Mask used to indicate cells ready to be calved and
+                                 !! converted to bonded-particle tabular icebergs
+                                 !! 0: not ready to calve
+                                 !! >1: ready to calve
 
   logical :: tabular_calving_from_file !< If true, read in tabular calving mask from a file
 
   logical :: debug             !< If true, write verbose output
 
-  type(external_field) :: calving_mask_handle
-  !< Handle for reading the time interpolated ice shelf tabular calving mask from a file
+  type(external_field) :: calving_mask_handle !< Handle for reading the time-interpolated
+                                              !! ice shelf tabular calving mask from a file
 end type tabular_calving_state
 
 contains
@@ -72,7 +66,7 @@ subroutine initialize_tabular_calving(param_file, TC, G)
 
   allocate(TC)
   !allocate(TC%c_id(isd:ied,jsd:jed), source=0.0 )
-  allocate(TC%calve_mask(isd:ied,jsd:jed), source=0.0 )
+  allocate(TC%tabular_calve_mask(isd:ied,jsd:jed), source=0.0 )
 
   call get_param(param_file, mdl, "DEBUG", TC%debug, default=.false.)
   !call get_param(param_file, mdl, "TABULAR_BERG_PARTICLE_RADIUS", CS%tabular_rad, &
@@ -114,196 +108,199 @@ subroutine initialize_tabular_calving(param_file, TC, G)
 
 end subroutine initialize_tabular_calving
 
-!> Initialize iKID icebergs from a tabular calving mask.
-subroutine process_tabular_calving(G, CS, ISS, TC, frac_cberg_calved, Time)
-  ! Arguments
-  type(ocean_grid_type), intent(in) :: G   !< The grid structure used by the ice shelf.
-  type(ice_shelf_CS),    pointer    :: CS   !< A pointer to the control structure returned
-                                            !! by a previous call to initialize_ice_shelf.
-  type(ice_shelf_state), pointer :: ISS     !< A structure with elements that describe
-                                            !! the ice-shelf state
-  type(tabular_calving_state), pointer :: TC !< A pointer to the tabular calving structure
-  real, dimension(:,:), intent(inout) :: frac_cberg_calved !< 
-  type(time_type),       intent(in)    :: Time !< The current model time
-  ! Local variables
-  integer :: max_TC_mask
-  integer :: i, j, is, ie, js, je, m, n
-
-  !TC%c_id(:,:) = 0
-
-  !First, remove any ice that has fully calved
-  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
-  do j=js,je ; do i=is,ie
-    if (frac_cberg_calved(i,j)>=1) then
-      TC%calve_mask(i,j)    = 0
-      ISS%mass_shelf(i,j)   = 0
-      ISS%area_shelf_h(i,j) = 0
-      ISS%hmask(i,j)        = 0
-      ISS%h_shelf(i,j)      = 0
-    elseif (frac_cberg_calved(i,j)>0 .and. frac_cberg_calved(i,j)<1) then
-      ISS%mass_shelf(i,j)   = (1-frac_cberg_calved(i,j))*ISS%mass_shelf(i,j)
-      ISS%area_shelf_h(i,j) = (1-frac_cberg_calved(i,j))*ISS%area_shelf_h(i,j)
-      ISS%hmask(i,j)=2
-    endif
-    !reset frac_cberg_calved
-    frac_cberg_calved(i,j)=0
-  enddo; enddo
-
-  call pass_var(ISS%mass_shelf,   G%domain, complete=.false.)
-  call pass_var(ISS%area_shelf_h, G%domain, complete=.false.)
-  call pass_var(ISS%hmask,        G%domain, complete=.false.)
-  call pass_var(ISS%h_shelf,      G%domain, complete=.true.)
-
-  !First, update the tabular calving mask
-  call update_tabular_calving_mask(G, CS, TC, Time)
-
-  ! max_TC_mask = maxval(TC%calve_mask)
-  ! call max_across_PEs(max_TC_mask)
-  ! if (max_TC_mask<=0) then !no calving
-  !   if (allocated(TC%berg_list)) deallocate(TC%berg_list)
-  !   return
-  ! endif
-
-  ! !We want to initialize (calve)  bonded-particle tabular bergs that cover the "berg cells" defined
-  ! !where mask>0. There may be multiple tabular bergs to calve in the domain,
-  ! !which may overlap multiple cells and PEs. The approach is to create a field of unique IDs
-  ! !that are each associated with a different tabular berg. This ID is the same on
-  ! !all PEs that the corresponding berg may overlap. Then, the max/min x and y coordinates of
-  ! !each berg are passed between the PEs that the berg overlaps. Next, a rectangular array of
-  ! !bonded particles in initialized that spans these max/min coordinates, and which is defined
-  ! !identically and redundantly for each PE that the berg overlaps. On each PE, excess particles which
-  ! !do not overlap any berg cell associated with the current berg are then trimmed off. Initialization
-  ! !of the fully-bonded berg is completed in the iceberg module, where the bonded particles of the
-  ! !berg are connected across PE boundaries to produce the full iceberg.
-
-  ! !TODO: Note that the code here assumes that any two neighboring cells, each with mask>0, must
-  ! !be part of the same berg. If we want to calve adjacent bergs, we can calve one on the first timestep
-  ! !and the other on the next timestep after the first is fully initialized. Or if using damage, calve both
-  ! !as one berg, interp the damage to the new berg, and break bonds where there is a rift.
-
-  ! !Alternatively, if we want to allow multiple, adjacent bergs, to calve on a single
-  ! !time step, then we could assign different (positive, non-zero) mask values to differentiate the
-  ! !bergs. After the single berg is calved, we can break bonds where the mask is different (we would
-  ! !not break over halo cells unless the mask indicated, though the mask values may differ on other PEs).
-  ! !In other words, we would initialize the multiple and adjacent bergs as a single berg, which is
-  ! !which is subsequently broken up into the multiple adjecent bergs. This approach guarantees that
-  ! !the adjacent bergs are initialized without inter-berg particle overlap/separation.
-
-  ! !Alternatively, we could just have a "background" set of bonded particles that are
-  ! !kept constant over time, and initialize bergs by copying over a subset of these bonded
-  ! !particles as needed to represent the new bergs. However, this approach is not
-  ! !as versatile for controlling particle size. Also, it is not simple to guarantee that
-  ! !the particles extents of the (meridionally-aligned) first and last column would align (zonally).
-
-  ! !comment out halo-filling of calve_mask for now. If there are multiple, adjacent calving events, we
-  ! !may define them with different calve_mask>0 on each PE, so that the value of calve_mask may
-  ! !differ between PEs for the same berg. However, we make sure each PE calculates its own calve_mask
-  ! !in its own halo cells, and then make a copy of the resulting calve_mask. Then pass_var the original
-  ! !calve_mask and compare to the copy to backcalculate a consistent value for calve_mask for each berg
-  ! !that can be shared between each PE later.
-  ! !call pass_var(TC%calve_mask, G%domain)
-
-  ! !TODO: Icebergs may overlap with each other or the ice shelf, so make sure mass scaling is done appropriately
-  ! !on new iceberg particles to avoid issues with pressure on the ocean...Also should strongly force bergs away
-  ! !from ice shelves. Perhaps need to ensure that the total pressure on the ocean does not exceed that of a combination
-  ! !of the iceberg(s) and ice shelf mass should it fully-cover the cell (with adjustments for mass-weighting and the
-  ! !percentage of the total unadjusted mass that the pressure of each component exerts on the cell...). Mass will not
-  ! !be conserved at that instant, but ultimately is over time.
-
-  ! !1) Generate a unique label (TC%c_id) for each berg on the computational domain of a PE
-  ! call initialize_tabular_calving_labels_1PE(G, TC%calve_mask, TC%c_id)
-
-  ! !2) fill halos with the unique berg labels. Find connected berg cells, and update them
-  ! !   with the lowest berg label (TC%c_id) of all of the connected berg cells. Repeat until no changes.
-  ! call update_tabular_calving_labels_over_pes(G, mask, TC%c_id)
-
-  ! !3) Make a list of each of the i bergs on the local PE domain (TC%berg_list(i,1)), their
-  ! !   min (TC%berg_list(i,2)) max longitude (TC%berg_list(i,3)), and their
-  ! !   min (TC%berg_list(i,4)) max latitude (TC%berg_list(i,5))
-  ! call tabular_berg_info(G, TC)
-
-  ! !4) Initialize iKID icebergs over these bounds, and remove excess particles. Call this from SIS2?
-  ! call initialize_bonded_bergs_from_shelf(bergs, TC, h_shelf, frac_shelf_h)
-
-end subroutine process_tabular_calving
-
-!> Updates the ice shelf tabular calving mask using data from a file.
-subroutine update_tabular_calving_mask(G, CS, TC, Time)
-  type(ocean_grid_type), intent(inout) :: G   !< The ocean's grid structure.
-  type(ice_shelf_CS),    pointer       :: CS    !< A pointer to the control structure returned
-                                                 !! by a previous call to initialize_ice_shelf.
-  type(ice_shelf_state), intent(inout) :: TC  !< The ice shelf tabular calving state type that is being updated
-  type(time_type),       intent(in)    :: Time !< The current model time
-  ! local variables
-  integer :: i, j, is, ie, js, je, m, n
-  real, allocatable, dimension(:,:)   :: tmp2d ! Temporary array for storing ice shelf input data
-
-  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
-
-  if (TC%tabular_calving_from_file) then
-
-    if (CS%rotate_index) then
-      allocate(tmp2d(CS%Grid_in%isd:CS%Grid_in%ied,CS%Grid_in%jsd:CS%Grid_in%jed), source=0.0)
-    else
-      allocate(tmp2d(is:ie,js:je), source=0.0)
-    endif
-
-    call time_interp_external(TC%tabular_calving_handle, Time, tmp2d)
-    call rotate_array(tmp2d, CS%turns, TC%calve_mask)
-    deallocate(tmp2d)
-
-    !for now, only calve where there is ice present.
-    do j=js,je ; do i=is,ie
-      if (CS%area_shelf_h(i,j)<=0) TC%calve_mask(i,j)=0
-    enddo; enddo
-
-  else
-    !TODO: implement a tabular calving law here.
-    call MOM_error(FATAL, "Tabular calving is currently only possible by reading in the tabular calving mask "//&
-                   "from a file (see subourinte initialize_tabular_calving), i.e. there is not yet a tabular "//&
-                   "calving law."
-  endif
-
-  call pass_var(TC%calve_mask, G%domain, complete=.true.)
-
-  !Adjust mask to make sure it extends 2 cells past the calving front. The mask will not change until the
-  !transition period for the gradual transition between ice shelf and iceberg is complete, so this
-  !extension should account for any ice that advects into these cells over this time period.
-  !TODO: If for some strange reason, 2 cells is not enough, you may need to just calve excess ice as
-  !non-interactive bergs.
-
-  !start by set calving mask to zero wherever there is no ice. This probably will not be necessary when
-  !a calving law is implemented, but may be helpful when reading in calving masks from file, which
-  !could extend into the ocean as a safeguard to make sure that the ice front is calved regardless of
-  !any ice front advection.
-  do j=js,je ; do i=is,ie
-    if (CS%area_shelf_h(i,j)<=0) TC%calve_mask(i,j)=0
-  enddo; enddo
-
-  !then set calving mask to one wherever non-ice cells are within 2 cells of a calving cell
-  do j=js,je; do i=is,ie
-    if (TC%calve_mask(i,j)>0 .and. CS%area_shelf_h(i,j)>0) then
-      do m=j-2,j+2; do n=i-2,i+2
-        if (CS%area_shelf_h(m,n)<=0) TC%calve_mask(i,j)=1
-      enddo; enddo
-    endif
-  enddo; enddo
-
-  call pass_var(TC%calve_mask, G%domain, complete=.true.)
-
-end subroutine update_tabular_calving_mask
-
 !> Deallocates all memory associated with this module
-subroutine ice_shelf_calving_end(TC)
+subroutine tabular_calving_end(TC)
   type(tabular_calving_state), pointer :: TC !< A pointer to the ice shelf calving structure
 
   if (.not.associated(TC)) return
 
-  if (allocated(TC%berg_list)) deallocate(TC%berg_list)
-  deallocate(TC%calve_mask)
-  deallocate(TC%c_id)
+!  if (allocated(TC%berg_list)) deallocate(TC%berg_list)
+  deallocate(TC%tabular_calve_mask)
+!  deallocate(TC%c_id)
   deallocate(TC)
-end subroutine ice_shelf_calving_end
+end subroutine tabular_calving_end
+
+!!$!> Initialize iKID icebergs from a tabular calving mask.
+!!$subroutine process_tabular_calving(G, CS, ISS, TC, frac_cberg_calved, Time)
+!!$  ! Arguments
+!!$  type(ocean_grid_type), intent(in) :: G   !< The grid structure used by the ice shelf.
+!!$  type(ice_shelf_CS),    pointer    :: CS   !< A pointer to the control structure returned
+!!$                                            !! by a previous call to initialize_ice_shelf.
+!!$  type(ice_shelf_state), pointer :: ISS     !< A structure with elements that describe
+!!$                                            !! the ice-shelf state
+!!$  type(tabular_calving_state), pointer :: TC !< A pointer to the tabular calving structure
+!!$  real, dimension(:,:), intent(inout) :: frac_cberg_calved !< cell fraction of fully-calved bonded bergs
+!!$                                                           !! from the ice sheet [nondim]
+!!$  type(time_type),       intent(in)    :: Time !< The current model time
+!!$  ! Local variables
+!!$  integer :: max_TC_mask
+!!$  integer :: i, j, is, ie, js, je, m, n
+!!$
+!!$  !TC%c_id(:,:) = 0
+!!$
+!!$  !First, remove any ice that has fully calved
+!!$  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
+!!$  do j=js,je ; do i=is,ie
+!!$    if (frac_cberg_calved(i,j)>=1) then
+!!$      TC%tabular_calve_mask(i,j)    = 0
+!!$      ISS%mass_shelf(i,j)   = 0
+!!$      ISS%area_shelf_h(i,j) = 0
+!!$      ISS%hmask(i,j)        = 0
+!!$      ISS%h_shelf(i,j)      = 0
+!!$    elseif (frac_cberg_calved(i,j)>0 .and. frac_cberg_calved(i,j)<1) then
+!!$      ISS%mass_shelf(i,j)   = (1-frac_cberg_calved(i,j))*ISS%mass_shelf(i,j)
+!!$      ISS%area_shelf_h(i,j) = (1-frac_cberg_calved(i,j))*ISS%area_shelf_h(i,j)
+!!$      ISS%hmask(i,j)=2
+!!$    endif
+!!$    !reset frac_cberg_calved
+!!$    frac_cberg_calved(i,j)=0
+!!$  enddo; enddo
+!!$
+!!$  call pass_var(ISS%mass_shelf,   G%domain, complete=.false.)
+!!$  call pass_var(ISS%area_shelf_h, G%domain, complete=.false.)
+!!$  call pass_var(ISS%hmask,        G%domain, complete=.false.)
+!!$  call pass_var(ISS%h_shelf,      G%domain, complete=.true.)
+!!$
+!!$  !First, update the tabular calving mask
+!!$  call update_tabular_calving_mask(G, CS, TC, Time)
+!!$
+!!$  ! max_TC_mask = maxval(TC%tabular_calve_mask)
+!!$  ! call max_across_PEs(max_TC_mask)
+!!$  ! if (max_TC_mask<=0) then !no calving
+!!$  !   if (allocated(TC%berg_list)) deallocate(TC%berg_list)
+!!$  !   return
+!!$  ! endif
+!!$
+!!$  ! !We want to initialize (calve)  bonded-particle tabular bergs that cover the "berg cells" defined
+!!$  ! !where mask>0. There may be multiple tabular bergs to calve in the domain,
+!!$  ! !which may overlap multiple cells and PEs. The approach is to create a field of unique IDs
+!!$  ! !that are each associated with a different tabular berg. This ID is the same on
+!!$  ! !all PEs that the corresponding berg may overlap. Then, the max/min x and y coordinates of
+!!$  ! !each berg are passed between the PEs that the berg overlaps. Next, a rectangular array of
+!!$  ! !bonded particles in initialized that spans these max/min coordinates, and which is defined
+!!$  ! !identically and redundantly for each PE that the berg overlaps. On each PE, excess particles which
+!!$  ! !do not overlap any berg cell associated with the current berg are then trimmed off. Initialization
+!!$  ! !of the fully-bonded berg is completed in the iceberg module, where the bonded particles of the
+!!$  ! !berg are connected across PE boundaries to produce the full iceberg.
+!!$
+!!$  ! !TODO: Note that the code here assumes that any two neighboring cells, each with mask>0, must
+!!$  ! !be part of the same berg. If we want to calve adjacent bergs, we can calve one on the first timestep
+!!$  ! !and the other on the next timestep after the first is fully initialized. Or if using damage, calve both
+!!$  ! !as one berg, interp the damage to the new berg, and break bonds where there is a rift.
+!!$
+!!$  ! !Alternatively, if we want to allow multiple, adjacent bergs, to calve on a single
+!!$  ! !time step, then we could assign different (positive, non-zero) mask values to differentiate the
+!!$  ! !bergs. After the single berg is calved, we can break bonds where the mask is different (we would
+!!$  ! !not break over halo cells unless the mask indicated, though the mask values may differ on other PEs).
+!!$  ! !In other words, we would initialize the multiple and adjacent bergs as a single berg, which is
+!!$  ! !which is subsequently broken up into the multiple adjecent bergs. This approach guarantees that
+!!$  ! !the adjacent bergs are initialized without inter-berg particle overlap/separation.
+!!$
+!!$  ! !Alternatively, we could just have a "background" set of bonded particles that are
+!!$  ! !kept constant over time, and initialize bergs by copying over a subset of these bonded
+!!$  ! !particles as needed to represent the new bergs. However, this approach is not
+!!$  ! !as versatile for controlling particle size. Also, it is not simple to guarantee that
+!!$  ! !the particles extents of the (meridionally-aligned) first and last column would align (zonally).
+!!$
+!!$  ! !comment out halo-filling of tabular_calve_mask for now. If there are multiple, adjacent calving events, we
+!!$  ! !may define them with different tabular_calve_mask>0 on each PE, so that the value of tabular_calve_mask may
+!!$  ! !differ between PEs for the same berg. However, we make sure each PE calculates its own tabular_calve_mask
+!!$  ! !in its own halo cells, and then make a copy of the resulting tabular_calve_mask. Then pass_var the original
+!!$  ! !tabular_calve_mask and compare to the copy to backcalculate a consistent value for
+!!$  ! !tabular_calve_mask for each berg
+!!$  ! !that can be shared between each PE later.
+!!$  ! !call pass_var(TC%tabular_calve_mask, G%domain)
+!!$
+!!$  ! !TODO: Icebergs may overlap with each other or the ice shelf, so make sure mass scaling is done appropriately
+!!$  ! !on new iceberg particles to avoid issues with pressure on the ocean...Also should strongly force bergs away
+!!$  ! !from ice shelves. Perhaps need to ensure that the total pressure on the ocean does not exceed that
+!!$  ! !of a combination
+!!$  ! !of the iceberg(s) and ice shelf mass should it fully-cover the cell (with adjustments for mass-weighting and the
+!!$  ! !percentage of the total unadjusted mass that the pressure of each component exerts on the cell...). Mass will not
+!!$  ! !be conserved at that instant, but ultimately is over time.
+!!$
+!!$  ! !1) Generate a unique label (TC%c_id) for each berg on the computational domain of a PE
+!!$  ! call initialize_tabular_calving_labels_1PE(G, TC%tabular_calve_mask, TC%c_id)
+!!$
+!!$  ! !2) fill halos with the unique berg labels. Find connected berg cells, and update them
+!!$  ! !   with the lowest berg label (TC%c_id) of all of the connected berg cells. Repeat until no changes.
+!!$  ! call update_tabular_calving_labels_over_pes(G, mask, TC%c_id)
+!!$
+!!$  ! !3) Make a list of each of the i bergs on the local PE domain (TC%berg_list(i,1)), their
+!!$  ! !   min (TC%berg_list(i,2)) max longitude (TC%berg_list(i,3)), and their
+!!$  ! !   min (TC%berg_list(i,4)) max latitude (TC%berg_list(i,5))
+!!$  ! call tabular_berg_info(G, TC)
+!!$
+!!$  ! !4) Initialize iKID icebergs over these bounds, and remove excess particles. Call this from SIS2?
+!!$  ! call initialize_bonded_bergs_from_shelf(bergs, TC, h_shelf, frac_shelf_h)
+!!$
+!!$end subroutine process_tabular_calving
+!!$
+!!$!> Updates the ice shelf tabular calving mask using data from a file.
+!!$subroutine update_tabular_calving_mask(G, CS, TC, Time)
+!!$  type(ocean_grid_type), intent(inout) :: G   !< The ocean's grid structure.
+!!$  type(ice_shelf_CS),    pointer       :: CS    !< A pointer to the control structure returned
+!!$                                                 !! by a previous call to initialize_ice_shelf.
+!!$  type(ice_shelf_state), intent(inout) :: TC  !< The ice shelf tabular calving state type that is being updated
+!!$  type(time_type),       intent(in)    :: Time !< The current model time
+!!$  ! local variables
+!!$  integer :: i, j, is, ie, js, je, m, n
+!!$  real, allocatable, dimension(:,:)   :: tmp2d ! Temporary array for storing ice shelf input data
+!!$
+!!$  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
+!!$
+!!$  if (TC%tabular_calving_from_file) then
+!!$
+!!$    if (CS%rotate_index) then
+!!$      allocate(tmp2d(CS%Grid_in%isd:CS%Grid_in%ied,CS%Grid_in%jsd:CS%Grid_in%jed), source=0.0)
+!!$    else
+!!$      allocate(tmp2d(is:ie,js:je), source=0.0)
+!!$    endif
+!!$
+!!$    call time_interp_external(TC%tabular_calving_handle, Time, tmp2d)
+!!$    call rotate_array(tmp2d, CS%turns, TC%tabular_calve_mask)
+!!$    deallocate(tmp2d)
+!!$
+!!$    !for now, only calve where there is ice present.
+!!$    do j=js,je ; do i=is,ie
+!!$      if (CS%area_shelf_h(i,j)<=0) TC%tabular_calve_mask(i,j)=0
+!!$    enddo; enddo
+!!$
+!!$  else
+!!$    !TODO: implement a tabular calving law here.
+!!$    call MOM_error(FATAL, "Tabular calving is currently only possible by reading in the tabular calving mask "//&
+!!$                   "from a file (see subroutine initialize_tabular_calving), i.e. there is not yet a tabular "//&
+!!$                   "calving law.")
+!!$  endif
+!!$
+!!$  call pass_var(TC%tabular_calve_mask, G%domain, complete=.true.)
+!!$
+!!$  !Adjust mask to make sure it extends 2 cells past the calving front. The mask will not change until the
+!!$  !transition period for the gradual transition between ice shelf and iceberg is complete, so this
+!!$  !extension should account for any ice that advects into these cells over this time period.
+!!$  !TODO: If for some strange reason, 2 cells is not enough, you may need to just calve excess ice as
+!!$  !non-interactive bergs.
+!!$
+!!$  !start by set calving mask to zero wherever there is no ice. This probably will not be necessary when
+!!$  !a calving law is implemented, but may be helpful when reading in calving masks from file, which
+!!$  !could extend into the ocean as a safeguard to make sure that the ice front is calved regardless of
+!!$  !any ice front advection.
+!!$  do j=js,je ; do i=is,ie
+!!$    if (CS%area_shelf_h(i,j)<=0) TC%tabular_calve_mask(i,j)=0
+!!$  enddo; enddo
+!!$
+!!$  !then set calving mask to one wherever non-ice cells are within 2 cells of a calving cell
+!!$  do j=js,je; do i=is,ie
+!!$    if (TC%tabular_calve_mask(i,j)>0 .and. CS%area_shelf_h(i,j)>0) then
+!!$      do m=j-2,j+2; do n=i-2,i+2
+!!$        if (CS%area_shelf_h(m,n)<=0) TC%tabular_calve_mask(i,j)=1.0
+!!$      enddo; enddo
+!!$    endif
+!!$  enddo; enddo
+!!$
+!!$  call pass_var(TC%tabular_calve_mask, G%domain, complete=.true.)
+!!$
+!!$end subroutine update_tabular_calving_mask
 
 ! !> Initializes labels for the grid cells that comprise a tabular iceberg that is about to calve from an ice
 ! !! shelf (i.e. a group of all neighboring grid cells where calving mask > 0). Considers the current PE only.
@@ -672,7 +669,7 @@ end subroutine ice_shelf_calving_end
 
 ! !> Calculate cell_id, a unique integer for each grid cell.
 ! !! This is the same as ij_component_of_id in icebergs_framework.
-! integer function generate_cell_id(G, i, j)
+! xinteger function generate_cell_id(G, i, j)
 !   type(ocean_grid_type), intent(in) :: G   !< The grid structure used by the ice shelf.
 !   integer,                intent(in) :: i   !< i-index of grid cell
 !   integer,                intent(in) :: j   !< j-index of grid cell

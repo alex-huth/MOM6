@@ -2003,7 +2003,8 @@ end subroutine step_offline
 !! initializing the ocean state variables, and initializing subsidiary modules
 subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
                           Time_in, offline_tracer_mode, input_restart_file, diag_ptr, &
-                          count_calls, tracer_flow_CSp,  ice_shelf_CSp, waves_CSp, ensemble_num)
+                          count_calls, tracer_flow_CSp,  ice_shelf_CSp, waves_CSp, ensemble_num, &
+                          calve_ice_shelf_bergs)
   type(time_type), target,   intent(inout) :: Time        !< model time, set in this routine
   type(time_type),           intent(in)    :: Time_init   !< The start time for the coupled model's calendar
   type(param_file_type),     intent(out)   :: param_file  !< structure indicating parameter file to parse
@@ -2026,6 +2027,11 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
                    optional, pointer       :: Waves_CSp   !< An optional pointer to a wave property CS
   integer, optional :: ensemble_num                       !< Ensemble index provided by the cap (instead of FMS
                                                           !! ensemble manager)
+  character(len=*), optional, intent(in) :: calve_ice_shelf_bergs !< If 'POINT', convert ice shelf flux through
+                                              !! a static ice shelf front into point-particle icebergs. If 'BONDED',
+                                              !! convert ice shelf into bonded-particle tabular bergs where tabular
+                                              !! calving mask exceeds zero. If 'MIXED', use 'POINT' for N Hemisphere
+                                              !! and 'BONDED' for S Hemisphere. If 'NONE', no calving.
   ! local variables
   type(ocean_grid_type),  pointer :: G => NULL()    ! A pointer to the metric grid use for the run
   type(ocean_grid_type),  pointer :: G_in => NULL() ! Pointer to the input grid
@@ -2918,7 +2924,7 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, &
       ! when using an ice shelf. Passing the ice shelf diagnostics CS from MOM
       ! for legacy reasons. The actual ice shelf diag CS is internal to the ice shelf
       call initialize_ice_shelf(param_file, G_in, Time, ice_shelf_CSp, diag_ptr, &
-                                Time_init, dirs%output_directory)
+                                Time_init, dirs%output_directory, calve_ice_shelf_bergs=calve_ice_shelf_bergs)
       allocate(frac_shelf_in(G_in%isd:G_in%ied, G_in%jsd:G_in%jed), source=0.0)
       allocate(mass_shelf_in(G_in%isd:G_in%ied, G_in%jsd:G_in%jed), source=0.0)
       allocate(CS%frac_shelf_h(isd:ied, jsd:jed), source=0.0)

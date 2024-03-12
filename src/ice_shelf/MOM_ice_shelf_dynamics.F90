@@ -893,8 +893,11 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
   type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
   real,                   intent(in)    :: time_step !< time step [T ~> s]
   type(time_type),        intent(in)    :: Time !< The current model time
-  logical,                intent(in)    :: calve_ice_shelf_bergs !< To convert ice flux through front
-                                                                 !! to bergs
+  character(len=*), intent(in) :: calve_ice_shelf_bergs !< If 'POINT', convert ice shelf flux through
+                                              !! a static ice shelf front into point-particle icebergs. If 'BONDED',
+                                              !! convert ice shelf into bonded-particle tabular bergs where tabular
+                                              !! calving mask exceeds zero. If 'MIXED', use 'POINT' for N Hemisphere
+                                              !! and 'BONDED' for S Hemisphere. If 'NONE', no calving.
   real, dimension(SZDI_(G),SZDJ_(G)), &
                 optional, intent(in)    :: ocean_mass !< If present this is the mass per unit area
                                               !! of the ocean [R Z ~> kg m-2].
@@ -1127,9 +1130,11 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
   type(ocean_grid_type),  intent(inout) :: G  !< The grid structure used by the ice shelf.
   real,                   intent(in)    :: time_step !< time step [T ~> s]
   type(time_type),        intent(in)    :: Time !< The current model time
-  logical,                intent(in)    :: calve_ice_shelf_bergs !< If true, track ice shelf flux through a
-                                               !! static ice shelf, so that it can be converted into icebergs
-
+  character(len=*), intent(in) :: calve_ice_shelf_bergs !< If 'POINT', convert ice shelf flux through
+                                              !! a static ice shelf front into point-particle icebergs. If 'BONDED',
+                                              !! convert ice shelf into bonded-particle tabular bergs where tabular
+                                              !! calving mask exceeds zero. If 'MIXED', use 'POINT' for N Hemisphere
+                                              !! and 'BONDED' for S Hemisphere. If 'NONE', no calving
 ! 3/8/11 DNG
 !
 !    This subroutine takes the velocity (on the Bgrid) and timesteps h_t = - div (uh) once.
@@ -1196,7 +1201,8 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
     if (CS%calve_to_mask) then
       call calve_to_mask(G, ISS%h_shelf, ISS%area_shelf_h, ISS%hmask, CS%calve_mask)
     endif
-  elseif (calve_ice_shelf_bergs) then
+  elseif ( trim(calve_ice_shelf_bergs)=='POINT' .or. &
+          (trim(calve_ice_shelf_bergs) == 'MIXED' .and. minval(G%geoLatCv(:,:))>0) ) then
     !advect the front to create partially-filled cells
     call shelf_advance_front(CS, ISS, G, ISS%hmask, uh_ice, vh_ice)
     !add mass of the partially-filled cells to calving field, which is used to initialize icebergs
