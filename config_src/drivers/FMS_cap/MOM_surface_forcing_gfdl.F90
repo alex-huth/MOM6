@@ -500,6 +500,12 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
       fluxes%frac_cberg_calved(i,j) = IOB%frac_cberg_calved(i-i0,j-j0) * G%mask2dT(i,j)
       if (CS%check_no_land_fluxes) &
         call check_mask_val_consistency(IOB%frac_cberg_calved(i-i0,j-j0), G%mask2dT(i,j), i, j, 'frac_cberg_calved', G)
+      ! It may be unknown which is called first: convert_IOB_to_fluxes or convert_IOB_to_forces. These calls
+      ! update fluxes%frac_cberg_calved and forces%frac_cberg_calved, respectively, to match the
+      ! IOB%frac_cberg_calved field. After each call, fluxes (or forces) % frac_cberg_calved is used to adjust
+      ! the ice-shelf mass and area. However, this adjustment should only have an effect the first time it is
+      ! called. which is guaranteed by setting IOB%frac_cberg_calved = 0.0 here.
+      IOB%frac_cberg_calved(i-i0,j-j0) = 0.0
     endif
 
     if (associated(IOB%runoff_hflx)) then
@@ -876,6 +882,20 @@ subroutine convert_IOB_to_forces(IOB, forces, index_bounds, Time, G, US, CS, dt_
 
   if (associated(IOB%mass_berg)) then ; do j=js,je ; do i=is,ie
     forces%mass_berg(i,j) = US%m_to_Z*US%kg_m3_to_R * IOB%mass_berg(i-i0,j-j0) * G%mask2dT(i,j)
+  enddo ; enddo ; endif
+
+  if (associated(IOB%frac_cberg)) then ; do j=js,je ; do i=is,ie
+    forces%frac_cberg(i,j) = US%m_to_Z*US%kg_m3_to_R * IOB%frac_cberg(i-i0,j-j0) * G%mask2dT(i,j)
+  enddo ; enddo ; endif
+
+  if (associated(IOB%frac_cberg)) then ; do j=js,je ; do i=is,ie
+    forces%frac_cberg_calved(i,j) = US%m_to_Z*US%kg_m3_to_R * IOB%frac_cberg_calved(i-i0,j-j0) * G%mask2dT(i,j)
+    ! It may be unknown which is called first: convert_IOB_to_fluxes or convert_IOB_to_forces. These calls
+    ! update fluxes%frac_cberg_calved and forces%frac_cberg_calved, respectively, to match the
+    ! IOB%frac_cberg_calved field. After each call, fluxes (or forces) % frac_cberg_calved is used to adjust
+    ! the ice-shelf mass and area. However, this adjustment should only have an effect the first time it is
+    ! called. which is guaranteed by setting IOB%frac_cberg_calved = 0.0 here.
+    IOB%frac_cberg_calved(i-i0,j-j0) = 0.0
   enddo ; enddo ; endif
 
   ! Obtain sea ice related dynamic fields

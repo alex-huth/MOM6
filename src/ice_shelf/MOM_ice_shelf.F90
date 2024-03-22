@@ -77,6 +77,7 @@ public shelf_calc_flux, initialize_ice_shelf, ice_shelf_end, ice_shelf_query
 public ice_shelf_save_restart, solo_step_ice_shelf, add_shelf_forces
 public initialize_ice_shelf_fluxes, initialize_ice_shelf_forces
 public ice_sheet_calving_to_ocean_sfc, ice_sheet_bonded_calving_to_ocean_sfc
+public adjust_shelf_for_tabular_calving
 
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
 ! consistency testing. These are noted in comments with units like Z, H, L, and T, along with
@@ -795,13 +796,12 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
       ISS%dhdt_shelf(i,j) = (ISS%h_shelf(i,j) - ISS%dhdt_shelf(i,j))*Itime_step
     enddo; enddo
 
-    if ( trim(CS%calve_ice_shelf_bergs)=='BONDED' .or. &
-        (trim(CS%calve_ice_shelf_bergs)=='MIXED' .and. maxval(G%geolonCv(:,:))<0) ) then
-      call process_tabular_calving(G, CS, ISS, CS%TC, fluxes%frac_cberg_calved, Time)
-      !TODO: make sure forces%frac_cberg_calved matches appropriately
-    endif
-
     call IS_dynamics_post_data(time_step, Time, CS%dCS, G)
+  endif
+
+  if ( trim(CS%calve_ice_shelf_bergs)=='BONDED' .or. &
+    (trim(CS%calve_ice_shelf_bergs)=='MIXED' .and. maxval(G%geolonCv(:,:))<0) ) then
+    call process_tabular_calving(G, CS, ISS, CS%TC, Time)
   endif
 
   if (CS%shelf_mass_is_dynamic) &
@@ -2334,8 +2334,46 @@ subroutine ice_shelf_end(CS)
 
 end subroutine ice_shelf_end
 
+!> Remove any ice associated with the completed tabular calving
+subroutine adjust_shelf_for_tabular_calving(CS, frac_cberg_calved)
+  ! Arguments
+  type(ice_shelf_CS),    pointer    :: CS   !< A pointer to the control structure returned
+                                            !! by a previous call to initialize_ice_shelf.
+  real, dimension(:,:), pointer, intent(inout) :: frac_cberg_calved !< cell fraction of fully-calved bonded bergs
+                                                        !! from the ice sheet [nondim]
+  type(ocean_grid_type), pointer :: G => NULL()   !< The grid structure used by the ice shelf.
+  type(ice_shelf_state), pointer :: ISS => NULL() !< A structure with elements that describe
+                                                  !! the ice-shelf state
+  integer :: i, j, is, ie, js, je
+
+  G => CS%grid
+
+  if ( (trim(CS%calve_ice_shelf_bergs)=='BONDED') .or. &
+    (trim(CS%calve_ice_shelf_bergs)=='MIXED' .and. maxval(G%geolonCv(:,:))<0) ) then
+    ISS => CS%ISS
+    is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
+    do j=js,je ; do i=is,ie
+      if (frac_cberg_calved(i,j)>=1) then
+        ISS%mass_shelf(i,j)   = 0
+        ISS%area_shelf_h(i,j) = 0
+        ISS%hmask(i,j)        = 0
+        ISS%h_shelf(i,j)      = 0
+      elseif (frac_cberg_calved(i,j)>0 .and. frac_cberg_calved(i,j)<1) then
+        ISS%mass_shelf(i,j)   = (1-frac_cberg_calved(i,j))*ISS%mass_shelf(i,j)
+        ISS%area_shelf_h(i,j) = (1-frac_cberg_calved(i,j))*ISS%area_shelf_h(i,j)
+        ISS%hmask(i,j)=2
+      endif
+      frac_cberg_calved(i,j) = 0
+    enddo; enddo
+    call pass_var(ISS%mass_shelf,   G%domain, complete=.false.)
+    call pass_var(ISS%area_shelf_h, G%domain, complete=.false.)
+    call pass_var(ISS%hmask,        G%domain, complete=.false.)
+    call pass_var(ISS%h_shelf,      G%domain, complete=.true.)
+  endif
+end subroutine adjust_shelf_for_tabular_calving
+
 !> Removes ice shelf where tabular calving has occurred. Updates tabular calving mask.
-subroutine process_tabular_calving(G, CS, ISS, TC, frac_cberg_calved, Time)
+subroutine process_tabular_calving(G, CS, ISS, TC, Time)
   ! Arguments
   type(ocean_grid_type), intent(in) :: G   !< The grid structure used by the ice shelf.
   type(ice_shelf_CS),    pointer    :: CS   !< A pointer to the control structure returned
@@ -2343,37 +2381,18 @@ subroutine process_tabular_calving(G, CS, ISS, TC, frac_cberg_calved, Time)
   type(ice_shelf_state), pointer :: ISS     !< A structure with elements that describe
                                             !! the ice-shelf state
   type(tabular_calving_state), pointer :: TC !< A pointer to the tabular calving structure
-  real, dimension(:,:), intent(inout) :: frac_cberg_calved !< cell fraction of fully-calved bonded bergs
-                                                           !! from the ice sheet [nondim]
   type(time_type),       intent(in)    :: Time !< The current model time
   ! Local variables
   integer :: max_TC_mask
   integer :: i, j, is, ie, js, je, m, n
   real, allocatable, dimension(:,:)   :: tmp2d ! Temporary array for storing ice shelf input data
+  real :: Calve_lat, Calve_lon, R_calve2, dist(4)
+  logical :: visited=.false.
+  save :: visited
 
+  TC%tabular_calve_mask(:,:)=0.0
 
-  !First, remove any ice that has fully calved
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
-  do j=js,je ; do i=is,ie
-    if (frac_cberg_calved(i,j)>=1) then
-      TC%tabular_calve_mask(i,j)    = 0
-      ISS%mass_shelf(i,j)   = 0
-      ISS%area_shelf_h(i,j) = 0
-      ISS%hmask(i,j)        = 0
-      ISS%h_shelf(i,j)      = 0
-    elseif (frac_cberg_calved(i,j)>0 .and. frac_cberg_calved(i,j)<1) then
-      ISS%mass_shelf(i,j)   = (1-frac_cberg_calved(i,j))*ISS%mass_shelf(i,j)
-      ISS%area_shelf_h(i,j) = (1-frac_cberg_calved(i,j))*ISS%area_shelf_h(i,j)
-      ISS%hmask(i,j)=2
-    endif
-    !reset frac_cberg_calved
-    frac_cberg_calved(i,j)=0
-  enddo; enddo
-
-  call pass_var(ISS%mass_shelf,   G%domain, complete=.false.)
-  call pass_var(ISS%area_shelf_h, G%domain, complete=.false.)
-  call pass_var(ISS%hmask,        G%domain, complete=.false.)
-  call pass_var(ISS%h_shelf,      G%domain, complete=.true.)
 
   if (TC%tabular_calving_from_file) then
 
@@ -2394,12 +2413,42 @@ subroutine process_tabular_calving(G, CS, ISS, TC, frac_cberg_calved, Time)
 
   else
 
-    !TODO: implement a tabular calving law here, e.g.
-    !call update_tabular_calving_mask(G, CS, TC, Time)
-    
-    call MOM_error(FATAL, "Tabular calving is currently only possible by reading in the tabular calving mask "//&
-                   "from a file (see subroutine initialize_tabular_calving), i.e. there is not yet a tabular "//&
-                   "calving law.")
+    if (.not. visited) then
+      !for testing on MISOMIP (e.g. Stern et al 2017)
+      !assign calving event just at first time step
+      !TODO: replace this with tabular calving from file
+
+      Calve_lat = 40 !km !20.2*2000
+      Calve_lon = 650 !km !165*2000
+      R_calve2= 20 !km !(12*2000)
+      do j=js,je ; do i=is,ie
+        if (ISS%area_shelf_h(i,j)<=0) then
+          TC%tabular_calve_mask(i,j)=0
+        else
+          !Full-cell calving (TODO: sub-cell calving)
+          TC%tabular_calve_mask(i,j) = max((1-sqrt((G%geolonT(i,j)-Calve_lon)**2 + (G%geolatT(i,j)-Calve_lat)**2)/R_calve2),0.0)
+          if (TC%tabular_calve_mask(i,j)>0) TC%tabular_calve_mask(i,j) = 1
+
+          !lazy way to test sub-cell calving: Scale the cell's calving mask according to the percentage of the
+          !cell's corners that lie within the calving radius. Values of tabular_calve_mask will then be 0, 0.25,
+          !0.5, 0.75, or 1
+          ! dist(1) = max((1-((G%geolonBu(i  ,j  )-Calve_lon)**2 + (G%geolatBu(i  ,j  )-Calve_lat)**2)/R_calve2),0.0)
+          ! dist(2) = max((1-((G%geolonBu(i-1,j  )-Calve_lon)**2 + (G%geolatBu(i-1,j  )-Calve_lat)**2)/R_calve2),0.0)
+          ! dist(3) = max((1-((G%geolonBu(i-1,j-1)-Calve_lon)**2 + (G%geolatBu(i-1,j-1)-Calve_lat)**2)/R_calve2),0.0)
+          ! dist(4) = max((1-((G%geolonBu(i  ,j-1)-Calve_lon)**2 + (G%geolatBu(i  ,j-1)-Calve_lat)**2)/R_calve2),0.0)
+
+          ! TC%tabular_calve_mask(i,j) = sum(dist)/4.0
+        endif
+      enddo; enddo
+      visited=.true.
+    endif
+
+  !   !TODO: implement a tabular calving law here, e.g.
+  !   !call update_tabular_calving_mask(G, CS, TC, Time)
+
+  !   call MOM_error(FATAL, "Tabular calving is currently only possible by reading in the tabular calving mask "//&
+  !                  "from a file (see subroutine initialize_tabular_calving), i.e. there is not yet a tabular "//&
+  !                  "calving law.")
   endif
 
   call pass_var(TC%tabular_calve_mask, G%domain, complete=.true.)

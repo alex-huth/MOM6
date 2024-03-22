@@ -56,7 +56,7 @@ use MOM_ice_shelf, only : initialize_ice_shelf, shelf_calc_flux, ice_shelf_CS
 use MOM_ice_shelf, only : initialize_ice_shelf_fluxes, initialize_ice_shelf_forces
 use MOM_ice_shelf, only : add_shelf_forces, ice_shelf_end, ice_shelf_save_restart
 use MOM_ice_shelf, only : ice_sheet_calving_to_ocean_sfc
-use MOM_ice_shelf, only : ice_sheet_bonded_calving_to_ocean_sfc
+use MOM_ice_shelf, only : ice_sheet_bonded_calving_to_ocean_sfc, adjust_shelf_for_tabular_calving
 use MOM_wave_interface, only: wave_parameters_CS, MOM_wave_interface_init
 use MOM_wave_interface, only: Update_Surface_Waves
 use iso_fortran_env, only : int64
@@ -539,8 +539,10 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
   if (do_dyn) then
     call convert_IOB_to_forces(Ice_ocean_boundary, OS%forces, index_bnds, OS%Time_dyn, OS%grid, OS%US, &
                                OS%forcing_CSp, dt_forcing=dt_coupling, reset_avg=OS%fluxes%fluxes_used)
-    if (OS%use_ice_shelf) &
+    if (OS%use_ice_shelf) then
+      if (associated(OS%forces%frac_cberg_calved)) call adjust_shelf_for_tabular_calving(OS%Ice_shelf_CSp, OS%forces%frac_cberg_calved)
       call add_shelf_forces(OS%grid, OS%US, OS%Ice_shelf_CSp, OS%forces)
+    endif
     if (OS%icebergs_alter_ocean) &
       call iceberg_forces(OS%grid, OS%forces, OS%use_ice_shelf, &
                           OS%sfc_state, dt_coupling, OS%marine_ice_CSp)
@@ -552,8 +554,10 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
                                  OS%grid, OS%US, OS%forcing_CSp, OS%sfc_state)
 
       ! Add ice shelf fluxes
-      if (OS%use_ice_shelf) &
+      if (OS%use_ice_shelf) then
+        if (associated(OS%fluxes%frac_cberg_calved)) call adjust_shelf_for_tabular_calving(OS%Ice_shelf_CSp, OS%fluxes%frac_cberg_calved)
         call shelf_calc_flux(OS%sfc_state, OS%fluxes, OS%Time, dt_coupling, OS%Ice_shelf_CSp)
+      endif
       if (OS%icebergs_alter_ocean) &
         call iceberg_fluxes(OS%grid, OS%US, OS%fluxes, OS%use_ice_shelf, &
                             OS%sfc_state, dt_coupling, OS%marine_ice_CSp)
