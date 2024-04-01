@@ -1222,7 +1222,7 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
   endif
 
   do j=jsc,jec; do i=isc,iec
-    ISS%mass_shelf(i,j) = (ISS%h_shelf(i,j) * CS%density_ice) * (ISS%area_shelf_h(i,j) * G%IareaT(i,j))
+    ISS%mass_shelf(i,j) = (ISS%h_shelf(i,j) * CS%density_ice) ! * (ISS%area_shelf_h(i,j) * G%IareaT(i,j))
   enddo; enddo
 
   call pass_var(ISS%mass_shelf, G%domain, complete=.false.)

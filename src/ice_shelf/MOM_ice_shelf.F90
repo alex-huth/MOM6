@@ -934,7 +934,7 @@ subroutine change_thickness_using_melt(ISS, G, US, time_step, fluxes, density_ic
         ISS%hmask(i,j) = 0.0
         ISS%area_shelf_h(i,j) = 0.0
       endif
-      ISS%mass_shelf(i,j) = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) * G%IareaT(i,j) * density_ice
+      ISS%mass_shelf(i,j) = ISS%h_shelf(i,j) * density_ice !ISS%area_shelf_h(i,j) * G%IareaT(i,j) * density_ice
     endif
   enddo ; enddo
 
@@ -1012,7 +1012,7 @@ subroutine add_shelf_forces(Ocn_grid, US, CS, forces, do_shelf_area, external_ca
         forces%frac_shelf_v(i,J) = 0.0
         if ((G%areaT(i,j)*(1-forces%frac_cberg(i,j) + G%areaT(i,j+1)*(1-forces%frac_cberg(i,j+1)))) > 0.0) &
           forces%frac_shelf_v(i,J) = (ISS%area_shelf_h(i,j)*(1-forces%frac_cberg(i,j)) + &
-                                      ISS%area_shelf_h(i,j+1)*(1-forces%frac_cberg(i+1,j))) / &
+                                      ISS%area_shelf_h(i,j+1)*(1-forces%frac_cberg(i,j+1))) / &
                                      (G%areaT(i,j) + G%areaT(i,j+1))
       enddo; enddo
     else
@@ -1060,7 +1060,7 @@ subroutine add_shelf_forces(Ocn_grid, US, CS, forces, do_shelf_area, external_ca
     do J=js-1,je ; do i=is,ie
       if (.not.forces%accumulate_rigidity) forces%rigidity_ice_v(i,J) = 0.0
       forces%rigidity_ice_v(i,J) = forces%rigidity_ice_v(i,J) + kv_rho_ice * &
-          min(ISS%mass_shelf(i,j)*(1-forces%frac_cberg(i,j)), ISS%mass_shelf(i,j+1)*(1-forces%frac_cberg(i+1,j)))
+          min(ISS%mass_shelf(i,j)*(1-forces%frac_cberg(i,j)), ISS%mass_shelf(i,j+1)*(1-forces%frac_cberg(i,j+1)))
     enddo ; enddo
   else
     do j=js,je ; do I=is-1,ie
@@ -2195,7 +2195,8 @@ subroutine change_thickness_using_precip(CS, ISS, G, US, fluxes, time_step, Time
         ISS%hmask(i,j) = 0.0
         ISS%area_shelf_h(i,j) = 0.0
       endif
-      ISS%mass_shelf(i,j) = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) * G%IareaT(i,j) * CS%density_ice
+      ISS%mass_shelf(i,j) = ISS%h_shelf(i,j) * CS%density_ice
+      !ISS%area_shelf_h(i,j) * G%IareaT(i,j) * CS%density_ice
     endif
   enddo ; enddo
 
@@ -2345,6 +2346,7 @@ subroutine adjust_shelf_for_tabular_calving(CS, frac_cberg_calved)
   type(ice_shelf_state), pointer :: ISS => NULL() !< A structure with elements that describe
                                                   !! the ice-shelf state
   integer :: i, j, is, ie, js, je
+  real :: calve_ice_frac
 
   G => CS%grid
 
@@ -2359,9 +2361,15 @@ subroutine adjust_shelf_for_tabular_calving(CS, frac_cberg_calved)
         ISS%hmask(i,j)        = 0
         ISS%h_shelf(i,j)      = 0
       elseif (frac_cberg_calved(i,j)>0 .and. frac_cberg_calved(i,j)<1) then
-        ISS%mass_shelf(i,j)   = (1-frac_cberg_calved(i,j))*ISS%mass_shelf(i,j)
-        ISS%area_shelf_h(i,j) = (1-frac_cberg_calved(i,j))*ISS%area_shelf_h(i,j)
-        ISS%hmask(i,j)=2
+        calve_ice_frac = min(frac_cberg_calved(i,j)/(ISS%area_shelf_h(i,j)/G%areaT(i,j)),1.0)
+        ISS%mass_shelf(i,j)   = (1-calve_ice_frac)*ISS%mass_shelf(i,j)
+        ISS%area_shelf_h(i,j) = (1-calve_ice_frac)*ISS%area_shelf_h(i,j)
+        if (calve_ice_frac<1) then
+          ISS%hmask(i,j)=2
+        else
+          ISS%hmask(i,j)=0
+          ISS%h_shelf(i,j)=0
+        endif
       endif
       frac_cberg_calved(i,j) = 0
     enddo; enddo
@@ -2414,12 +2422,13 @@ subroutine process_tabular_calving(G, CS, ISS, TC, Time)
   else
 
     if (.not. visited) then
-      !for testing on MISOMIP (e.g. Stern et al 2017)
+      !for testing on ISOMIP (e.g. Stern et al 2017)
       !assign calving event just at first time step
       !TODO: replace this with tabular calving from file
 
       Calve_lat = 40 !km !20.2*2000
-      Calve_lon = 650 !km !165*2000
+      !Calve_lon = 650 !km !165*2000
+      Calve_lon = 640 !640 for the modified domain that cuts off the multiple partially-full cells at the front
       R_calve2= 20 !km !(12*2000)
       do j=js,je ; do i=is,ie
         if (ISS%area_shelf_h(i,j)<=0) then
@@ -2471,7 +2480,7 @@ subroutine process_tabular_calving(G, CS, ISS, TC, Time)
   do j=js,je; do i=is,ie
     if (TC%tabular_calve_mask(i,j)>0 .and. ISS%area_shelf_h(i,j)>0) then
       do m=j-2,j+2; do n=i-2,i+2
-        if (ISS%area_shelf_h(m,n)<=0) TC%tabular_calve_mask(i,j)=1.0
+        if (ISS%area_shelf_h(n,m)<=0) TC%tabular_calve_mask(n,m)=1.0
       enddo; enddo
     endif
   enddo; enddo
