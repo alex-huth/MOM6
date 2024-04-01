@@ -986,13 +986,15 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, G)
 end subroutine IS_dynamics_post_data
 
 !>  Writes the total ice shelf kinetic energy and mass to an ascii file
-subroutine write_ice_shelf_energy(CS, G, US, mass, day, time_step)
+subroutine write_ice_shelf_energy(CS, G, US, mass, area, day, time_step)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
   type(ocean_grid_type),  intent(inout) :: G  !< The grid structure used by the ice shelf.
   type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(in)    :: mass !< The mass per unit area of the ice shelf
                                                 !! or sheet [R Z ~> kg m-2]
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                           intent(in)    :: area !< The ice shelf or ice sheet area [L2 ~> m2]
   type(time_type),         intent(in)    :: day !< The current model time.
   type(time_type),  optional, intent(in) :: time_step !< The current time step
   ! Local variables
@@ -1051,7 +1053,7 @@ subroutine write_ice_shelf_energy(CS, G, US, mass, day, time_step)
   tmp1(:,:)=0.0
   KE_scale_factor = US%L_to_m**2 * (US%RZ_to_kg_m2 * US%L_T_to_m_s**2)
   do j=js,je ; do i=is,ie
-    tmp1(i,j) = (KE_scale_factor * 0.03125) * (G%areaT(i,j) * mass(i,j)) * &
+    tmp1(i,j) = (KE_scale_factor * 0.03125) * (mass(i,j) * area(i,j)) * &
       (((CS%u_shelf(I-1,J-1)+CS%u_shelf(I,J))+(CS%u_shelf(I,J-1)+CS%u_shelf(I-1,J)))**2 + &
        ((CS%v_shelf(I-1,J-1)+CS%v_shelf(I,J))+(CS%v_shelf(I,J-1)+CS%v_shelf(I-1,J)))**2)
   enddo; enddo
@@ -1062,7 +1064,7 @@ subroutine write_ice_shelf_energy(CS, G, US, mass, day, time_step)
   tmp1(:,:)=0.0
   mass_scale_factor = US%L_to_m**2 * US%RZ_to_kg_m2
   do j=js,je ; do i=is,ie
-    tmp1(i,j) =  mass_scale_factor * (mass(i,j) * G%areaT(i,j))
+    tmp1(i,j) =  mass_scale_factor * (mass(i,j) * area(i,j))
   enddo; enddo
 
   mass_tot = reproducing_sum(tmp1, isr, ier, jsr, jer)
@@ -1216,7 +1218,7 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
   endif
 
   do j=jsc,jec; do i=isc,iec
-    ISS%mass_shelf(i,j) = (ISS%h_shelf(i,j) * CS%density_ice) * (ISS%area_shelf_h(i,j) * G%IareaT(i,j))
+    ISS%mass_shelf(i,j) = ISS%h_shelf(i,j) * CS%density_ice
   enddo; enddo
 
   call pass_var(ISS%mass_shelf, G%domain, complete=.false.)
