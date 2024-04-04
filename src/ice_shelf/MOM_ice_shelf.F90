@@ -2028,41 +2028,45 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
        'kg m-2 s-1', conversion=US%RZ_T_to_kg_m2s)
   endif
   !scalars (area integrated)
-  CS%id_vaf = register_scalar_field('ice_shelf_model', 'vaf', CS%diag%axesT1, CS%Time, &
-    'Ice sheet volume above floatation', 'm3')
-  CS%id_adott = register_scalar_field('ice_shelf_model', 'smb', CS%diag%axesT1, CS%Time, &
-    'Area integrated surface accumulation - melt over the entire ice sheet, over a time step', 'm3')
-  CS%id_g_adott = register_scalar_field('ice_shelf_model', 'grounded_smb', CS%diag%axesT1, CS%Time, &
-    'Area integrated surface accumulation - melt over grounded ice sheet, over a time step', 'm3')
-  CS%id_f_adott = register_scalar_field('ice_shelf_model', 'floating_smb', CS%diag%axesT1, CS%Time, &
-    'Area integrated surface accumulation - melt over floating ice sheet, over a time step', 'm3')
-  CS%id_bdott = register_scalar_field('ice_shelf_model', 'bmb', CS%diag%axesT1, CS%Time, &
-    'Area integrated basal accumulation - melt over ice shelves, over a time step', 'm3')
-  CS%id_bdott_melt = register_scalar_field('ice_shelf_model', 'bmb_melt', CS%diag%axesT1, CS%Time, &
-    'Area integrated basal melt over ice shelves, over a time step', 'm3')
-  CS%id_bdott_accum = register_scalar_field('ice_shelf_model', 'bmb_accum', CS%diag%axesT1, CS%Time, &
-    'Area integrated basal accumulation over ice shelves, over a time step', 'm3')
-  CS%id_t_area = register_scalar_field('ice_shelf_model', 'tot_IS_area', CS%diag%axesT1, CS%Time, &
-    'Total area of ice-sheet', 'm2')
-  CS%id_f_area = register_scalar_field('ice_shelf_model', 'tot_f_IS_area', CS%diag%axesT1, CS%Time, &
-    'Total area of floating ice-sheet', 'm2')
-  CS%id_g_area = register_scalar_field('ice_shelf_model', 'tot_g_IS_area', CS%diag%axesT1, CS%Time, &
-    'Total area of grounded ice-sheet', 'm2')
+  CS%id_vaf = register_scalar_field('ice_shelf_model', 'int_vaf', CS%diag%axesT1, CS%Time, &
+    'Area integrated ice sheet volume above floatation', 'm3')
+  CS%id_adott = register_scalar_field('ice_shelf_model', 'int_a', CS%diag%axesT1, CS%Time, &
+    'Area integrated (entire ice sheet) change in ice-sheet thickness ' //&
+    'due to surface accum+melt during a DT_THERM time step', 'm3')
+  CS%id_g_adott = register_scalar_field('ice_shelf_model', 'int_a_ground', CS%diag%axesT1, CS%Time, &
+    'Area integrated change in grounded ice-sheet thickness ' //&
+    'due to surface accum+melt during a DT_THERM time step', 'm3')
+  CS%id_f_adott = register_scalar_field('ice_shelf_model', 'int_a_float', CS%diag%axesT1, CS%Time, &
+    'Area integrated change in floating ice-shelf thickness ' //&
+    'due to surface accum+melt during a DT_THERM time step', 'm3')
+  CS%id_bdott = register_scalar_field('ice_shelf_model', 'int_b', CS%diag%axesT1, CS%Time, &
+    'Area integrated change in floating ice-shelf thickness '//&
+    'due to basal accum+melt during a DT_THERM time step', 'm3')
+  CS%id_bdott_melt = register_scalar_field('ice_shelf_model', 'int_b_melt', CS%diag%axesT1, CS%Time, &
+    'Area integrated basal melt over ice shelves during a DT_THERM time step', 'm3')
+  CS%id_bdott_accum = register_scalar_field('ice_shelf_model', 'int_b_accum', CS%diag%axesT1, CS%Time, &
+    'Area integrated basal accumulation over ice shelves during a DT_THERM a time step', 'm3')
+  CS%id_t_area = register_scalar_field('ice_shelf_model', 'tot_area', CS%diag%axesT1, CS%Time, &
+    'Total area of entire ice-sheet', 'm2')
+  CS%id_f_area = register_scalar_field('ice_shelf_model', 'tot_area_float', CS%diag%axesT1, CS%Time, &
+    'Total area of floating ice shelves', 'm2')
+  CS%id_g_area = register_scalar_field('ice_shelf_model', 'tot_area_ground', CS%diag%axesT1, CS%Time, &
+    'Total area of grounded ice sheet', 'm2')
   !scalars (area integrated rates)
-  CS%id_dvafdt = register_scalar_field('ice_shelf_model', 'dvafdt', CS%diag%axesT1, CS%Time, &
-    'Area integrated rate of change in ice sheet volume above floatation', 'm3 s-1')
-   CS%id_adot = register_scalar_field('ice_shelf_model', 'smb_rate', CS%diag%axesT1, CS%Time, &
-    'Area integrated rate of surface accumulation - melt over the entire ice sheet', 'm3 s-1')
-  CS%id_g_adot = register_scalar_field('ice_shelf_model', 'grounded_smb_rate', CS%diag%axesT1, CS%Time, &
-    'Area integrated rate of surface accumulation - melt over grounded ice sheet', 'm3 s-1')
-  CS%id_f_adot = register_scalar_field('ice_shelf_model', 'floating_smb_rate', CS%diag%axesT1, CS%Time, &
-    'Area integrated rate of surface accumulation - melt over floating ice sheet', 'm3 s-1')
-  CS%id_bdot = register_scalar_field('ice_shelf_model', 'bmb_rate', CS%diag%axesT1, CS%Time, &
-    'Area integrated basal accumulation - melt over ice shelves', 'm3 s-1')
-  CS%id_bdot_melt = register_scalar_field('ice_shelf_model', 'bmb_melt_rate', CS%diag%axesT1, CS%Time, &
-    'Area integrated basal melt over ice shelves', 'm3 s-1')
-  CS%id_bdot_accum = register_scalar_field('ice_shelf_model', 'bmb_accum_rate', CS%diag%axesT1, CS%Time, &
-    'Area integrated basal accumulation over ice shelves', 'm3 s-1')
+  CS%id_dvafdt = register_scalar_field('ice_shelf_model', 'int_vafdot', CS%diag%axesT1, CS%Time, &
+    'Area integrated rate of change in ice-sheet volume above floatation', 'm3 s-1')
+   CS%id_adot = register_scalar_field('ice_shelf_model', 'int_adot', CS%diag%axesT1, CS%Time, &
+    'Area integrated (full ice sheet) rate of change in ice-sheet thickness due to surface accum+melt', 'm3 s-1')
+  CS%id_g_adot = register_scalar_field('ice_shelf_model', 'int_adot_ground', CS%diag%axesT1, CS%Time, &
+    'Area integrated rate of change in grounded ice-sheet thickness due to surface accum+melt', 'm3 s-1')
+  CS%id_f_adot = register_scalar_field('ice_shelf_model', 'int_adot_float', CS%diag%axesT1, CS%Time, &
+    'Area integrated rate of change in floating ice-shelf thickness due to surface accum+melt', 'm3 s-1')
+  CS%id_bdot = register_scalar_field('ice_shelf_model', 'int_bdot', CS%diag%axesT1, CS%Time, &
+    'Area integrated rate of change in ice-shelf thickness due to basal accum+melt', 'm3 s-1')
+  CS%id_bdot_melt = register_scalar_field('ice_shelf_model', 'int_bdot_melt', CS%diag%axesT1, CS%Time, &
+    'Area integrated basal melt rate over ice shelves', 'm3 s-1')
+  CS%id_bdot_accum = register_scalar_field('ice_shelf_model', 'int_bdot_accum', CS%diag%axesT1, CS%Time, &
+    'Area integrated basal accumulation rate over ice shelves', 'm3 s-1')
 
   call MOM_IS_diag_mediator_close_registration(CS%diag)
 
