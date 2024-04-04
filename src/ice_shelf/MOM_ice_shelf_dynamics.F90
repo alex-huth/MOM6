@@ -36,7 +36,8 @@ implicit none ; private
 
 public register_ice_shelf_dyn_restarts, initialize_ice_shelf_dyn, update_ice_shelf, IS_dynamics_post_data
 public ice_time_step_CFL, ice_shelf_dyn_end, change_in_draft, write_ice_shelf_energy
-public shelf_advance_front, ice_shelf_min_thickness_calve, calve_to_mask
+public shelf_advance_front, ice_shelf_min_thickness_calve, calve_to_mask, volume_above_floatation
+public masked_var_grounded
 
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
 ! consistency testing. These are noted in comments with units like Z, H, L, and T, along with
@@ -935,6 +936,51 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
 ! call ice_shelf_temp(CS, ISS, G, US, time_step, ISS%water_flux, Time)
 
 end subroutine update_ice_shelf
+
+subroutine volume_above_floatation(CS, G, ISS, vab)
+  type(ice_shelf_dyn_CS), intent(in) :: CS !< The ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in) :: G  !< The grid structure used by the ice shelf.
+  type(ice_shelf_state),  intent(in) :: ISS !< A structure with elements that describe
+                                            !! the ice-shelf state
+  real, intent(out) :: vab !< area integrated volume above floatation
+  real, dimension(SZI_(G),SZJ_(G))  :: vab_cell !< cell-wise volume above floatation [Z ~> m}
+  integer :: is,ie,js,je,i,j
+  real :: rhoi_rhow, rhow_rhoi
+
+  if (CS%GL_couple) &
+    call MOM_error(FATAL, "MOM_ice_shelf_dyn, volume above floatation calculation assumes GL_couple=.FALSE..")
+
+  vab_cell(:,:)=0.0
+  rhoi_rhow = CS%density_ice / CS%density_ocean_avg
+  rhow_rhoi = CS%density_ocean_avg / CS%density_ice
+  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
+
+  do j = js,je; do i = is,ie
+    if (ISS%hmask(i,j)>0) then
+      if (CS%bed_elev(i,j) <= 0) then
+        !grounded above sea level
+        vab_cell(i,j)= (ISS%h_shelf(i,j) * G%US%Z_to_m) * (ISS%area_shelf_h(i,j) * G%US%L_to_m**2)
+      else
+        !grounded if vab_cell(i,j) > 0
+        vab_cell(i,j) = (max(ISS%h_shelf(i,j) - rhow_rhoi * CS%bed_elev(i,j), 0.0) * G%US%Z_to_m) * (ISS%area_shelf_h(i,j) * G%US%L_to_m**2)
+      endif
+    endif
+  enddo; enddo
+
+  vab = reproducing_sum(vab_cell)
+end subroutine volume_above_floatation
+
+!> multiplies a variable with the ice sheet grounding fraction
+subroutine masked_var_grounded(G,CS,var,varout)
+  type(ocean_grid_type), intent(in) :: G !< The grid structure used by the ice shelf.
+  type(ice_shelf_dyn_CS), intent(in) :: CS !< The ice shelf dynamics control structure
+  real, dimension(SZI_(G),SZJ_(G)), intent(in)  :: var !< variable in
+  real, dimension(SZI_(G),SZJ_(G)), intent(out)  :: varout !<variable out
+  integer :: i,j
+  do j = G%jsc,G%jec; do i = G%isc,G%iec
+      varout(i,j) = var(i,j) * CS%ground_frac(i,j)
+  enddo; enddo
+end subroutine masked_var_grounded
 
 !> Ice shelf dynamics post_data calls
 subroutine IS_dynamics_post_data(time_step, Time, CS, G)
