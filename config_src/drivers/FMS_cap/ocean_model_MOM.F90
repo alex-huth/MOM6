@@ -559,13 +559,15 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
       call convert_IOB_to_fluxes(Ice_ocean_boundary, OS%flux_tmp, index_bnds, OS%Time, dt_coupling, &
                                  OS%grid, OS%US, OS%forcing_CSp, OS%sfc_state)
 
-      if (OS%use_ice_shelf) &
-        call shelf_calc_flux(OS%sfc_state, OS%flux_tmp, OS%Time,dt_coupling, OS%Ice_shelf_CSp)
-      if (OS%icebergs_alter_ocean) &
-        call iceberg_fluxes(OS%grid, OS%US, OS%flux_tmp, OS%use_ice_shelf, &
-                            OS%sfc_state, dt_coupling, OS%marine_ice_CSp)
+      !THIS CODE DOES NOT WORK - MJH
+      !if (OS%use_ice_shelf) &
+      !  call shelf_calc_flux(OS%sfc_state, OS%flux_tmp, OS%Time,dt_coupling, OS%Ice_shelf_CSp)
+      !if (OS%icebergs_alter_ocean) &
+      !  call iceberg_fluxes(OS%grid, OS%US, OS%flux_tmp, OS%use_ice_shelf, &
+      !                      OS%sfc_state, dt_coupling, OS%marine_ice_CSp)
 
-      call fluxes_accumulate(OS%flux_tmp, OS%fluxes, OS%grid, weight)
+      !call fluxes_accumulate(OS%flux_tmp, OS%fluxes, OS%grid, weight)
+      !END BAD BLOCK - MJH
 #ifdef _USE_GENERIC_TRACER
        ! Incorporate the current tracer fluxes into the running averages
       call MOM_generic_tracer_fluxes_accumulate(OS%flux_tmp, weight)
