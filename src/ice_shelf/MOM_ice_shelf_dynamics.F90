@@ -402,7 +402,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   type(diag_ctrl), target, intent(in)    :: diag !< A structure that is used to regulate the diagnostic output.
   logical,                 intent(in)    :: new_sim !< If true this is a new simulation, otherwise
                                                  !! has been started from a restart file.
-  real,                    intent(in)    :: Cp_ice !< Heat capacity of ice (J kg-1 K-1)
+  real,                    intent(in)    :: Cp_ice !< Heat capacity of ice [Q C-1 ~> J kg-1 degC-1]
   type(time_type),         intent(in)    :: Input_start_time !< The start time of the simulation.
   character(len=*),        intent(in)    :: directory  !< The directory where the ice sheet energy file goes.
   logical,       optional, intent(in)    :: solo_ice_sheet_in !< If present, this indicates whether
@@ -915,20 +915,20 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
 
 end subroutine update_ice_shelf
 
-subroutine volume_above_floatation(CS, G, ISS, vab)
+subroutine volume_above_floatation(CS, G, ISS, vaf)
   type(ice_shelf_dyn_CS), intent(in) :: CS !< The ice shelf dynamics control structure
   type(ocean_grid_type),  intent(in) :: G  !< The grid structure used by the ice shelf.
   type(ice_shelf_state),  intent(in) :: ISS !< A structure with elements that describe
                                             !! the ice-shelf state
-  real, intent(out) :: vab !< area integrated volume above floatation
-  real, dimension(SZI_(G),SZJ_(G))  :: vab_cell !< cell-wise volume above floatation [Z ~> m}
+  real, intent(out) :: vaf !< area integrated volume above floatation [m3]
+  real, dimension(SZI_(G),SZJ_(G))  :: vaf_cell !< cell-wise volume above floatation [m3]
   integer :: is,ie,js,je,i,j
   real :: rhoi_rhow, rhow_rhoi
 
   if (CS%GL_couple) &
     call MOM_error(FATAL, "MOM_ice_shelf_dyn, volume above floatation calculation assumes GL_couple=.FALSE..")
 
-  vab_cell(:,:)=0.0
+  vaf_cell(:,:)=0.0
   rhoi_rhow = CS%density_ice / CS%density_ocean_avg
   rhow_rhoi = CS%density_ocean_avg / CS%density_ice
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
@@ -937,16 +937,16 @@ subroutine volume_above_floatation(CS, G, ISS, vab)
     if (ISS%hmask(i,j)>0) then
       if (CS%bed_elev(i,j) <= 0) then
         !grounded above sea level
-        vab_cell(i,j)= (ISS%h_shelf(i,j) * G%US%Z_to_m) * (ISS%area_shelf_h(i,j) * G%US%L_to_m**2)
+        vaf_cell(i,j)= (ISS%h_shelf(i,j) * G%US%Z_to_m) * (ISS%area_shelf_h(i,j) * G%US%L_to_m**2)
       else
-        !grounded if vab_cell(i,j) > 0
-        vab_cell(i,j) = (max(ISS%h_shelf(i,j) - rhow_rhoi * CS%bed_elev(i,j), 0.0) * G%US%Z_to_m) * &
+        !grounded if vaf_cell(i,j) > 0
+        vaf_cell(i,j) = (max(ISS%h_shelf(i,j) - rhow_rhoi * CS%bed_elev(i,j), 0.0) * G%US%Z_to_m) * &
                         (ISS%area_shelf_h(i,j) * G%US%L_to_m**2)
       endif
     endif
   enddo; enddo
 
-  vab = reproducing_sum(vab_cell)
+  vaf = reproducing_sum(vaf_cell)
 end subroutine volume_above_floatation
 
 !> multiplies a variable with the ice sheet grounding fraction
