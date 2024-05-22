@@ -2497,8 +2497,8 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
 
   enddo
 
-  call write_ice_shelf_energy(CS%dCS, G, US, ISS%mass_shelf, ISS%area_shelf_h, Time, &
-                              time_step=time_interval)
+  call write_ice_shelf_energy(CS%dCS, G, US, ISS%mass_shelf, Time, time_step=time_interval)
+
   do j=js,je ; do i=is,ie
     ISS%dhdt_shelf(i,j) = (ISS%h_shelf(i,j) - ISS%dhdt_shelf(i,j)) * Ifull_time_step
   enddo; enddo
