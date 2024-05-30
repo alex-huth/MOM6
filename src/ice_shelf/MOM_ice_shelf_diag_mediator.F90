@@ -350,10 +350,11 @@ subroutine post_IS_data_0d(diag_field_id, field, diag_cs, is_static)
   integer,           intent(in) :: diag_field_id !< The id for an output variable returned by a
                                                  !! previous call to register_diag_field.
   real,              intent(in) :: field         !< real value being offered for output or averaging
+                                                 !! in internally scaled arbitrary units [A ~> a]
   type(diag_ctrl), target, intent(in) :: diag_CS !< Structure used to regulate diagnostic output
   logical, optional, intent(in) :: is_static !< If true, this is a static field that is always offered.
   ! Local variables
-  real :: locfield
+  real :: locfield ! The field being offered in arbitrary unscaled units [a]
   logical :: used, is_stat
   type(diag_type), pointer :: diag => null()
 
@@ -459,22 +460,25 @@ function register_MOM_IS_diag_field(module_name, field_name, axes, init_time, &
   character(len=*), optional, intent(in) :: long_name !< Long name of a field.
   character(len=*), optional, intent(in) :: units !< Units of a field.
   character(len=*), optional, intent(in) :: standard_name !< Standardized name associated with a field
-  real,             optional, intent(in) :: missing_value !< A value that indicates missing values.
+  real,             optional, intent(in) :: missing_value !< A value that indicates missing values in
+                                                          !! output files, in unscaled arbitrary units [a]
   real,             optional, intent(in) :: range(2) !< Valid range of a variable (not used in MOM?)
+                                                     !! in arbitrary units [a]
   logical,          optional, intent(in) :: mask_variant !< If true a logical mask must be provided with
                                                          !! post_IS_data calls (not used in MOM?)
   logical,          optional, intent(in) :: verbose !< If true, FMS is verbose (not used in MOM?)
   logical,          optional, intent(in) :: do_not_log !< If true, do not log something (not used in MOM?)
   character(len=*), optional, intent(out):: err_msg !< String into which an error message might be
-                                                         !! placed (not used in MOM?)
+                                                    !! placed (not used in MOM?)
   character(len=*), optional, intent(in) :: interp_method !< If 'none' indicates the field should not
-                                                         !! be interpolated as a scalar
-  integer,          optional, intent(in) :: tile_count   !< no clue (not used in MOM_IS?)
-  real,             optional, intent(in) :: conversion !< A value to multiply data by before writing to file
-
+                                                          !! be interpolated as a scalar
+  integer,          optional, intent(in) :: tile_count !< no clue (not used in MOM_IS?)
+  real,             optional, intent(in) :: conversion !< A value to multiply data by before writing to file,
+                                                       !! often including factors to undo internal scaling and
+                                                       !! in units of [a A-1 ~> 1]
   ! Local variables
   character(len=240) :: mesg
-  real :: MOM_missing_value
+  real :: MOM_missing_value ! A value used to indicate missing values in output files, in arbitrary units [a]
   integer :: primary_id, fms_id
   type(diag_ctrl), pointer :: diag_cs => NULL() ! A structure that is used
                                                ! to regulate diagnostic output

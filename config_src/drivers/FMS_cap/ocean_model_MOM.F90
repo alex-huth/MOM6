@@ -124,8 +124,8 @@ type, public ::  ocean_public_type
     OBLD => NULL(),   & !< Ocean boundary layer depth [m].
     area => NULL(),   & !< cell area of the ocean surface [m2].
     calving => NULL(), &!< The mass per unit area of the ice shelf to convert to
-                        !!bergs [R Z ~> kg m-2].
-    calving_hflx => NULL() !< Calving heat flux [Q R Z T-1 ~> W m-2].
+                        !! bergs [kg m-2].
+    calving_hflx => NULL() !< Calving heat flux [W m-2].
   type(coupler_2d_bc_type) :: fields    !< A structure that may contain named
                                         !! arrays of tracer-related surface fields.
   integer                  :: avg_kount !< A count of contributions to running
