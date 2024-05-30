@@ -51,7 +51,7 @@ type, public :: ice_shelf_state
 
     !only active when calve_ice_shelf_bergs=true:
     calving => NULL(), &       !< The mass flux per unit area of the ice shelf to convert to
-                               !!bergs [RZ_T ~> kg m-2 s-1].
+                               !! bergs [R Z T-1 ~> kg m-2 s-1].
     calving_hflx => NULL()     !< Calving heat flux [Q R Z T-1 ~> W m-2].
 end type ice_shelf_state
 
