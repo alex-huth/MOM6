@@ -500,7 +500,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "min. ice thickness used during ice dynamics", &
                   units="m", default=0.,scale=US%m_to_L)
     call get_param(param_file, mdl, "MIN_BASAL_TRACTION", CS%min_basal_traction, &
-                 "min. allowed basal traction", &
+                 "min. allowed basal traction. Input is in [Pa m-1 yr], but is converted when read in to [Pa m-1 s]", &
                  units="Pa m-1 yr", default=0., scale=365.0*86400.0*US%Pa_to_RLZ_T2*US%L_T_to_m_s)
     call get_param(param_file, mdl, "MAX_SURFACE_SLOPE", CS%max_surface_slope, &
                  "max. allowed ice-sheet surface slope. To ignore, set to zero.", &
