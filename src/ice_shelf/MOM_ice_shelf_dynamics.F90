@@ -955,26 +955,48 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
 
 end subroutine update_ice_shelf
 
-subroutine volume_above_floatation(CS, G, ISS, vaf)
+subroutine volume_above_floatation(CS, G, ISS, vaf, hemisphere)
   type(ice_shelf_dyn_CS), intent(in) :: CS !< The ice shelf dynamics control structure
   type(ocean_grid_type),  intent(in) :: G  !< The grid structure used by the ice shelf.
   type(ice_shelf_state),  intent(in) :: ISS !< A structure with elements that describe
                                             !! the ice-shelf state
   real, intent(out) :: vaf !< area integrated volume above floatation [m3]
+  integer, optional, intent(in) :: hemisphere !< 0 for Antarctica only, 1 for Greenland only. Otherwise, all ice sheets
+  integer :: IS_ID ! local copy of hemisphere
   real, dimension(SZI_(G),SZJ_(G))  :: vaf_cell !< cell-wise volume above floatation [m3]
+  integer, dimension(SZI_(G),SZJ_(G))  :: mask ! a mask for active cells depending on hemisphere indicated
   integer :: is,ie,js,je,i,j
   real :: rhoi_rhow, rhow_rhoi
 
   if (CS%GL_couple) &
     call MOM_error(FATAL, "MOM_ice_shelf_dyn, volume above floatation calculation assumes GL_couple=.FALSE..")
 
-  vaf_cell(:,:)=0.0
   rhoi_rhow = CS%density_ice / CS%density_ocean_avg
   rhow_rhoi = CS%density_ocean_avg / CS%density_ice
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
 
+  if (present(hemisphere)) then
+    IS_ID=hemisphere
+  else
+    IS_ID=-1
+  endif
+
+  mask(:,:)=0
+  if (IS_ID==0) then     !Antarctica (S. Hemisphere) only
+    do j = js,je; do i = is,ie
+      if (ISS%hmask(i,j)>0 .and. G%geoLatT(i,j)<=0.0) mask(i,j)=1
+    enddo; enddo
+  elseif (IS_ID==1) then !Greenland (N. Hemisphere) only
+    do j = js,je; do i = is,ie
+      if (ISS%hmask(i,j)>0 .and. G%geoLatT(i,j)>0.0)  mask(i,j)=1
+    enddo; enddo
+  else                   !All ice sheets
+    mask(is:ie,js:je)=ISS%hmask(is:ie,js:je)
+  endif
+
+  vaf_cell(:,:)=0.0
   do j = js,je; do i = is,ie
-    if (ISS%hmask(i,j)>0) then
+    if (mask(i,j)>0) then
       if (CS%bed_elev(i,j) <= 0) then
         !grounded above sea level
         vaf_cell(i,j)= (ISS%h_shelf(i,j) * G%US%Z_to_m) * (ISS%area_shelf_h(i,j) * G%US%L_to_m**2)
