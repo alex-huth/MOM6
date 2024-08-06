@@ -906,7 +906,7 @@ subroutine sum_En(G, US, CS, En, label)
 
   En_sum = 0.0
   do a=1,CS%nAngle
-    En_sum = En_sum + global_area_integral(En(:,:,a), G, scale=US%RZ3_T3_to_W_m2*US%T_to_s)
+    En_sum = En_sum + global_area_integral(En(:,:,a), G, unscale=US%RZ3_T3_to_W_m2*US%T_to_s)
   enddo
   CS%En_sum = En_sum
   !En_sum_diff = En_sum - CS%En_sum
@@ -1096,7 +1096,7 @@ subroutine refract(En, cn, freq, dt, G, US, NAngle, use_PPMang)
 
   cnmask(:,:) = merge(0., 1., cn(:,:) == 0.)
 
-  do j=js,je ; do i=is-1,ie
+  do j=js,je ; do I=is-1,ie
     ! wgt = 0 if local cn == 0, wgt = 0.5 if both contiguous values != 0
     ! and wgt = 1 if neighbour cn == 0
     wgt1 = cnmask(i,j) - 0.5 * cnmask(i,j) * cnmask(i+1,j)
@@ -1104,7 +1104,7 @@ subroutine refract(En, cn, freq, dt, G, US, NAngle, use_PPMang)
     cn_u(I,j) = wgt1*cn(i,j) + wgt2*cn(i+1,j)
   enddo ; enddo
 
-  do j=js-1,je ; do i=is,ie
+  do J=js-1,je ; do i=is,ie
     wgt1 = cnmask(i,j) - 0.5 * cnmask(i,j) * cnmask(i,j+1)
     wgt2 = cnmask(i,j+1) - 0.5 * cnmask(i,j) * cnmask(i,j+1)
     cn_v(i,J) = wgt1*cn(i,j) + wgt2*cn(i,j+1)
@@ -2550,6 +2550,7 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
   real, dimension(:,:), allocatable :: ridge_temp ! array for temporary storage of flags
                                                   ! of cells with double-reflecting ridges [nondim]
   logical :: use_int_tides, use_temperature
+  logical :: om4_remap_via_sub_cells ! Use the OM4-era ramap_via_sub_cells for calculating the EBT structure
   real    :: IGW_c1_thresh ! A threshold first mode internal wave speed below which all higher
                  ! mode speeds are not calculated but simply assigned a speed of 0 [L T-1 ~> m s-1].
   real    :: kappa_h2_factor    ! A roughness scaling factor [nondim]
@@ -2726,6 +2727,10 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
                  "mode speeds are not calculated but are simply reported as 0.  This must be "//&
                  "non-negative for the wave_speeds routine to be used.", &
                  units="m s-1", default=0.01, scale=US%m_s_to_L_T)
+  call get_param(param_file, mdl, "INTWAVE_REMAPPING_USE_OM4_SUBCELLS", om4_remap_via_sub_cells, &
+                 "If true, use the OM4 remapping-via-subcells algorithm for calculating EBT structure. "//&
+                 "See REMAPPING_USE_OM4_SUBCELLS for details. "//&
+                 "We recommend setting this option to false.", default=.true.)
 
   call get_param(param_file, mdl, "UNIFORM_TEST_CG", CS%uniform_test_cg, &
                  "If positive, a uniform group velocity of internal tide for test case", &
@@ -3107,7 +3112,8 @@ subroutine internal_tides_init(Time, G, GV, US, param_file, diag, CS)
   enddo
 
   ! Initialize the module that calculates the wave speeds.
-  call wave_speed_init(CS%wave_speed, c1_thresh=IGW_c1_thresh)
+  call wave_speed_init(CS%wave_speed, c1_thresh=IGW_c1_thresh, &
+                       om4_remap_via_sub_cells=om4_remap_via_sub_cells)
 
 end subroutine internal_tides_init
 
