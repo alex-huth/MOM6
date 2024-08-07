@@ -1045,7 +1045,7 @@ subroutine Ocean_stock_pe(OS, index, value, time_index)
       if (OS%GV%Boussinesq) then
         call get_ocean_stocks(OS%MOM_CSp, mass=value, ice_shelf_CSp=OS%ice_shelf_CSp, on_PE_only=.true.)
       else  ! In non-Boussinesq mode, the mass of salt needs to be subtracted.
-        call get_ocean_stocks(OS%MOM_CSp, mass=value, ice_shelf_CSp=OS%ice_shelf_CSp, salt=salt, on_PE_only=.true.)
+        call get_ocean_stocks(OS%MOM_CSp, mass=value, salt=salt, ice_shelf_CSp=OS%ice_shelf_CSp, on_PE_only=.true.)
         value = value - salt
       endif
     case (ISTOCK_HEAT)  ! Return the heat content of the ocean in [J].

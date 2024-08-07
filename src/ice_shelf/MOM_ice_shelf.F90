@@ -1301,7 +1301,6 @@ subroutine add_shelf_flux(G, US, CS, sfc_state, fluxes, time_step)
         call change_in_draft(CS%dCS, G, last_h_shelf, ISS%h_shelf, delta_draft)
 
         !this currently assumes area_shelf_h is constant over the time step
-        !should area in each of these global_area_integral calls actually be G%areaT?
         delta_mass_shelf = global_area_integral(delta_draft, G, tmp_scale=US%RZ_to_kg_m2, &
                                                 area=ISS%area_shelf_h) &
                                                 * CS%Rho_ocn / CS%time_step
