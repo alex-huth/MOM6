@@ -282,9 +282,9 @@ function quad_area (X, Y)
     !  |   |
     !  1 - 2
 
-  p2 = (X(4)-X(1))**2 + (Y(4)-Y(1))**2 ; q2 = (X(3)-X(2))**2 + (Y(3)-Y(2))**2
-  a2 = (X(3)-X(4))**2 + (Y(3)-Y(4))**2 ; c2 = (X(1)-X(2))**2 + (Y(1)-Y(2))**2
-  b2 = (X(2)-X(4))**2 + (Y(2)-Y(4))**2 ; d2 = (X(3)-X(1))**2 + (Y(3)-Y(1))**2
+  p2 = ((X(4)-X(1))**2 + (Y(4)-Y(1))**2) ; q2 = ((X(3)-X(2))**2 + (Y(3)-Y(2))**2)
+  a2 = ((X(3)-X(4))**2 + (Y(3)-Y(4))**2) ; c2 = ((X(1)-X(2))**2 + (Y(1)-Y(2))**2)
+  b2 = ((X(2)-X(4))**2 + (Y(2)-Y(4))**2) ; d2 = ((X(3)-X(1))**2 + (Y(3)-Y(1))**2)
   quad_area = .25 * sqrt(4*P2*Q2-(B2+D2-A2-C2)**2)
 
 end function quad_area
@@ -898,10 +898,10 @@ function ice_time_step_CFL(CS, ISS, G)
   min_vel = (1.0e-12/(365.0*86400.0)) * G%US%m_s_to_L_T
   do j=G%jsc,G%jec ; do i=G%isc,G%iec ; if (ISS%hmask(i,j) == 1.0 .or. ISS%hmask(i,j)==3) then
     dt_local = 2.0*G%areaT(i,j) / &
-       ((G%dyCu(I,j)  * max(abs(CS%u_shelf(I,J)  + CS%u_shelf(I,j-1)), min_vel) + &
-         G%dyCu(I-1,j)* max(abs(CS%u_shelf(I-1,J)+ CS%u_shelf(I-1,j-1)), min_vel)) + &
-        (G%dxCv(i,J)  * max(abs(CS%v_shelf(i,J)  + CS%v_shelf(i-1,J)), min_vel) + &
-         G%dxCv(i,J-1)* max(abs(CS%v_shelf(i,J-1)+ CS%v_shelf(i-1,J-1)), min_vel)))
+       (((G%dyCu(I,j)  * max(abs(CS%u_shelf(I,J)  + CS%u_shelf(I,j-1)), min_vel)) + &
+         (G%dyCu(I-1,j)* max(abs(CS%u_shelf(I-1,J)+ CS%u_shelf(I-1,j-1)), min_vel))) + &
+        ((G%dxCv(i,J)  * max(abs(CS%v_shelf(i,J)  + CS%v_shelf(i-1,J)), min_vel)) + &
+         (G%dxCv(i,J-1)* max(abs(CS%v_shelf(i,J-1)+ CS%v_shelf(i-1,J-1)), min_vel))))
 
     min_dt = min(min_dt, dt_local)
   endif ; enddo ; enddo ! i- and j- loops
@@ -1154,8 +1154,8 @@ subroutine write_ice_shelf_energy(CS, G, US, mass, area, day, time_step)
   KE_scale_factor = US%L_to_m**2 * (US%RZ_to_kg_m2 * US%L_T_to_m_s**2)
   do j=js,je ; do i=is,ie
     tmp1(i,j) = (KE_scale_factor * 0.03125) * (mass(i,j) * area(i,j)) * &
-      (((CS%u_shelf(I-1,J-1)+CS%u_shelf(I,J))+(CS%u_shelf(I,J-1)+CS%u_shelf(I-1,J)))**2 + &
-       ((CS%v_shelf(I-1,J-1)+CS%v_shelf(I,J))+(CS%v_shelf(I,J-1)+CS%v_shelf(I-1,J)))**2)
+      ((((CS%u_shelf(I-1,J-1)+CS%u_shelf(I,J))+(CS%u_shelf(I,J-1)+CS%u_shelf(I-1,J)))**2) + &
+       (((CS%v_shelf(I-1,J-1)+CS%v_shelf(I,J))+(CS%v_shelf(I,J-1)+CS%v_shelf(I-1,J)))**2))
   enddo; enddo
 
   KE_tot = reproducing_sum(tmp1, isr, ier, jsr, jer)
@@ -1556,7 +1556,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
         if (CS%vmask(I,J) == 1) then
           err_tempv = MAX(ABS(v_last(I,J)-v_shlf(I,J)), err_tempu)
           if (err_tempv >= err_max) err_max = err_tempv
-          tempv = SQRT(v_shlf(I,J)**2 + tempu**2)
+          tempv = SQRT((v_shlf(I,J)**2) + (tempu**2))
         endif
         if (tempv >= max_vel) max_vel = tempv
       enddo ; enddo
@@ -2608,53 +2608,53 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
 
         qp = 2*(jq-1)+iq !current quad point
 
-        uq = (u_shlf(I-1,J-1) * (xquad(3-iq) * xquad(3-jq)) + &
-             u_shlf(I,J) * (xquad(iq) * xquad(jq))) + &
-             (u_shlf(I,J-1) * (xquad(iq) * xquad(3-jq)) + &
-             u_shlf(I-1,J) * (xquad(3-iq) * xquad(jq)))
+        uq = ((u_shlf(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
+              (u_shlf(I,J) * (xquad(iq) * xquad(jq)))) + &
+             ((u_shlf(I,J-1) * (xquad(iq) * xquad(3-jq))) + &
+              (u_shlf(I-1,J) * (xquad(3-iq) * xquad(jq))))
 
-        vq = (v_shlf(I-1,J-1) * (xquad(3-iq) * xquad(3-jq)) + &
-             v_shlf(I,J) * (xquad(iq) * xquad(jq))) + &
-             (v_shlf(I,J-1) * (xquad(iq) * xquad(3-jq)) + &
-             v_shlf(I-1,J) * (xquad(3-iq) * xquad(jq)))
+        vq = ((v_shlf(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
+              (v_shlf(I,J) * (xquad(iq) * xquad(jq)))) + &
+             ((v_shlf(I,J-1) * (xquad(iq) * xquad(3-jq))) + &
+              (v_shlf(I-1,J) * (xquad(3-iq) * xquad(jq))))
 
-        ux = (u_shlf(I-1,J-1) * Phi(1,qp,i,j) + &
-             u_shlf(I,J) * Phi(7,qp,i,j)) + &
-             (u_shlf(I,J-1) * Phi(3,qp,i,j) + &
-             u_shlf(I-1,J) * Phi(5,qp,i,j))
+        ux = ((u_shlf(I-1,J-1) * Phi(1,qp,i,j)) + &
+              (u_shlf(I,J) * Phi(7,qp,i,j))) + &
+             ((u_shlf(I,J-1) * Phi(3,qp,i,j)) + &
+              (u_shlf(I-1,J) * Phi(5,qp,i,j)))
 
-        vx = (v_shlf(I-1,J-1) * Phi(1,qp,i,j) + &
-             v_shlf(I,J) * Phi(7,qp,i,j)) + &
-             (v_shlf(I,J-1) * Phi(3,qp,i,j) + &
-             v_shlf(I-1,J) * Phi(5,qp,i,j))
+        vx = ((v_shlf(I-1,J-1) * Phi(1,qp,i,j)) + &
+              (v_shlf(I,J) * Phi(7,qp,i,j))) + &
+             ((v_shlf(I,J-1) * Phi(3,qp,i,j)) + &
+              (v_shlf(I-1,J) * Phi(5,qp,i,j)))
 
-        uy = (u_shlf(I-1,J-1) * Phi(2,qp,i,j) + &
-             u_shlf(I,J) * Phi(8,qp,i,j)) + &
-             (u_shlf(I,J-1) * Phi(4,qp,i,j) + &
-             u_shlf(I-1,J) * Phi(6,qp,i,j))
+        uy = ((u_shlf(I-1,J-1) * Phi(2,qp,i,j)) + &
+              (u_shlf(I,J) * Phi(8,qp,i,j))) + &
+             ((u_shlf(I,J-1) * Phi(4,qp,i,j)) + &
+              (u_shlf(I-1,J) * Phi(6,qp,i,j)))
 
-        vy = (v_shlf(I-1,J-1) * Phi(2,qp,i,j) + &
-             v_shlf(I,J) * Phi(8,qp,i,j)) + &
-             (v_shlf(I,J-1) * Phi(4,qp,i,j) + &
-             v_shlf(I-1,J) * Phi(6,qp,i,j))
+        vy = ((v_shlf(I-1,J-1) * Phi(2,qp,i,j)) + &
+              (v_shlf(I,J) * Phi(8,qp,i,j))) + &
+             ((v_shlf(I,J-1) * Phi(4,qp,i,j)) + &
+              (v_shlf(I-1,J) * Phi(6,qp,i,j)))
 
         if (visc_qp4) qpv = qp !current quad point for viscosity
 
         do jphi=1,2 ; Jtgt = J-2+jphi ; do iphi=1,2 ; Itgt = I-2+iphi
           if (umask(Itgt,Jtgt) == 1) uret_qp(iphi,jphi,qp) = ice_visc(i,j,qpv) * &
-            ((4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
-            (uy+vx) * Phi(2*(2*(jphi-1)+iphi),qp,i,j))
+            (((4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j)) + &
+            ((uy+vx) * Phi(2*(2*(jphi-1)+iphi),qp,i,j)))
           if (vmask(Itgt,Jtgt) == 1) vret_qp(iphi,jphi,qp) = ice_visc(i,j,qpv) * &
-            ((uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
-            (4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),qp,i,j))
+            (((uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j)) + &
+            ((4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),qp,i,j)))
 
           if (float_cond(i,j) == 0) then
             ilq = 1 ; if (iq == iphi) ilq = 2
             jlq = 1 ; if (jq == jphi) jlq = 2
             if (umask(Itgt,Jtgt) == 1) uret_qp(iphi,jphi,qp) = uret_qp(iphi,jphi,qp) +  &
-              (basal_trac(i,j) * uq) * (xquad(ilq) * xquad(jlq))
+              ((basal_trac(i,j) * uq) * (xquad(ilq) * xquad(jlq)))
             if (vmask(Itgt,Jtgt) == 1) vret_qp(iphi,jphi,qp) = vret_qp(iphi,jphi,qp) +  &
-              (basal_trac(i,j) * vq) * (xquad(ilq) * xquad(jlq))
+              ((basal_trac(i,j) * vq) * (xquad(ilq) * xquad(jlq)))
           endif
         enddo ; enddo
       enddo ; enddo
@@ -2732,13 +2732,13 @@ subroutine CG_action_subgrid_basal(Phisub, H, U, V, bathyT, dens_ratio, Ucontr, 
   uloc_arr(:,:,:,:) = 0.0; vloc_arr(:,:,:,:)=0.0
 
   do j=1,nsub ; do i=1,nsub;  do qy=1,2 ; do qx=1,2
-    hloc = (Phisub(qx,qy,i,j,1,1)*H(1,1) + Phisub(qx,qy,i,j,2,2)*H(2,2)) + &
-           (Phisub(qx,qy,i,j,1,2)*H(1,2) + Phisub(qx,qy,i,j,2,1)*H(2,1))
+    hloc = ((Phisub(qx,qy,i,j,1,1)*H(1,1)) + (Phisub(qx,qy,i,j,2,2)*H(2,2))) + &
+           ((Phisub(qx,qy,i,j,1,2)*H(1,2)) + (Phisub(qx,qy,i,j,2,1)*H(2,1)))
     if (dens_ratio * hloc - bathyT > 0) then
-      uloc_arr(qx,qy,i,j) = ((Phisub(qx,qy,i,j,1,1) * U(1,1) + Phisub(qx,qy,i,j,2,2) * U(2,2)) + &
-                            (Phisub(qx,qy,i,j,1,2) * U(1,2) + Phisub(qx,qy,i,j,2,1) * U(2,1)))
-      vloc_arr(qx,qy,i,j) = ((Phisub(qx,qy,i,j,1,1) * V(1,1) + Phisub(qx,qy,i,j,2,2) * V(2,2)) + &
-                            (Phisub(qx,qy,i,j,1,2) * V(1,2) + Phisub(qx,qy,i,j,2,1) * V(2,1)))
+      uloc_arr(qx,qy,i,j) = (((Phisub(qx,qy,i,j,1,1) * U(1,1)) + (Phisub(qx,qy,i,j,2,2) * U(2,2))) + &
+                             ((Phisub(qx,qy,i,j,1,2) * U(1,2)) + (Phisub(qx,qy,i,j,2,1) * U(2,1))))
+      vloc_arr(qx,qy,i,j) = (((Phisub(qx,qy,i,j,1,1) * V(1,1)) + (Phisub(qx,qy,i,j,2,2) * V(2,2))) + &
+                             ((Phisub(qx,qy,i,j,1,2) * V(1,2)) + (Phisub(qx,qy,i,j,2,1) * V(2,1))))
     endif
   enddo; enddo ; enddo ; enddo
 
@@ -2891,8 +2891,8 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
           vy = 0.
 
           u_diag_qp(iphi,jphi,qp) = &
-            ice_visc(i,j,qpv) * ((4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
-            (uy+vx) * Phi(2*(2*(jphi-1)+iphi),qp,i,j))
+            ice_visc(i,j,qpv) * (((4*ux+2*vy) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j)) + &
+            ((uy+vx) * Phi(2*(2*(jphi-1)+iphi),qp,i,j)))
 
           if (float_cond(i,j) == 0) then
             uq = xquad(ilq) * xquad(jlq)
@@ -2909,8 +2909,8 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
           uy = 0.
 
           v_diag_qp(iphi,jphi,qp) = &
-            ice_visc(i,j,qpv) * ((uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
-            (4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),qp,i,j))
+            ice_visc(i,j,qpv) * (((uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j)) + &
+            ((4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),qp,i,j)))
 
           if (float_cond(i,j) == 0) then
             vq = xquad(ilq) * xquad(jlq)
@@ -2941,15 +2941,15 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
       Hcell(:,:) = H_node(i-1:i,j-1:j)
       call CG_diagonal_subgrid_basal(Phisub, Hcell, CS%bed_elev(i,j), dens_ratio, sub_ground)
 
-        if (CS%umask(I-1,J-1) == 1) u_diag_b(I-1,J-1,4) = u_diag_b(I-1,J-1,4) + sub_ground(1,1) * basal_trac(i,j)
-        if (CS%umask(I-1,J  ) == 1) u_diag_b(I-1,J  ,2) = u_diag_b(I-1,J  ,2) + sub_ground(1,2) * basal_trac(i,j)
-        if (CS%umask(I  ,J-1) == 1) u_diag_b(I  ,J-1,3) = u_diag_b(I  ,J-1,3) + sub_ground(2,1) * basal_trac(i,j)
-        if (CS%umask(I  ,J  ) == 1) u_diag_b(I  ,J  ,1) = u_diag_b(I  ,J  ,1) + sub_ground(2,2) * basal_trac(i,j)
+        if (CS%umask(I-1,J-1) == 1) u_diag_b(I-1,J-1,4) = u_diag_b(I-1,J-1,4) + (sub_ground(1,1) * basal_trac(i,j))
+        if (CS%umask(I-1,J  ) == 1) u_diag_b(I-1,J  ,2) = u_diag_b(I-1,J  ,2) + (sub_ground(1,2) * basal_trac(i,j))
+        if (CS%umask(I  ,J-1) == 1) u_diag_b(I  ,J-1,3) = u_diag_b(I  ,J-1,3) + (sub_ground(2,1) * basal_trac(i,j))
+        if (CS%umask(I  ,J  ) == 1) u_diag_b(I  ,J  ,1) = u_diag_b(I  ,J  ,1) + (sub_ground(2,2) * basal_trac(i,j))
 
-        if (CS%vmask(I-1,J-1) == 1) v_diag_b(I-1,J-1,4) = v_diag_b(I-1,J-1,4) + sub_ground(1,1) * basal_trac(i,j)
-        if (CS%vmask(I-1,J  ) == 1) v_diag_b(I-1,J  ,2) = v_diag_b(I-1,J  ,2) + sub_ground(1,2) * basal_trac(i,j)
-        if (CS%vmask(I  ,J-1) == 1) v_diag_b(I  ,J-1,3) = v_diag_b(I  ,J-1,3) + sub_ground(2,1) * basal_trac(i,j)
-        if (CS%vmask(I  ,J  ) == 1) v_diag_b(I  ,J  ,1) = v_diag_b(I  ,J  ,1) + sub_ground(2,2) * basal_trac(i,j)
+        if (CS%vmask(I-1,J-1) == 1) v_diag_b(I-1,J-1,4) = v_diag_b(I-1,J-1,4) + (sub_ground(1,1) * basal_trac(i,j))
+        if (CS%vmask(I-1,J  ) == 1) v_diag_b(I-1,J  ,2) = v_diag_b(I-1,J  ,2) + (sub_ground(1,2) * basal_trac(i,j))
+        if (CS%vmask(I  ,J-1) == 1) v_diag_b(I  ,J-1,3) = v_diag_b(I  ,J-1,3) + (sub_ground(2,1) * basal_trac(i,j))
+        if (CS%vmask(I  ,J  ) == 1) v_diag_b(I  ,J  ,1) = v_diag_b(I  ,J  ,1) + (sub_ground(2,2) * basal_trac(i,j))
     endif
   endif ; enddo ; enddo
 
@@ -2986,8 +2986,8 @@ subroutine CG_diagonal_subgrid_basal (Phisub, H_node, bathyT, dens_ratio, f_grnd
   grnd_stat(:,:,:,:)=0
 
   do j=1,nsub ; do i=1,nsub;  do qy=1,2 ; do qx=1,2
-    hloc = (Phisub(qx,qy,i,j,1,1)*H_node(1,1) + Phisub(qx,qy,i,j,2,2)*H_node(2,2)) + &
-           (Phisub(qx,qy,i,j,1,2)*H_node(1,2) + Phisub(qx,qy,i,j,2,1)*H_node(2,1))
+    hloc = ((Phisub(qx,qy,i,j,1,1)*H_node(1,1)) + (Phisub(qx,qy,i,j,2,2)*H_node(2,2))) + &
+           ((Phisub(qx,qy,i,j,1,2)*H_node(1,2)) + (Phisub(qx,qy,i,j,2,1)*H_node(2,1)))
     if (dens_ratio * hloc - bathyT > 0) grnd_stat(qx,qy,i,j) = 1
   enddo; enddo ; enddo ; enddo
 
@@ -3071,25 +3071,25 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
         Visc_coef = (CS%AGlen_visc(i,j))**(-1./n_g)
         ! Units of Aglen_visc [Pa-(n_g) s-1]
 
-        ux = (u_shlf(I-1,J-1) * CS%PhiC(1,i,j) + &
-             u_shlf(I,J) * CS%PhiC(7,i,j)) + &
-             (u_shlf(I-1,J) * CS%PhiC(5,i,j) + &
-             u_shlf(I,J-1) * CS%PhiC(3,i,j))
+        ux = ((u_shlf(I-1,J-1) * CS%PhiC(1,i,j)) + &
+              (u_shlf(I,J) * CS%PhiC(7,i,j))) + &
+             ((u_shlf(I-1,J) * CS%PhiC(5,i,j)) + &
+              (u_shlf(I,J-1) * CS%PhiC(3,i,j)))
 
-        vx = (v_shlf(I-1,J-1) * CS%PhiC(1,i,j) + &
-             v_shlf(I,J) * CS%PhiC(7,i,j)) + &
-             (v_shlf(I-1,J) * CS%PhiC(5,i,j) + &
-             v_shlf(I,J-1) * CS%PhiC(3,i,j))
+        vx = ((v_shlf(I-1,J-1) * CS%PhiC(1,i,j)) + &
+              (v_shlf(I,J) * CS%PhiC(7,i,j))) + &
+             ((v_shlf(I-1,J) * CS%PhiC(5,i,j)) + &
+              (v_shlf(I,J-1) * CS%PhiC(3,i,j)))
 
-        uy = (u_shlf(I-1,J-1) * CS%PhiC(2,i,j) + &
-             u_shlf(I,J) * CS%PhiC(8,i,j)) + &
-             (u_shlf(I-1,J) * CS%PhiC(6,i,j) + &
-             u_shlf(I,J-1) * CS%PhiC(4,i,j))
+        uy = ((u_shlf(I-1,J-1) * CS%PhiC(2,i,j)) + &
+              (u_shlf(I,J) * CS%PhiC(8,i,j))) + &
+             ((u_shlf(I-1,J) * CS%PhiC(6,i,j)) + &
+              (u_shlf(I,J-1) * CS%PhiC(4,i,j)))
 
-        vy = (v_shlf(I-1,J-1) * CS%PhiC(2,i,j) + &
-             v_shlf(I,J) * CS%PhiC(8,i,j)) + &
-             (v_shlf(I-1,J) * CS%PhiC(6,i,j) + &
-             v_shlf(I,J-1) * CS%PhiC(4,i,j))
+        vy = ((v_shlf(I-1,J-1) * CS%PhiC(2,i,j)) + &
+              (v_shlf(I,J) * CS%PhiC(8,i,j))) + &
+             ((v_shlf(I-1,J) * CS%PhiC(6,i,j)) + &
+              (v_shlf(I,J-1) * CS%PhiC(4,i,j)))
 
         CS%ice_visc(i,j,1) = max(0.5 * Visc_coef * (G%areaT(i,j) * max(ISS%h_shelf(i,j),CS%min_h_shelf)) * &
           (US%s_to_T**2 * ((ux**2 + vy**2) + (ux*vy + 0.25*(uy+vx)**2) + eps_min**2))**((1.-n_g)/(2.*n_g)) * &
@@ -3101,25 +3101,25 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
 
         do iq=1,2 ; do jq=1,2
 
-          ux = (u_shlf(I-1,J-1) * CS%Phi(1,2*(jq-1)+iq,i,j) + &
-               u_shlf(I,J) * CS%Phi(7,2*(jq-1)+iq,i,j)) + &
-               (u_shlf(I,J-1) * CS%Phi(3,2*(jq-1)+iq,i,j) + &
-               u_shlf(I-1,J) * CS%Phi(5,2*(jq-1)+iq,i,j))
+          ux = ((u_shlf(I-1,J-1) * CS%Phi(1,2*(jq-1)+iq,i,j)) + &
+                (u_shlf(I,J) * CS%Phi(7,2*(jq-1)+iq,i,j))) + &
+               ((u_shlf(I,J-1) * CS%Phi(3,2*(jq-1)+iq,i,j)) + &
+                (u_shlf(I-1,J) * CS%Phi(5,2*(jq-1)+iq,i,j)))
 
-          vx = (v_shlf(I-1,J-1) * CS%Phi(1,2*(jq-1)+iq,i,j) + &
-               v_shlf(I,J) * CS%Phi(7,2*(jq-1)+iq,i,j)) + &
-               (v_shlf(I,J-1) * CS%Phi(3,2*(jq-1)+iq,i,j) + &
-               v_shlf(I-1,J) * CS%Phi(5,2*(jq-1)+iq,i,j))
+          vx = ((v_shlf(I-1,J-1) * CS%Phi(1,2*(jq-1)+iq,i,j)) + &
+                (v_shlf(I,J) * CS%Phi(7,2*(jq-1)+iq,i,j))) + &
+               ((v_shlf(I,J-1) * CS%Phi(3,2*(jq-1)+iq,i,j)) + &
+                (v_shlf(I-1,J) * CS%Phi(5,2*(jq-1)+iq,i,j)))
 
-          uy = (u_shlf(I-1,J-1) * CS%Phi(2,2*(jq-1)+iq,i,j) + &
-               u_shlf(I,J) * CS%Phi(8,2*(jq-1)+iq,i,j)) + &
-               (u_shlf(I,J-1) * CS%Phi(4,2*(jq-1)+iq,i,j) + &
-               u_shlf(I-1,J) * CS%Phi(6,2*(jq-1)+iq,i,j))
+          uy = ((u_shlf(I-1,J-1) * CS%Phi(2,2*(jq-1)+iq,i,j)) + &
+                (u_shlf(I,J) * CS%Phi(8,2*(jq-1)+iq,i,j))) + &
+               ((u_shlf(I,J-1) * CS%Phi(4,2*(jq-1)+iq,i,j)) + &
+                (u_shlf(I-1,J) * CS%Phi(6,2*(jq-1)+iq,i,j)))
 
-          vy = (v_shlf(I-1,J-1) * CS%Phi(2,2*(jq-1)+iq,i,j) + &
-               v_shlf(I,J) * CS%Phi(8,2*(jq-1)+iq,i,j)) + &
-               (v_shlf(I,J-1) * CS%Phi(4,2*(jq-1)+iq,i,j) + &
-               v_shlf(I-1,J) * CS%Phi(6,2*(jq-1)+iq,i,j))
+          vy = ((v_shlf(I-1,J-1) * CS%Phi(2,2*(jq-1)+iq,i,j)) + &
+                (v_shlf(I,J) * CS%Phi(8,2*(jq-1)+iq,i,j))) + &
+               ((v_shlf(I,J-1) * CS%Phi(4,2*(jq-1)+iq,i,j)) + &
+                (v_shlf(I-1,J) * CS%Phi(6,2*(jq-1)+iq,i,j)))
 
           CS%ice_visc(i,j,2*(jq-1)+iq) = max(0.5 * Visc_coef * (G%areaT(i,j) * max(ISS%h_shelf(i,j),CS%min_h_shelf)) * &
             (US%s_to_T**2 * ((ux**2 + vy**2) + (ux*vy + 0.25*(uy+vx)**2) + eps_min**2))**((1.-n_g)/(2.*n_g)) * &
@@ -3181,7 +3181,7 @@ subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
       if ((ISS%hmask(i,j) == 1) .OR. (ISS%hmask(i,j) == 3)) then
         umid = ((u_shlf(I,J) + u_shlf(I-1,J-1)) + (u_shlf(I,J-1) + u_shlf(I-1,J))) * 0.25
         vmid = ((v_shlf(I,J) + v_shlf(I-1,J-1)) + (v_shlf(I,J-1) + v_shlf(I-1,J))) * 0.25
-        unorm = US%L_T_to_m_s * sqrt( (umid**2 + vmid**2) + (eps_min**2 * (G%dxT(i,j)**2 + G%dyT(i,j)**2)) )
+        unorm = US%L_T_to_m_s * sqrt( ((umid**2) + (vmid**2)) + (eps_min**2 * (G%dxT(i,j)**2 + G%dyT(i,j)**2)) )
 
         !Coulomb friction (Schoof 2005, Gagliardini et al 2007)
         if (CS%CoulombFriction) then
@@ -3358,10 +3358,10 @@ subroutine bilinear_shape_functions (X, Y, Phi, area)
 
   do qpoint=1,4
 
-    a = -X(1)*(1-yquad(qpoint)) + X(2)*(1-yquad(qpoint)) - X(3)*yquad(qpoint) + X(4)*yquad(qpoint) ! d(x)/d(x*)
-    b = -Y(1)*(1-yquad(qpoint)) + Y(2)*(1-yquad(qpoint)) - Y(3)*yquad(qpoint) + Y(4)*yquad(qpoint) ! d(y)/d(x*)
-    c = -X(1)*(1-xquad(qpoint)) - X(2)*xquad(qpoint) + X(3)*(1-xquad(qpoint)) + X(4)*xquad(qpoint) ! d(x)/d(y*)
-    d = -Y(1)*(1-xquad(qpoint)) - Y(2)*xquad(qpoint) + Y(3)*(1-xquad(qpoint)) + Y(4)*xquad(qpoint) ! d(y)/d(y*)
+    a = ((-X(1)*(1-yquad(qpoint)))+(X(4)*yquad(qpoint))) + ((X(2)*(1-yquad(qpoint)))-(X(3)*yquad(qpoint))) !d(x)/d(x*)
+    b = ((-Y(1)*(1-yquad(qpoint)))+(Y(4)*yquad(qpoint))) + ((Y(2)*(1-yquad(qpoint)))-(Y(3)*yquad(qpoint))) !d(y)/d(x*)
+    c = ((-X(1)*(1-xquad(qpoint)))+(X(4)*xquad(qpoint))) + ((-X(2)*xquad(qpoint))+(X(3)*(1-xquad(qpoint))))!d(x)/d(y*)
+    d = ((-Y(1)*(1-xquad(qpoint)))+(Y(4)*xquad(qpoint))) + ((-Y(2)*xquad(qpoint))+(Y(3)*(1-xquad(qpoint))))!d(y)/d(y*)
 
     do node=1,4
 
@@ -3379,8 +3379,8 @@ subroutine bilinear_shape_functions (X, Y, Phi, area)
         xexp = xquad(qpoint)
       endif
 
-      Phi(2*node-1,qpoint) = ( d * (2 * xnode - 3) * yexp - b * (2 * ynode - 3) * xexp) / (a*d-b*c)
-      Phi(2*node,qpoint)   = (-c * (2 * xnode - 3) * yexp + a * (2 * ynode - 3) * xexp) / (a*d-b*c)
+      Phi(2*node-1,qpoint) = ( d * (2 * xnode - 3) * yexp - b * (2 * ynode - 3) * xexp) / ((a*d)-(b*c))
+      Phi(2*node,qpoint)   = (-c * (2 * xnode - 3) * yexp + a * (2 * ynode - 3) * xexp) / ((a*d)-(b*c))
 
     enddo
   enddo
@@ -3420,12 +3420,12 @@ subroutine bilinear_shape_fn_grid(G, i, j, Phi)
 
   do qpoint=1,4
     if (J>1) then
-      a = G%dxCv(i,J-1) * (1-yquad(qpoint)) + G%dxCv(i,J) * yquad(qpoint) ! d(x)/d(x*)
+      a = (G%dxCv(i,J-1) * (1-yquad(qpoint))) + (G%dxCv(i,J) * yquad(qpoint)) ! d(x)/d(x*)
     else
       a = G%dxCv(i,J) !* yquad(qpoint) ! d(x)/d(x*)
     endif
     if (I>1) then
-      d = G%dyCu(I-1,j) * (1-xquad(qpoint)) + G%dyCu(I,j) * xquad(qpoint) ! d(y)/d(y*)
+      d = (G%dyCu(I-1,j) * (1-xquad(qpoint))) + (G%dyCu(I,j) * xquad(qpoint)) ! d(y)/d(y*)
     else
       d = G%dyCu(I,j) !* xquad(qpoint)
     endif
@@ -3942,8 +3942,8 @@ subroutine ice_shelf_advect_temp_x(CS, G, time_step, hmask, h0, h_after_uflux)
 
                 elseif (hmask(i-1,j) * hmask(i-2,j) == 1) then  ! h(i-2) and h(i-1) are valid
                   phi = slope_limiter(stencil(-1)-stencil(-2), stencil(0)-stencil(-1))
-                  flux_diff = flux_diff + ABS(u_face) * G%dyCu(I-1,j)* time_step / G%areaT(i,j) * &
-                           (stencil(-1) - phi * (stencil(-1)-stencil(0))/2)
+                  flux_diff = flux_diff + ((ABS(u_face) * G%dyCu(I-1,j)* time_step / G%areaT(i,j)) * &
+                           (stencil(-1) - (phi * (stencil(-1)-stencil(0))/2)))
 
                 else                            ! h(i-1) is valid
                                     ! (o.w. flux would most likely be out of cell)
@@ -3956,8 +3956,8 @@ subroutine ice_shelf_advect_temp_x(CS, G, time_step, hmask, h0, h_after_uflux)
               elseif (u_face < 0) then !flux is out of cell - we need info from h(i-1), h(i+1) if available
                 if (hmask(i-1,j) * hmask(i+1,j) == 1) then         ! h(i-1) and h(i+1) are both valid
                   phi = slope_limiter(stencil(0)-stencil(1), stencil(-1)-stencil(0))
-                  flux_diff = flux_diff - ABS(u_face) * G%dyCu(I-1,j) * time_step / G%areaT(i,j) * &
-                             (stencil(0) - phi * (stencil(0)-stencil(-1))/2)
+                  flux_diff = flux_diff - ((ABS(u_face) * G%dyCu(I-1,j) * time_step / G%areaT(i,j)) * &
+                             (stencil(0) - (phi * (stencil(0)-stencil(-1))/2)))
 
                 else
                   flux_diff = flux_diff - ABS(u_face) * G%dyCu(I-1,j) * time_step / G%areaT(i,j) * stencil(0)
@@ -3987,8 +3987,8 @@ subroutine ice_shelf_advect_temp_x(CS, G, time_step, hmask, h0, h_after_uflux)
                 elseif (hmask(i+1,j) * hmask(i+2,j) == 1) then  ! h(i+2) and h(i+1) are valid
 
                   phi = slope_limiter(stencil(1)-stencil(2), stencil(0)-stencil(1))
-                  flux_diff = flux_diff + ABS(u_face) * G%dyCu(I,j) * time_step / G%areaT(i,j) * &
-                      (stencil(1) - phi * (stencil(1)-stencil(0))/2)
+                  flux_diff = flux_diff + ((ABS(u_face) * G%dyCu(I,j) * time_step / G%areaT(i,j)) * &
+                      (stencil(1) - (phi * (stencil(1)-stencil(0))/2)))
 
                 else                            ! h(i+1) is valid
                                             ! (o.w. flux would most likely be out of cell)
@@ -4003,8 +4003,8 @@ subroutine ice_shelf_advect_temp_x(CS, G, time_step, hmask, h0, h_after_uflux)
                 if (hmask(i-1,j) * hmask(i+1,j) == 1) then         ! h(i-1) and h(i+1) are both valid
 
                   phi = slope_limiter(stencil(0)-stencil(-1), stencil(1)-stencil(0))
-                  flux_diff = flux_diff - ABS(u_face) * G%dyCu(I,j) * time_step / G%areaT(i,j) * &
-                      (stencil(0) - phi * (stencil(0)-stencil(1))/2)
+                  flux_diff = flux_diff - ((ABS(u_face) * G%dyCu(I,j) * time_step / G%areaT(i,j)) * &
+                      (stencil(0) - (phi * (stencil(0)-stencil(1))/2)))
 
                 else  ! h(i+1) is valid (o.w. flux would most likely be out of cell) but h(i+2) is not
 
@@ -4108,8 +4108,8 @@ subroutine ice_shelf_advect_temp_y(CS, G, time_step, hmask, h_after_uflux, h_aft
                 elseif (hmask(i,j-1) * hmask(i,j-2) == 1) then  ! h(j-2) and h(j-1) are valid
 
                   phi = slope_limiter(stencil(-1)-stencil(-2), stencil(0)-stencil(-1))
-                  flux_diff = flux_diff + ABS(v_face) * G%dxCv(i,J-1) * time_step / G%areaT(i,j) * &
-                      (stencil(-1) - phi * (stencil(-1)-stencil(0))/2)
+                  flux_diff = flux_diff + ((ABS(v_face) * G%dxCv(i,J-1) * time_step / G%areaT(i,j)) * &
+                      (stencil(-1) - (phi * (stencil(-1)-stencil(0))/2)))
 
                 else     ! h(j-1) is valid
                          ! (o.w. flux would most likely be out of cell)
@@ -4121,8 +4121,8 @@ subroutine ice_shelf_advect_temp_y(CS, G, time_step, hmask, h_after_uflux, h_aft
 
                 if (hmask(i,j-1) * hmask(i,j+1) == 1) then  ! h(j-1) and h(j+1) are both valid
                   phi = slope_limiter(stencil(0)-stencil(1), stencil(-1)-stencil(0))
-                  flux_diff = flux_diff - ABS(v_face) * G%dxCv(i,J-1) * time_step / G%areaT(i,j) * &
-                      (stencil(0) - phi * (stencil(0)-stencil(-1))/2)
+                  flux_diff = flux_diff - ((ABS(v_face) * G%dxCv(i,J-1) * time_step / G%areaT(i,j)) * &
+                      (stencil(0) - (phi * (stencil(0)-stencil(-1))/2)))
                 else
                   flux_diff = flux_diff - ABS(v_face) * G%dxCv(i,J-1) * time_step / G%areaT(i,j) * stencil(0)
                 endif
@@ -4148,8 +4148,8 @@ subroutine ice_shelf_advect_temp_y(CS, G, time_step, hmask, h_after_uflux, h_aft
                   flux_diff = flux_diff + ABS(v_face) * G%dxCv(i,J) * time_step * stencil(1) / G%areaT(i,j)
                 elseif (hmask(i,j+1) * hmask(i,j+2) == 1) then  ! h(j+2) and h(j+1) are valid
                   phi = slope_limiter (stencil(1)-stencil(2), stencil(0)-stencil(1))
-                  flux_diff = flux_diff + ABS(v_face) * G%dxCv(i,J) * time_step / G%areaT(i,j) * &
-                      (stencil(1) - phi * (stencil(1)-stencil(0))/2)
+                  flux_diff = flux_diff + ((ABS(v_face) * G%dxCv(i,J) * time_step / G%areaT(i,j)) * &
+                      (stencil(1) - (phi * (stencil(1)-stencil(0))/2)))
                 else     ! h(j+1) is valid
                          ! (o.w. flux would most likely be out of cell)
                          !  but h(j+2) is not
@@ -4160,8 +4160,8 @@ subroutine ice_shelf_advect_temp_y(CS, G, time_step, hmask, h_after_uflux, h_aft
 
                 if (hmask(i,j-1) * hmask(i,j+1) == 1) then         ! h(j-1) and h(j+1) are both valid
                   phi = slope_limiter (stencil(0)-stencil(-1), stencil(1)-stencil(0))
-                  flux_diff = flux_diff - ABS(v_face) * G%dxCv(i,J) * time_step / G%areaT(i,j) * &
-                      (stencil(0) - phi * (stencil(0)-stencil(1))/2)
+                  flux_diff = flux_diff - ((ABS(v_face) * G%dxCv(i,J) * time_step / G%areaT(i,j)) * &
+                      (stencil(0) - (phi * (stencil(0)-stencil(1))/2)))
                 else   ! h(j+1) is valid
                        ! (o.w. flux would most likely be out of cell)
                        !  but h(j+2) is not
