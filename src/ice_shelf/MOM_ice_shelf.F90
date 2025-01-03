@@ -827,7 +827,7 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
     call IS_dynamics_post_data(time_step, Time, CS%dCS, ISS, G)
   endif
 
-  if (CS%shelf_mass_is_dynamic) &
+  if (CS%shelf_mass_is_dynamic .and. CS%active_shelf_dynamics) &
     call write_ice_shelf_energy(CS%dCS, G, US, ISS%mass_shelf, ISS%area_shelf_h, Time, &
                                 time_step=real_to_time(US%T_to_s*time_step) )
 
@@ -856,7 +856,9 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
   if (CS%id_h_shelf > 0) call post_data(CS%id_h_shelf, ISS%h_shelf, CS%diag)
   if (CS%id_dhdt_shelf > 0) call post_data(CS%id_dhdt_shelf, ISS%dhdt_shelf, CS%diag)
   if (CS%id_h_mask > 0) call post_data(CS%id_h_mask,ISS%hmask,CS%diag)
-  call process_and_post_scalar_data(CS, vaf0, vaf0_A, vaf0_G, Itime_step, dh_adott, dh_bdott)
+  if (CS%shelf_mass_is_dynamic .and. CS%active_shelf_dynamics) then
+    call process_and_post_scalar_data(CS, vaf0, vaf0_A, vaf0_G, Itime_step, dh_adott, dh_bdott)
+  endif
   call disable_averaging(CS%diag)
 
   call cpu_clock_end(id_clock_shelf)
@@ -1933,7 +1935,7 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
     ISS%water_flux(:,:) = 0.0
   endif
 
-  if (CS%shelf_mass_is_dynamic) &
+  if (CS%shelf_mass_is_dynamic .and. CS%active_shelf_dynamics) &
     call initialize_ice_shelf_dyn(param_file, Time, ISS, CS%dCS, G, US, CS%diag, new_sim, CS%Cp_ice, &
     Time_init, directory, solo_ice_sheet_in)
 
@@ -2424,7 +2426,13 @@ subroutine update_shelf_mass(G, US, CS, ISS, Time)
   endif
 
   call time_interp_external(CS%mass_handle, Time, tmp2d, scale=US%kg_m3_to_R*US%m_to_Z)
-  call rotate_array(tmp2d, CS%turns, ISS%mass_shelf)
+  if (CS%rotate_index) then
+    call rotate_array(tmp2d, CS%turns, ISS%mass_shelf)
+  else
+    do j=js,je ; do i=is,ie
+      ISS%mass_shelf(i,j) = tmp2d(i,j)
+    enddo ; enddo
+  endif
   deallocate(tmp2d)
 
   do j=js,je ; do i=is,ie
@@ -2618,6 +2626,7 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
   enddo; enddo
 
   call enable_averages(full_time_step, Time, CS%diag)
+  if (CS%id_shelf_mass > 0)   call post_data(CS%id_shelf_mass   ,ISS%mass_shelf  ,CS%diag)
   if (CS%id_area_shelf_h > 0) call post_data(CS%id_area_shelf_h ,ISS%area_shelf_h,CS%diag)
   if (CS%id_h_shelf > 0)      call post_data(CS%id_h_shelf      ,ISS%h_shelf     ,CS%diag)
   if (CS%id_dhdt_shelf > 0)   call post_data(CS%id_dhdt_shelf   ,ISS%dhdt_shelf  ,CS%diag)
