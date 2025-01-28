@@ -149,6 +149,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                 !! to be updated first in directionally split
                                 !! parts of the ice sheet calculation (e.g. advection).
   real    :: first_dir_restart_IS = -1.0 !< A real copy of CS%first_direction_IS for use in restart files
+  logical :: calc_flux_inout !< If true, calculate the total flux in/out of the domain. This may be required
+                             !! for some configurations to calculate flux within a hole in the domain (e.g. at S. Pole)
   integer :: visc_qps !< The number of quadrature points per cell (1 or 4) on which to calculate ice viscosity.
   character(len=40) :: ice_viscosity_compute !< Specifies whether the ice viscosity is computed internally
                                    !! according to Glen's flow law; is constant (for debugging purposes)
@@ -352,6 +354,10 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
                  "direction advection updates occur first. "//&
                  "If this is true, FIRST_DIRECTION applies at the start of a new run or if "//&
                  "the next first direction can not be found in the restart file.", default=.false.)
+    call get_param(param_file, mdl, "CALC_FLUX_INOUT", CS%calc_flux_inout, &
+                 "If true, during every advection call, calculate the total flux in/out of the domain. "//&
+                 "This may be required for some configurations to calculate flux within a hole "//&
+                 "in the domain (e.g. at S. Pole)", default=.false.)
 
     allocate(CS%u_shelf(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%v_shelf(IsdB:IedB,JsdB:JedB), source=0.0)
@@ -1178,7 +1184,7 @@ subroutine ice_visc_diag(CS,G,ice_visc)
 end subroutine ice_visc_diag
 
 !>  Writes the total ice shelf kinetic energy and mass to an ascii file
-subroutine write_ice_shelf_energy(CS, G, US, mass, area, day, time_step)
+subroutine write_ice_shelf_energy(CS, G, US, mass, area, day, time_step, mass_hole)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
   type(ocean_grid_type),  intent(inout) :: G  !< The grid structure used by the ice shelf.
   type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
@@ -1189,6 +1195,7 @@ subroutine write_ice_shelf_energy(CS, G, US, mass, area, day, time_step)
                            intent(in)    :: area !< The ice shelf or ice sheet area [L2 ~> m2]
   type(time_type),         intent(in)    :: day !< The current model time.
   type(time_type),  optional, intent(in) :: time_step !< The current time step
+  real, optional, intent(in) :: mass_hole !< ice-sheet mass in the ocean grid hole, if present [RZL2 ~> kg]
   ! Local variables
   type(time_type) :: dt ! A time_type version of the timestep.
   real, dimension(SZDI_(G),SZDJ_(G)) :: tmp1 ! A temporary array used in reproducing sums [various]
@@ -1250,8 +1257,7 @@ subroutine write_ice_shelf_energy(CS, G, US, mass, area, day, time_step)
        (((CS%v_shelf(I-1,J-1)+CS%v_shelf(I,J))+(CS%v_shelf(I,J-1)+CS%v_shelf(I-1,J)))**2))
   enddo; enddo
 
-  KE_tot = US%RZL2_to_kg*US%L_T_to_m_s**2 * &
-           reproducing_sum(tmp1, isr, ier, jsr, jer, unscale=(US%RZL2_to_kg*US%L_T_to_m_s**2))
+  KE_tot = reproducing_sum(tmp1, isr, ier, jsr, jer, unscale=(US%RZL2_to_kg*US%L_T_to_m_s**2))
 
   !calculate mass
   tmp1(:,:) = 0.0
@@ -1259,7 +1265,8 @@ subroutine write_ice_shelf_energy(CS, G, US, mass, area, day, time_step)
     tmp1(i,j) = mass(i,j) * area(i,j)
   enddo; enddo
 
-  mass_tot = US%RZL2_to_kg * reproducing_sum(tmp1, isr, ier, jsr, jer, unscale=US%RZL2_to_kg)
+  mass_tot = reproducing_sum(tmp1, isr, ier, jsr, jer, unscale=US%RZL2_to_kg)
+  if (present(mass_hole)) mass_tot = mass_tot + US%RZL2_to_kg * mass_hole
 
   if (is_root_pe()) then  ! Only the root PE actually writes anything.
     if (day > CS%Start_time) then
@@ -1323,6 +1330,7 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
   type(time_type),        intent(in)    :: Time !< The current model time
   logical,                intent(in)    :: calve_ice_shelf_bergs !< If true, track ice shelf flux through a
                                                !! static ice shelf, so that it can be converted into icebergs
+  real :: calc_flux_inout !< Total accumulated flux in/out of the domain edges (outward is positive) [Z L2 ~> m3]
 
 ! 3/8/11 DNG
 !
@@ -1380,6 +1388,8 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
       if (ISS%hmask(i,j) == 1) ISS%h_shelf(i,j) = h_after_flux2(i,j)
     enddo
   enddo
+
+  if (CS%calc_flux_inout) call calculate_flux_inout(CS, ISS, G, uh_ice, vh_ice)
 
   if (CS%moving_shelf_front) then
     call shelf_advance_front(CS, ISS, G, ISS%hmask, uh_ice, vh_ice)
@@ -2322,6 +2332,75 @@ subroutine shelf_advance_front(CS, ISS, G, hmask, uh_ice, vh_ice)
   endif
 
 end subroutine shelf_advance_front
+
+!> Calculate total horizontal flux in/out of the domain. This subroutine could be used to  calculate the
+!! stocks in the hole that may appear grid at the South Pole. The flux is calculated over edges of the
+!! computational domain with non-zero boundary conditions set for velocity or flux.
+subroutine calculate_flux_inout(CS, ISS, G, uh_ice, vh_ice)
+  type(ice_shelf_dyn_CS), intent(in)    :: CS !< A pointer to the ice shelf control structure
+  type(ice_shelf_state),  intent(inout) :: ISS !< A structure with elements that describe
+                                               !! the ice-shelf state
+  type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
+  real, dimension(SZDIB_(G),SZDJ_(G)), intent(in) :: uh_ice !< The accumulated zonal ice volume flux [Z L2 ~> m3]
+  real, dimension(SZDI_(G),SZDJB_(G)), intent(in) :: vh_ice !< The accumulated meridional ice volume flux [Z L2 ~> m3]
+  integer :: i, j, isc, iec, jsc, jec
+  integer :: i_off, j_off
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: u_flux ! Accumulated zonal flux in/out of the domain
+                                                ! (outward is positive) [Z L2 ~> m3]
+  real, dimension(SZDI_(G),SZDJB_(G)) :: v_flux ! Accumulated meridional flux in/out of the domain
+                                                  ! (outward is positive) [Z L2 ~> m3]
+
+  isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
+  i_off = G%idg_offset ; j_off = G%jdg_offset
+
+  u_flux(:,:) = 0.0
+  v_flux(:,:) = 0.0
+
+  !Southern boundary (symmetric only, flux here is zero if non-symmetric)
+  if (G%symmetric) then
+    if (jsc+j_off == 1) then
+      J=jsc-1
+      do i = isc,iec
+        if (CS%v_face_mask(i,J)==3 .or. CS%v_face_mask(i,J)==4 .or. CS%v_face_mask(i,J)==6) then
+          v_flux(i,J) = -vh_ice(i,J)
+        endif
+      enddo
+    endif
+
+    !Western boundary (symmetric only, flux here is zero if non-symmetric)
+    if (isc+i_off == 1) then
+      I=isc-1
+      do j = jsc,jec
+        if (CS%u_face_mask(I,j)>=3 .and. CS%u_face_mask(I,j)<=5) then
+          u_flux(I,j) = -uh_ice(I,j)
+        endif
+      enddo
+    endif
+  endif
+
+  !Northern boundary
+  if (jec+j_off == G%domain%njglobal) then
+    J=jec
+    do i = isc,iec
+      if (CS%v_face_mask(i,J)==3 .or. CS%v_face_mask(i,J)==4 .or. CS%v_face_mask(i,J)==6) then
+        v_flux(i,J) = vh_ice(i,J)
+      endif
+    enddo
+  endif
+
+  !Eastern boundary
+  if (iec+i_off == G%domain%niglobal) then
+    I=iec
+    do j = jsc,jec
+      if (CS%u_face_mask(I,j)>=3 .and. CS%u_face_mask(I,j)<=5) then
+        u_flux(I,j) = uh_ice(I,j)
+      endif
+    enddo
+  endif
+
+  !Total accumulated flux in/out of the domain edges (outward is positive)
+  ISS%tot_flux_inout = reproducing_sum(u_flux) + reproducing_sum(v_flux)
+end subroutine calculate_flux_inout
 
 !> Apply a very simple calving law using a minimum thickness rule
 subroutine ice_shelf_min_thickness_calve(G, h_shelf, area_shelf_h, hmask, thickness_calve, halo)

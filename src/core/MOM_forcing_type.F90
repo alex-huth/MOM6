@@ -190,6 +190,8 @@ type, public :: forcing
                                  !! deposition from the atmosphere. [R Z T-1 ~> kg m-2 s-1]
 
   ! Scalars set by surface forcing modules
+  real :: IS_adot_int_land = 0.   !< The total surface mass flux to the ice sheet,
+                                  !! area-integrated over the land grid [kg s-1]
   real :: vPrecGlobalAdj = 0.     !< adjustment to restoring vprec to zero out global net [kg m-2 s-1]
   real :: saltFluxGlobalAdj = 0.  !< adjustment to restoring salt flux to zero out global net [kgSalt m-2 s-1]
   real :: netFWGlobalAdj = 0.     !< adjustment to net fresh water to zero out global net [kg m-2 s-1]
@@ -3288,7 +3290,9 @@ subroutine allocate_forcing_by_group(G, fluxes, water, heat, ustar, press, &
     call myAlloc(fluxes%frac_shelf_h,isd,ied,jsd,jed, shelf)
     call myAlloc(fluxes%ustar_shelf,isd,ied,jsd,jed, shelf)
     call myAlloc(fluxes%iceshelf_melt,isd,ied,jsd,jed, shelf)
-    if (shelf_sfc_acc) call myAlloc(fluxes%shelf_sfc_mass_flux,isd,ied,jsd,jed, shelf_sfc_acc)
+    if (shelf_sfc_acc) then
+      call myAlloc(fluxes%shelf_sfc_mass_flux,isd,ied,jsd,jed, shelf_sfc_acc)
+    endif
   endif; endif
 
   !These fields should only on allocated when iceberg area is being passed through the coupler.
@@ -3570,8 +3574,7 @@ subroutine deallocate_forcing_type(fluxes)
   if (associated(fluxes%ustar_tidal))          deallocate(fluxes%ustar_tidal)
   if (associated(fluxes%ustar_shelf))          deallocate(fluxes%ustar_shelf)
   if (associated(fluxes%iceshelf_melt))        deallocate(fluxes%iceshelf_melt)
-  if (associated(fluxes%shelf_sfc_mass_flux)) &
-                                               deallocate(fluxes%shelf_sfc_mass_flux)
+  if (associated(fluxes%shelf_sfc_mass_flux))  deallocate(fluxes%shelf_sfc_mass_flux)
   if (associated(fluxes%frac_shelf_h))         deallocate(fluxes%frac_shelf_h)
   if (associated(fluxes%ustar_berg))           deallocate(fluxes%ustar_berg)
   if (associated(fluxes%area_berg))            deallocate(fluxes%area_berg)
