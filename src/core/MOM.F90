@@ -4159,7 +4159,7 @@ subroutine get_ocean_stocks(CS, mass, heat, salt, ice_shelf_CSp, on_PE_only)
     salt = 1.0e-3 * global_mass_integral(CS%h, CS%G, CS%GV, CS%tv%S, on_PE_only=on_PE_only, unscale=CS%US%S_to_ppt)
 
   if (present(ice_shelf_CSp) .and. present(mass)) then !add ice shelf contribution
-      mass = mass + get_ice_shelf_mass_stock(ice_shelf_CSp, CS%G, CS%US, on_PE_only)
+      mass = mass + CS%US%RZL2_to_kg * get_ice_shelf_mass_stock(ice_shelf_CSp, CS%G, CS%US, on_PE_only)
   endif
 end subroutine get_ocean_stocks
 

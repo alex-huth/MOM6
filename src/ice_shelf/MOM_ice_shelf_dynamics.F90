@@ -1266,7 +1266,7 @@ subroutine write_ice_shelf_energy(CS, G, US, mass, area, day, time_step, mass_ho
   enddo; enddo
 
   mass_tot = reproducing_sum(tmp1, isr, ier, jsr, jer, unscale=US%RZL2_to_kg)
-  if (present(mass_hole)) mass_tot = mass_tot + US%RZL2_to_kg * mass_hole
+  if (present(mass_hole)) mass_tot = mass_tot + mass_hole
 
   if (is_root_pe()) then  ! Only the root PE actually writes anything.
     if (day > CS%Start_time) then
@@ -2349,16 +2349,22 @@ subroutine calculate_flux_inout(CS, ISS, G, uh_ice, vh_ice)
                                                 ! (outward is positive) [Z L2 ~> m3]
   real, dimension(SZDI_(G),SZDJB_(G)) :: v_flux ! Accumulated meridional flux in/out of the domain
                                                   ! (outward is positive) [Z L2 ~> m3]
+  integer :: Isdq, Iedq, Jsdq, Jedq
+  integer :: Iscq, Iecq, Jscq, Jecq
+  integer :: Is_sum, Js_sum, Ie_sum, Je_sum ! Loop bounds for global sums or arrays starting at 1.
+  integer :: Iscq_sv, Jscq_sv ! Starting loop bound for sum_vec
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
+  Isdq = G%IsdB ; Iedq = G%IedB ; Jsdq = G%JsdB ; Jedq = G%JedB
+  Iscq = G%IscB ; Iecq = G%IecB ; Jscq = G%JscB ; Jecq = G%JecB
   i_off = G%idg_offset ; j_off = G%jdg_offset
 
   u_flux(:,:) = 0.0
   v_flux(:,:) = 0.0
 
   !Southern boundary (symmetric only, flux here is zero if non-symmetric)
-  if (G%symmetric) then
-    if (jsc+j_off == 1) then
+  if (G%symmetric .and. (.not. CS%reentrant_y)) then
+    if (jsc+j_off == G%jsg) then
       J=jsc-1
       do i = isc,iec
         if (CS%v_face_mask(i,J)==3 .or. CS%v_face_mask(i,J)==4 .or. CS%v_face_mask(i,J)==6) then
@@ -2366,9 +2372,11 @@ subroutine calculate_flux_inout(CS, ISS, G, uh_ice, vh_ice)
         endif
       enddo
     endif
+  endif
 
-    !Western boundary (symmetric only, flux here is zero if non-symmetric)
-    if (isc+i_off == 1) then
+  !Western boundary (symmetric only, flux here is zero if non-symmetric)
+  if (G%symmetric .and. (.not. CS%reentrant_x)) then
+    if (isc+i_off == G%isg) then
       I=isc-1
       do j = jsc,jec
         if (CS%u_face_mask(I,j)>=3 .and. CS%u_face_mask(I,j)<=5) then
@@ -2379,27 +2387,46 @@ subroutine calculate_flux_inout(CS, ISS, G, uh_ice, vh_ice)
   endif
 
   !Northern boundary
-  if (jec+j_off == G%domain%njglobal) then
-    J=jec
-    do i = isc,iec
-      if (CS%v_face_mask(i,J)==3 .or. CS%v_face_mask(i,J)==4 .or. CS%v_face_mask(i,J)==6) then
-        v_flux(i,J) = vh_ice(i,J)
-      endif
-    enddo
+  if (.not. CS%reentrant_y) then
+    if (jec+j_off == G%domain%njglobal) then
+      J=jec
+      do i = isc,iec
+        if (CS%v_face_mask(i,J)==3 .or. CS%v_face_mask(i,J)==4 .or. CS%v_face_mask(i,J)==6) then
+          v_flux(i,J) = vh_ice(i,J)
+        endif
+      enddo
+    endif
   endif
 
   !Eastern boundary
-  if (iec+i_off == G%domain%niglobal) then
-    I=iec
-    do j = jsc,jec
-      if (CS%u_face_mask(I,j)>=3 .and. CS%u_face_mask(I,j)<=5) then
-        u_flux(I,j) = uh_ice(I,j)
-      endif
-    enddo
+  if (.not. CS%reentrant_x) then
+    if (iec+i_off == G%domain%niglobal) then
+      I=iec
+      do j = jsc,jec
+        if (CS%u_face_mask(I,j)>=3 .and. CS%u_face_mask(I,j)<=5) then
+          u_flux(I,j) = uh_ice(I,j)
+        endif
+      enddo
+    endif
   endif
 
+  ! Determine the loop limits for sums, bearing in mind that the arrays will be starting at 1.
+  ! Includes the edge of the tile is at the western/southern bdry (if symmetric)
+  if ((isc+G%idg_offset==G%isg) .and. (.not. CS%reentrant_x)) then
+    Is_sum = Iscq + (1-Isdq) ; Iscq_sv = Iscq
+  else
+    Is_sum = isc  + (1-Isdq) ; Iscq_sv = isc
+  endif
+  if ((jsc+G%jdg_offset==G%jsg) .and. (.not. CS%reentrant_y)) then
+    Js_sum = Jscq + (1-Jsdq) ; Jscq_sv = Jscq
+  else
+    Js_sum = jsc + (1-Jsdq) ; Jscq_sv = jsc
+  endif
+  Ie_sum = Iecq + (1-Isdq) ; Je_sum = Jecq + (1-Jsdq)
+
   !Total accumulated flux in/out of the domain edges (outward is positive)
-  ISS%tot_flux_inout = reproducing_sum(u_flux) + reproducing_sum(v_flux)
+  ISS%tot_flux_inout = reproducing_sum(u_flux, Is_sum, Ie_sum, Js_sum, Je_sum) + &
+                       reproducing_sum(v_flux, Is_sum, Ie_sum, Js_sum, Je_sum)
 end subroutine calculate_flux_inout
 
 !> Apply a very simple calving law using a minimum thickness rule
@@ -2619,8 +2646,10 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
         endif
 
         if (CS%max_surface_slope>0) then
-          scale = min(CS%max_surface_slope/sqrt((sx**2)+(sy**2)),1.0)
-          sx = scale*sx; sy = scale*sy
+          if ((sx**2 + sy**2)>0) then
+            scale = min(CS%max_surface_slope/sqrt((sx**2)+(sy**2)),1.0)
+            sx = scale*sx; sy = scale*sy
+          endif
         endif
 
         sx_e(i,j) = (-.25 * G%areaT(i,j)) * ((rho * grav) * (max(ISS%h_shelf(i,j),CS%min_h_shelf) * sx))

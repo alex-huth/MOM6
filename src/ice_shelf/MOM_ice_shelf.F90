@@ -4,6 +4,7 @@
 module MOM_ice_shelf
 
 ! This file is part of MOM6. See LICENSE.md for the license.
+use mpp_mod, only : mpp_pe
 use MOM_array_transform,      only : rotate_array
 use MOM_constants, only : hlf
 use MOM_cpu_clock, only : cpu_clock_id, cpu_clock_begin, cpu_clock_end
@@ -343,6 +344,7 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
   real :: asv1, asv2   ! and v-points [L2 ~> m2].
   real :: I_au, I_av   ! The Adcroft reciprocals of the ice shelf areas at adjacent points [L-2 ~> m-2]
   real :: Irho0        ! The inverse of the mean density times a unit conversion factor [R-1 L Z-1 ~> m3 kg-1]
+  real :: adot_int     ! Area integral of adot over the ice sheet
   logical :: Sb_min_set, Sb_max_set
   logical :: update_ice_vel ! If true, it is time to update the ice shelf velocities.
   logical :: coupled_GL     ! If true, the grounding line position is determined based on
@@ -829,13 +831,30 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
     !the ice sheet (i.e. the adot * dt from land, integrated over the land grid area, minus adot *dt on the
     !ice-sheet, integrated over the ocean grid area), plus any flux in/out of the ice-sheet domain due to
     !horizontal ice sheet advection.
-    ISS%mass_hole = ISS%mass_hole + &
-                fluxes%IS_adot_int_land - & !land-area-integrated adot * dt
-                integrate_over_ice_sheet_area(G, ISS, dh_adott * CS%density_ice, unscale=US%m_to_L**2) + &
-                ISS%tot_flux_inout * CS%density_ice !ice-sheet flux in/out of the ice-sheet domain
+    !land-area-integrated adot * dt
+    !ice-sheet flux in/out of the ice-sheet domain
+    dh_adott = dh_adott * CS%density_ice
+    adot_int = integrate_over_ice_sheet_area(G, ISS, dh_adott, US%RZ_T_to_kg_m2s) ![RZL2]
+    dh_adott = dh_adott / CS%density_ice
+    ISS%mass_hole = ISS%mass_hole + fluxes%IS_adot_int_land * time_step - &
+                    adot_int + ISS%tot_flux_inout * CS%density_ice
+
+    ! if (is_root_pe()) print *,''
+    if (is_root_pe()) print *,'time_step',time_step
+    if (is_root_pe()) print *,'fluxes%IS_adot_int_land/dt',fluxes%IS_adot_int_land
+    if (is_root_pe()) print *,'fluxes%IS_adot_int_land',fluxes%IS_adot_int_land * time_step
+    if (is_root_pe()) print *,'dh_adott_mass_int',adot_int
+    if (is_root_pe()) print *,'tot_flux_inout_hole',ISS%tot_flux_inout * CS%density_ice
+    if (is_root_pe()) print *,'delta_mass_hole',fluxes%IS_adot_int_land * time_step - &
+                    adot_int + ISS%tot_flux_inout * CS%density_ice
+    if (is_root_pe()) print *,'ISS%MASS_HOLE',ISS%mass_hole
+    if (is_root_pe()) print *,''
   else
-    ISS%mass_hole = ISS%mass_hole + fluxes%IS_adot_int_land !surface mass flux is not passed from land to the ice-sheet
+     !surface mass flux is not passed from land to the ice-sheet
+    ISS%mass_hole = ISS%mass_hole + fluxes%IS_adot_int_land * time_step
   endif
+
+  if (is_root_pe()) ISS%mass_hole_root = ISS%mass_hole
 
   if (CS%shelf_mass_is_dynamic) &
     call write_ice_shelf_energy(CS%dCS, G, US, ISS%mass_shelf, ISS%area_shelf_h, Time, &
@@ -932,9 +951,9 @@ function integrate_over_ice_sheet_area(G, ISS, var, unscale, hemisphere, on_PE_o
   else
     var_out = 0.0
     do j=G%jsc,G%jec ; do i=G%isc,G%iec
-      var_out = var_out + var_cell(i,j)
+      var_out = var_out + var_cell(i,j)*(unscale*G%US%L_to_m**2)
     enddo; enddo
-    var_out = var_out*G%US%L_to_m**2
+    var_out = var_out/(unscale*G%US%L_to_m**2)
   endif
 end function integrate_over_ice_sheet_area
 
@@ -1818,6 +1837,8 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
   ISS%hmask(:,:)=0.0
   ISS%mass_shelf(:,:)=0.0
   ISS%mass_hole=0.0
+  ISS%mass_hole_root = 0.0
+  ISS%tot_flux_inout = 0.0
 
   if (CS%override_shelf_movement .and. CS%mass_from_file) then
 
@@ -1861,7 +1882,7 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
                               "Ice shelf area in cell", "m2", conversion=US%L_to_m**2)
   call register_restart_field(ISS%h_shelf, "h_shelf", .true., CS%restart_CSp, &
                               "ice sheet/shelf thickness", "m", conversion=US%Z_to_m)
-  call register_restart_field(ISS%mass_hole, "mass_hole", .true., CS%restart_CSp, &
+  call register_restart_field(ISS%mass_hole, "mass_hole", .false., CS%restart_CSp, &
                               "ice-sheet mass in the ocean grid hole, if present", "kg", conversion=US%RZL2_to_kg)
 
   if (CS%calve_ice_shelf_bergs) then
@@ -2489,8 +2510,16 @@ function get_ice_shelf_mass_stock(CS, G, US, on_PE_only)
 
   ISS => CS%ISS
   get_ice_shelf_mass_stock = &
-          integrate_over_ice_sheet_area(G, ISS, ISS%mass_shelf, unscale=US%RZ_to_kg_m2, on_PE_only=on_PE_only) + &
-          US%RZL2_to_kg * ISS%mass_hole
+    integrate_over_ice_sheet_area(G, ISS, ISS%mass_shelf, unscale=US%RZ_to_kg_m2, on_PE_only=on_PE_only)
+
+  if (present(on_PE_only)) then
+    if (on_PE_only) then
+      !mass_hole will only be added to the root pe
+      get_ice_shelf_mass_stock = get_ice_shelf_mass_stock + ISS%mass_hole_root
+    else
+      get_ice_shelf_mass_stock = get_ice_shelf_mass_stock + ISS%mass_hole
+    endif
+  endif
 end function get_ice_shelf_mass_stock
 
 !> Save the ice shelf restart file
@@ -2680,6 +2709,7 @@ subroutine process_and_post_scalar_data(CS, vaf0, vaf0_A, vaf0_G, Itime_step, dh
                                !! melt/accumulation over a time step  [Z ~> m]
   real, dimension(SZI_(CS%grid),SZJ_(CS%grid)) :: dh_bdott !< Surface (plus basal if solo shelf mode)
                                !! melt/accumulation over a time step  [Z ~> m]
+
   ! Local variables
   real, dimension(SZI_(CS%grid),SZJ_(CS%grid)) :: tmp ! Temporary field used when calculating diagnostics [various]
   real, dimension(SZI_(CS%grid),SZJ_(CS%grid)) :: ones ! Temporary field used when calculating diagnostics [various]
@@ -2758,7 +2788,7 @@ subroutine process_and_post_scalar_data(CS, vaf0, vaf0_A, vaf0_G, Itime_step, dh
       call post_scalar_data(CS%id_f_area,val,CS%diag)
     endif
   endif
-  if (CS%id_mass_hole > 0) call post_scalar_data(CS%id_mass_hole,ISS%mass_hole,CS%diag)
+  if (CS%id_mass_hole > 0) call post_scalar_data(CS%id_mass_hole,ISS%mass_hole*US%RZL2_to_kg,CS%diag)
 
   !---ANTARCTICA ONLY---!
   if (CS%id_Ant_vaf > 0 .or. CS%id_Ant_dvafdt > 0) &  !calculate current volume above floatation (vaf)
