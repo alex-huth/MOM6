@@ -191,7 +191,7 @@ type, public :: forcing
 
   ! Scalars set by surface forcing modules
   real :: IS_adot_int_land = 0.   !< The total surface mass flux to the ice sheet,
-                                  !! area-integrated over the land grid [kg s-1]
+                                  !! area-integrated over the land grid [R Z L2 T-1 ~> kg s-1]
   real :: vPrecGlobalAdj = 0.     !< adjustment to restoring vprec to zero out global net [kg m-2 s-1]
   real :: saltFluxGlobalAdj = 0.  !< adjustment to restoring salt flux to zero out global net [kgSalt m-2 s-1]
   real :: netFWGlobalAdj = 0.     !< adjustment to net fresh water to zero out global net [kg m-2 s-1]

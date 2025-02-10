@@ -202,8 +202,8 @@ type, public :: ice_ocean_boundary_type
                                                             !! for divergence damping, as determined
                                                             !! outside of the ocean model [m3 s-1]
   real, pointer, dimension(:,:) :: shelf_sfc_mass_flux =>NULL() !< mass flux to surface of ice sheet [kg m-2 s-1]
-  real :: IS_adot_int_land      !< The total surface mass flux to the ice sheet,
-                                !! area-integrated over the land grid (kg s-1)
+  real :: IS_adot_int_land      !< The total surface mass flux to the ice sheet from land,
+                                !! area-integrated over the land grid [kg s-1]
   integer :: xtype                    !< The type of the exchange - REGRID, REDIST or DIRECT
   type(coupler_2d_bc_type) :: fluxes  !< A structure that may contain an array of named fields
                                       !! used for passive tracer fluxes.
@@ -670,7 +670,7 @@ subroutine convert_IOB_to_fluxes(IOB, fluxes, index_bounds, Time, valid_time, G,
   ! Allow for user-written code to alter fluxes after all the above
   call user_alter_forcing(sfc_state, fluxes, Time, G, CS%urf_CS)
 
-  fluxes%IS_adot_int_land = IOB%IS_adot_int_land * kg_m2_s_conversion
+  fluxes%IS_adot_int_land = IOB%IS_adot_int_land / (US%RZL2_to_kg * US%s_to_T)
 
   call cpu_clock_end(id_clock_forcing)
 

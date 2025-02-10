@@ -4,7 +4,6 @@
 module MOM_ice_shelf
 
 ! This file is part of MOM6. See LICENSE.md for the license.
-use mpp_mod, only : mpp_pe
 use MOM_array_transform,      only : rotate_array
 use MOM_constants, only : hlf
 use MOM_cpu_clock, only : cpu_clock_id, cpu_clock_begin, cpu_clock_end
@@ -135,6 +134,7 @@ type, public :: ice_shelf_CS ; private
   logical :: mass_from_file !< Read the ice shelf mass from a file every dt
   logical :: ustar_shelf_from_vel !< If true, use the surface velocities, and not the previous
                        !! values of the stresses to set ustar.
+
   !!!! PHYSICAL AND NUMERICAL PARAMETERS FOR ICE DYNAMICS !!!!!!
 
   real :: time_step    !< this is the shortest timestep that the ice shelf sees [T ~> s], and
@@ -827,30 +827,17 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
 
     call IS_dynamics_post_data(time_step, Time, CS%dCS, ISS, G)
 
-    !mass_hole is time-and-area integrated surface mass flux from the land model that is not interpolated to
-    !the ice sheet (i.e. the adot * dt from land, integrated over the land grid area, minus adot *dt on the
-    !ice-sheet, integrated over the ocean grid area), plus any flux in/out of the ice-sheet domain due to
-    !horizontal ice sheet advection.
-    !land-area-integrated adot * dt
-    !ice-sheet flux in/out of the ice-sheet domain
+    !here, ISS%mass_hole is the time-and-area integrated surface mass flux from the land model that is not interpolated
+    !to the ice sheet (i.e. the adot * dt from land, integrated over the land grid area, minus adot * dt on the
+    !ice-sheet, integrated over the ocean grid area), plus any flux in/out of the ice-sheet domain due to horizontal
+    !ice sheet advection.
     dh_adott = dh_adott * CS%density_ice
     adot_int = integrate_over_ice_sheet_area(G, ISS, dh_adott, US%RZ_T_to_kg_m2s) ![RZL2]
     dh_adott = dh_adott / CS%density_ice
     ISS%mass_hole = ISS%mass_hole + fluxes%IS_adot_int_land * time_step - &
                     adot_int + ISS%tot_flux_inout * CS%density_ice
-
-    ! if (is_root_pe()) print *,''
-    if (is_root_pe()) print *,'time_step',time_step
-    if (is_root_pe()) print *,'fluxes%IS_adot_int_land/dt',fluxes%IS_adot_int_land
-    if (is_root_pe()) print *,'fluxes%IS_adot_int_land',fluxes%IS_adot_int_land * time_step
-    if (is_root_pe()) print *,'dh_adott_mass_int',adot_int
-    if (is_root_pe()) print *,'tot_flux_inout_hole',ISS%tot_flux_inout * CS%density_ice
-    if (is_root_pe()) print *,'delta_mass_hole',fluxes%IS_adot_int_land * time_step - &
-                    adot_int + ISS%tot_flux_inout * CS%density_ice
-    if (is_root_pe()) print *,'ISS%MASS_HOLE',ISS%mass_hole
-    if (is_root_pe()) print *,''
   else
-     !surface mass flux is not passed from land to the ice-sheet
+    !Without active ice shelf, ISS%mass_hole is adot * dt from the land, integrated over the land grid area
     ISS%mass_hole = ISS%mass_hole + fluxes%IS_adot_int_land * time_step
   endif
 
@@ -1944,6 +1931,7 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
     ! This line calls a subroutine that reads the initial conditions from a restart file.
     call MOM_mesg("MOM_ice_shelf.F90, initialize_ice_shelf: Restoring ice shelf from file.")
     call restore_state(dirs%input_filename, dirs%restart_input_dir, Time, G, CS%restart_CSp)
+    if (is_root_pe()) ISS%mass_hole_root = ISS%mass_hole
 
   endif ! .not. new_sim
 
