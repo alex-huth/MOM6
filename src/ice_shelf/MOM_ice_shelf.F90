@@ -2505,21 +2505,27 @@ function get_ice_shelf_mass_stock(CS, G, US, on_PE_only)
   type(ocean_grid_type), intent(inout) :: G   !< The ocean's grid structure.
   type(unit_scale_type), intent(in)    :: US  !< A dimensional unit scaling type
   logical, optional, intent(in)  :: on_PE_only !< If present and true, only sum on the local PE.
-  type(ice_shelf_state), pointer :: ISS => NULL() ! A structure with elements that describe the ice-shelf state
   real :: get_ice_shelf_mass_stock !< The globally integrated ice-sheet mass
+  type(ice_shelf_state), pointer :: ISS => NULL() ! A structure with elements that describe the ice-shelf state
+  logical :: this_pe_only ! Only sum on the local PE
 
   ISS => CS%ISS
   get_ice_shelf_mass_stock = &
     integrate_over_ice_sheet_area(G, ISS, ISS%mass_shelf, unscale=US%RZ_to_kg_m2, on_PE_only=on_PE_only)
 
   if (present(on_PE_only)) then
-    if (on_PE_only) then
-      !mass_hole will only be added to the root pe
-      get_ice_shelf_mass_stock = get_ice_shelf_mass_stock + ISS%mass_hole_root
-    else
-      get_ice_shelf_mass_stock = get_ice_shelf_mass_stock + ISS%mass_hole
-    endif
+    this_pe_only = on_PE_only
+  else
+    this_pe_only=.false.
   endif
+
+  if (this_pe_only) then
+      !mass_hole will only be added to the ocean root pe
+      get_ice_shelf_mass_stock = get_ice_shelf_mass_stock + ISS%mass_hole_root
+  else
+      get_ice_shelf_mass_stock = get_ice_shelf_mass_stock + ISS%mass_hole
+  endif
+
 end function get_ice_shelf_mass_stock
 
 !> Save the ice shelf restart file
