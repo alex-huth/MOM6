@@ -36,7 +36,7 @@ type, public :: ice_shelf_state
                                !! -2 : default (out of computational boundary)
                                !! NOTE: hmask will change over time and NEEDS TO BE MAINTAINED
                                !!   otherwise the wrong nodes will be included in velocity calcs.
-
+    hmask0 => NULL(),&
     tflux_ocn => NULL(), &     !< The downward sensible ocean heat flux at the
                                !! ocean-ice interface [Q R Z T-1 ~> W m-2].
     salt_flux => NULL(), &     !< The downward salt flux at the ocean-ice
@@ -52,12 +52,18 @@ type, public :: ice_shelf_state
     !only active when calve_ice_shelf_bergs=true:
     calving => NULL(), &       !< The mass flux per unit area of the ice shelf to convert to
                                !! bergs [R Z T-1 ~> kg m-2 s-1].
-    calving_hflx => NULL()     !< Calving heat flux [Q R Z T-1 ~> W m-2].
+    calving_hflx => NULL(), &  !< Calving heat flux [Q R Z T-1 ~> W m-2].
+
+    !only active when redistribute_surface_mass_flux=.true.
+    cells_to_IS_status => NULL() ,& !< The number of cells away from an ice-sheet cell [nondim]
+    num_cells_for_adot_redist => NULL() !> The number of surrounding cells to which surface mass flux will
+                                        !! be redistributed from each cell, when consolidating the flux that
+                                         !! ended up in ocean cells (during the land to ice sheet intepolation)
+                                         !! back onto the ice sheet [nondim]
   real :: mass_hole      !< The surface mass flux * dt from land, integrated over the land grid area,
                          !! minus surface mass flux * dt on the ice-sheet, integrated over ocean grid area,
                          !! plus any flux in/out of the ice-sheet domain due to horizontal ice sheet advection.
                          !! [R Z L2 ~> kg]
-  real :: mass_hole_root !< Mass hole, but non-zero on the ocean root pe only, for stock calculations [R Z L2 ~> kg]
   real :: tot_flux_inout !< Total accumulated flux in/out of the domain edges (outward is positive) [Z L2 ~> m3]
 end type ice_shelf_state
 
@@ -92,6 +98,11 @@ subroutine ice_shelf_state_init(ISS, G)
 
   allocate(ISS%calving(isd:ied,jsd:jed), source=0.0 )
   allocate(ISS%calving_hflx(isd:ied,jsd:jed), source=0.0 )
+
+  allocate(ISS%hmask0(isd:ied,jsd:jed), source=-2.0 )
+  allocate(ISS%cells_to_IS_status(isd:ied,jsd:jed), source=0.0)
+  allocate(ISS%num_cells_for_adot_redist(isd:ied,jsd:jed), source=0.0)
+
 end subroutine ice_shelf_state_init
 
 
@@ -107,6 +118,8 @@ subroutine ice_shelf_state_end(ISS)
   deallocate(ISS%tfreeze)
 
   deallocate(ISS%calving, ISS%calving_hflx)
+
+  deallocate(ISS%cells_to_IS_status, ISS%num_cells_for_adot_redist, ISS%hmask0)
 
   deallocate(ISS)
 

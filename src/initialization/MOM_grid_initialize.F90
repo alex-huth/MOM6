@@ -18,7 +18,7 @@ use MOM_unit_scaling,  only : unit_scale_type
 
 implicit none ; private
 
-public set_grid_metrics, initialize_masks, Adcroft_reciprocal
+public set_grid_metrics, initialize_masks, Adcroft_reciprocal, extrapolate_metric
 
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
 ! consistency testing. These are noted in comments with units like Z, H, L, and T, along with

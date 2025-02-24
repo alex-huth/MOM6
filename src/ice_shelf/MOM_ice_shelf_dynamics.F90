@@ -1402,7 +1402,7 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
     endif
   elseif (calve_ice_shelf_bergs) then
     !advect the front to create partially-filled cells
-    call shelf_advance_front(CS, ISS, G, ISS%hmask, uh_ice, vh_ice)
+    call shelf_advance_front(CS, ISS, G, ISS%hmask, uh_ice, vh_ice, calving=calve_ice_shelf_bergs)
     !add mass of the partially-filled cells to calving field, which is used to initialize icebergs
     !Then, remove the partially-filled cells from the ice shelf
     ISS%calving(:,:)=0.0
@@ -2127,11 +2127,13 @@ subroutine ice_shelf_advect_thickness_y(CS, G, LB, time_step, hmask, h0, h_after
 
 end subroutine ice_shelf_advect_thickness_y
 
-subroutine shelf_advance_front(CS, ISS, G, hmask, uh_ice, vh_ice)
+subroutine shelf_advance_front(CS, ISS, G, hmask, uh_ice, vh_ice, calving)
   type(ice_shelf_dyn_CS), intent(in)    :: CS !< A pointer to the ice shelf control structure
   type(ice_shelf_state),  intent(inout) :: ISS !< A structure with elements that describe
                                            !! the ice-shelf state
   type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
+  logical, optional, intent(in)         :: calving !< If True, shelf_advance front is being
+                                                                 !! used for calving from a static ice front
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(inout) :: hmask !< A mask indicating which tracer points are
                                               !! partly or fully covered by an ice-shelf
@@ -2179,12 +2181,19 @@ subroutine shelf_advance_front(CS, ISS, G, hmask, uh_ice, vh_ice)
   real :: tot_flux_ns ! The contribution to total ice mass flux from north + south cells [Z L2 ~> m3]
   real :: partial_vol ! The volume covered by ice shelf [Z L2 ~> m3]
   real :: dxdyh       ! Cell area [L2 ~> m2]
+  logical :: ice_shelf_calving ! True if this subroutine is being used for ice-shelf calving
   character(len=160) :: mesg  ! The text of an error message
   integer, dimension(4) :: mapi, mapj, new_partial
   real, dimension(SZDI_(G),SZDJ_(G),4) :: flux_enter  ! The ice volume flux into the
                                               ! cell through the 4 cell boundaries [Z L2 ~> m3].
   real, dimension(SZDI_(G),SZDJ_(G),4) :: flux_enter_replace ! An updated ice volume flux into the
                                               ! cell through the 4 cell boundaries [Z L2 ~> m3].
+
+  if (present(calving)) then
+    ice_shelf_calving = calving
+  else
+    ice_shelf_calving = .false.
+  endif
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   i_off = G%idg_offset ; j_off = G%jdg_offset
@@ -2264,7 +2273,14 @@ subroutine shelf_advance_front(CS, ISS, G, hmask, uh_ice, vh_ice)
               !h_reference = h_reference / real(n_flux)
               partial_vol = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) + tot_flux
 
-              if ((partial_vol / G%areaT(i,j)) == h_reference) then ! cell is exactly covered, no overflow
+              if (ice_shelf_calving) then
+                !Mark calving cells as "underfilled" (hmask = 2), even in the unlikely case that they
+                !are exactly covered or overflowed. Hmask, area_shelf_h and h_shelf will be reset to zero
+                !after being used to calculate the calving mass for the cell.
+                ISS%hmask(i,j) = 2
+                ISS%area_shelf_h(i,j) = partial_vol / h_reference
+                ISS%h_shelf(i,j) = h_reference
+              elseif ((partial_vol / G%areaT(i,j)) == h_reference) then ! cell is exactly covered, no overflow
                 if (ISS%hmask(i,j)/=3) ISS%hmask(i,j) = 1
                 ISS%h_shelf(i,j) = h_reference
                 ISS%area_shelf_h(i,j) = G%areaT(i,j)

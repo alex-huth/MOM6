@@ -165,10 +165,15 @@ subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, G, U
           endif
         endif
 
+        ! Fix for any round-off difference in ice-shelf area between the file and model grid
+        if (hmask_set) then
+          if (hmask(i,j)==1 .or. hmask(i,j)==3) area_shelf_h(i,j)=G%areaT(i,j)
+        endif
+
       ! update thickness mask
 
         if (area_shelf_h(i,j) >= G%areaT(i,j)) then
-          hmask(i,j) = 1.
+          if (.not. hmask_set) hmask(i,j) = 1.
           area_shelf_h(i,j)=G%areaT(i,j)
         elseif (area_shelf_h(i,j) == 0.0) then
           hmask(i,j) = 0.
@@ -177,6 +182,7 @@ subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, G, U
         else
           call MOM_error(FATAL,mdl// " AREA IN CELL OUT OF RANGE")
         endif
+
       enddo
     enddo
 end subroutine initialize_ice_thickness_from_file
