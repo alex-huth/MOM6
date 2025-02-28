@@ -181,6 +181,7 @@ subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, G, U
           hmask(i,j) = 2.
         else
           call MOM_error(FATAL,mdl// " AREA IN CELL OUT OF RANGE")
+
         endif
 
       enddo
