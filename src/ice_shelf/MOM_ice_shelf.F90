@@ -293,9 +293,7 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
     dh_bdott, & !< Basal melt/accumulation over a time step, used for diagnostics [Z ~> m]
     dh_adott    !< Surface melt/accumulation over a time step, used for diagnostics [Z ~> m]
   real, dimension(SZDI_(CS%grid),SZDJ_(CS%grid)) :: &
-    mass_flux, &  !< Total mass flux of freshwater across the ice-ocean interface. [R Z L2 T-1 ~> kg s-1]
-    tempadot, &
-    area
+    mass_flux  !< Total mass flux of freshwater across the ice-ocean interface. [R Z L2 T-1 ~> kg s-1]
   real, dimension(SZDI_(CS%grid),SZDJ_(CS%grid)) :: &
     haline_driving !< (SSS - S_boundary) ice-ocean
                !! interface, positive for melting and negative for freezing [S ~> ppt].
@@ -355,7 +353,6 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
   real :: adot_int_nh  ! Area integral of adot over N hemisphere ice sheet [R Z L2 T-1 ~> kg s-1]
   real :: adot_int_sh  ! Area integral of adot over S hemisphere ice sheet [R Z L2 T-1 ~> kg s-1]
   real :: adot_int_tot ! Area integral of adot over all ice sheet [R Z L2 T-1 ~> kg s-1]
-  real :: adot_int     ! Area integral of adot over all ice sheet [R Z L2 T-1 ~> kg s-1]
   real :: adot_intt    ! Area and time integrated change in ice thickness due to surface mass flux [R Z L2 ~> kg]
   logical :: Sb_min_set, Sb_max_set
   logical :: update_ice_vel ! If true, it is time to update the ice shelf velocities.
@@ -370,7 +367,6 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
                                !for all ice sheets, Antarctica only, or Greenland only [Z L2 ~> m3]
   real :: mass_hole_lnd !Land minus ice-sheet (regular grid) area-integrated surface mass flux
   real :: mass_hole_IS  !Modified minus regular grid ice-sheet area-integrated surface mass flux
-  real :: num_smb_into_IS_cell, num_smb_into_non_IS_cell,area_int
 
   if (.not. associated(CS)) call MOM_error(FATAL, "shelf_calc_flux: "// &
        "initialize_ice_shelf must be called before shelf_calc_flux.")
@@ -866,72 +862,23 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
       adot_int_tot*US%RZL2_to_kg*US%s_to_T, 100*(adot_int_tot-fluxes%IS_adot_int_land)/fluxes%IS_adot_int_land
     call MOM_mesg("MOM6-IS: "//trim(mesg))
 
-    adot_int = 0.0
-    tempadot = 0.0
-    area=0.0
-    num_smb_into_non_IS_cell = 0
-    num_smb_into_IS_cell = 0
-    do j = G%jsc,G%jec; do i = G%isc,G%iec
-      tempadot(i,j) = fluxes%shelf_sfc_mass_flux(i,j) * G%areaT(i,j)
-      if (ISS%hmask(i,j)>0 .and. G%geoLatT(i,j)>0.0) area(i,j) = G%areaT(i,j)
-      if (ISS%hmask(i,j)==2) &
-      call MOM_error(FATAL,"(1) hmask==2 detected where not expected")
-      if (ISS%hmask(i,j)<=0 .and. (tempadot(i,j)/=0.0)) then
-        num_smb_into_non_IS_cell = num_smb_into_non_IS_cell + 1
-      else
-        num_smb_into_IS_cell = num_smb_into_IS_cell + 1
-      endif
-    enddo; enddo
-    area_int = reproducing_sum(area)
-    call sum_across_PEs(num_smb_into_non_IS_cell)
-    call sum_across_PEs(num_smb_into_IS_cell)
+    !Calculate mass in the hole:
 
-    if (is_root_pe()) then
-      if (num_smb_into_non_IS_cell > 0) &
-        print *,'num IS, nonIS',int(num_smb_into_IS_cell),int(num_smb_into_non_IS_cell)
-      print *,'NH area int',area_int
-    endif
-
-    tempadot = 0.0
-    area=0.0
-    num_smb_into_non_IS_cell = 0
-    num_smb_into_IS_cell = 0
-    do j = G%jsc,G%jec; do i = G%isc,G%iec
-      if (ISS%hmask(i,j)>0 .and. G%geoLatT(i,j)<=0.0) then
-        tempadot(i,j) = fluxes%shelf_sfc_mass_flux(i,j) * CS%areaT_lndXIS(i,j)
-        area(i,j) = CS%areaT_lndXIS(i,j)
-        if (ISS%hmask(i,j)==2) &
-          call MOM_error(FATAL,"(2) hmask==2 detected where not expected")
-
-        if (CS%areaT_lndXIS(i,j) .ne. G%areaT(i,j)) then
-          num_smb_into_non_IS_cell = num_smb_into_non_IS_cell + 1
-        else
-          num_smb_into_IS_cell = num_smb_into_IS_cell + 1
-        endif
-      endif
-    enddo; enddo
-    adot_int = reproducing_sum(tempadot)
-    area_int = reproducing_sum(area)
-    call sum_across_PEs(num_smb_into_non_IS_cell)
-    call sum_across_PEs(num_smb_into_IS_cell)
-
-    if (is_root_pe()) then
-      print *,'SH lndXis area: shelf sfc mass flux int lndXIS',adot_int
-      print *,'SH area int lndXis', area_int
-      print *,'num area matching: yes',int(num_smb_into_IS_cell),'no',int(num_smb_into_non_IS_cell)
-      print *,''
-    endif
-
+    !Change in thickness due to precipitation
     dh_adott = dh_adott * CS%density_ice
     adot_intt = integrate_over_ice_sheet_area(G, ISS, dh_adott, US%RZ_T_to_kg_m2s) ![RZL2]
     dh_adott = dh_adott / CS%density_ice
+
     mass_hole_lnd = fluxes%IS_adot_int_land * time_step - &
                     adot_intt + ISS%tot_flux_inout * CS%density_ice
     mass_hole_IS  = adot_int_tot * time_step - &
                     adot_intt + ISS%tot_flux_inout * CS%density_ice
 
-    write(mesg,*) 'Mass hole increment using surface mass flux from: land',&
-                   mass_hole_lnd*US%RZL2_to_kg,'ice sheet with modified grid',mass_hole_IS*US%RZL2_to_kg
+    write(mesg,*) 'd(Mass hole) using surf mass flux from land            ',&
+                   mass_hole_lnd*US%RZL2_to_kg
+    call MOM_mesg("MOM6-IS: "//trim(mesg))
+    write(mesg,*) 'd(Mass hole) using surf mass flux from modified-area IS',&
+                   mass_hole_IS*US%RZL2_to_kg
     call MOM_mesg("MOM6-IS: "//trim(mesg))
     write(mesg,*) 'mass hole increment % error (IS modified compared to lnd):',&
                    100*(mass_hole_IS-mass_hole_lnd)/mass_hole_lnd
@@ -1114,8 +1061,10 @@ subroutine change_thickness_using_melt(ISS, G, US, time_step, fluxes, density_ic
 
   call sum_across_PEs(count)
 
-  write(mesg,*) 'Number of ice sheet cells melted to zero', count
-  call MOM_mesg(mesg)
+  if (count > 0) then
+    write(mesg,*) 'Number of ice sheet cells melted to zero', count
+    call MOM_mesg(mesg)
+  endif
 
   call pass_var(ISS%area_shelf_h, G%domain, complete=.false.)
   call pass_var(ISS%h_shelf, G%domain, complete=.false.)
@@ -2038,23 +1987,18 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
     call initialize_ice_thickness(ISS%h_shelf, ISS%area_shelf_h, ISS%hmask, CS%Grid, CS%Grid_in, US, param_file,&
           CS%rotate_index, CS%turns)
 
-!!$    ! Here, use calving and calving_hflx to 
-!!$    ISS%calving=0; ISS%calving_hflx=0
     ! next make sure mass is consistent with thickness
     do j=G%jsd,G%jed ; do i=G%isd,G%ied
       if ((ISS%hmask(i,j) == 1) .or. (ISS%hmask(i,j) == 2) .or. (ISS%hmask(i,j) == 3)) then
         ISS%mass_shelf(i,j) = ISS%h_shelf(i,j)*CS%density_ice
-!!$        ISS%calving(i,j)=1
-!!$        if (G%geoLatT(i,j)<=0.0) ISS%calving_hflx(i,j) = ISS%area_shelf_h(i,j) * CS%areaT_lndXIS(i,j)/G%areaT(i,j)
       endif
     enddo ; enddo
-!!$    nha = integrate_over_ice_sheet_area(G, ISS, ISS%calving, 1., hemisphere=1)
+
     if (associated(CS%areaT_lndXIS)) then
       call MOM_mesg("initialize_ice_shelf: Calculating initial ice sheet areas")
 
       nha = integrate_over_ice_sheet_area(G, ISS, CS%areaT_lndXIS*G%IareaT, 1., hemisphere=1)
       sha = integrate_over_ice_sheet_area(G, ISS, CS%areaT_lndXIS*G%IareaT, 1., hemisphere=0)
-!!$    sha = reproducing_sum(ISS%calving_hflx)*US%L_to_m**2
       write (mesg,*) "Initial hole-adjusted ice sheet area: Northern Hemisphere", nha*US%L_to_m**2
       call MOM_mesg("initialize_ice_shelf: "//trim(mesg))
       write (mesg,*) "Initial hole-adjusted ice sheet area: Southern Hemisphere", sha*US%L_to_m**2
@@ -2065,11 +2009,6 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
     else
       call MOM_mesg("initialize_ice_shelf: Did not calculate initial ice sheet areas")
     endif
-!!$    if (is_root_pe()) then
-!!$      print *,'INITIAL NHA ISt AREA       ',nha
-!!$      print *,'INITIAL SH ISt AREA_lndXIS',sha
-!!$    endif
-!!$    ISS%calving=0; ISS%calving_hflx=0
 
     if (CS%debug) then
       call hchksum(ISS%mass_shelf, "IS init: mass_shelf", G%HI, haloshift=0, unscale=US%RZ_to_kg_m2)
@@ -2628,14 +2567,16 @@ subroutine redistribute_sfc_mass_flux(G, ISS, adot)
     if (adot(i,j)/=0.0) max_cell_count = max(max_cell_count,ISS%cells_to_IS_status(i,j))
     if (adot(i,j)/=0.0 .and. ISS%hmask(i,j)<1) then
       count = count+1
-!!$      print *,'nonzero adot with hmask<1',adot(i,j), ISS%cells_to_IS_status(i,j),ISS%hmask(i,j),ISS%hmask0(i,j),i+G%idg_offset,j+G%jdg_offset
     endif
   enddo; enddo
   call mpp_max(max_cell_count)
   call sum_across_PEs(count)
 
+  if (count==0) return
+
   write(mesg,*) "Number of cells to redistribute",count
   call MOM_mesg("redistribute_sfc_mass_flux: "//trim(mesg))
+
 
   ! Redistribute the flux from cells with a given cells_to_IS_status(:,:)=max_cell_count to cells with
   ! max_cell_count - 1. The, repeat with max_cell_count = max_cell_count - 1 until all flux is
@@ -2683,8 +2624,6 @@ subroutine redistribute_sfc_mass_flux(G, ISS, adot)
 
   call pass_var(adot, G%domain)
   call sum_across_PEs(count)
-
-!!$  ! if (is_root_pe() .and. count>0) print *,'num cells redistributed',count, 'over', int(max_cell_count2), 'iters'
 
   count = 0
   do j=G%jsc,G%jec; do i=G%isc,G%iec
