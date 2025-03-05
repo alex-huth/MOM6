@@ -60,10 +60,10 @@ type, public :: ice_shelf_state
                                         !! be redistributed from each cell, when consolidating the flux that
                                          !! ended up in ocean cells (during the land to ice sheet intepolation)
                                          !! back onto the ice sheet [nondim]
-  real :: mass_hole      !< The surface mass flux * dt from land, integrated over the land grid area,
-                         !! minus surface mass flux * dt on the ice-sheet, integrated over ocean grid area,
-                         !! plus any flux in/out of the ice-sheet domain due to horizontal ice sheet advection.
-                         !! [R Z L2 ~> kg]
+  real :: mass_hole      !< The surface mass flux * dt from land, integrated over land grid or modified (no hole)
+                         !! MOM grid area,  minus surface mass flux * dt on the ice-sheet, integrated over ocean
+                         !! grid area plus any flux in/out of the ice-sheet domain due to horizontal ice sheet
+                         !! advection [R Z L2 ~> kg]
   real :: tot_flux_inout !< Total accumulated flux in/out of the domain edges (outward is positive) [Z L2 ~> m3]
 end type ice_shelf_state
 

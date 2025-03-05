@@ -844,27 +844,26 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
     !to the ice sheet (i.e. the adot * dt from land, integrated over the land grid area, minus adot * dt on the
     !ice-sheet, integrated over the ocean grid area), plus any flux in/out of the ice-sheet domain due to horizontal
     !ice sheet advection.
-    ! if (CS%debug) then
-    adot_int_nh = integrate_over_ice_sheet_area(G, ISS, &
-                                             fluxes%shelf_sfc_mass_flux * CS%areaT_lndXIS * G%IareaT, &
-                                             US%RZ_T_to_kg_m2s, hemisphere=1)
-    write(mesg,*) 'Ice sheet integrated surface mass flux NH', adot_int_nh*US%RZL2_to_kg*US%s_to_T
-    call MOM_mesg("MOM6-IS: "//trim(mesg))
-    adot_int_sh = integrate_over_ice_sheet_area(G, ISS, &
-                                             fluxes%shelf_sfc_mass_flux * CS%areaT_lndXIS * G%IareaT, &
-                                             US%RZ_T_to_kg_m2s, hemisphere=0)
-    write(mesg,*) 'Ice sheet integrated surface mass flux SH', adot_int_sh*US%RZL2_to_kg*US%s_to_T
-    call MOM_mesg("MOM6-IS: "//trim(mesg))
-    adot_int_tot = integrate_over_ice_sheet_area(G, ISS, &
-                                             fluxes%shelf_sfc_mass_flux * CS%areaT_lndXIS * G%IareaT, &
-                                             US%RZ_T_to_kg_m2s)
-    write(mesg,*) 'Ice sheet integrated surface mass flux Tot, % error with land', &
-      adot_int_tot*US%RZL2_to_kg*US%s_to_T, 100*(adot_int_tot-fluxes%IS_adot_int_land)/fluxes%IS_adot_int_land
-    call MOM_mesg("MOM6-IS: "//trim(mesg))
-
+    if (associated(CS%areaT_lndXIS)) then
+      adot_int_nh = integrate_over_ice_sheet_area(G, ISS, &
+                                               fluxes%shelf_sfc_mass_flux * CS%areaT_lndXIS * G%IareaT, &
+                                               US%RZ_T_to_kg_m2s, hemisphere=1)
+      write(mesg,*) 'Ice sheet integrated surface mass flux NH', adot_int_nh*US%RZL2_to_kg*US%s_to_T
+      call MOM_mesg("MOM6-IS: "//trim(mesg))
+      adot_int_sh = integrate_over_ice_sheet_area(G, ISS, &
+                                               fluxes%shelf_sfc_mass_flux * CS%areaT_lndXIS * G%IareaT, &
+                                               US%RZ_T_to_kg_m2s, hemisphere=0)
+      write(mesg,*) 'Ice sheet integrated surface mass flux SH', adot_int_sh*US%RZL2_to_kg*US%s_to_T
+      call MOM_mesg("MOM6-IS: "//trim(mesg))
+      adot_int_tot = integrate_over_ice_sheet_area(G, ISS, &
+                                               fluxes%shelf_sfc_mass_flux * CS%areaT_lndXIS * G%IareaT, &
+                                               US%RZ_T_to_kg_m2s)
+      write(mesg,*) 'Ice sheet integrated surface mass flux Tot, % error with land', &
+        adot_int_tot*US%RZL2_to_kg*US%s_to_T, 100*(adot_int_tot-fluxes%IS_adot_int_land)/fluxes%IS_adot_int_land
+      call MOM_mesg("MOM6-IS: "//trim(mesg))
+    endif
     !Calculate mass in the hole:
-
-    !Change in thickness due to precipitation
+    !Change in thickness due to precipitation, accounting for any cells where thickness is constant
     dh_adott = dh_adott * CS%density_ice
     adot_intt = integrate_over_ice_sheet_area(G, ISS, dh_adott, US%RZ_T_to_kg_m2s) ![RZL2]
     dh_adott = dh_adott / CS%density_ice
@@ -884,10 +883,21 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
                    100*(mass_hole_IS-mass_hole_lnd)/mass_hole_lnd
     call MOM_mesg("MOM6-IS: "//trim(mesg))
 
+    ! For now, use the mass_hole_lnd to calculate the mass in the hole
     ISS%mass_hole = ISS%mass_hole + mass_hole_lnd
   else
-    !Without active ice shelf, ISS%mass_hole is adot * dt from the land, integrated over the land grid area
-    ISS%mass_hole = ISS%mass_hole + fluxes%IS_adot_int_land * time_step
+    !Without active ice shelf dynamics, the ice sheet mass is constant, and ISS%mass_hole represents
+    !the integrated adot over ice sheet area:
+    if (associated(CS%areaT_lndXIS)) then
+      !integrate adot over the modified ice sheet area
+      adot_int_tot = integrate_over_ice_sheet_area(G, ISS, &
+        fluxes%shelf_sfc_mass_flux * CS%areaT_lndXIS * G%IareaT, &
+        US%RZ_T_to_kg_m2s)
+      ISS%mass_hole = ISS%mass_hole + adot_int_tot * time_step
+    else
+      !use the adot integrated over the ice sheet area from the land model
+      ISS%mass_hole = ISS%mass_hole + fluxes%IS_adot_int_land * time_step
+    endif
   endif
 
   if (CS%shelf_mass_is_dynamic) &
@@ -1986,7 +1996,6 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
     ! This model is initialized internally or from a file.
     call initialize_ice_thickness(ISS%h_shelf, ISS%area_shelf_h, ISS%hmask, CS%Grid, CS%Grid_in, US, param_file,&
           CS%rotate_index, CS%turns)
-
     ! next make sure mass is consistent with thickness
     do j=G%jsd,G%jed ; do i=G%isd,G%ied
       if ((ISS%hmask(i,j) == 1) .or. (ISS%hmask(i,j) == 2) .or. (ISS%hmask(i,j) == 3)) then
@@ -2178,7 +2187,7 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
   CS%id_bdot_accum = register_scalar_field('ice_shelf_model', 'int_bdot_accum', CS%diag%axesT1, CS%Time, &
       'Area integrated basal accumulation rate over ice shelves', &
       units='m3 s-1', conversion=US%Z_to_m*US%L_to_m**2*US%s_to_T)
-CS%id_mass_hole = register_scalar_field('ice_shelf_model', 'mass_hole_IS', CS%diag%axesT1, CS%Time, &
+  CS%id_mass_hole = register_scalar_field('ice_shelf_model', 'mass_hole_IS', CS%diag%axesT1, CS%Time, &
       'Ice-sheet mass in the ocean grid hole, if present', &
       units='kg', conversion=US%RZL2_to_kg)
 
