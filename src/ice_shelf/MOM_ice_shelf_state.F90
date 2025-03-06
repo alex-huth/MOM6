@@ -36,7 +36,6 @@ type, public :: ice_shelf_state
                                !! -2 : default (out of computational boundary)
                                !! NOTE: hmask will change over time and NEEDS TO BE MAINTAINED
                                !!   otherwise the wrong nodes will be included in velocity calcs.
-    hmask0 => NULL(),&
     tflux_ocn => NULL(), &     !< The downward sensible ocean heat flux at the
                                !! ocean-ice interface [Q R Z T-1 ~> W m-2].
     salt_flux => NULL(), &     !< The downward salt flux at the ocean-ice
@@ -99,7 +98,6 @@ subroutine ice_shelf_state_init(ISS, G)
   allocate(ISS%calving(isd:ied,jsd:jed), source=0.0 )
   allocate(ISS%calving_hflx(isd:ied,jsd:jed), source=0.0 )
 
-  allocate(ISS%hmask0(isd:ied,jsd:jed), source=-2.0 )
   allocate(ISS%cells_to_IS_status(isd:ied,jsd:jed), source=0.0)
   allocate(ISS%num_cells_for_adot_redist(isd:ied,jsd:jed), source=0.0)
 
@@ -119,7 +117,7 @@ subroutine ice_shelf_state_end(ISS)
 
   deallocate(ISS%calving, ISS%calving_hflx)
 
-  deallocate(ISS%cells_to_IS_status, ISS%num_cells_for_adot_redist, ISS%hmask0)
+  deallocate(ISS%cells_to_IS_status, ISS%num_cells_for_adot_redist)
 
   deallocate(ISS)
 

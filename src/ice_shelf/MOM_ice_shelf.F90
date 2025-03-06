@@ -95,6 +95,11 @@ type, public :: ice_shelf_CS ; private
   logical :: rotate_index = .false.   !< True if index map is rotated
   logical :: set_grid_hole_area = .false. !< True to use areas from a second h_grid to calculate stocks
                                           !! that account for flux into a hole in the original grid
+  logical :: debug_mass_hole = .false. !! True to output messages related to integrated surface mass flux
+                                       !! and mass in the grid hole
+  logical :: mass_hole_from_land = .true. !! Calculate hole mass using integrated surface mass flux
+                                          !! from (True) the land model or (False) the modified mom grid areas
+
   integer :: turns                    !< The number of quarter turns for rotation testing.
   type(ocean_grid_type), pointer :: Grid => NULL() !< Grid for the ice-shelf model
   type(unit_scale_type), pointer :: &
@@ -848,20 +853,27 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
       adot_int_nh = integrate_over_ice_sheet_area(G, ISS, &
                                                fluxes%shelf_sfc_mass_flux * CS%areaT_lndXIS * G%IareaT, &
                                                US%RZ_T_to_kg_m2s, hemisphere=1)
-      write(mesg,*) 'Ice sheet integrated surface mass flux NH', adot_int_nh*US%RZL2_to_kg*US%s_to_T
-      call MOM_mesg("MOM6-IS: "//trim(mesg))
+      if (CS%debug_mass_hole) then
+        write(mesg,*) 'Ice sheet integrated surface mass flux NH', adot_int_nh*US%RZL2_to_kg*US%s_to_T
+        call MOM_mesg("MOM6-IS: "//trim(mesg))
+      endif
       adot_int_sh = integrate_over_ice_sheet_area(G, ISS, &
                                                fluxes%shelf_sfc_mass_flux * CS%areaT_lndXIS * G%IareaT, &
                                                US%RZ_T_to_kg_m2s, hemisphere=0)
-      write(mesg,*) 'Ice sheet integrated surface mass flux SH', adot_int_sh*US%RZL2_to_kg*US%s_to_T
-      call MOM_mesg("MOM6-IS: "//trim(mesg))
+      if (CS%debug_mass_hole) then
+        write(mesg,*) 'Ice sheet integrated surface mass flux SH', adot_int_sh*US%RZL2_to_kg*US%s_to_T
+        call MOM_mesg("MOM6-IS: "//trim(mesg))
+      endif
       adot_int_tot = integrate_over_ice_sheet_area(G, ISS, &
                                                fluxes%shelf_sfc_mass_flux * CS%areaT_lndXIS * G%IareaT, &
                                                US%RZ_T_to_kg_m2s)
-      write(mesg,*) 'Ice sheet integrated surface mass flux Tot, % error with land', &
-        adot_int_tot*US%RZL2_to_kg*US%s_to_T, 100*(adot_int_tot-fluxes%IS_adot_int_land)/fluxes%IS_adot_int_land
-      call MOM_mesg("MOM6-IS: "//trim(mesg))
+      if (CS%debug_mass_hole) then
+        write(mesg,*) 'Ice sheet integrated surface mass flux Tot, % error with land', &
+          adot_int_tot*US%RZL2_to_kg*US%s_to_T, 100*(adot_int_tot-fluxes%IS_adot_int_land)/fluxes%IS_adot_int_land
+        call MOM_mesg("MOM6-IS: "//trim(mesg))
+      endif
     endif
+
     !Calculate mass in the hole:
     !Change in thickness due to precipitation, accounting for any cells where thickness is constant
     dh_adott = dh_adott * CS%density_ice
@@ -870,25 +882,35 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
 
     mass_hole_lnd = fluxes%IS_adot_int_land * time_step - &
                     adot_intt + ISS%tot_flux_inout * CS%density_ice
-    mass_hole_IS  = adot_int_tot * time_step - &
-                    adot_intt + ISS%tot_flux_inout * CS%density_ice
 
-    write(mesg,*) 'd(Mass hole) using surf mass flux from land            ',&
-                   mass_hole_lnd*US%RZL2_to_kg
-    call MOM_mesg("MOM6-IS: "//trim(mesg))
-    write(mesg,*) 'd(Mass hole) using surf mass flux from modified-area IS',&
-                   mass_hole_IS*US%RZL2_to_kg
-    call MOM_mesg("MOM6-IS: "//trim(mesg))
-    write(mesg,*) 'mass hole increment % error (IS modified compared to lnd):',&
-                   100*(mass_hole_IS-mass_hole_lnd)/mass_hole_lnd
-    call MOM_mesg("MOM6-IS: "//trim(mesg))
+    if (associated(CS%areaT_lndXIS)) then
+      mass_hole_IS  = adot_int_tot * time_step - &
+        adot_intt + ISS%tot_flux_inout * CS%density_ice
+    endif
 
-    ! For now, use the mass_hole_lnd to calculate the mass in the hole
-    ISS%mass_hole = ISS%mass_hole + mass_hole_lnd
+    if (CS%debug_mass_hole) then
+      write(mesg,*) 'd(Mass hole) using surf mass flux from land            ',&
+        mass_hole_lnd*US%RZL2_to_kg
+      call MOM_mesg("MOM6-IS: "//trim(mesg))
+      if (associated(CS%areaT_lndXIS)) then
+        write(mesg,*) 'd(Mass hole) using surf mass flux from modified-area IS',&
+          mass_hole_IS*US%RZL2_to_kg
+        call MOM_mesg("MOM6-IS: "//trim(mesg))
+        write(mesg,*) 'mass hole increment % error (IS modified compared to lnd):',&
+          100*(mass_hole_IS-mass_hole_lnd)/mass_hole_lnd
+        call MOM_mesg("MOM6-IS: "//trim(mesg))
+      endif
+    endif
+
+    if (associated(CS%areaT_lndXIS) .and. (.not. CS%mass_hole_from_land)) then
+      ISS%mass_hole = ISS%mass_hole + mass_hole_IS
+    else
+      ISS%mass_hole = ISS%mass_hole + mass_hole_lnd
+    endif
   else
     !Without active ice shelf dynamics, the ice sheet mass is constant, and ISS%mass_hole represents
     !the integrated adot over ice sheet area:
-    if (associated(CS%areaT_lndXIS)) then
+    if (associated(CS%areaT_lndXIS) .and. (.not. CS%mass_hole_from_land)) then
       !integrate adot over the modified ice sheet area
       adot_int_tot = integrate_over_ice_sheet_area(G, ISS, &
         fluxes%shelf_sfc_mass_flux * CS%areaT_lndXIS * G%IareaT, &
@@ -1523,9 +1545,23 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
                  default=.false., layoutParam=.true.)
 
   call get_param(param_file, mdl, "SET_GRID_HOLE_AREA", CS%set_grid_hole_area, &
-                "Use a second h_grid in INPUT_lndXIS to defines extended areas for "//&
-                "cells near any hole in the grid, used to account for surface mass flux into "//&
-                "the hole area when calculating stocks", default=.false.)
+                 "If true, use a second h_grid in INPUT_lndXIS to defines extended areas for "//&
+                 "cells near any hole in the grid, used to account for surface mass flux into "//&
+                 "the hole area when calculating stocks", default=.false.)
+
+  call get_param(param_file, mdl, "DEBUG_MASS_HOLE", CS%debug_mass_hole, &
+                 "If true, output messages related to integrated surface mass flux and mass in the "//&
+                 "grid hole, for both integrated surface mass flux from the land grid and modified "//&
+                 "ocean grid.", default=.false.)
+
+  call get_param(param_file, mdl, "MASS_HOLE_FROM_LAND", CS%mass_hole_from_land, &
+                 "Calculate hole mass using integrated surface mass flux from (True) the land model "//&
+                 "or (False) the modified MOM grid areas.", default=.true.)
+
+  if ((.not. CS%mass_hole_from_land) .and. (.not. CS%set_grid_hole_area)) then
+        call MOM_error(FATAL, "MOM_ice_shelf.F90, initialize_ice_shelf: "// &
+                          "set_grid_hole_area must be true if mass_hole_from_land=false.")
+  endif
 
   ! Set up the ice-shelf domain and grid
   wd_halos(:)=0
@@ -1795,7 +1831,7 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
                  "buoyancy iteration.", units="nondim", default=1.0e-4)
   call get_param(param_file, mdl, "REDISTRIBUTE_SURFACE_MASS_FLUX", CS%redistrib_sfc_mass_flux, &
                  "Detect the surface mass flux that accumulates within non-ice-sheet cells due to" //&
-                  "land_grid-to-ocean_grid interpolation errors, and redistribute it onto ice-sheet", default=.false.)
+                 "land_grid-to-ocean_grid interpolation errors, and redistribute it onto ice-sheet", default=.false.)
 
   if (PRESENT(sfc_state_in)) then
     ! assuming frazil is enabled in ocean. This could break some configurations?
@@ -2506,7 +2542,6 @@ subroutine initialize_redistribute_sfc_mass_flux(G, ISS)
 
   call pass_var(ISS%hmask, G%domain)
 
-  ISS%hmask0=ISS%hmask
   ! For each non-ice-sheet ocean cell, save how many cells it is away from an ice-sheet cell by setting
   ! ISS%cells_to_IS_status == 1 for an ice-sheet cell, and adding 1 for each additional cell away from an
   ! ice-sheet cell. TODO: only process the cells within the ice-sheet mask from land.
