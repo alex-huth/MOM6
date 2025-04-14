@@ -2865,21 +2865,26 @@ subroutine process_tabular_calving(G, CS, ISS, TC, Time)
   logical :: visited=.false.
   save :: visited
 
-  TC%tabular_calve_mask(:,:)=0.0
-
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
 
   if (TC%tabular_calving_from_file) then
 
-    if (CS%rotate_index) then
-      allocate(tmp2d(CS%Grid_in%isd:CS%Grid_in%ied,CS%Grid_in%jsd:CS%Grid_in%jed), source=0.0)
+    !for now, let's just calve on the first step. Later, we can think about using a time-varying calving file...
+    if (.not. visited) then
+      visited=.true.
     else
-      allocate(tmp2d(is:ie,js:je), source=0.0)
+      TC%tabular_calve_mask(:,:)=0.0
     endif
 
-    call time_interp_external(TC%calving_mask_handle, Time, tmp2d)
-    call rotate_array(tmp2d, CS%turns, TC%tabular_calve_mask)
-    deallocate(tmp2d)
+    ! if (CS%rotate_index) then
+    !   allocate(tmp2d(CS%Grid_in%isd:CS%Grid_in%ied,CS%Grid_in%jsd:CS%Grid_in%jed), source=0.0)
+    ! else
+    !   allocate(tmp2d(is:ie,js:je), source=0.0)
+    ! endif
+
+    ! call time_interp_external(TC%calving_mask_handle, Time, tmp2d)
+    ! call rotate_array(tmp2d, CS%turns, TC%tabular_calve_mask)
+    ! deallocate(tmp2d)
 
     !for now, only calve where there is ice present.
     do j=js,je ; do i=is,ie
@@ -2887,6 +2892,8 @@ subroutine process_tabular_calving(G, CS, ISS, TC, Time)
     enddo; enddo
 
   else
+
+    TC%tabular_calve_mask(:,:)=0.0
 
     if (.not. visited) then
       !for testing on ISOMIP (e.g. Stern et al 2017)
