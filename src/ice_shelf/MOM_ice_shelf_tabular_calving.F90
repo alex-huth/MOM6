@@ -18,7 +18,7 @@ use MOM_coms, only : reproducing_sum
 use MOM_checksums, only : hchksum, qchksum, chksum, uchksum, vchksum, uvchksum
 use mpp_mod, only : mpp_sync_self
 use MOM_file_parser, only : read_param, get_param, log_param, log_version, param_file_type
-use MOM_io, only : slasher, file_exists
+use MOM_io, only : slasher, file_exists, MOM_read_data
 use MOM_interpolate, only : init_external_field, time_interp_external, time_interp_external_init
 use MOM_interpolate, only : external_field
 use MOM_unit_scaling, only : unit_scale_type
@@ -81,7 +81,7 @@ subroutine initialize_tabular_calving(param_file, TC, G)
 
   if (TC%tabular_calving_from_file) then
 
-    call time_interp_external_init()
+!    call time_interp_external_init()
 
     call get_param(param_file, mdl, "INPUTDIR", inputdir, default=".")
 
@@ -102,8 +102,11 @@ subroutine initialize_tabular_calving(param_file, TC, G)
     if (.not.file_exists(filename, G%Domain)) call MOM_error(FATAL, &
          "initialize_tabular_calving: Unable to open "//trim(filename))
 
-    TC%calving_mask_handle = init_external_field(filename, TC_mask_var, &
-                                                 MOM_domain=G%Domain, verbose=TC%debug)
+    !for now, let's just calve on the first step. Later, we can think about using a time-varying calving file...
+    call MOM_read_data(TC_file, TC_mask_var, TC%tabular_calve_mask, G%domain)
+
+ !   TC%calving_mask_handle = init_external_field(filename, TC_mask_var, &
+ !                                                MOM_domain=G%Domain, verbose=TC%debug)
   endif
 
 end subroutine initialize_tabular_calving
