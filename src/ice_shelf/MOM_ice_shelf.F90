@@ -92,9 +92,9 @@ type, public :: ice_shelf_CS ; private
                                                   !! structure for the ice shelves
   type(ocean_grid_type), pointer :: Grid_in => NULL() !< un-rotated input grid metric
   logical :: rotate_index = .false.   !< True if index map is rotated
-  logical :: calculate_mass_hole = .true. !! True to calculate mass in the S. Pole grid hole. Likely
+  logical :: calculate_mass_hole = .true. !< True to calculate mass in the S. Pole grid hole. Likely
                                           !! set false unless using surface mass flux from the land model
-  logical :: debug_mass_hole = .false. !! True to output the mass_hole increment over the current time step
+  logical :: debug_mass_hole = .false. !< True to output the mass_hole increment over the current time step
   integer :: turns                    !< The number of quarter turns for rotation testing.
   type(ocean_grid_type), pointer :: Grid => NULL() !< Grid for the ice-shelf model
   type(unit_scale_type), pointer :: &
