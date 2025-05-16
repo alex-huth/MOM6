@@ -1009,7 +1009,7 @@ subroutine change_thickness_using_melt(ISS, G, US, time_step, fluxes, density_ic
 
   count=0
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
-    if ((ISS%hmask(i,j) == 1) .or. (ISS%hmask(i,j) == 2)) then
+    if ((ISS%hmask(i,j) == 1) .or. (ISS%hmask(i,j) == 2 .and. ISS%h_shelf(i,j) > 0)) then
       ! first, zero out fluxes applied during previous time step
       if (associated(fluxes%lprec)) fluxes%lprec(i,j) = 0.0
       if (associated(fluxes%sens)) fluxes%sens(i,j) = 0.0
@@ -1033,7 +1033,7 @@ subroutine change_thickness_using_melt(ISS, G, US, time_step, fluxes, density_ic
   call sum_across_PEs(count)
 
   if (count > 0) then
-    write(mesg,*) 'Number of ice sheet cells melted to zero', count
+    write(mesg,*) 'Number of ice sheet cells melted to zero (basal melt)', count
     call MOM_mesg(mesg)
   endif
 
@@ -2447,12 +2447,15 @@ subroutine change_thickness_using_precip(CS, ISS, G, US, fluxes, time_step, Time
 
   ! locals
   integer :: i, j
+  integer :: count ! number of ice sheet cells that have melted entirely
   real ::I_rho_ice
+  character(len=160) :: mesg  ! The text of an error message
 
   I_rho_ice = 1.0 / CS%density_ice
 
+  count=0
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
-    if ((ISS%hmask(i,j) == 1) .or. (ISS%hmask(i,j) == 2)) then
+    if ((ISS%hmask(i,j) == 1) .or. (ISS%hmask(i,j) == 2 .and. ISS%h_shelf(i,j) > 0)) then
 
       if (-fluxes%shelf_sfc_mass_flux(i,j) * time_step * I_rho_ice  < ISS%h_shelf(i,j)) then
         ISS%h_shelf(i,j) = ISS%h_shelf(i,j) + fluxes%shelf_sfc_mass_flux(i,j) * time_step * I_rho_ice
@@ -2462,10 +2465,18 @@ subroutine change_thickness_using_precip(CS, ISS, G, US, fluxes, time_step, Time
         ISS%h_shelf(i,j) = 0.0
         ISS%hmask(i,j) = 0.0
         ISS%area_shelf_h(i,j) = 0.0
+        count=count+1
       endif
       ISS%mass_shelf(i,j) = ISS%h_shelf(i,j) * CS%density_ice
     endif
   enddo ; enddo
+
+  call sum_across_PEs(count)
+
+  if (count > 0) then
+    write(mesg,*) 'Number of ice sheet cells melted to zero (surface melt)', count
+    call MOM_mesg(mesg)
+  endif
 
   call pass_var(ISS%area_shelf_h, G%domain, complete=.false.)
   call pass_var(ISS%h_shelf, G%domain, complete=.false.)
