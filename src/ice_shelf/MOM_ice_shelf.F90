@@ -8,7 +8,7 @@ use MOM_array_transform,      only : rotate_array
 use MOM_constants, only : hlf
 use MOM_cpu_clock, only : cpu_clock_id, cpu_clock_begin, cpu_clock_end
 use MOM_cpu_clock, only : CLOCK_COMPONENT, CLOCK_ROUTINE
-use MOM_coms,                 only : num_PEs, reproducing_sum, sum_across_PEs, PE_here, broadcast
+use MOM_coms,                 only : num_PEs, reproducing_sum, sum_across_PEs, max_across_PEs, PE_here, broadcast
 use MOM_data_override,       only : data_override
 use MOM_diag_mediator, only    : MOM_diag_ctrl=>diag_ctrl
 use MOM_IS_diag_mediator, only : post_data=>post_IS_data, post_scalar_data=>post_IS_data_0d
@@ -889,7 +889,7 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
   ISS%calving_stock = reproducing_sum(time_step*ISS%calving(is:ie,js:je)*G%areaT(is:ie,js:je),unscale=G%US%RZL2_to_kg)
 
   if ( trim(CS%calve_ice_shelf_bergs)=='BONDED' .or. &
-    (trim(CS%calve_ice_shelf_bergs)=='MIXED' .and. maxval(G%geolonCv(:,:))<0) ) then
+       trim(CS%calve_ice_shelf_bergs)=='MIXED') then
     call process_tabular_calving(G, CS, ISS, CS%TC, Time)
   endif
 
@@ -1042,11 +1042,11 @@ end subroutine ice_sheet_calving_to_ocean_sfc
 
 !> Converts the ice-shelf-to-ocean bonded-particle tabular calving variables from the ice-shelf state (ISS)
 !! type to the ocean public type
-subroutine ice_sheet_bonded_calving_to_ocean_sfc(CS,US,tabular_calve_mask,mass_shelf,area_shelf_h)
+subroutine ice_sheet_bonded_calving_to_ocean_sfc(CS,US,tabular_calve_mask,mass_shelf,frac_shelf)
   type(ice_shelf_CS),      pointer :: CS        !< A pointer to the ice shelf control structure
   type(unit_scale_type), intent(in)    :: US   !< A dimensional unit scaling type
   real, dimension(:,:), intent(inout) :: mass_shelf !< The mass per unit area of the ice shelf [R Z ~> kg m-2].
-  real, dimension(:,:), intent(inout) :: area_shelf_h !<  The area per cell covered by the ice shelf [L2 ~> m2].
+  real, dimension(:,:), intent(inout) :: frac_shelf !<  The cell fraction covered by the ice shelf [nondim].
   real, dimension(:,:), intent(inout) :: tabular_calve_mask !< Mask used to indicate cells ready to be calved and
                                             !! converted to bonded-particle tabular icebergs
                                             !! 0: not ready to calve
@@ -1065,7 +1065,7 @@ subroutine ice_sheet_bonded_calving_to_ocean_sfc(CS,US,tabular_calve_mask,mass_s
 
   tabular_calve_mask = TC%tabular_calve_mask(is:ie,js:je)
   mass_shelf = ISS%mass_shelf(is:ie,js:je)*US%RZ_to_kg_m2
-  area_shelf_h = ISS%area_shelf_h(is:ie,js:je)*US%L_to_m**2
+  frac_shelf = ISS%area_shelf_h(is:ie,js:je)*G%IareaT(is:ie,js:je)
 end subroutine ice_sheet_bonded_calving_to_ocean_sfc
 
 !> Changes the thickness (mass) of the ice shelf based on sub-ice-shelf melting
@@ -2044,11 +2044,6 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
 
   endif
 
-  if ( trim(CS%calve_ice_shelf_bergs)=='BONDED' .or. &
-      (trim(CS%calve_ice_shelf_bergs)=='MIXED' .and. maxval(G%geolonCv(:,:))<0) ) then
-    call initialize_tabular_calving(param_file, CS%TC, G)
-  endif
-
   ! Set up the restarts.
 
   call restart_init(param_file, CS%restart_CSp, "Shelf.res")
@@ -2062,7 +2057,7 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
                               "ice-sheet mass in the ocean grid hole, if present", "kg", conversion=US%RZL2_to_kg)
 
   if (trim(CS%calve_ice_shelf_bergs)=='POINT' .or. &
-      (trim(CS%calve_ice_shelf_bergs)=='MIXED')) then
+      trim(CS%calve_ice_shelf_bergs)=='MIXED') then
     call register_restart_field(ISS%calving, "shelf_calving", .true., CS%restart_CSp, &
                                 "Calving flux from ice shelf into icebergs", "kg m-2", conversion=US%RZ_to_kg_m2)
     call register_restart_field(ISS%calving_hflx, "shelf_calving_hflx", .true., CS%restart_CSp, &
@@ -2154,6 +2149,12 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
 
   if (CS%debug) then
     call hchksum(ISS%area_shelf_h, "IS init: area_shelf_h", G%HI, haloshift=0, unscale=US%L_to_m*US%L_to_m)
+  endif
+
+  if (trim(CS%calve_ice_shelf_bergs)=='BONDED' .or. &
+      trim(CS%calve_ice_shelf_bergs)=='MIXED' ) then
+    call initialize_tabular_calving(param_file, CS%TC, G)
+    call process_tabular_calving(G, CS, ISS, CS%TC, Time)
   endif
 
   CS%Time = Time
@@ -2817,8 +2818,8 @@ subroutine adjust_shelf_for_tabular_calving(CS, frac_cberg_calved)
 
   G => CS%grid
 
-  if ( (trim(CS%calve_ice_shelf_bergs)=='BONDED') .or. &
-    (trim(CS%calve_ice_shelf_bergs)=='MIXED' .and. maxval(G%geolonCv(:,:))<0) ) then
+  if ( trim(CS%calve_ice_shelf_bergs)=='BONDED' .or. &
+      (trim(CS%calve_ice_shelf_bergs)=='MIXED' .and. maxval(G%geolatCv(:,:))<0) ) then
     ISS => CS%ISS
     is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
     do j=js,je ; do i=is,ie
@@ -2951,10 +2952,10 @@ subroutine process_tabular_calving(G, CS, ISS, TC, Time)
     if (ISS%area_shelf_h(i,j)<=0) TC%tabular_calve_mask(i,j)=0
   enddo; enddo
 
-  !then set calving mask to one wherever non-ice cells are within 2 cells of a calving cell
+  !then set calving mask to one wherever non-ice cells are within 1 cells of a calving cell
   do j=js,je; do i=is,ie
     if (TC%tabular_calve_mask(i,j)>0 .and. ISS%area_shelf_h(i,j)>0) then
-      do m=j-2,j+2; do n=i-2,i+2
+      do m=j-1,j+1; do n=i-1,i+1
         if (ISS%area_shelf_h(n,m)<=0) TC%tabular_calve_mask(n,m)=1.0
       enddo; enddo
     endif

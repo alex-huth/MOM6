@@ -103,7 +103,7 @@ subroutine initialize_tabular_calving(param_file, TC, G)
          "initialize_tabular_calving: Unable to open "//trim(filename))
 
     !for now, let's just calve on the first step. Later, we can think about using a time-varying calving file...
-    call MOM_read_data(TC_file, TC_mask_var, TC%tabular_calve_mask, G%domain)
+    call MOM_read_data(filename, TC_mask_var, TC%tabular_calve_mask, G%domain)
 
  !   TC%calving_mask_handle = init_external_field(filename, TC_mask_var, &
  !                                                MOM_domain=G%Domain, verbose=TC%debug)
