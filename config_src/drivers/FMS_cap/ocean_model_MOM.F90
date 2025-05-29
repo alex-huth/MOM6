@@ -129,7 +129,7 @@ type, public ::  ocean_public_type
     tabular_calve_mask => NULL(), & !< Mask used to indicate cells ready to be calved and converted
                         !!to bonded-particle tabular icebergs. 0: not ready to calve,  >1: ready to calve
     mass_shelf => NULL(), & !< The mass per unit area of the ice shelf or sheet [R Z ~> kg m-2].
-    area_shelf_h => NULL() !< The area per cell covered by the ice shelf [L2 ~> m2].
+    frac_shelf => NULL() !< The cell fraction covered by the ice shelf [nondim].
   type(coupler_2d_bc_type) :: fields    !< A structure that may contain named
                                         !! arrays of tracer-related surface fields.
   integer                  :: avg_kount !< A count of contributions to running
@@ -825,7 +825,7 @@ subroutine initialize_ocean_public_type(input_domain, Ocean_sfc, diag, gas_field
              Ocean_sfc%calving_hflx(isc:iec,jsc:jec), &
              Ocean_sfc%tabular_calve_mask(isc:iec,jsc:jec), &
              Ocean_sfc%mass_shelf(isc:iec,jsc:jec), &
-             Ocean_sfc%area_shelf_h(isc:iec,jsc:jec), &
+             Ocean_sfc%frac_shelf(isc:iec,jsc:jec), &
              Ocean_sfc%area   (isc:iec,jsc:jec), &
              Ocean_sfc%melt_potential(isc:iec,jsc:jec), &
              Ocean_sfc%OBLD   (isc:iec,jsc:jec), &
@@ -841,7 +841,7 @@ subroutine initialize_ocean_public_type(input_domain, Ocean_sfc, diag, gas_field
   Ocean_sfc%tabular_calve_mask(:,:) = 0.0 ! mask for converting ice shelf into bonded-particle bergs,
                                           ! passed to ice model
   Ocean_sfc%mass_shelf(:,:) = 0.0 ! mass per unit area of the ice shelf or sheet (kg m-2), passed to ice model
-  Ocean_sfc%area_shelf_h(:,:) = 0.0 ! area of ice shelf (m2), passed to ice model
+  Ocean_sfc%frac_shelf(:,:) = 0.0 ! cell fraction of ice shelf passed to ice model
   Ocean_sfc%frazil(:,:)  = 0.0  ! time accumulated frazil (J/m^2) passed to ice model
   Ocean_sfc%melt_potential(:,:)  = 0.0  ! time accumulated melt potential (J/m^2) passed to ice model
   Ocean_sfc%OBLD(:,:)    = 0.0  ! ocean boundary layer depth (m)
@@ -1000,7 +1000,7 @@ subroutine convert_shelf_state_to_ocean_type(Ocean_sfc, G, CS, US, calve_ice_she
       Ocean_sfc%calving_hflx(isc_bnd:iec_bnd,jsc_bnd:jec_bnd))
   elseif (trim(calve_ice_shelf_bergs) == 'BONDED' .or. trim(calve_ice_shelf_bergs) == 'MIXED') then
     call ice_sheet_bonded_calving_to_ocean_sfc(CS,US,Ocean_sfc%tabular_calve_mask(isc_bnd:iec_bnd,jsc_bnd:jec_bnd),&
-      Ocean_sfc%mass_shelf(isc_bnd:iec_bnd,jsc_bnd:jec_bnd),Ocean_sfc%area_shelf_h(isc_bnd:iec_bnd,jsc_bnd:jec_bnd))
+      Ocean_sfc%mass_shelf(isc_bnd:iec_bnd,jsc_bnd:jec_bnd),Ocean_sfc%frac_shelf(isc_bnd:iec_bnd,jsc_bnd:jec_bnd))
   endif
 
 end subroutine convert_shelf_state_to_ocean_type

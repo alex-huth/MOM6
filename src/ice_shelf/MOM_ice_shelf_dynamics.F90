@@ -1405,7 +1405,7 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
   elseif ( trim(calve_ice_shelf_bergs)=='POINT' .or. &
           (trim(calve_ice_shelf_bergs) == 'MIXED' .and. minval(G%geoLatCv(:,:))>0) ) then
     !advect the front to create partially-filled cells
-    call shelf_advance_front(CS, ISS, G, ISS%hmask, uh_ice, vh_ice, calving=calve_ice_shelf_bergs)
+    call shelf_advance_front(CS, ISS, G, ISS%hmask, uh_ice, vh_ice, calving=.true.)
     !add mass of the partially-filled cells to calving field, which is used to initialize icebergs
     !Then, remove the partially-filled cells from the ice shelf
     ISS%calving(:,:)=0.0
