@@ -355,9 +355,8 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
                  "If this is true, FIRST_DIRECTION applies at the start of a new run or if "//&
                  "the next first direction can not be found in the restart file.", default=.false.)
     call get_param(param_file, mdl, "CALC_FLUX_INOUT", CS%calc_flux_inout, &
-                 "If true, during every advection call, calculate the total flux in/out of the domain. "//&
-                 "This may be required for some configurations to calculate flux within a hole "//&
-                 "in the domain (e.g. at S. Pole)", default=.false.)
+                 "If true, during every advection call, calculate and output the total flux in/out " //&
+                 "of the domain (e.g. at S. Pole)", default=.false.)
 
     allocate(CS%u_shelf(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%v_shelf(IsdB:IedB,JsdB:JedB), source=0.0)
@@ -1331,7 +1330,6 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
   type(time_type),        intent(in)    :: Time !< The current model time
   logical,                intent(in)    :: calve_ice_shelf_bergs !< If true, track ice shelf flux through a
                                                !! static ice shelf, so that it can be converted into icebergs
-  real :: calc_flux_inout !< Total accumulated flux in/out of the domain edges (outward is positive) [Z L2 ~> m3]
 
 ! 3/8/11 DNG
 !
@@ -2371,6 +2369,7 @@ subroutine calculate_flux_inout(CS, ISS, G, uh_ice, vh_ice)
   integer :: Iscq, Iecq, Jscq, Jecq
   integer :: Is_sum, Js_sum, Ie_sum, Je_sum ! Loop bounds for global sums or arrays starting at 1.
   integer :: Iscq_sv, Jscq_sv ! Starting loop bound for sum_vec
+  character(len=160) :: mesg  ! The text of an error message
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   Isdq = G%IsdB ; Iedq = G%IedB ; Jsdq = G%JsdB ; Jedq = G%JedB
@@ -2445,6 +2444,9 @@ subroutine calculate_flux_inout(CS, ISS, G, uh_ice, vh_ice)
   !Total accumulated flux in/out of the domain edges (outward is positive)
   ISS%tot_flux_inout = reproducing_sum(u_flux, Is_sum, Ie_sum, Js_sum, Je_sum) + &
                        reproducing_sum(v_flux, Is_sum, Ie_sum, Js_sum, Je_sum)
+
+  write(mesg,*) 'Flux in/out of domain', ISS%tot_flux_inout * CS%density_ice * G%US%RZL2_to_kg
+  call MOM_mesg("MOM6-IS: "//trim(mesg))
 end subroutine calculate_flux_inout
 
 !> Apply a very simple calving law using a minimum thickness rule

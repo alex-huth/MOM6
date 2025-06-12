@@ -57,6 +57,7 @@ type, public :: ice_shelf_state
                          !! minus surface mass flux * dt on the ice-sheet, integrated over ocean
                          !! grid area plus any flux in/out of the ice-sheet domain due to horizontal ice sheet
                          !! advection [R Z L2 ~> kg]
+  real :: calving_stock  !< The area-integrated calving mass flux * dt [R Z L2 ~> kg]
   real :: tot_flux_inout !< Total accumulated flux in/out of the domain edges (outward is positive) [Z L2 ~> m3]
 end type ice_shelf_state
 
