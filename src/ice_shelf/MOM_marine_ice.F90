@@ -32,7 +32,10 @@ type, public :: marine_ice_CS ; private
                               !! good value to use.) Not applied for negative values.
   real :: latent_heat_fusion  !< Latent heat of fusion [Q ~> J kg-1]
   real :: density_iceberg     !< A typical density of icebergs [R ~> kg m-3] (for ice rigidity)
+  real :: g_Earth             !< The gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
 
+  type(unit_scale_type), pointer :: &
+    US => NULL()       !< A structure containing various unit conversion factors
   type(time_type), pointer :: Time !< A pointer to the ocean model's clock.
   type(diag_ctrl), pointer :: diag !< A structure that is used to regulate the timing of diagnostic output.
 end type marine_ice_CS
@@ -52,6 +55,7 @@ subroutine iceberg_forces(G, forces, use_ice_shelf, sfc_state, time_step, CS)
   type(marine_ice_CS),   pointer       :: CS      !< Pointer to the control structure for MOM_marine_ice
 
   real :: kv_rho_ice ! The viscosity of ice divided by its density [L4 Z-2 T-1 R-1 ~> m5 kg-1 s-1].
+  ! real :: press_ice       !< The pressure of the ice shelf per unit area of ocean (not ice) [R L2 T-2 ~> Pa].
   integer :: i, j, is, ie, js, je
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
   !This routine adds iceberg data to the ice shelf data (if ice shelf is used)
@@ -94,6 +98,18 @@ subroutine iceberg_forces(G, forces, use_ice_shelf, sfc_state, time_step, CS)
                          min(forces%mass_berg(i,j), forces%mass_berg(i,j+1))
   enddo ; enddo
 
+  ! do j=js,je ; do i=is,ie
+  !   press_ice = forces%area_berg(i,j) * (CS%g_Earth * forces%mass_berg(i,j))
+  !   if (associated(forces%p_surf)) then
+  !     !if (.not.forces%accumulate_p_surf) forces%p_surf(i,j) = 0.0
+  !     forces%p_surf(i,j) = forces%p_surf(i,j) + press_ice
+  !   endif
+  !   if (associated(forces%p_surf_full)) then
+  !     !if (.not.forces%accumulate_p_surf) forces%p_surf_full(i,j) = 0.0
+  !     forces%p_surf_full(i,j) = forces%p_surf_full(i,j) + press_ice
+  !   endif
+  ! enddo ; enddo
+
 end subroutine iceberg_forces
 
 !> iceberg_fluxes adds ice-area-coverage and modifies various
@@ -132,7 +148,7 @@ subroutine iceberg_fluxes(G, US, fluxes, use_ice_shelf, sfc_state, time_step, CS
     fluxes%ustar_shelf(:,:) = 0.
   endif
   do j=jsd,jed ; do i=isd,ied ; if (G%areaT(i,j) > 0.0) then
-    fluxes%frac_shelf_h(i,j) = fluxes%frac_shelf_h(i,j) + fluxes%area_berg(i,j)
+    fluxes%frac_shelf_h(i,j) = min(1.0,fluxes%frac_shelf_h(i,j) + fluxes%area_berg(i,j))
     fluxes%ustar_shelf(i,j)  = fluxes%ustar_shelf(i,j)  + fluxes%ustar_berg(i,j)
   endif ; enddo ; enddo
 
@@ -200,6 +216,9 @@ subroutine marine_ice_init(Time, G, param_file, diag, CS)
                  "Fraction of grid cell which iceberg must occupy, so that fluxes "//&
                  "below berg are set to zero. Not applied for negative values.", &
                  units="nondim", default=-1.0)
+  call get_param(param_file, mdl, "G_EARTH", CS%g_Earth, &
+                 "The gravitational acceleration of the Earth.", &
+                 units="m s-2", default=9.80, scale=G%US%m_s_to_L_T**2*G%US%Z_to_m)
 
 end subroutine marine_ice_init
 

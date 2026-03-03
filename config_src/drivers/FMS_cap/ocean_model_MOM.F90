@@ -15,7 +15,7 @@ use MOM, only : initialize_MOM, step_MOM, MOM_control_struct, MOM_end
 use MOM, only : extract_surface_state, allocate_surface_state, finish_MOM_initialization
 use MOM, only : get_MOM_state_elements, MOM_state_is_synchronized
 use MOM, only : get_ocean_stocks, step_offline
-use MOM, only : save_MOM_restart
+use MOM, only : save_MOM_restart, ice_shelf_query_MOM
 use MOM_coms,      only : field_chksum
 use MOM_constants, only : CELSIUS_KELVIN_OFFSET, hlf
 use MOM_coupler_types, only : coupler_1d_bc_type, coupler_2d_bc_type
@@ -591,6 +591,10 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
     endif
   endif
 
+  if (OS%use_ice_shelf .and. OS%icebergs_alter_ocean) then
+    call ice_shelf_query_MOM(OS%Ice_shelf_CSp, OS%MOM_CSp, OS%forces)
+  endif
+
   ! The net mass forcing is not currently used in the MOM6 dynamics solvers, so this is may be unnecessary.
   if (do_dyn .and. associated(OS%forces%net_mass_src) .and. .not.OS%forces%net_mass_src_set) &
     call get_net_mass_forcing(OS%fluxes, OS%grid, OS%US, OS%forces%net_mass_src)
@@ -936,7 +940,7 @@ subroutine convert_state_to_ocean_type(sfc_state, Ocean_sfc, G, US, patm, press_
     if (present(frac_shelf_h)) then
       do j=jsc_bnd,jec_bnd ; do i=isc_bnd,iec_bnd
         Ocean_sfc%frazil(i,j) = US%Q_to_J_kg*US%RZ_to_kg_m2 * &
-                                sfc_state%frazil(i+i0,j+j0) * (1.0-frac_shelf_h(i+i0,j+j0))
+                                sfc_state%frazil(i+i0,j+j0) * (1.0-min(1.0,frac_shelf_h(i+i0,j+j0)))
       enddo ; enddo
     else
       do j=jsc_bnd,jec_bnd ; do i=isc_bnd,iec_bnd

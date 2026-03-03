@@ -477,7 +477,7 @@ public step_MOM, step_offline
 public extract_surface_state, get_ocean_stocks
 public get_MOM_state_elements, MOM_state_is_synchronized
 public allocate_surface_state, deallocate_surface_state
-public save_MOM_restart
+public save_MOM_restart, ice_shelf_query_MOM
 
 !>@{ CPU time clock IDs
 integer :: id_clock_ocean
@@ -2185,6 +2185,15 @@ subroutine step_offline(forces, fluxes, sfc_state, Time_start, time_interval, CS
   call cpu_clock_end(id_clock_offline_tracer)
 
 end subroutine step_offline
+
+subroutine ice_shelf_query_MOM(ice_shelf_CSp, CS, forces)
+  type(ice_shelf_CS), pointer :: ice_shelf_CSp !< A pointer to an ice shelf control structure
+  type(MOM_control_struct),  intent(inout), target :: CS  !< pointer set in this routine to MOM control structure
+  type(mech_forcing),    intent(inout) :: forces  !< A structure with the driving mechanical forces
+
+  call ice_shelf_query(ice_shelf_CSp,CS%G,CS%frac_shelf_h, CS%mass_shelf, forces=forces)
+
+end subroutine ice_shelf_query_MOM
 
 !> Initialize MOM, including memory allocation, setting up parameters and diagnostics,
 !! initializing the ocean state variables, and initializing subsidiary modules

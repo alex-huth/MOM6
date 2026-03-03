@@ -1502,12 +1502,13 @@ subroutine add_shelf_flux(G, US, CS, sfc_state, fluxes, time_step)
     endif
   endif
 
-  if (CS%active_shelf_dynamics .or. CS%override_shelf_movement) then
-    do j=jsd,jed ; do i=isd,ied
-      if (G%areaT(i,j) > 0.0) &
-        fluxes%frac_shelf_h(i,j) = min(1.0, ISS%area_shelf_h(i,j) * G%IareaT(i,j))
-    enddo ; enddo
-  endif
+  ! if (CS%active_shelf_dynamics .or. CS%override_shelf_movement) then
+  fluxes%frac_shelf_h(:,:)=0.0
+  do j=jsd,jed ; do i=isd,ied
+    if (G%areaT(i,j) > 0.0) &
+      fluxes%frac_shelf_h(i,j) = min(1.0, ISS%area_shelf_h(i,j) * G%IareaT(i,j))
+  enddo; enddo
+  ! endif
 
   if (CS%debug) then
     call MOM_forcing_chksum("Before adding shelf fluxes", fluxes, G, CS%US, haloshift=0)
@@ -2866,13 +2867,14 @@ function get_ice_shelf_mass_stock(CS, G, US, on_PE_only)
 end function get_ice_shelf_mass_stock
 
 !> Save the ice shelf restart file
-subroutine ice_shelf_query(CS, G, frac_shelf_h, mass_shelf, data_override_shelf_fluxes)
+subroutine ice_shelf_query(CS, G, frac_shelf_h, mass_shelf, data_override_shelf_fluxes, forces)
   type(ice_shelf_CS),         pointer    :: CS !< ice shelf control structure
   type(ocean_grid_type), intent(in)      :: G  !< A pointer to an ocean grid control structure.
   real, optional, dimension(SZI_(G),SZJ_(G)), intent(out)  :: frac_shelf_h !< Ice shelf area fraction [nondim].
   real, optional, dimension(SZI_(G),SZJ_(G)), intent(out)  :: mass_shelf !< Ice shelf mass [R Z ~> kg m-2]
   logical, optional                      :: data_override_shelf_fluxes !< If true, shelf fluxes can be written using
                                                !! the data_override capability (only for MOSAIC grids)
+  type(mech_forcing), optional, intent(inout) :: forces  !< A structure with the driving mechanical forces
 
   integer :: i, j
 
@@ -2893,6 +2895,20 @@ subroutine ice_shelf_query(CS, G, frac_shelf_h, mass_shelf, data_override_shelf_
   if (present(data_override_shelf_fluxes)) then
     data_override_shelf_fluxes=.false.
     if (CS%active_shelf_dynamics) data_override_shelf_fluxes = CS%data_override_shelf_fluxes
+  endif
+
+  if (present(forces)) then
+    if (present(frac_shelf_h)) then
+      do j=G%jsd,G%jed ; do i=G%isd,G%ied
+        frac_shelf_h(i,j) = min(frac_shelf_h(i,j) + forces%area_berg(i,j),1.0)
+      enddo; enddo
+    endif
+
+    if (present(mass_shelf)) then
+      do j=G%jsd,G%jed ; do i=G%isd,G%ied
+        mass_shelf(i,j) = mass_shelf(i,j) + forces%mass_berg(i,j)
+      enddo; enddo
+    endif
   endif
 
 end subroutine ice_shelf_query
