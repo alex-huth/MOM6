@@ -3060,7 +3060,8 @@ subroutine process_tabular_calving(G, CS, ISS, TC, Time)
           TC%tabular_calve_mask(i,j)=0
         else
           !Full-cell calving (TODO: sub-cell calving)
-          TC%tabular_calve_mask(i,j) = max((1-sqrt((G%geolonT(i,j)-Calve_lon)**2 + (G%geolatT(i,j)-Calve_lat)**2)/R_calve2),0.0)
+          TC%tabular_calve_mask(i,j) = &
+            max((1-sqrt((G%geolonT(i,j)-Calve_lon)**2 + (G%geolatT(i,j)-Calve_lat)**2)/R_calve2),0.0)
           if (TC%tabular_calve_mask(i,j)>0) TC%tabular_calve_mask(i,j) = 1
 
           !lazy way to test sub-cell calving: Scale the cell's calving mask according to the percentage of the

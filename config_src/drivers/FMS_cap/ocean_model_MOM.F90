@@ -545,7 +545,8 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
     call convert_IOB_to_forces(Ice_ocean_boundary, OS%forces, index_bnds, OS%Time_dyn, OS%grid, OS%US, &
                                OS%forcing_CSp, dt_forcing=dt_coupling, reset_avg=OS%fluxes%fluxes_used)
     if (OS%use_ice_shelf) then
-      if (associated(OS%forces%frac_cberg_calved)) call adjust_shelf_for_tabular_calving(OS%Ice_shelf_CSp, OS%forces%frac_cberg_calved)
+      if (associated(OS%forces%frac_cberg_calved)) &
+        call adjust_shelf_for_tabular_calving(OS%Ice_shelf_CSp, OS%forces%frac_cberg_calved)
       call add_shelf_forces(OS%grid, OS%US, OS%Ice_shelf_CSp, OS%forces)
     endif
     if (OS%icebergs_alter_ocean) &
@@ -560,7 +561,8 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
 
       ! Add ice shelf fluxes
       if (OS%use_ice_shelf) then
-        if (associated(OS%fluxes%frac_cberg_calved)) call adjust_shelf_for_tabular_calving(OS%Ice_shelf_CSp, OS%fluxes%frac_cberg_calved)
+        if (associated(OS%fluxes%frac_cberg_calved)) &
+          call adjust_shelf_for_tabular_calving(OS%Ice_shelf_CSp, OS%fluxes%frac_cberg_calved)
         call shelf_calc_flux(OS%sfc_state, OS%fluxes, OS%Time, dt_coupling, OS%Ice_shelf_CSp)
       endif
       if (OS%icebergs_alter_ocean) &

@@ -219,8 +219,8 @@ end subroutine tabular_calving_end
 !!$  ! !from ice shelves. Perhaps need to ensure that the total pressure on the ocean does not exceed that
 !!$  ! !of a combination
 !!$  ! !of the iceberg(s) and ice shelf mass should it fully-cover the cell (with adjustments for mass-weighting and the
-!!$  ! !percentage of the total unadjusted mass that the pressure of each component exerts on the cell...). Mass will not
-!!$  ! !be conserved at that instant, but ultimately is over time.
+!!$  ! !percentage of the total unadjusted mass that the pressure of each component exerts on the cell...).
+!!$  ! ! Mass will not be conserved at that instant, but ultimately is over time.
 !!$
 !!$  ! !1) Generate a unique label (TC%c_id) for each berg on the computational domain of a PE
 !!$  ! call initialize_tabular_calving_labels_1PE(G, TC%tabular_calve_mask, TC%c_id)
