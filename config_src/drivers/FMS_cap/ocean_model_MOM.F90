@@ -402,6 +402,8 @@ contains
     call marine_ice_init(OS%Time, OS%grid, param_file, OS%diag, OS%marine_ice_CSp)
     if (.not. OS%use_ice_shelf) &
       call allocate_forcing_type(OS%grid, OS%fluxes, shelf=.true.)
+    call iceberg_forces(OS%grid, OS%forces, OS%use_ice_shelf, &
+                        OS%sfc_state, OS%marine_ice_CSp, fluxes=OS%fluxes)
   endif
 
   call get_param(param_file, mdl, "USE_WAVES", OS%Use_Waves, &
@@ -548,7 +550,7 @@ subroutine update_ocean_model(Ice_ocean_boundary, OS, Ocean_sfc, time_start_upda
     endif
     if (OS%icebergs_alter_ocean) &
       call iceberg_forces(OS%grid, OS%forces, OS%use_ice_shelf, &
-                          OS%sfc_state, dt_coupling, OS%marine_ice_CSp)
+                          OS%sfc_state, OS%marine_ice_CSp)
   endif
 
   if (do_thermo) then

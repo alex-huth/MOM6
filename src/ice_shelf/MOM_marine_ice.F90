@@ -45,17 +45,18 @@ contains
 !> add_berg_flux_to_shelf adds rigidity and ice-area coverage due to icebergs
 !! to the forces type fields, and adds ice-areal coverage and modifies various
 !! thermodynamic fluxes due to the presence of icebergs.
-subroutine iceberg_forces(G, forces, use_ice_shelf, sfc_state, time_step, CS)
+subroutine iceberg_forces(G, forces, use_ice_shelf, sfc_state, CS, fluxes)
   type(ocean_grid_type), intent(inout) :: G       !< The ocean's grid structure
   type(mech_forcing),    intent(inout) :: forces  !< A structure with the driving mechanical forces
+  type(forcing), optional, intent(inout) :: fluxes  !< A structure with pointers to themodynamic,
+                                                  !! tracer and mass exchange forcing fields
   type(surface),         intent(inout) :: sfc_state !< A structure containing fields that
                                                     !! describe the surface state of the ocean.
   logical,               intent(in)    :: use_ice_shelf  !< If true, this configuration uses ice shelves.
-  real,                  intent(in)    :: time_step  !< The coupling time step [T ~> s].
   type(marine_ice_CS),   pointer       :: CS      !< Pointer to the control structure for MOM_marine_ice
 
   real :: kv_rho_ice ! The viscosity of ice divided by its density [L4 Z-2 T-1 R-1 ~> m5 kg-1 s-1].
-  ! real :: press_ice       !< The pressure of the ice shelf per unit area of ocean (not ice) [R L2 T-2 ~> Pa].
+  real :: press_ice  !< The pressure of the icebergs per unit area of ocean (not ice) [R L2 T-2 ~> Pa].
   integer :: i, j, is, ie, js, je
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
   !This routine adds iceberg data to the ice shelf data (if ice shelf is used)
@@ -98,18 +99,35 @@ subroutine iceberg_forces(G, forces, use_ice_shelf, sfc_state, time_step, CS)
                          min(forces%mass_berg(i,j), forces%mass_berg(i,j+1))
   enddo ; enddo
 
-  ! do j=js,je ; do i=is,ie
-  !   press_ice = forces%area_berg(i,j) * (CS%g_Earth * forces%mass_berg(i,j))
-  !   if (associated(forces%p_surf)) then
-  !     !if (.not.forces%accumulate_p_surf) forces%p_surf(i,j) = 0.0
-  !     forces%p_surf(i,j) = forces%p_surf(i,j) + press_ice
-  !   endif
-  !   if (associated(forces%p_surf_full)) then
-  !     !if (.not.forces%accumulate_p_surf) forces%p_surf_full(i,j) = 0.0
-  !     forces%p_surf_full(i,j) = forces%p_surf_full(i,j) + press_ice
-  !   endif
-  ! enddo ; enddo
+  do j=js,je ; do i=is,ie
+    ! press_ice = forces%area_berg(i,j) * (CS%g_Earth * forces%mass_berg(i,j))
+    press_ice = CS%g_Earth * forces%mass_berg(i,j)
+    if (associated(forces%p_surf)) then
+      !if (.not.forces%accumulate_p_surf) forces%p_surf(i,j) = 0.0
+      forces%p_surf(i,j) = forces%p_surf(i,j) + press_ice
+    endif
+    if (associated(forces%p_surf_full)) then
+      !if (.not.forces%accumulate_p_surf) forces%p_surf_full(i,j) = 0.0
+      forces%p_surf_full(i,j) = forces%p_surf_full(i,j) + press_ice
+    endif
+  enddo ; enddo
 
+  !Only call this from initialization
+  if (present(fluxes)) then
+    if (.not. associated(forces%mass_berg) ) return
+    do j=js,je ; do i=is,ie
+      ! press_ice = fluxes%area_berg(i,j) * (CS%g_Earth * fluxes%mass_berg(i,j))
+      press_ice = CS%g_Earth * fluxes%mass_berg(i,j)
+      if (associated(fluxes%p_surf)) then
+        !if (.not.fluxes%accumulate_p_surf) fluxes%p_surf(i,j) = 0.0
+        fluxes%p_surf(i,j) = fluxes%p_surf(i,j) + press_ice
+      endif
+      if (associated(fluxes%p_surf_full)) then
+        !if (.not.forces%accumulate_p_surf) fluxes%p_surf_full(i,j) = 0.0
+        fluxes%p_surf_full(i,j) = fluxes%p_surf_full(i,j) + press_ice
+      endif
+    enddo; enddo
+  endif
 end subroutine iceberg_forces
 
 !> iceberg_fluxes adds ice-area-coverage and modifies various
@@ -126,6 +144,7 @@ subroutine iceberg_fluxes(G, US, fluxes, use_ice_shelf, sfc_state, time_step, CS
   type(marine_ice_CS),   pointer       :: CS      !< Pointer to the control structure for MOM_marine_ice
 
   real :: fraz      ! refreezing rate [R Z T-1 ~> kg m-2 s-1]
+  real :: press_ice !< The pressure of the icebergs per unit area of ocean (not ice) [R L2 T-2 ~> Pa].
   real :: I_dt_LHF  ! The inverse of the timestep times the latent heat of fusion [Q-1 T-1 ~> kg J-1 s-1].
   integer :: i, j, is, ie, js, je, isd, ied, jsd, jed
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
@@ -151,6 +170,19 @@ subroutine iceberg_fluxes(G, US, fluxes, use_ice_shelf, sfc_state, time_step, CS
     fluxes%frac_shelf_h(i,j) = min(1.0,fluxes%frac_shelf_h(i,j) + fluxes%area_berg(i,j))
     fluxes%ustar_shelf(i,j)  = fluxes%ustar_shelf(i,j)  + fluxes%ustar_berg(i,j)
   endif ; enddo ; enddo
+
+  do j=js,je ; do i=is,ie
+    ! press_ice = fluxes%area_berg(i,j) * (CS%g_Earth * fluxes%mass_berg(i,j))
+    press_ice = CS%g_Earth * fluxes%mass_berg(i,j)
+    if (associated(fluxes%p_surf)) then
+      !if (.not.fluxes%accumulate_p_surf) fluxes%p_surf(i,j) = 0.0
+      fluxes%p_surf(i,j) = fluxes%p_surf(i,j) + press_ice
+    endif
+    if (associated(fluxes%p_surf_full)) then
+      !if (.not.fluxes%accumulate_p_surf) fluxes%p_surf_full(i,j) = 0.0
+      fluxes%p_surf_full(i,j) = fluxes%p_surf_full(i,j) + press_ice
+    endif
+  enddo ; enddo
 
   !Zero'ing out other fluxes under the tabular icebergs
   if (CS%berg_area_threshold >= 0.) then
