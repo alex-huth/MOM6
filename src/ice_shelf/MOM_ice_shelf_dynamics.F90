@@ -2094,25 +2094,26 @@ subroutine ice_shelf_solve_inner_bicgstab(CS, ISS, G, US, u_shlf, v_shlf, taudx,
   real, dimension(SZDIB_(G),SZDJB_(G)) :: &
       r_u, r_v,           &  ! Residual r [R L3 Z T-2 ~> kg m s-2]
       r_star_u, r_star_v, &  ! Shadow residual r* (fixed) [R L3 Z T-2 ~> kg m s-2]
-      p_u, p_v,           &  ! Direction p_k [R L3 Z T-2 ~> kg m s-2]
-      v_u, v_v,           &  ! A*M^{-1}*p (stored between iterations) [R L3 Z T-2 ~> kg m s-2]
+      p_u, p_v,           &  ! Search direction [L T-1 ~> m s-1] (preconditioned)
+      v_u, v_v,           &  ! A*p stored between iterations [R L3 Z T-2 ~> kg m s-2]
       s_u, s_v,           &  ! Half-step residual s [R L3 Z T-2 ~> kg m s-2]
-      ph_u, ph_v,         &  ! Working array: M^{-1}*p or M^{-1}*s [L T-1 ~> m s-1]
+      ph_u, ph_v,         &  ! Working: M^{-1}*s [L T-1 ~> m s-1]
       Au, Av,             &  ! CG_action output [R L3 Z T-2 ~> kg m s-2]
       DIAGu, DIAGv,       &  ! Jacobi preconditioner diagonal [R L2 Z T-1 ~> kg s-1]
       RHSu, RHSv,         &  ! Right-hand side (driving stress) [R L3 Z T-2 ~> kg m s-2]
-      sum_vec                ! Staging array for global squared-norm sums [m2 kg2 s-4]
+      sum_vec                ! Staging array for global sum [various]
   real, dimension(SZDIB_(G),SZDJB_(G),3) :: sum_vec_3d ! Global sum staging, 3 components
 
-  real    :: rho_prev    ! Previous rho = r* . r [m2 kg2 s-4]
-  real    :: rho_cur     ! Current  rho = r* . r [m2 kg2 s-4]
-  real    :: alpha_k     ! Step size for ph direction [nondim]
+  real    :: rho_prev    ! Previous rho = r* . z [various]
+  real    :: rho_cur     ! Current  rho = r* . z [various]
+  real    :: alpha_k     ! Step size for p direction [nondim]
   real    :: omega_k     ! Step size for sh direction [nondim]
   real    :: beta_k      ! Mixing coefficient for p update [nondim]
   real    :: resid0tol2  ! Convergence tolerance times initial residual squared [m2 kg2 s-4]
   real    :: sv3dsum     ! Unused scalar return from reproducing_sum [various]
   real    :: sv3dsums(3) ! Index-wise global sums of sum_vec_3d
-  real    :: resid2_scale ! Redimensionalisation scale for squared residuals [m2 kg2 s-4]
+  real    :: resid_scale  ! Scale factor for velocity*force products
+  real    :: resid2_scale ! Scale factor for force^2 products [m2 kg2 s-4]
   real    :: rhoi_rhow   ! Density of ice divided by a typical water density [nondim]
   integer :: cg_halo, max_cg_halo
   integer :: is, ie, js, je, isc, iec, jsc, jec, iter, i, j
@@ -2152,6 +2153,7 @@ subroutine ice_shelf_solve_inner_bicgstab(CS, ISS, G, US, u_shlf, v_shlf, taudx,
   ph_u(:,:) = 0 ; ph_v(:,:) = 0
   sum_vec(:,:) = 0
 
+  resid_scale  = US%s_to_T*(US%RZL2_to_kg*US%L_T_to_m_s**2)
   resid2_scale = ((US%RZ_to_kg_m2*US%L_to_m)*US%L_T_to_m_s**2)**2
 
   ! ---------- Set up RHS, diagonal, and initial residual r0 = b - A*x0 ----------
@@ -2178,17 +2180,29 @@ subroutine ice_shelf_solve_inner_bicgstab(CS, ISS, G, US, u_shlf, v_shlf, taudx,
   enddo ; enddo
   resid0tol2 = CS%cg_tol_newton**2 * reproducing_sum(sum_vec, Is_sum, Ie_sum, Js_sum, Je_sum)
 
-  ! Initialise BiCGStab scalars and shadow residual
-  ! r* = r0; p = 0 (already zero); v = 0 (already zero)
-  ! rho_{-1} = 1 (set rho_prev = 1 so first beta computation uses rho_cur/1)
-  ! alpha = 1, omega_0 = 1
+  ! Initialise left-preconditioned BiCGStab.
+  !
+  ! Standard BiCGStab solves A x = b. Left-preconditioned BiCGStab solves
+  !   M^{-1} A x = M^{-1} b,  with shadow residual r* chosen = r0.
+  ! We store the unpreconditioned residual r (force units) and the
+  ! preconditioned search direction p = M^{-1} p_unprec (velocity units).
+  ! This keeps all dot products as velocity*force, matching CG's resid_scale.
+  !
+  ! r* = r0 (fixed shadow residual, force units)
+  ! p = 0 (velocity units, already zero)
+  ! v = 0 (force units, already zero)
+  ! rho_prev = 1, alpha = 1, omega_0 = 1
+
   r_star_u(:,:) = r_u(:,:) ; r_star_v(:,:) = r_v(:,:)
   rho_prev = 1.0 ; alpha_k = 1.0 ; omega_k = 1.0
-  ! rho_cur = r* . r0 = ||r0||^2 (r* == r0 initially)
+
+  ! rho_cur = r* . M^{-1} r0 (velocity * force with resid_scale)
   sum_vec(:,:) = 0.0
   do J=Jscq_sv,Jecq ; do I=Iscq_sv,Iecq
-    if (CS%umask(I,J) == 1) sum_vec(I,J) = resid2_scale * r_star_u(I,J) * r_u(I,J)
-    if (CS%vmask(I,J) == 1) sum_vec(I,J) = sum_vec(I,J) + resid2_scale * r_star_v(I,J) * r_v(I,J)
+    if (CS%umask(I,J) == 1 .and. DIAGu(I,J) /= 0) &
+      sum_vec(I,J) = resid_scale * r_star_u(I,J) * (r_u(I,J) / DIAGu(I,J))
+    if (CS%vmask(I,J) == 1 .and. DIAGv(I,J) /= 0) &
+      sum_vec(I,J) = sum_vec(I,J) + resid_scale * r_star_v(I,J) * (r_v(I,J) / DIAGv(I,J))
   enddo ; enddo
   rho_cur = reproducing_sum(sum_vec, Is_sum, Ie_sum, Js_sum, Je_sum)
 
@@ -2206,6 +2220,25 @@ subroutine ice_shelf_solve_inner_bicgstab(CS, ISS, G, US, u_shlf, v_shlf, taudx,
   !!                      !!
   !!!!!!!!!!!!!!!!!!!!!!!!!!
 
+  ! Left-preconditioned BiCGStab (van der Vorst 1992).
+  !
+  ! Variables stored between iterations:
+  !   r (force), r* (force, fixed), p (velocity), v (force)
+  !   rho_cur, alpha_k, omega_k
+  !
+  ! Each iteration:
+  !   beta   = (rho_k / rho_{k-1}) * (alpha / omega)
+  !   p      = M^{-1}*r + beta*(p - omega*M^{-1}*v)         [velocity]
+  !   v      = A*p                                            [force]
+  !   alpha  = rho_k / (r* . p)     [velocity*force / (force*velocity)]
+  !   s      = r - alpha*v                                    [force]
+  !   sh     = M^{-1}*s                                       [velocity]
+  !   t      = A*sh                                           [force]
+  !   omega  = (t . s) / (t . t)                              [nondim]
+  !   x     += alpha*p + omega*sh                             [velocity]
+  !   r      = s - omega*t                                    [force]
+  !   rho_{k+1} = r* . M^{-1}*r
+
   do iter = 1, CS%cg_max_iterations
 
     is = isc - cg_halo ; ie = Iecq + cg_halo
@@ -2214,24 +2247,24 @@ subroutine ice_shelf_solve_inner_bicgstab(CS, ISS, G, US, u_shlf, v_shlf, taudx,
     ! beta = (rho_cur/rho_prev) * (alpha/omega)
     beta_k = (rho_cur / rho_prev) * (alpha_k / omega_k)
 
-    ! p = r + beta*(p - omega*v)
+    ! p = M^{-1}*r + beta*(p - omega*M^{-1}*v)
+    ! p is in velocity units; M^{-1}*r and M^{-1}*v are computed inline
     do J=js,je-1 ; do I=is,ie-1
-      if (CS%umask(I,J) == 1) &
-        p_u(I,J) = r_u(I,J) + beta_k * (p_u(I,J) - omega_k * v_u(I,J))
-      if (CS%vmask(I,J) == 1) &
-        p_v(I,J) = r_v(I,J) + beta_k * (p_v(I,J) - omega_k * v_v(I,J))
+      if (CS%umask(I,J) == 1) then
+        if (DIAGu(I,J) /= 0) then
+          p_u(I,J) = r_u(I,J) / DIAGu(I,J) + beta_k * (p_u(I,J) - omega_k * v_u(I,J) / DIAGu(I,J))
+        endif
+      endif
+      if (CS%vmask(I,J) == 1) then
+        if (DIAGv(I,J) /= 0) then
+          p_v(I,J) = r_v(I,J) / DIAGv(I,J) + beta_k * (p_v(I,J) - omega_k * v_v(I,J) / DIAGv(I,J))
+        endif
+      endif
     enddo ; enddo
 
-    ! ph = M^{-1} * p  (Jacobi preconditioner: element-wise divide by diagonal)
-    do J=js,je ; do I=is,ie
-      ph_u(I,J) = 0.0 ; ph_v(I,J) = 0.0
-      if (CS%umask(I,J) == 1 .and. DIAGu(I,J) /= 0) ph_u(I,J) = p_u(I,J) / DIAGu(I,J)
-      if (CS%vmask(I,J) == 1 .and. DIAGv(I,J) /= 0) ph_v(I,J) = p_v(I,J) / DIAGv(I,J)
-    enddo ; enddo
-
-    ! v = A * ph
+    ! v = A * p   (p is in velocity units, v = A*p in force units)
     Au(:,:) = 0 ; Av(:,:) = 0
-    call CG_action(CS, Au, Av, ph_u, ph_v, Phi, Phisub, CS%umask, CS%vmask, hmask, &
+    call CG_action(CS, Au, Av, p_u, p_v, Phi, Phisub, CS%umask, CS%vmask, hmask, &
                    H_node, CS%ice_visc, float_cond, CS%bed_elev, CS%basal_traction, &
                    G, US, is, ie, js, je, rhoi_rhow)
     call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
@@ -2241,21 +2274,21 @@ subroutine ice_shelf_solve_inner_bicgstab(CS, ISS, G, US, u_shlf, v_shlf, taudx,
       if (CS%vmask(I,J) == 1) v_v(I,J) = Av(I,J)
     enddo ; enddo
 
-    ! alpha = rho_cur / (r* . v)
+    ! alpha = rho_cur / (r* . p)   [resid_scale * force * velocity]
     sum_vec(:,:) = 0.0
     do J=Jscq_sv,Jecq ; do I=Iscq_sv,Iecq
-      if (CS%umask(I,J) == 1) sum_vec(I,J) = resid2_scale * r_star_u(I,J) * v_u(I,J)
-      if (CS%vmask(I,J) == 1) sum_vec(I,J) = sum_vec(I,J) + resid2_scale * r_star_v(I,J) * v_v(I,J)
+      if (CS%umask(I,J) == 1) sum_vec(I,J) = resid_scale * r_star_u(I,J) * p_u(I,J)
+      if (CS%vmask(I,J) == 1) sum_vec(I,J) = sum_vec(I,J) + resid_scale * r_star_v(I,J) * p_v(I,J)
     enddo ; enddo
     sv3dsums(1) = reproducing_sum(sum_vec, Is_sum, Ie_sum, Js_sum, Je_sum)
 
-    ! Guard against BiCGStab breakdown: r* . v == 0 (shadow residual orthogonal to v)
+    ! Guard against BiCGStab breakdown: r* . p == 0
     if (sv3dsums(1) == 0.0) then
       iters = iter ; conv_flag = 0 ; exit
     endif
     alpha_k = rho_cur / sv3dsums(1)
 
-    ! s = r - alpha*v
+    ! s = r - alpha*v   (force units)
     do J=js,je-1 ; do I=is,ie-1
       if (CS%umask(I,J) == 1) s_u(I,J) = r_u(I,J) - alpha_k * v_u(I,J)
       if (CS%vmask(I,J) == 1) s_v(I,J) = r_v(I,J) - alpha_k * v_v(I,J)
@@ -2269,32 +2302,30 @@ subroutine ice_shelf_solve_inner_bicgstab(CS, ISS, G, US, u_shlf, v_shlf, taudx,
     enddo ; enddo
     sv3dsums(2) = reproducing_sum(sum_vec, Is_sum, Ie_sum, Js_sum, Je_sum)
     if (sv3dsums(2) <= resid0tol2) then
-      ! Apply half-step update: x += alpha * M^{-1} * p  (x += alpha * p / DIAG)
+      ! x += alpha * p  (p already in velocity units)
       do J=js,je-1 ; do I=is,ie-1
-        if (CS%umask(I,J) == 1 .and. DIAGu(I,J) /= 0) &
-          u_shlf(I,J) = u_shlf(I,J) + alpha_k * p_u(I,J) / DIAGu(I,J)
-        if (CS%vmask(I,J) == 1 .and. DIAGv(I,J) /= 0) &
-          v_shlf(I,J) = v_shlf(I,J) + alpha_k * p_v(I,J) / DIAGv(I,J)
+        if (CS%umask(I,J) == 1) u_shlf(I,J) = u_shlf(I,J) + alpha_k * p_u(I,J)
+        if (CS%vmask(I,J) == 1) v_shlf(I,J) = v_shlf(I,J) + alpha_k * p_v(I,J)
       enddo ; enddo
       iters = iter ; conv_flag = 1 ; exit
     endif
 
-    ! sh = M^{-1} * s
+    ! sh = M^{-1} * s   (velocity units)
     do J=js,je ; do I=is,ie
       ph_u(I,J) = 0.0 ; ph_v(I,J) = 0.0
       if (CS%umask(I,J) == 1 .and. DIAGu(I,J) /= 0) ph_u(I,J) = s_u(I,J) / DIAGu(I,J)
       if (CS%vmask(I,J) == 1 .and. DIAGv(I,J) /= 0) ph_v(I,J) = s_v(I,J) / DIAGv(I,J)
     enddo ; enddo
 
-    ! t = A * sh
+    ! t = A * sh   (force units)
     Au(:,:) = 0 ; Av(:,:) = 0
     call CG_action(CS, Au, Av, ph_u, ph_v, Phi, Phisub, CS%umask, CS%vmask, hmask, &
                    H_node, CS%ice_visc, float_cond, CS%bed_elev, CS%basal_traction, &
                    G, US, is, ie, js, je, rhoi_rhow)
     call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
 
-    ! omega = (t . s) / (t . t); guard against breakdown t . t == 0
-    sum_vec_3d(:,:,:) = 0.0
+    ! omega = (t . s) / (t . t);  use resid2_scale for force*force products
+    sum_vec_3d(:,:,1:2) = 0.0
     do J=Jscq_sv,Jecq ; do I=Iscq_sv,Iecq
       if (CS%umask(I,J) == 1) then
         sum_vec_3d(I,J,1) = resid2_scale * Au(I,J) * s_u(I,J)
@@ -2307,42 +2338,41 @@ subroutine ice_shelf_solve_inner_bicgstab(CS, ISS, G, US, u_shlf, v_shlf, taudx,
     enddo ; enddo
     sv3dsum = reproducing_sum(sum_vec_3d(:,:,1:2), Is_sum, Ie_sum, Js_sum, Je_sum, sums=sv3dsums(1:2))
 
-    ! Guard against omega breakdown: t . t == 0 means t=0, so s is already the solution update
+    ! Guard against omega breakdown
     if (sv3dsums(2) == 0.0) then
+      ! Apply half-step x += alpha * p only
       do J=js,je-1 ; do I=is,ie-1
-        if (CS%umask(I,J) == 1 .and. DIAGu(I,J) /= 0) &
-          u_shlf(I,J) = u_shlf(I,J) + alpha_k * p_u(I,J) / DIAGu(I,J)
-        if (CS%vmask(I,J) == 1 .and. DIAGv(I,J) /= 0) &
-          v_shlf(I,J) = v_shlf(I,J) + alpha_k * p_v(I,J) / DIAGv(I,J)
+        if (CS%umask(I,J) == 1) u_shlf(I,J) = u_shlf(I,J) + alpha_k * p_u(I,J)
+        if (CS%vmask(I,J) == 1) v_shlf(I,J) = v_shlf(I,J) + alpha_k * p_v(I,J)
       enddo ; enddo
       iters = iter ; conv_flag = 0 ; exit
     endif
     omega_k = sv3dsums(1) / sv3dsums(2)
 
-    ! x = x + alpha*M^{-1}*p + omega*M^{-1}*s   (ph_u/v holds M^{-1}*s = sh at this point)
-    ! r = s - omega*t
+    ! x += alpha*p + omega*sh   (all velocity units)
+    ! r  = s - omega*t          (force units)
     do J=js,je-1 ; do I=is,ie-1
       if (CS%umask(I,J) == 1) then
-        if (DIAGu(I,J) /= 0) u_shlf(I,J) = u_shlf(I,J) + alpha_k * p_u(I,J) / DIAGu(I,J)
-        u_shlf(I,J) = u_shlf(I,J) + omega_k * ph_u(I,J)
+        u_shlf(I,J) = u_shlf(I,J) + alpha_k * p_u(I,J) + omega_k * ph_u(I,J)
         r_u(I,J) = s_u(I,J) - omega_k * Au(I,J)
       endif
       if (CS%vmask(I,J) == 1) then
-        if (DIAGv(I,J) /= 0) v_shlf(I,J) = v_shlf(I,J) + alpha_k * p_v(I,J) / DIAGv(I,J)
-        v_shlf(I,J) = v_shlf(I,J) + omega_k * ph_v(I,J)
+        v_shlf(I,J) = v_shlf(I,J) + alpha_k * p_v(I,J) + omega_k * ph_v(I,J)
         r_v(I,J) = s_v(I,J) - omega_k * Av(I,J)
       endif
     enddo ; enddo
 
-    ! Compute rho_{k+1} = r* . r_k  AND  ||r_k||^2 together
-    sum_vec_3d(:,:,:) = 0.0
+    ! rho_{k+1} = r* . M^{-1}*r  AND  ||r||^2 for convergence
+    sum_vec_3d(:,:,1:2) = 0.0
     do J=Jscq_sv,Jecq ; do I=Iscq_sv,Iecq
       if (CS%umask(I,J) == 1) then
-        sum_vec_3d(I,J,1) = resid2_scale * r_star_u(I,J) * r_u(I,J)
+        if (DIAGu(I,J) /= 0) &
+          sum_vec_3d(I,J,1) = resid_scale * r_star_u(I,J) * (r_u(I,J) / DIAGu(I,J))
         sum_vec_3d(I,J,2) = resid2_scale * r_u(I,J)**2
       endif
       if (CS%vmask(I,J) == 1) then
-        sum_vec_3d(I,J,1) = sum_vec_3d(I,J,1) + resid2_scale * r_star_v(I,J) * r_v(I,J)
+        if (DIAGv(I,J) /= 0) &
+          sum_vec_3d(I,J,1) = sum_vec_3d(I,J,1) + resid_scale * r_star_v(I,J) * (r_v(I,J) / DIAGv(I,J))
         sum_vec_3d(I,J,2) = sum_vec_3d(I,J,2) + resid2_scale * r_v(I,J)**2
       endif
     enddo ; enddo
