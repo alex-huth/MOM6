@@ -2247,13 +2247,37 @@ subroutine ice_shelf_solve_inner_bicgstab(CS, ISS, G, US, u_shlf, v_shlf, taudx,
       if (CS%umask(I,J) == 1) sum_vec(I,J) = resid2_scale * r_star_u(I,J) * v_u(I,J)
       if (CS%vmask(I,J) == 1) sum_vec(I,J) = sum_vec(I,J) + resid2_scale * r_star_v(I,J) * v_v(I,J)
     enddo ; enddo
-    alpha_k = rho_cur / reproducing_sum(sum_vec, Is_sum, Ie_sum, Js_sum, Je_sum)
+    sv3dsums(1) = reproducing_sum(sum_vec, Is_sum, Ie_sum, Js_sum, Je_sum)
+
+    ! Guard against BiCGStab breakdown: r* . v == 0 (shadow residual orthogonal to v)
+    if (sv3dsums(1) == 0.0) then
+      iters = iter ; conv_flag = 0 ; exit
+    endif
+    alpha_k = rho_cur / sv3dsums(1)
 
     ! s = r - alpha*v
     do J=js,je-1 ; do I=is,ie-1
       if (CS%umask(I,J) == 1) s_u(I,J) = r_u(I,J) - alpha_k * v_u(I,J)
       if (CS%vmask(I,J) == 1) s_v(I,J) = r_v(I,J) - alpha_k * v_v(I,J)
     enddo ; enddo
+
+    ! Half-step convergence check: ||s||^2 <= tol^2 * ||r0||^2
+    sum_vec(:,:) = 0.0
+    do J=Jscq_sv,Jecq ; do I=Iscq_sv,Iecq
+      if (CS%umask(I,J) == 1) sum_vec(I,J) = resid2_scale * s_u(I,J)**2
+      if (CS%vmask(I,J) == 1) sum_vec(I,J) = sum_vec(I,J) + resid2_scale * s_v(I,J)**2
+    enddo ; enddo
+    sv3dsums(2) = reproducing_sum(sum_vec, Is_sum, Ie_sum, Js_sum, Je_sum)
+    if (sv3dsums(2) <= resid0tol2) then
+      ! Apply half-step update: x += alpha * M^{-1} * p  (x += alpha * p / DIAG)
+      do J=js,je-1 ; do I=is,ie-1
+        if (CS%umask(I,J) == 1 .and. DIAGu(I,J) /= 0) &
+          u_shlf(I,J) = u_shlf(I,J) + alpha_k * p_u(I,J) / DIAGu(I,J)
+        if (CS%vmask(I,J) == 1 .and. DIAGv(I,J) /= 0) &
+          v_shlf(I,J) = v_shlf(I,J) + alpha_k * p_v(I,J) / DIAGv(I,J)
+      enddo ; enddo
+      iters = iter ; conv_flag = 1 ; exit
+    endif
 
     ! sh = M^{-1} * s
     do J=js,je ; do I=is,ie
@@ -2269,7 +2293,7 @@ subroutine ice_shelf_solve_inner_bicgstab(CS, ISS, G, US, u_shlf, v_shlf, taudx,
                    G, US, is, ie, js, je, rhoi_rhow)
     call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
 
-    ! omega = (t . s) / (t . t)
+    ! omega = (t . s) / (t . t); guard against breakdown t . t == 0
     sum_vec_3d(:,:,:) = 0.0
     do J=Jscq_sv,Jecq ; do I=Iscq_sv,Iecq
       if (CS%umask(I,J) == 1) then
@@ -2282,6 +2306,17 @@ subroutine ice_shelf_solve_inner_bicgstab(CS, ISS, G, US, u_shlf, v_shlf, taudx,
       endif
     enddo ; enddo
     sv3dsum = reproducing_sum(sum_vec_3d(:,:,1:2), Is_sum, Ie_sum, Js_sum, Je_sum, sums=sv3dsums(1:2))
+
+    ! Guard against omega breakdown: t . t == 0 means t=0, so s is already the solution update
+    if (sv3dsums(2) == 0.0) then
+      do J=js,je-1 ; do I=is,ie-1
+        if (CS%umask(I,J) == 1 .and. DIAGu(I,J) /= 0) &
+          u_shlf(I,J) = u_shlf(I,J) + alpha_k * p_u(I,J) / DIAGu(I,J)
+        if (CS%vmask(I,J) == 1 .and. DIAGv(I,J) /= 0) &
+          v_shlf(I,J) = v_shlf(I,J) + alpha_k * p_v(I,J) / DIAGv(I,J)
+      enddo ; enddo
+      iters = iter ; conv_flag = 0 ; exit
+    endif
     omega_k = sv3dsums(1) / sv3dsums(2)
 
     ! x = x + alpha*M^{-1}*p + omega*M^{-1}*s   (ph_u/v holds M^{-1}*s = sh at this point)
