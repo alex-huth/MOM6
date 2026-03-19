@@ -250,6 +250,7 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! and use reproducible sums
   logical :: doing_newton = .false. !< If true, the outer iteration is using Newton (tangent) linearization
                                     !! instead of Picard (secant) linearization for the ice viscosity
+  character(len=16) :: inner_solver !< Name of the inner linear solver: "CG" or "BICGSTAB"
   logical :: module_is_initialized = .false. !< True if this module has been initialized.
 
   !>@{ Diagnostic handles
@@ -594,6 +595,11 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                 units="none", default=CS%nonlinear_tolerance)
     call get_param(param_file, mdl, "NEWTON_ADAPT_CG_TOL", CS%newton_adapt_cg_tol, &
                 "Use an adaptive CG tolerance during Newton iterations.",default=.true.)
+    call get_param(param_file, mdl, "ICE_SHELF_INNER_SOLVER", CS%inner_solver, &
+                "Choice of inner linear solver for the ice-shelf SSA velocity system. "//&
+                "Valid values are CG (preconditioned conjugate gradient) and BICGSTAB "//&
+                "(right-preconditioned BiCGStab, robust for non-symmetric Newton systems).", &
+                default="CG")
     call get_param(param_file, mdl, "CONJUGATE_GRADIENT_MAXIT", CS%cg_max_iterations, &
                 "max iteratiions in CG solver", default=2000)
     call get_param(param_file, mdl, "THRESH_FLOAT_COL_DEPTH", CS%thresh_float_col_depth, &
@@ -1640,8 +1646,14 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
   do iter=1,50
 
-    call ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H_node, CS%float_cond, &
-                               ISS%hmask, conv_flag, iters, time, CS%Phi, CS%Phisub)
+    if (trim(CS%inner_solver) == "BICGSTAB") then
+      call ice_shelf_solve_inner_bicgstab(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H_node, &
+                                          CS%float_cond, ISS%hmask, conv_flag, iters, time, &
+                                          CS%Phi, CS%Phisub)
+    else
+      call ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H_node, CS%float_cond, &
+                                 ISS%hmask, conv_flag, iters, time, CS%Phi, CS%Phisub)
+    endif
 
     if (CS%debug) then
       call qchksum(u_shlf, "u shelf", G%HI, haloshift=2, unscale=US%L_T_to_m_s)
@@ -2041,6 +2053,307 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
   endif
 
 end subroutine ice_shelf_solve_inner
+
+!> Right-preconditioned BiCGStab solver for the ice-shelf SSA velocity system.
+!! Identical interface to ice_shelf_solve_inner; handles non-symmetric Newton-linearised systems.
+subroutine ice_shelf_solve_inner_bicgstab(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H_node, &
+                                          float_cond, hmask, conv_flag, iters, time, Phi, Phisub)
+  type(ice_shelf_dyn_CS), intent(in)    :: CS !< A pointer to the ice shelf control structure
+  type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe
+                                           !! the ice-shelf state
+  type(ocean_grid_type),  intent(inout) :: G  !< The grid structure used by the ice shelf.
+  type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(inout) :: u_shlf  !< The zonal ice shelf velocity at vertices [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(inout) :: v_shlf  !< The meridional ice shelf velocity at vertices [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in)    :: taudx !< The x-direction driving stress [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in)    :: taudy  !< The y-direction driving stress [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in)    :: H_node !< The ice shelf thickness at nodal (corner)
+                                             !! points [Z ~> m].
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(in)    :: float_cond !< If GL_regularize=true, indicates cells containing
+                                                !! the grounding line (float_cond=1) or not (float_cond=0)
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(in)    :: hmask !< A mask indicating which tracer points are
+                                             !! partly or fully covered by an ice-shelf
+  integer,                intent(out)   :: conv_flag !< A flag indicating whether (1) or not (0) the
+                                           !! iterations have converged to the specified tolerance
+  integer,                intent(out)   :: iters !< The number of iterations used in the solver.
+  type(time_type),        intent(in)    :: Time !< The current model time
+  real, dimension(8,4,SZDI_(G),SZDJ_(G)), &
+                          intent(in)    :: Phi !< The gradients of bilinear basis elements at Gaussian
+                                             !! quadrature points surrounding the cell vertices [L-1 ~> m-1].
+  real, dimension(:,:,:,:,:,:), &
+                          intent(in)    :: Phisub !< Quadrature structure weights at subgridscale
+                                            !! locations for finite element calculations [nondim]
+
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: &
+      r_u, r_v,           &  ! Residual r [R L3 Z T-2 ~> kg m s-2]
+      r_star_u, r_star_v, &  ! Shadow residual r* (fixed) [R L3 Z T-2 ~> kg m s-2]
+      p_u, p_v,           &  ! Direction p_k [R L3 Z T-2 ~> kg m s-2]
+      v_u, v_v,           &  ! A*M^{-1}*p (stored between iterations) [R L3 Z T-2 ~> kg m s-2]
+      s_u, s_v,           &  ! Half-step residual s [R L3 Z T-2 ~> kg m s-2]
+      ph_u, ph_v,         &  ! Working array: M^{-1}*p or M^{-1}*s [L T-1 ~> m s-1]
+      Au, Av,             &  ! CG_action output [R L3 Z T-2 ~> kg m s-2]
+      DIAGu, DIAGv,       &  ! Jacobi preconditioner diagonal [R L2 Z T-1 ~> kg s-1]
+      RHSu, RHSv,         &  ! Right-hand side (driving stress) [R L3 Z T-2 ~> kg m s-2]
+      sum_vec                ! Staging array for global squared-norm sums [m2 kg2 s-4]
+  real, dimension(SZDIB_(G),SZDJB_(G),3) :: sum_vec_3d ! Global sum staging, 3 components
+
+  real    :: rho_prev    ! Previous rho = r* . r [m2 kg2 s-4]
+  real    :: rho_cur     ! Current  rho = r* . r [m2 kg2 s-4]
+  real    :: alpha_k     ! Step size for ph direction [nondim]
+  real    :: omega_k     ! Step size for sh direction [nondim]
+  real    :: beta_k      ! Mixing coefficient for p update [nondim]
+  real    :: resid0tol2  ! Convergence tolerance times initial residual squared [m2 kg2 s-4]
+  real    :: sv3dsum     ! Unused scalar return from reproducing_sum [various]
+  real    :: sv3dsums(3) ! Index-wise global sums of sum_vec_3d
+  real    :: resid2_scale ! Redimensionalisation scale for squared residuals [m2 kg2 s-4]
+  real    :: rhoi_rhow   ! Density of ice divided by a typical water density [nondim]
+  integer :: cg_halo, max_cg_halo
+  integer :: is, ie, js, je, isc, iec, jsc, jec, iter, i, j
+  integer :: Is_sum, Js_sum, Ie_sum, Je_sum
+  integer :: Isdq, Iedq, Jsdq, Jedq, Iscq, Iecq, Jscq, Jecq, nx_halo, ny_halo
+  integer :: Iscq_sv, Jscq_sv
+
+  Isdq = G%IsdB ; Iedq = G%IedB ; Jsdq = G%JsdB ; Jedq = G%JedB
+  Iscq = G%IscB ; Iecq = G%IecB ; Jscq = G%JscB ; Jecq = G%JecB
+  ny_halo = G%domain%njhalo ; nx_halo = G%domain%nihalo
+  isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
+
+  rhoi_rhow = CS%density_ice / CS%density_ocean_avg
+
+  ! Determine loop limits for global sums (matches ice_shelf_solve_inner)
+  if ((isc+G%idg_offset==G%isg) .and. (.not. CS%reentrant_x)) then
+    Is_sum = Iscq + (1-Isdq) ; Iscq_sv = Iscq
+  else
+    Is_sum = isc  + (1-Isdq) ; Iscq_sv = isc
+  endif
+  if ((jsc+G%jdg_offset==G%jsg) .and. (.not. CS%reentrant_y)) then
+    Js_sum = Jscq + (1-Jsdq) ; Jscq_sv = Jscq
+  else
+    Js_sum = jsc + (1-Jsdq) ; Jscq_sv = jsc
+  endif
+  Ie_sum = Iecq + (1-Isdq) ; Je_sum = Jecq + (1-Jsdq)
+
+  ! Initialise local arrays
+  DIAGu(:,:) = 0 ; DIAGv(:,:) = 0
+  Au(:,:) = 0 ; Av(:,:) = 0
+  RHSu(:,:) = 0 ; RHSv(:,:) = 0
+  r_u(:,:) = 0 ; r_v(:,:) = 0
+  r_star_u(:,:) = 0 ; r_star_v(:,:) = 0
+  p_u(:,:) = 0 ; p_v(:,:) = 0
+  v_u(:,:) = 0 ; v_v(:,:) = 0
+  s_u(:,:) = 0 ; s_v(:,:) = 0
+  ph_u(:,:) = 0 ; ph_v(:,:) = 0
+  sum_vec(:,:) = 0
+
+  resid2_scale = ((US%RZ_to_kg_m2*US%L_to_m)*US%L_T_to_m_s**2)**2
+
+  ! ---------- Set up RHS, diagonal, and initial residual r0 = b - A*x0 ----------
+  RHSu(:,:) = taudx(:,:) ; RHSv(:,:) = taudy(:,:)
+  call pass_vector(RHSu, RHSv, G%domain, TO_ALL, BGRID_NE, complete=.false.)
+
+  call matrix_diagonal(CS, G, US, float_cond, H_node, CS%ice_visc, CS%basal_traction, &
+                       hmask, rhoi_rhow, Phi, Phisub, DIAGu, DIAGv)
+  call pass_vector(DIAGu, DIAGv, G%domain, TO_ALL, BGRID_NE, complete=.false.)
+
+  call CG_action(CS, Au, Av, u_shlf, v_shlf, Phi, Phisub, CS%umask, CS%vmask, hmask, &
+                 H_node, CS%ice_visc, float_cond, CS%bed_elev, CS%basal_traction, &
+                 G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, use_newton_in=.false.)
+  call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE, complete=.true.)
+
+  r_u(:,:) = RHSu(:,:) - Au(:,:)
+  r_v(:,:) = RHSv(:,:) - Av(:,:)
+
+  ! Compute initial residual norm squared and set convergence target
+  sum_vec(:,:) = 0.0
+  do J=Jscq_sv,Jecq ; do I=Iscq_sv,Iecq
+    if (CS%umask(I,J) == 1) sum_vec(I,J) = resid2_scale * r_u(I,J)**2
+    if (CS%vmask(I,J) == 1) sum_vec(I,J) = sum_vec(I,J) + resid2_scale * r_v(I,J)**2
+  enddo ; enddo
+  resid0tol2 = CS%cg_tol_newton**2 * reproducing_sum(sum_vec, Is_sum, Ie_sum, Js_sum, Je_sum)
+
+  ! Initialise BiCGStab scalars and shadow residual
+  ! r* = r0; p = 0 (already zero); v = 0 (already zero)
+  ! rho_{-1} = 1 (set rho_prev = 1 so first beta computation uses rho_cur/1)
+  ! alpha = 1, omega_0 = 1
+  r_star_u(:,:) = r_u(:,:) ; r_star_v(:,:) = r_v(:,:)
+  rho_prev = 1.0 ; alpha_k = 1.0 ; omega_k = 1.0
+  ! rho_cur = r* . r0 = ||r0||^2 (r* == r0 initially)
+  sum_vec(:,:) = 0.0
+  do J=Jscq_sv,Jecq ; do I=Iscq_sv,Iecq
+    if (CS%umask(I,J) == 1) sum_vec(I,J) = resid2_scale * r_star_u(I,J) * r_u(I,J)
+    if (CS%vmask(I,J) == 1) sum_vec(I,J) = sum_vec(I,J) + resid2_scale * r_star_v(I,J) * r_v(I,J)
+  enddo ; enddo
+  rho_cur = reproducing_sum(sum_vec, Is_sum, Ie_sum, Js_sum, Je_sum)
+
+  if (G%symmetric) then
+    max_cg_halo = min(nx_halo, ny_halo)
+  else
+    max_cg_halo = min(nx_halo, ny_halo) - 1
+  endif
+  cg_halo = max_cg_halo
+  conv_flag = 0
+
+  !!!!!!!!!!!!!!!!!!!!!!!!!!
+  !!                      !!
+  !! MAIN BICGSTAB LOOP   !!
+  !!                      !!
+  !!!!!!!!!!!!!!!!!!!!!!!!!!
+
+  do iter = 1, CS%cg_max_iterations
+
+    is = isc - cg_halo ; ie = Iecq + cg_halo
+    js = jsc - cg_halo ; je = Jecq + cg_halo
+
+    ! beta = (rho_cur/rho_prev) * (alpha/omega)
+    beta_k = (rho_cur / rho_prev) * (alpha_k / omega_k)
+
+    ! p = r + beta*(p - omega*v)
+    do J=js,je-1 ; do I=is,ie-1
+      if (CS%umask(I,J) == 1) &
+        p_u(I,J) = r_u(I,J) + beta_k * (p_u(I,J) - omega_k * v_u(I,J))
+      if (CS%vmask(I,J) == 1) &
+        p_v(I,J) = r_v(I,J) + beta_k * (p_v(I,J) - omega_k * v_v(I,J))
+    enddo ; enddo
+
+    ! ph = M^{-1} * p  (Jacobi preconditioner: element-wise divide by diagonal)
+    do J=js,je ; do I=is,ie
+      ph_u(I,J) = 0.0 ; ph_v(I,J) = 0.0
+      if (CS%umask(I,J) == 1 .and. DIAGu(I,J) /= 0) ph_u(I,J) = p_u(I,J) / DIAGu(I,J)
+      if (CS%vmask(I,J) == 1 .and. DIAGv(I,J) /= 0) ph_v(I,J) = p_v(I,J) / DIAGv(I,J)
+    enddo ; enddo
+
+    ! v = A * ph
+    Au(:,:) = 0 ; Av(:,:) = 0
+    call CG_action(CS, Au, Av, ph_u, ph_v, Phi, Phisub, CS%umask, CS%vmask, hmask, &
+                   H_node, CS%ice_visc, float_cond, CS%bed_elev, CS%basal_traction, &
+                   G, US, is, ie, js, je, rhoi_rhow)
+    call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
+
+    do J=js,je-1 ; do I=is,ie-1
+      if (CS%umask(I,J) == 1) v_u(I,J) = Au(I,J)
+      if (CS%vmask(I,J) == 1) v_v(I,J) = Av(I,J)
+    enddo ; enddo
+
+    ! alpha = rho_cur / (r* . v)
+    sum_vec(:,:) = 0.0
+    do J=Jscq_sv,Jecq ; do I=Iscq_sv,Iecq
+      if (CS%umask(I,J) == 1) sum_vec(I,J) = resid2_scale * r_star_u(I,J) * v_u(I,J)
+      if (CS%vmask(I,J) == 1) sum_vec(I,J) = sum_vec(I,J) + resid2_scale * r_star_v(I,J) * v_v(I,J)
+    enddo ; enddo
+    alpha_k = rho_cur / reproducing_sum(sum_vec, Is_sum, Ie_sum, Js_sum, Je_sum)
+
+    ! s = r - alpha*v
+    do J=js,je-1 ; do I=is,ie-1
+      if (CS%umask(I,J) == 1) s_u(I,J) = r_u(I,J) - alpha_k * v_u(I,J)
+      if (CS%vmask(I,J) == 1) s_v(I,J) = r_v(I,J) - alpha_k * v_v(I,J)
+    enddo ; enddo
+
+    ! sh = M^{-1} * s
+    do J=js,je ; do I=is,ie
+      ph_u(I,J) = 0.0 ; ph_v(I,J) = 0.0
+      if (CS%umask(I,J) == 1 .and. DIAGu(I,J) /= 0) ph_u(I,J) = s_u(I,J) / DIAGu(I,J)
+      if (CS%vmask(I,J) == 1 .and. DIAGv(I,J) /= 0) ph_v(I,J) = s_v(I,J) / DIAGv(I,J)
+    enddo ; enddo
+
+    ! t = A * sh
+    Au(:,:) = 0 ; Av(:,:) = 0
+    call CG_action(CS, Au, Av, ph_u, ph_v, Phi, Phisub, CS%umask, CS%vmask, hmask, &
+                   H_node, CS%ice_visc, float_cond, CS%bed_elev, CS%basal_traction, &
+                   G, US, is, ie, js, je, rhoi_rhow)
+    call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
+
+    ! omega = (t . s) / (t . t)
+    sum_vec_3d(:,:,:) = 0.0
+    do J=Jscq_sv,Jecq ; do I=Iscq_sv,Iecq
+      if (CS%umask(I,J) == 1) then
+        sum_vec_3d(I,J,1) = resid2_scale * Au(I,J) * s_u(I,J)
+        sum_vec_3d(I,J,2) = resid2_scale * Au(I,J) * Au(I,J)
+      endif
+      if (CS%vmask(I,J) == 1) then
+        sum_vec_3d(I,J,1) = sum_vec_3d(I,J,1) + resid2_scale * Av(I,J) * s_v(I,J)
+        sum_vec_3d(I,J,2) = sum_vec_3d(I,J,2) + resid2_scale * Av(I,J) * Av(I,J)
+      endif
+    enddo ; enddo
+    sv3dsum = reproducing_sum(sum_vec_3d(:,:,1:2), Is_sum, Ie_sum, Js_sum, Je_sum, sums=sv3dsums(1:2))
+    omega_k = sv3dsums(1) / sv3dsums(2)
+
+    ! x = x + alpha*M^{-1}*p + omega*M^{-1}*s   (ph_u/v holds M^{-1}*s = sh at this point)
+    ! r = s - omega*t
+    do J=js,je-1 ; do I=is,ie-1
+      if (CS%umask(I,J) == 1) then
+        if (DIAGu(I,J) /= 0) u_shlf(I,J) = u_shlf(I,J) + alpha_k * p_u(I,J) / DIAGu(I,J)
+        u_shlf(I,J) = u_shlf(I,J) + omega_k * ph_u(I,J)
+        r_u(I,J) = s_u(I,J) - omega_k * Au(I,J)
+      endif
+      if (CS%vmask(I,J) == 1) then
+        if (DIAGv(I,J) /= 0) v_shlf(I,J) = v_shlf(I,J) + alpha_k * p_v(I,J) / DIAGv(I,J)
+        v_shlf(I,J) = v_shlf(I,J) + omega_k * ph_v(I,J)
+        r_v(I,J) = s_v(I,J) - omega_k * Av(I,J)
+      endif
+    enddo ; enddo
+
+    ! Compute rho_{k+1} = r* . r_k  AND  ||r_k||^2 together
+    sum_vec_3d(:,:,:) = 0.0
+    do J=Jscq_sv,Jecq ; do I=Iscq_sv,Iecq
+      if (CS%umask(I,J) == 1) then
+        sum_vec_3d(I,J,1) = resid2_scale * r_star_u(I,J) * r_u(I,J)
+        sum_vec_3d(I,J,2) = resid2_scale * r_u(I,J)**2
+      endif
+      if (CS%vmask(I,J) == 1) then
+        sum_vec_3d(I,J,1) = sum_vec_3d(I,J,1) + resid2_scale * r_star_v(I,J) * r_v(I,J)
+        sum_vec_3d(I,J,2) = sum_vec_3d(I,J,2) + resid2_scale * r_v(I,J)**2
+      endif
+    enddo ; enddo
+    sv3dsum = reproducing_sum(sum_vec_3d(:,:,1:2), Is_sum, Ie_sum, Js_sum, Je_sum, sums=sv3dsums(1:2))
+
+    rho_prev = rho_cur
+    rho_cur  = sv3dsums(1)
+
+    if (sv3dsums(2) <= resid0tol2) then
+      iters = iter
+      conv_flag = 1
+      exit
+    endif
+
+    ! Halo management: decrement once per full BiCGStab iteration
+    cg_halo = cg_halo - 1
+
+    if (cg_halo == 0) then
+      call pass_vector(p_u, p_v, G%domain, TO_ALL, BGRID_NE, complete=.false.)
+      call pass_vector(u_shlf, v_shlf, G%domain, TO_ALL, BGRID_NE, complete=.false.)
+      call pass_vector(r_u, r_v, G%domain, TO_ALL, BGRID_NE, complete=.true.)
+      cg_halo = max_cg_halo
+    endif
+
+  enddo ! end of BiCGStab loop
+
+  ! Apply boundary conditions and update halos (identical to ice_shelf_solve_inner)
+  do J=Jsdq,Jedq ; do I=Isdq,Iedq
+    if (CS%umask(I,J) == 3) then
+      u_shlf(I,J) = CS%u_bdry_val(I,J)
+    elseif (CS%umask(I,J) == 0) then
+      u_shlf(I,J) = 0
+    endif
+    if (CS%vmask(I,J) == 3) then
+      v_shlf(I,J) = CS%v_bdry_val(I,J)
+    elseif (CS%vmask(I,J) == 0) then
+      v_shlf(I,J) = 0
+    endif
+  enddo ; enddo
+
+  call pass_vector(u_shlf, v_shlf, G%domain, TO_ALL, BGRID_NE)
+  if (conv_flag == 0) then
+    iters = CS%cg_max_iterations
+  endif
+
+end subroutine ice_shelf_solve_inner_bicgstab
 
 subroutine ice_shelf_advect_thickness_x(CS, G, LB, time_step, hmask, h0, h_after_uflux, uh_ice)
   type(ice_shelf_dyn_CS), intent(in)    :: CS !< A pointer to the ice shelf control structure
