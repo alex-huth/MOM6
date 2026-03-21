@@ -42,7 +42,7 @@ use MOM_io, only : slasher, fieldtype, vardesc, var_desc
 use MOM_io, only : close_file, SINGLE_FILE, MULTIPLE
 use MOM_restart, only : register_restart_field, save_restart
 use MOM_restart, only : restart_init, restore_state, MOM_restart_CS, register_restart_pair
-use MOM_time_manager, only : time_type, time_type_to_real, real_to_time, operator(>), operator(-)
+use MOM_time_manager, only : time_type, time_type_to_real, real_to_time, operator(>), operator(-), operator(+)
 use MOM_transcribe_grid, only : copy_dyngrid_to_MOM_grid, copy_MOM_grid_to_dyngrid
 use MOM_transcribe_grid, only : rotate_dyngrid
 use MOM_unit_scaling, only : unit_scale_type, unit_scaling_init, fix_restart_unit_scaling
@@ -3003,7 +3003,10 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
     ISS%dhdt_shelf(i,j) = (ISS%h_shelf(i,j) - ISS%dhdt_shelf(i,j)) * Ifull_time_step
   enddo; enddo
 
-  call enable_averages(full_time_step, Time, CS%diag)
+  ! Stamp diagnostics at the END of the outer step (Time + time_interval), so that
+  ! the t=1yr record contains the state after 1yr of Lagrangian evolution, not the
+  ! state from the beginning of the next outer step.
+  call enable_averages(full_time_step, Time + time_interval, CS%diag)
   if (CS%id_area_shelf_h > 0) call post_data(CS%id_area_shelf_h ,ISS%area_shelf_h,CS%diag)
   if (CS%id_h_shelf > 0)      call post_data(CS%id_h_shelf      ,ISS%h_shelf     ,CS%diag)
   if (CS%id_dhdt_shelf > 0)   call post_data(CS%id_dhdt_shelf   ,ISS%dhdt_shelf  ,CS%diag)
@@ -3011,7 +3014,7 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
   call process_and_post_scalar_data(CS, vaf0, vaf0_A, vaf0_G, Ifull_time_step, dh_adott, dh_adott*0.0)
   call disable_averaging(CS%diag)
 
-  call IS_dynamics_post_data(full_time_step, Time, CS%dCS, ISS, G)
+  call IS_dynamics_post_data(full_time_step, Time + time_interval, CS%dCS, ISS, G)
 end subroutine solo_step_ice_shelf
 
 !> Post_data calls for ice-sheet scalars

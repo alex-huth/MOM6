@@ -32,6 +32,9 @@ use MOM_checksums, only : hchksum, qchksum
 use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary_channel,initialize_ice_flow_from_file
 use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary_from_file,initialize_ice_C_basal_friction
 use MOM_ice_shelf_initialize, only : initialize_ice_AGlen
+use MOM_ice_shelf_MPM, only : MPM_CS, MPM_init, MPM_end, &
+                               MPM_P2G, MPM_G2P, MPM_Lagrangian_update, &
+                               MPM_split, MPM_migrate, MPM_reseed, MPM_update_masks
 implicit none ; private
 
 #include <MOM_memory.h>
@@ -252,6 +255,10 @@ type, public :: ice_shelf_dyn_CS ; private
                                     !! instead of Picard (secant) linearization for the ice viscosity
   character(len=16) :: inner_solver !< Name of the inner linear solver: "CG","CG2","CR",or "MINRES"
   logical :: module_is_initialized = .false. !< True if this module has been initialized.
+
+  ! --- MPM (Material Point Method) extension ---
+  logical :: use_MPM = .false.  !< If true, use sMPM for thickness evolution and Lagrangian tracking
+  type(MPM_CS), pointer :: MPM => NULL() !< MPM control structure (allocated when use_MPM is true)
 
   !>@{ Diagnostic handles
   integer :: id_u_shelf = -1, id_v_shelf = -1, id_shelf_speed, id_t_shelf = -1, &
@@ -479,6 +486,9 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   integer :: i, j, isd, ied, jsd, jed, Isdq, Iedq, Jsdq, Jedq, iters
   character(len=200) :: IS_energyfile  ! The name of the energy file.
   character(len=32) :: filename_appendix = '' ! FMS appendix to filename for ensemble runs
+  character(len=40) :: ice_bc_config   ! Controls BC initialization: "FILE" or "CHANNEL"
+  character(len=40) :: ice_flow_config ! Controls initial velocity/bed: "FILE" or "ZERO"
+  real :: max_depth ! [Z ~> m] used for ZERO flow config bed elevation
 
   Isdq = G%isdB ; Iedq = G%iedB ; Jsdq = G%jsdB ; Jedq = G%jedB
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -824,18 +834,45 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       call initialize_ice_AGlen(CS%AGlen_visc, CS%ice_viscosity_compute, G, US, param_file)
       call pass_var(CS%AGlen_visc, G%domain, complete=.false.)
 
-      !initialize boundary conditions
-      call initialize_ice_shelf_boundary_from_file(CS%u_face_mask_bdry, CS%v_face_mask_bdry, &
+      ! --- Boundary conditions ---
+      call get_param(param_file, mdl, "ICE_BOUNDARY_CONFIG", ice_bc_config, &
+                 "How to initialize ice shelf boundary conditions. "//&
+                 "Valid values are FILE (read from ICE_SHELF_BC_FILE) and "//&
+                 "CHANNEL (analytic channel flow, no input file required).", &
+                 default="FILE")
+
+      if (trim(ice_bc_config) == "CHANNEL") then
+        call initialize_ice_shelf_boundary_channel(CS%u_face_mask_bdry, CS%v_face_mask_bdry, &
+                  CS%u_flux_bdry_val, CS%v_flux_bdry_val, CS%u_bdry_val, CS%v_bdry_val, &
+                  CS%u_shelf, CS%v_shelf, CS%h_bdry_val, ISS%hmask, ISS%h_shelf, G, US, param_file)
+      else
+        call initialize_ice_shelf_boundary_from_file(CS%u_face_mask_bdry, CS%v_face_mask_bdry, &
                   CS%u_bdry_val, CS%v_bdry_val, CS%umask, CS%vmask, CS%h_bdry_val, &
-                  ISS%hmask,  ISS%h_shelf, G, US, param_file )
+                  ISS%hmask,  ISS%h_shelf, G, US, param_file)
+      endif
       call pass_var(ISS%hmask, G%domain, complete=.false.)
       call pass_var(CS%h_bdry_val, G%domain, complete=.true.)
       call pass_vector(CS%u_bdry_val, CS%v_bdry_val, G%domain, TO_ALL, BGRID_NE, complete=.false.)
       call pass_vector(CS%u_face_mask_bdry, CS%v_face_mask_bdry, G%domain, TO_ALL, BGRID_NE, complete=.false.)
 
-      !initialize ice flow characteristic (velocities, bed elevation under the grounded part, etc) from file
-      call initialize_ice_flow_from_file(CS%bed_elev,CS%u_shelf, CS%v_shelf, CS%ground_frac, &
+      ! --- Initial velocity and bed elevation ---
+      call get_param(param_file, mdl, "ICE_FLOW_CONFIG", ice_flow_config, &
+                 "How to initialize ice shelf velocities and bed elevation. "//&
+                 "Valid values are FILE (read from ICE_VELOCITY_FILE) and "//&
+                 "ZERO (zero velocities, fully floating, flat bed).", &
+                 default="FILE")
+
+      if (trim(ice_flow_config) == "ZERO") then
+        CS%u_shelf(:,:) = 0.0 ; CS%v_shelf(:,:) = 0.0
+        CS%ground_frac(:,:) = 0.0  ! all floating
+        call get_param(param_file, mdl, "MAXIMUM_DEPTH", max_depth, &
+                 "The maximum depth of the ocean.", units="m", scale=US%m_to_Z, &
+                 fail_if_missing=.true.)
+        CS%bed_elev(:,:) = -max_depth
+      else
+        call initialize_ice_flow_from_file(CS%bed_elev, CS%u_shelf, CS%v_shelf, CS%ground_frac, &
                   G, US, param_file)
+      endif
       call pass_vector(CS%u_shelf, CS%v_shelf, G%domain, TO_ALL, BGRID_NE, complete=.true.)
       call pass_var(CS%ground_frac, G%domain, complete=.false.)
       call pass_var(CS%bed_elev, G%domain, complete=.true.)
@@ -930,6 +967,18 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
 
   if (new_sim) then
     call update_OD_ffrac_uncoupled(CS, G, ISS%h_shelf(:,:))
+  endif
+
+  ! --- MPM initialisation ---
+  call get_param(param_file, mdl, "USE_MPM", CS%use_MPM, &
+                 "If true, use the simplified Material Point Method (sMPM) "//&
+                 "for Lagrangian thickness evolution and particle tracking. "//&
+                 "The existing SSA velocity solver is retained.", &
+                 default=.false.)
+  if (CS%use_MPM) then
+    allocate(CS%MPM)
+    call MPM_init(CS%MPM, ISS, G, US, param_file, CS%n_glen, CS%AGlen_visc(G%isc,G%jsc))
+    call MOM_mesg("MOM_ice_shelf_dyn: MPM mode enabled.")
   endif
 
 end subroutine initialize_ice_shelf_dyn
@@ -1028,13 +1077,23 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
   coupled_GL = .false.
   if (present(ocean_mass) .and. present(coupled_grounding)) coupled_GL = coupled_grounding
 !
-  if (CS%advect_shelf) then
+  if (CS%use_MPM) then
+    ! --- MPM path: Lagrangian thickness evolution via particles ---
+    ! P2G updates ISS%h_shelf and ISS%hmask from particle state.
+    call MPM_P2G(CS%MPM, ISS, G)
+    ! Rebuild velocity masks from the particle-derived hmask.
+    call update_velocity_masks(CS, G, ISS%hmask, CS%umask, CS%vmask, &
+                               CS%u_face_mask, CS%v_face_mask)
+    call pass_vector(CS%umask, CS%vmask, G%domain, TO_ALL, BGRID_NE)
+  elseif (CS%advect_shelf) then
+    ! --- FEM path: Eulerian advection of ISS%h_shelf ---
     call ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
     if (CS%alternate_first_direction_IS) then
       CS%first_direction_IS = modulo(CS%first_direction_IS+1,2)
       CS%first_dir_restart_IS = real(CS%first_direction_IS)
     endif
   endif
+
   CS%elapsed_velocity_time = CS%elapsed_velocity_time + time_step
   if (CS%elapsed_velocity_time >= CS%velocity_update_time_step) update_ice_vel = .true.
 
@@ -1046,8 +1105,23 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
   endif
 
   if (update_ice_vel) then
-    call ice_shelf_solve_outer(CS, ISS, G, US, CS%u_shelf, CS%v_shelf,CS%taudx_shelf,CS%taudy_shelf, iters, Time)
+    call ice_shelf_solve_outer(CS, ISS, G, US, CS%u_shelf, CS%v_shelf, &
+                               CS%taudx_shelf, CS%taudy_shelf, iters, Time)
     CS%elapsed_velocity_time = 0.0
+
+    ! --- MPM post-step: update particles from converged velocity field ---
+    if (CS%use_MPM) then
+      call MPM_G2P(CS%MPM, G, CS%u_shelf, CS%v_shelf)
+      call MPM_Lagrangian_update(CS%MPM, G, time_step)
+      call MPM_split(CS%MPM, G)
+      call MPM_migrate(CS%MPM, ISS, G)
+      call MPM_reseed(CS%MPM, ISS, G, CS%u_bdry_val, CS%v_bdry_val)
+      ! Update ISS%h_shelf from the new particle state so diagnostics and the
+      ! next SSA solve both see the correct thickness.
+      call MPM_P2G(CS%MPM, ISS, G)
+      call update_velocity_masks(CS, G, ISS%hmask, CS%umask, CS%vmask, &
+                                 CS%u_face_mask, CS%v_face_mask)
+    endif
   endif
 
 ! call ice_shelf_temp(CS, ISS, G, US, time_step, ISS%water_flux, Time)
@@ -5134,6 +5208,11 @@ subroutine ice_shelf_dyn_end(CS)
   deallocate(CS%OD_rt, CS%OD_av)
   deallocate(CS%t_bdry_val, CS%bed_elev)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
+
+  if (CS%use_MPM .and. associated(CS%MPM)) then
+    call MPM_end(CS%MPM)
+    deallocate(CS%MPM)
+  endif
 
   deallocate(CS)
 
