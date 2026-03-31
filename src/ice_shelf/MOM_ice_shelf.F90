@@ -59,6 +59,7 @@ use MOM_ice_shelf_dynamics, only : register_ice_shelf_dyn_restarts, initialize_i
 use MOM_ice_shelf_dynamics, only : ice_shelf_min_thickness_calve, change_in_draft
 use MOM_ice_shelf_dynamics, only : ice_time_step_CFL, ice_shelf_dyn_end, IS_dynamics_post_data
 use MOM_ice_shelf_dynamics, only : volume_above_floatation, masked_var_grounded
+use MOM_ice_shelf_dynamics, only : IS_dyn_save_MPM_restart, IS_dyn_restore_MPM_restart
 use MOM_ice_shelf_initialize, only : initialize_ice_thickness
 !MJH use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary
 use MOM_ice_shelf_state, only : ice_shelf_state, ice_shelf_state_end, ice_shelf_state_init
@@ -2270,6 +2271,11 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
     call initialize_ice_shelf_dyn(param_file, Time, ISS, CS%dCS, G, US, CS%diag, new_sim, CS%Cp_ice, &
     Time_init, directory, solo_ice_sheet_in)
 
+  ! Restore MPM particle state from restart if not a new simulation
+  if (.not. new_sim .and. CS%shelf_mass_is_dynamic .and. associated(CS%dCS)) then
+    call IS_dyn_restore_MPM_restart(CS%dCS, G, dirs%restart_input_dir)
+  endif
+
   call fix_restart_unit_scaling(US, unscaled=.true.)
 
   call get_param(param_file, mdl, "SAVE_INITIAL_CONDS", save_IC, &
@@ -2890,6 +2896,11 @@ subroutine ice_shelf_save_restart(CS, Time, directory, time_stamped, filename_su
   else ; restart_dir = CS%restart_output_dir ; endif
 
   call save_restart(restart_dir, Time, CS%grid_in, CS%restart_CSp, time_stamped)
+
+  ! Save MPM particle restart if MPM is active
+  if (CS%active_shelf_dynamics .and. associated(CS%dCS)) then
+    call IS_dyn_save_MPM_restart(CS%dCS, restart_dir)
+  endif
 
 end subroutine ice_shelf_save_restart
 

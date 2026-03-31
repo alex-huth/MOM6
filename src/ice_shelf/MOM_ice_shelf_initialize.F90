@@ -22,6 +22,7 @@ public initialize_ice_thickness
 public initialize_ice_shelf_boundary_channel
 public initialize_ice_flow_from_file
 public initialize_ice_shelf_boundary_from_file
+public initialize_MPM_node_masks_from_file
 public initialize_ice_C_basal_friction
 public initialize_ice_AGlen
 public initialize_ice_SMB
@@ -574,6 +575,56 @@ subroutine initialize_ice_shelf_boundary_from_file(u_face_mask_bdry, v_face_mask
   enddo
 
 end subroutine initialize_ice_shelf_boundary_from_file
+
+!> Read MPM node-based Dirichlet masks from the ice shelf BC file.
+!! For MPM mode only: reads h_node_mask, h_node_bdry_val, u_node_mask, v_node_mask
+!! at B-grid (CORNER) positions from ICE_SHELF_BC_FILE.
+subroutine initialize_MPM_node_masks_from_file(h_node_mask, h_node_bdry_val, &
+                                                u_node_mask, v_node_mask, G, US, PF)
+  type(ocean_grid_type), intent(in)    :: G   !< The ocean's grid structure
+  real, dimension(SZDIB_(G),SZDJB_(G)), intent(inout) :: h_node_mask    !< MPM thickness Dirichlet node mask [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)), intent(inout) :: h_node_bdry_val !< Prescribed H at Dirichlet nodes [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)), intent(inout) :: u_node_mask    !< MPM u-velocity Dirichlet node mask [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)), intent(inout) :: v_node_mask    !< MPM v-velocity Dirichlet node mask [nondim]
+  type(unit_scale_type), intent(in)    :: US  !< A structure containing unit conversion factors
+  type(param_file_type), intent(in)    :: PF  !< A structure to parse for run-time parameters
+
+  character(len=200) :: filename, bc_file, inputdir
+  character(len=200) :: h_nodemask_varname, h_nodebdry_varname
+  character(len=200) :: u_nodemask_varname, v_nodemask_varname
+  character(len=40)  :: mdl = "initialize_MPM_node_masks_from_file"
+
+  call get_param(PF, mdl, "INPUTDIR", inputdir, default=".")
+  inputdir = slasher(inputdir)
+  call get_param(PF, mdl, "ICE_SHELF_BC_FILE", bc_file, &
+                 "The file from which the boundary conditions are read.", &
+                 default="ice_shelf_bc.nc")
+  filename = trim(inputdir)//trim(bc_file)
+  call log_param(PF, mdl, "INPUTDIR/ICE_SHELF_BC_FILE (MPM node masks)", filename)
+
+  if (.not.file_exists(filename, G%Domain)) call MOM_error(FATAL, &
+       " initialize_MPM_node_masks_from_file: Unable to open "//trim(filename))
+
+  call get_param(PF, mdl, "ICE_H_NODEMASK_MPM_VARNAME", h_nodemask_varname, &
+                 "Variable name for the MPM thickness Dirichlet node mask in ICE_SHELF_BC_FILE.", &
+                 default="h_node_mask")
+  call get_param(PF, mdl, "ICE_H_NODEBDRY_MPM_VARNAME", h_nodebdry_varname, &
+                 "Variable name for the prescribed thickness at MPM Dirichlet nodes in ICE_SHELF_BC_FILE.", &
+                 default="h_node_bdry_val")
+  call get_param(PF, mdl, "ICE_U_NODEMASK_MPM_VARNAME", u_nodemask_varname, &
+                 "Variable name for the MPM u-velocity Dirichlet node mask in ICE_SHELF_BC_FILE.", &
+                 default="u_node_mask")
+  call get_param(PF, mdl, "ICE_V_NODEMASK_MPM_VARNAME", v_nodemask_varname, &
+                 "Variable name for the MPM v-velocity Dirichlet node mask in ICE_SHELF_BC_FILE.", &
+                 default="v_node_mask")
+
+  call MOM_read_data(filename, trim(h_nodemask_varname), h_node_mask, G%Domain, position=CORNER, scale=1.)
+  call MOM_read_data(filename, trim(h_nodebdry_varname), h_node_bdry_val, G%Domain, position=CORNER, &
+                     scale=US%m_to_Z)
+  call MOM_read_data(filename, trim(u_nodemask_varname), u_node_mask, G%Domain, position=CORNER, scale=1.)
+  call MOM_read_data(filename, trim(v_nodemask_varname), v_node_mask, G%Domain, position=CORNER, scale=1.)
+
+end subroutine initialize_MPM_node_masks_from_file
 
 !> Initialize ice basal friction
 subroutine initialize_ice_C_basal_friction(C_basal_friction, G, US, PF)

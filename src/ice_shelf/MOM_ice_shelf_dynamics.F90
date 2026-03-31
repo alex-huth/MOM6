@@ -31,10 +31,17 @@ use MOM_coms, only : reproducing_sum, max_across_PEs, min_across_PEs
 use MOM_checksums, only : hchksum, qchksum
 use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary_channel,initialize_ice_flow_from_file
 use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary_from_file,initialize_ice_C_basal_friction
+use MOM_ice_shelf_initialize, only : initialize_MPM_node_masks_from_file
 use MOM_ice_shelf_initialize, only : initialize_ice_AGlen
 use MOM_ice_shelf_MPM, only : MPM_CS, MPM_init, MPM_end, &
                                MPM_P2G, MPM_G2P, MPM_Lagrangian_update, &
-                               MPM_split, MPM_migrate, MPM_reseed, MPM_update_masks
+                               MPM_split, MPM_migrate, MPM_enforce_1d_test, &
+                               MPM_update_masks, &
+                               MPM_compute_visc, MPM_compute_is_front_cell, &
+                               MPM_store_pre_solve_vel, &
+                               MPM_P2G_velocity, MPM_compute_basal_trac, &
+                               MPM_write_vtu, MPM_save_restart, MPM_restore_restart, &
+                               smpm_shape, smpm_grad
 implicit none ; private
 
 #include <MOM_memory.h>
@@ -43,6 +50,7 @@ public register_ice_shelf_dyn_restarts, initialize_ice_shelf_dyn, update_ice_she
 public ice_time_step_CFL, ice_shelf_dyn_end, change_in_draft, write_ice_shelf_energy
 public shelf_advance_front, ice_shelf_min_thickness_calve, calve_to_mask, volume_above_floatation
 public masked_var_grounded
+public IS_dyn_save_MPM_restart, IS_dyn_restore_MPM_restart
 
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
 ! consistency testing. These are noted in comments with units like Z, H, L, and T, along with
@@ -89,6 +97,12 @@ type, public :: ice_shelf_dyn_CS ; private
   real, pointer, dimension(:,:) :: vmask => NULL()      !< v-mask on the actual degrees of freedom (B grid)
                                        !! 1=normal node, 3=inhomogeneous boundary node,
                                        !!  0 - no flow node (will also get ice-free nodes)
+  real, pointer, dimension(:,:) :: u_node_mask_MPM => NULL() !< MPM Dirichlet u-velocity mask at Bu corners [nondim]
+                                       !! 1 = prescribed (Dirichlet) u-node, 0 = free node.
+                                       !! Only allocated/used when use_MPM is true.
+  real, pointer, dimension(:,:) :: v_node_mask_MPM => NULL() !< MPM Dirichlet v-velocity mask at Bu corners [nondim]
+                                       !! 1 = prescribed (Dirichlet) v-node, 0 = free node.
+                                       !! Only allocated/used when use_MPM is true.
   real, pointer, dimension(:,:) :: calve_mask => NULL() !< a mask to prevent the ice shelf front from
                                           !! advancing past its initial position (but it may retreat)
   real, pointer, dimension(:,:) :: t_shelf => NULL() !< Vertically integrated temperature in the ice shelf/stream,
@@ -278,6 +292,11 @@ type, public :: ice_shelf_dyn_CS ; private
   integer :: id_h_after_uflux = -1, id_h_after_vflux = -1, id_h_after_adv = -1, &
              id_visc_shelf = -1, id_taub = -1
   !>@}
+
+  !>@{ MPM diagnostic handles
+  integer :: id_npart_per_cell = -1, id_reweight_MPM = -1
+  !>@}
+
   type(diag_ctrl), pointer :: diag => NULL() !< A structure that is used to control diagnostic output.
 
 end type ice_shelf_dyn_CS
@@ -957,8 +976,13 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
 
     !Update these variables so that they are nonzero in case
     !IS_dynamics_post_data is called before update_ice_shelf
-    if (CS%id_taudx_shelf>0 .or. CS%id_taudy_shelf>0) &
-      call calc_shelf_driving_stress(CS, ISS, G, US, CS%taudx_shelf, CS%taudy_shelf, CS%OD_av)
+    if (CS%id_taudx_shelf>0 .or. CS%id_taudy_shelf>0) then
+      if (CS%use_MPM .and. associated(CS%MPM)) then
+        call calc_shelf_driving_stress_MPM(CS, ISS, G, US, CS%taudx_shelf, CS%taudy_shelf, CS%OD_av)
+      else
+        call calc_shelf_driving_stress(CS, ISS, G, US, CS%taudx_shelf, CS%taudy_shelf, CS%OD_av)
+      endif
+    endif
     if (CS%id_taub>0) &
       call calc_shelf_taub(CS, ISS, G, US, CS%u_shelf, CS%v_shelf)
     if (CS%id_visc_shelf>0) &
@@ -977,8 +1001,23 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  default=.false.)
   if (CS%use_MPM) then
     allocate(CS%MPM)
-    call MPM_init(CS%MPM, ISS, G, US, param_file, CS%n_glen, CS%AGlen_visc(G%isc,G%jsc))
+    call MPM_init(CS%MPM, ISS, G, US, param_file, CS%n_glen, CS%eps_glen_min, &
+                  CS%AGlen_visc(G%isc,G%jsc), &
+                  CS%density_ice, CS%density_ocean_avg, CS%g_Earth)
+    ! Allocate MPM velocity Dirichlet node masks (same B-grid extents as umask/vmask)
+    allocate(CS%u_node_mask_MPM(Isdq:Iedq, Jsdq:Jedq), source=0.0)
+    allocate(CS%v_node_mask_MPM(Isdq:Iedq, Jsdq:Jedq), source=0.0)
+    ! Read MPM node masks and prescribed boundary values from input file
+    call initialize_MPM_node_masks_from_file(CS%MPM%h_node_mask, CS%MPM%h_node_bdry_val, &
+                                              CS%u_node_mask_MPM, CS%v_node_mask_MPM, &
+                                              G, US, param_file)
     call MOM_mesg("MOM_ice_shelf_dyn: MPM mode enabled.")
+
+    ! Register MPM diagnostics
+    CS%id_npart_per_cell = register_diag_field('ice_shelf_model', 'npart_per_cell', &
+        CS%diag%axesT1, Time, 'Number of active MPM particles per cell', '1')
+    CS%id_reweight_MPM = register_diag_field('ice_shelf_model', 'reweight_MPM', &
+        CS%diag%axesT1, Time, 'MPM reweighting factor (areaT / sum PVol)', '1')
   endif
 
 end subroutine initialize_ice_shelf_dyn
@@ -1081,10 +1120,12 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
     ! --- MPM path: Lagrangian thickness evolution via particles ---
     ! P2G updates ISS%h_shelf and ISS%hmask from particle state.
     call MPM_P2G(CS%MPM, ISS, G)
+
     ! Rebuild velocity masks from the particle-derived hmask.
     call update_velocity_masks(CS, G, ISS%hmask, CS%umask, CS%vmask, &
                                CS%u_face_mask, CS%v_face_mask)
     call pass_vector(CS%umask, CS%vmask, G%domain, TO_ALL, BGRID_NE)
+
   elseif (CS%advect_shelf) then
     ! --- FEM path: Eulerian advection of ISS%h_shelf ---
     call ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
@@ -1104,23 +1145,41 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
     CS%GL_couple=.false.
   endif
 
+
   if (update_ice_vel) then
+    ! --- MPM: compute front-cell flag, momentum P2G, then store pre-solve velocity ---
+    if (CS%use_MPM .and. associated(CS%MPM)) then
+      call MPM_compute_is_front_cell(CS%MPM, ISS, G, CS%u_node_mask_MPM)
+      ! Eq 27 (Huth 2021): momentum-conserving P2G velocity mapping.
+      ! Must be called BEFORE MPM_store_pre_solve_vel so that the momentum-mapped
+      ! velocity is stored as v_I^m for the FLIP/APIC G2P update.
+      call MPM_P2G_velocity(CS%MPM, G, CS%u_shelf, CS%v_shelf, &
+                            CS%umask, CS%vmask, CS%MPM%density_ice)
+      call MPM_store_pre_solve_vel(CS%MPM, G, CS%u_shelf, CS%v_shelf)
+    endif
+
+
     call ice_shelf_solve_outer(CS, ISS, G, US, CS%u_shelf, CS%v_shelf, &
                                CS%taudx_shelf, CS%taudy_shelf, iters, Time)
     CS%elapsed_velocity_time = 0.0
 
     ! --- MPM post-step: update particles from converged velocity field ---
     if (CS%use_MPM) then
-      call MPM_G2P(CS%MPM, G, CS%u_shelf, CS%v_shelf)
-      call MPM_Lagrangian_update(CS%MPM, G, time_step)
+      call MPM_G2P(CS%MPM, G, CS%u_shelf, CS%v_shelf, ISS%hmask)
+      call MPM_enforce_1d_test(CS%MPM, ISS, G)
+      call MPM_Lagrangian_update(CS%MPM, G, time_step, ISS%hmask)
       call MPM_split(CS%MPM, G)
       call MPM_migrate(CS%MPM, ISS, G)
-      call MPM_reseed(CS%MPM, ISS, G, CS%u_bdry_val, CS%v_bdry_val)
+      call MPM_enforce_1d_test(CS%MPM, ISS, G)
       ! Update ISS%h_shelf from the new particle state so diagnostics and the
       ! next SSA solve both see the correct thickness.
       call MPM_P2G(CS%MPM, ISS, G)
       call update_velocity_masks(CS, G, ISS%hmask, CS%umask, CS%vmask, &
                                  CS%u_face_mask, CS%v_face_mask)
+
+      ! VTU time accumulation — actual writing happens in IS_dynamics_post_data
+      CS%MPM%vtu_time_accum    = CS%MPM%vtu_time_accum    + time_step
+      CS%MPM%model_time_total  = CS%MPM%model_time_total  + time_step
     endif
   endif
 
@@ -1203,6 +1262,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
   type(ice_shelf_state),  intent(inout) :: ISS !< A structure with elements that describe
                                                !! the ice-shelf state
   type(ocean_grid_type),  intent(in) :: G  !< The grid structure used by the ice shelf.
+  real, dimension(SZDI_(G),SZDJ_(G))   :: npart_real ! Temporary for integer->real conversion [nondim]
   real, dimension(SZDIB_(G),SZDJB_(G))  :: taud_x, taud_y, taud  ! area-averaged driving stress [R L2 T-2 ~> Pa]
   real, dimension(SZDI_(G),SZDJ_(G))  :: ice_visc ! area-averaged vertically integrated ice viscosity
                                                   !! [R L2 Z T-1 ~> Pa s m]
@@ -1267,6 +1327,25 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
     if (CS%id_ufb_mask > 0) call post_data(CS%id_ufb_mask, CS%u_face_mask_bdry, CS%diag)
     if (CS%id_vfb_mask > 0) call post_data(CS%id_vfb_mask, CS%v_face_mask_bdry, CS%diag)
 !   if (CS%id_t_mask > 0) call post_data(CS%id_t_mask, CS%tmask, CS%diag)
+
+    ! MPM diagnostics
+    if (CS%use_MPM .and. associated(CS%MPM)) then
+      if (CS%id_npart_per_cell > 0) then
+        do j = G%jsd, G%jed ; do i = G%isd, G%ied
+          npart_real(i,j) = real(CS%MPM%cell_count(i,j))
+        enddo ; enddo
+        call post_data(CS%id_npart_per_cell, npart_real, CS%diag)
+      endif
+      if (CS%id_reweight_MPM > 0) then
+        call post_data(CS%id_reweight_MPM, CS%MPM%reweight, CS%diag)
+      endif
+
+      ! Write VTU particle output when accumulated time exceeds the output interval
+      if (CS%MPM%vtu_dt > 0.0 .and. CS%MPM%vtu_time_accum >= CS%MPM%vtu_dt) then
+        call MPM_write_vtu(CS%MPM, G, CS%MPM%model_time_total, trim(CS%MPM%vtu_dir))
+        CS%MPM%vtu_time_accum = CS%MPM%vtu_time_accum - CS%MPM%vtu_dt
+      endif
+    endif
 
     if (CS%id_duHdx > 0         .or. CS%id_dvHdy > 0         .or. CS%id_fluxdiv > 0       .or. &
         CS%id_devstress_xx > 0  .or. CS%id_devstress_yy > 0  .or. CS%id_devstress_xy > 0  .or. &
@@ -1592,6 +1671,16 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   rhoi_rhow = CS%density_ice / CS%density_ocean_avg
 
+  ! If no free (umask=1) nodes exist, all velocities are Dirichlet-prescribed
+  ! and there is nothing for the SSA solver to do.  This occurs in the front
+  ! advance test before particles flow into the active domain.
+  if (.not. any(CS%umask(G%IscB:G%IecB, G%JscB:G%JecB) == 1.0)) then
+    iters = 0
+    taudx(:,:) = 0.0 ; taudy(:,:) = 0.0
+    call MOM_mesg("ice_shelf_solve_outer: no free nodes, skipping SSA solve", 5)
+    return
+  endif
+
   taudx(:,:) = 0.0 ; taudy(:,:) = 0.0
   Au(:,:) = 0.0 ; Av(:,:) = 0.0
 
@@ -1608,7 +1697,13 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     enddo ; enddo
   endif
 
-  call calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, CS%OD_av)
+
+  if (CS%use_MPM .and. associated(CS%MPM)) then
+    call calc_shelf_driving_stress_MPM(CS, ISS, G, US, taudx, taudy, CS%OD_av)
+  else
+    call calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, CS%OD_av)
+  endif
+
   call pass_vector(taudx, taudy, G%domain, TO_ALL, BGRID_NE)
   ! This is to determine which cells contain the grounding line, the criterion being that the cell
   ! is ice-covered, with some nodes floating and some grounded flotation condition is estimated by
@@ -1643,7 +1738,13 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
   call calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
   call pass_var(CS%basal_traction, G%domain, complete=.true.)
+
+  if (CS%use_MPM .and. associated(CS%MPM)) then
+    call MPM_compute_basal_trac(CS%MPM, G, US, CS%bed_elev, u_shlf, v_shlf)
+    call MPM_compute_visc(CS%MPM, G, US, u_shlf, v_shlf)
+  endif
   call calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
+
   call pass_var(CS%ice_visc, G%domain)
   call pass_var(CS%newton_visc_factor, G%domain)
   call pass_var(CS%newton_str_ux, G%domain)
@@ -1668,9 +1769,11 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
     Au(:,:) = 0.0 ; Av(:,:) = 0.0
 
+
     call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, H_node, &
                    CS%ice_visc, CS%float_cond, CS%bed_elev, CS%basal_traction, &
                    G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow, use_newton_in=.false.)
+
     call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
 
     err_init = 0 ; err_tempu = 0 ; err_tempv = 0
@@ -1743,6 +1846,10 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
     call calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
     call pass_var(CS%basal_traction, G%domain, complete=.true.)
+    if (CS%use_MPM .and. associated(CS%MPM)) then
+      call MPM_compute_basal_trac(CS%MPM, G, US, CS%bed_elev, u_shlf, v_shlf)
+      call MPM_compute_visc(CS%MPM, G, US, u_shlf, v_shlf)
+    endif
     call calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
     call pass_var(CS%ice_visc, G%domain)
     call pass_var(CS%newton_visc_factor, G%domain)
@@ -3636,6 +3743,184 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
   enddo; enddo
 end subroutine calc_shelf_driving_stress
 
+!> Calculate driving stress for MPM simulations, following Huth et al. 2021.
+!! Interior cells (hmask==1, not front) use MPM particle quadrature with MPM%GradZs
+!! (surface-elevation gradient interpolated to each particle).  Front cells
+!! (hmask==1 and is_front_cell) use FEM 4-point Gauss quadrature with MPM%Zs_node
+!! and MPM%H_node.  Neumann (ice-front stress) boundary conditions are applied at
+!! calving fronts; the cell-averaged thickness for Neumann BCs is computed from the
+!! 4-corner H_node average.  hmask==3 (inflow BC) cells are not used in MPM mode.
+subroutine calc_shelf_driving_stress_MPM(CS, ISS, G, US, taudx, taudy, OD)
+  type(ice_shelf_dyn_CS), intent(in)    :: CS  !< Ice shelf dynamics control structure
+  type(ice_shelf_state),  intent(in)    :: ISS !< Ice shelf state
+  type(ocean_grid_type),  intent(inout) :: G   !< Ocean grid
+  type(unit_scale_type),  intent(in)    :: US  !< Unit scaling factors
+  real, dimension(SZDI_(G),SZDJ_(G)),   intent(in)    :: OD    !< Ocean floor depth [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)), intent(inout) :: taudx !< X driving stress at q-points [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(SZDIB_(G),SZDJB_(G)), intent(inout) :: taudy !< Y driving stress at q-points [R L3 Z T-2 ~> kg m s-2]
+
+  real :: rho, rhow, grav
+  real :: neumann_val, H_cell
+  real :: dxh, dyh
+  real :: xq(2)  ! 1-D Gauss-Legendre quadrature points in [0,1]
+  real :: GradZs_x_qp, GradZs_y_qp  ! Zs gradient at Gauss point [Z L-1 ~> nondim]
+  real :: H_qp                        ! Ice thickness at Gauss point [Z ~> m]
+  real :: Nm                          ! Shape function value at Gauss point [nondim]
+  real :: detJ_eff                    ! Particle integration weight [L2 ~> m2]
+  real :: fx, fy                      ! Particle driving force [R L3 Z T-2 ~> kg m s-2]
+  real :: taud_qp_x(2,2,4), taud_qp_y(2,2,4)  ! Per-Gauss-point nodal contributions
+  real :: N(4)   ! Shape function values at particle position [nondim]
+  integer :: i, j, p, iq, jq, qp, iphi, jphi, Itgt, Jtgt, ilq, jlq
+  integer :: isc, iec, jsc, jec
+  integer :: gisc, giec, gjsc, gjec, i_off, j_off
+
+  isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
+  i_off = G%idg_offset ; j_off = G%jdg_offset
+  gisc = 1 ; gjsc = 1
+  giec = G%domain%niglobal ; gjec = G%domain%njglobal
+
+  rho  = CS%density_ice ; rhow = CS%density_ocean_avg
+  grav = CS%g_Earth
+
+  xq(1) = 0.5 * (1.0 - 1.0/sqrt(3.0))
+  xq(2) = 0.5 * (1.0 + 1.0/sqrt(3.0))
+
+  ! --- Part 2: Interior MPM cells (hmask==1, not front): particle quadrature ---
+  ! Driving force at node k: f_kx = -Σ_p N_k(x_p) * ρ_i * g * H_p * GradZs_x(p) * V_p
+  ! where V_p = PVolume(p) * reweight(ic,jc)  (Huth et al. 2021 Eq. 31)
+  do p = 1, CS%MPM%n_active
+    if (CS%MPM%status(p) /= 1) cycle  ! ALIVE = 1
+    i = CS%MPM%ci(p) ; j = CS%MPM%cj(p)
+    if (ISS%hmask(i,j) == 0.0 .OR. ISS%hmask(i,j) == 2.0) cycle
+    if (CS%MPM%is_front_cell(i,j)) cycle
+
+    call smpm_shape(CS%MPM%xi(p), CS%MPM%eta(p), N)
+    detJ_eff = CS%MPM%PVolume(p) * CS%MPM%reweight(i,j)
+
+    fx = -rho * grav * CS%MPM%H(p) * CS%MPM%GradZs(1,p) * detJ_eff
+    fy = -rho * grav * CS%MPM%H(p) * CS%MPM%GradZs(2,p) * detJ_eff
+
+    ! Scatter to 4 B-grid corners (SW, SE, NW, NE of T-cell i,j)
+    taudx(I-1,J-1) = taudx(I-1,J-1) + N(1)*fx
+    taudx(I,  J-1) = taudx(I,  J-1) + N(2)*fx
+    taudx(I-1,J  ) = taudx(I-1,J  ) + N(3)*fx
+    taudx(I,  J  ) = taudx(I,  J  ) + N(4)*fx
+    taudy(I-1,J-1) = taudy(I-1,J-1) + N(1)*fy
+    taudy(I,  J-1) = taudy(I,  J-1) + N(2)*fy
+    taudy(I-1,J  ) = taudy(I-1,J  ) + N(3)*fy
+    taudy(I,  J  ) = taudy(I,  J  ) + N(4)*fy
+  enddo
+
+  ! --- Part 3: Front cells (hmask==1, is_front_cell): FEM Gauss quadrature ---
+  ! GradZs at each Gauss point is reconstructed from Zs_node using ∂N_k/∂x (Phi).
+  ! H at each Gauss point is bilinearly interpolated from H_node corners.
+  ! Both Zs_node and H_node are updated by MPM_P2G each timestep.
+  do j = jsc, jec ; do i = isc, iec
+    if (ISS%hmask(i,j) /= 1.0 .and. ISS%hmask(i,j) /= 3.0) cycle
+    if (.not. CS%MPM%is_front_cell(i,j)) cycle
+
+    taud_qp_x(:,:,:) = 0.0 ; taud_qp_y(:,:,:) = 0.0
+
+    do iq = 1, 2 ; do jq = 1, 2
+      qp = 2*(jq-1) + iq
+
+      ! Zs gradient at Gauss point: Σ_k (∂N_k/∂x)|_qp * Zs_node_k  [Z L-1 ~> nondim]
+      GradZs_x_qp = CS%Phi(1,qp,i,j)*CS%MPM%Zs_node(I-1,J-1) + &
+                    CS%Phi(3,qp,i,j)*CS%MPM%Zs_node(I,  J-1) + &
+                    CS%Phi(5,qp,i,j)*CS%MPM%Zs_node(I-1,J  ) + &
+                    CS%Phi(7,qp,i,j)*CS%MPM%Zs_node(I,  J  )
+      GradZs_y_qp = CS%Phi(2,qp,i,j)*CS%MPM%Zs_node(I-1,J-1) + &
+                    CS%Phi(4,qp,i,j)*CS%MPM%Zs_node(I,  J-1) + &
+                    CS%Phi(6,qp,i,j)*CS%MPM%Zs_node(I-1,J  ) + &
+                    CS%Phi(8,qp,i,j)*CS%MPM%Zs_node(I,  J  )
+
+      ! Ice thickness at Gauss point: bilinear interpolation from H_node corners
+      ! xq(3-iq) = 1-xq(iq) since xq(1)+xq(2) = 1
+      H_qp = max(CS%MPM%H_node(I-1,J-1) * (xq(3-iq)*xq(3-jq)) + &
+                 CS%MPM%H_node(I,  J-1) * (xq(iq)  *xq(3-jq)) + &
+                 CS%MPM%H_node(I-1,J  ) * (xq(3-iq)*xq(jq)  ) + &
+                 CS%MPM%H_node(I,  J  ) * (xq(iq)  *xq(jq)  ), CS%min_h_shelf)
+
+      ! Nodal contributions at this Gauss point: N_m(qp) * (-ρ_i * g * H_qp * GradZs_qp)
+      do jphi = 1, 2 ; do iphi = 1, 2
+        ! Shape function value N_m at Gauss point (iq,jq) for node (iphi,jphi):
+        !   same-side → xq(2) (large), opposite side → xq(1) (small)
+        ilq = 1 ; if (iq == iphi) ilq = 2
+        jlq = 1 ; if (jq == jphi) jlq = 2
+        Nm = xq(ilq) * xq(jlq)
+        taud_qp_x(iphi,jphi,qp) = -rho * grav * H_qp * GradZs_x_qp * Nm
+        taud_qp_y(iphi,jphi,qp) = -rho * grav * H_qp * GradZs_y_qp * Nm
+      enddo ; enddo
+    enddo ; enddo
+
+    ! Accumulate: 4-point Gauss weight = 0.25 * areaT; scatter to B-grid nodes.
+    ! Node ordering: SW=(1,1)→(I-1,J-1), SE=(2,1)→(I,J-1), NW=(1,2)→(I-1,J), NE=(2,2)→(I,J)
+    do jphi = 1, 2 ; do iphi = 1, 2
+      Itgt = i - 2 + iphi ; Jtgt = j - 2 + jphi
+      taudx(Itgt,Jtgt) = taudx(Itgt,Jtgt) + 0.25 * G%areaT(i,j) * &
+        ((taud_qp_x(iphi,jphi,1)+taud_qp_x(iphi,jphi,4)) + &
+         (taud_qp_x(iphi,jphi,2)+taud_qp_x(iphi,jphi,3)))
+      taudy(Itgt,Jtgt) = taudy(Itgt,Jtgt) + 0.25 * G%areaT(i,j) * &
+        ((taud_qp_y(iphi,jphi,1)+taud_qp_y(iphi,jphi,4)) + &
+         (taud_qp_y(iphi,jphi,2)+taud_qp_y(iphi,jphi,3)))
+    enddo ; enddo
+  enddo ; enddo
+
+  ! --- Part 4: Neumann (ice-front stress) boundary conditions ---
+  ! Applied for all ice cells (hmask==1).  In MPM mode, the cell-averaged thickness
+  ! is computed from the 4-corner H_node average; calving-front faces are skipped for
+  ! faces whose both adjacent nodes are Dirichlet velocity nodes (inflow BC faces).
+  do j = jsc-1, jec+1 ; do i = isc-1, iec+1
+    if (ISS%hmask(i,j) /= 1.0 .and. ISS%hmask(i,j) /= 3.0) cycle
+
+    dxh = G%dxT(i,j) ; dyh = G%dyT(i,j)
+
+    ! Cell-averaged ice thickness: 4-corner H_node average (MPM is B-grid based)
+    H_cell = max(0.25*(CS%MPM%H_node(I-1,J-1) + CS%MPM%H_node(I,  J-1) + &
+                       CS%MPM%H_node(I-1,J  ) + CS%MPM%H_node(I,  J  )), CS%min_h_shelf)
+
+    if (CS%ground_frac(i,j) == 1) then
+      neumann_val = 0.5 * grav * (rho * H_cell**2 - rhow * CS%bed_elev(i,j)**2)
+    else
+      neumann_val = 0.5 * grav * (1.0 - rho/rhow) * (rho * H_cell**2)
+    endif
+
+    ! West face: calving-front Neumann BC, skipped if both adjacent u-nodes are Dirichlet
+    if ((CS%u_face_mask_bdry(I-1,j) == 2) .OR. &
+        ((ISS%hmask(i-1,j) == 0 .OR. ISS%hmask(i-1,j) == 2) .AND. &
+         (CS%reentrant_x .OR. (i+i_off /= gisc)) .AND. &
+         (CS%u_node_mask_MPM(I-1,J-1) == 0.0 .OR. CS%u_node_mask_MPM(I-1,J) == 0.0))) then
+      taudx(I-1,J-1) = taudx(I-1,J-1) - 0.5 * dyh * neumann_val
+      taudx(I-1,J  ) = taudx(I-1,J  ) - 0.5 * dyh * neumann_val
+    endif
+    ! East face: calving-front Neumann BC, skipped if both adjacent u-nodes are Dirichlet
+    if ((CS%u_face_mask_bdry(I,j) == 2) .OR. &
+        ((ISS%hmask(i+1,j) == 0 .OR. ISS%hmask(i+1,j) == 2) .AND. &
+         (CS%reentrant_x .OR. (i+i_off /= giec)) .AND. &
+         (CS%u_node_mask_MPM(I,J-1) == 0.0 .OR. CS%u_node_mask_MPM(I,J) == 0.0))) then
+      taudx(I,J-1) = taudx(I,J-1) + 0.5 * dyh * neumann_val
+      taudx(I,J  ) = taudx(I,J  ) + 0.5 * dyh * neumann_val
+    endif
+    ! South face: calving-front Neumann BC, skipped if both adjacent v-nodes are Dirichlet
+    if ((CS%v_face_mask_bdry(i,J-1) == 2) .OR. &
+        ((ISS%hmask(i,j-1) == 0 .OR. ISS%hmask(i,j-1) == 2) .AND. &
+         (CS%reentrant_y .OR. (j+j_off /= gjsc)) .AND. &
+         (CS%v_node_mask_MPM(I-1,J-1) == 0.0 .OR. CS%v_node_mask_MPM(I,J-1) == 0.0))) then
+      taudy(I-1,J-1) = taudy(I-1,J-1) - 0.5 * dxh * neumann_val
+      taudy(I,  J-1) = taudy(I,  J-1) - 0.5 * dxh * neumann_val
+    endif
+    ! North face: calving-front Neumann BC, skipped if both adjacent v-nodes are Dirichlet
+    if ((CS%v_face_mask_bdry(i,J) == 2) .OR. &
+        ((ISS%hmask(i,j+1) == 0 .OR. ISS%hmask(i,j+1) == 2) .AND. &
+         (CS%reentrant_y .OR. (j+j_off /= gjec)) .AND. &
+         (CS%v_node_mask_MPM(I-1,J) == 0.0 .OR. CS%v_node_mask_MPM(I,J) == 0.0))) then
+      taudy(I-1,J) = taudy(I-1,J) + 0.5 * dxh * neumann_val
+      taudy(I,  J) = taudy(I,  J) + 0.5 * dxh * neumann_val
+    endif
+  enddo ; enddo
+
+end subroutine calc_shelf_driving_stress_MPM
+
 subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, hmask, H_node, &
                      ice_visc, float_cond, bathyT, basal_trac, G, US, is, ie, js, je, dens_ratio, use_newton_in)
 
@@ -3735,7 +4020,24 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   uret(:,:) = 0.0; vret(:,:)=0.0
   uret_b(:,:,:)=0.0 ; vret_b(:,:,:)=0.0
 
+  ! If MPM is active, handle hmask==1 cells via particle-based integration
+  ! and front-cell FEM, then only let the standard Gauss loop handle hmask==3
+  if (CS%use_MPM .and. associated(CS%MPM)) then
+    call CG_action_MPM(CS, CS%MPM, uret, vret, u_shlf, v_shlf, umask, vmask, hmask, &
+                       G, US, is, ie, js, je, use_newton)
+    ! Front cells are handled by the standard CG_action loop below (using frozen ice_visc).
+  endif
+
   do j=js,je ; do i=is,ie ; if (hmask(i,j) == 1 .or. hmask(i,j)==3) then
+
+    ! When MPM is active, skip interior hmask==1 cells that have particles (handled by CG_action_MPM).
+    ! Front cells (hmask==1 with an empty neighbor) stay in the standard loop so they
+    ! use the pre-computed ice_visc (frozen from previous Picard iterate).
+    ! Zero-particle interior cells (activated by GIMP domain overlap but no particle centres yet)
+    ! also stay here so the FEM stiffness (from calc_shelf_visc) prevents a singular SSA system.
+    if (CS%use_MPM .and. associated(CS%MPM) .and. (hmask(i,j) == 1 .or. hmask(i,j) == 3) &
+        .and. .not. CS%MPM%is_front_cell(i,j) &
+        .and. CS%MPM%cell_count(i,j) > 0) cycle
 
     uret_qp(:,:,:)=0.0; vret_qp(:,:,:)=0.0
 
@@ -3887,11 +4189,144 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   endif ; enddo ; enddo
 
   do J=js-1,je ; do I=is-1,ie
-    uret(I,J) = (uret_b(I,J,1)+uret_b(I,J,4)) + (uret_b(I,J,2)+uret_b(I,J,3))
-    vret(I,J) = (vret_b(I,J,1)+vret_b(I,J,4)) + (vret_b(I,J,2)+vret_b(I,J,3))
+    uret(I,J) = uret(I,J) + (uret_b(I,J,1)+uret_b(I,J,4)) + (uret_b(I,J,2)+uret_b(I,J,3))
+    vret(I,J) = vret(I,J) + (vret_b(I,J,1)+vret_b(I,J,4)) + (vret_b(I,J,2)+vret_b(I,J,3))
   enddo; enddo
 
 end subroutine CG_action
+
+! ============================================================
+!> MPM particle-based CG action: replaces Gauss quadrature with particles
+!! as integration points for interior ice cells.  Front cells and inflow BC
+!! cells are handled by the standard CG_action (using frozen ice_visc).
+!!
+!! Nodal contributions du(4)/dv(4) are accumulated locally per particle
+!! (matching the conceptual description in Huth et al. 2021) before being
+!! scattered to the global uret/vret arrays.  Optionally adds Newton tangent
+!! stiffness correction terms using MPM%newton_visc_factor.
+subroutine CG_action_MPM(CS, MPM, uret, vret, u_shlf, v_shlf, umask, vmask, hmask, &
+                         G, US, is, ie, js, je, use_newton)
+
+  type(ice_shelf_dyn_CS), intent(in)    :: CS
+  type(MPM_CS),           intent(in)    :: MPM
+  type(ocean_grid_type),  intent(in)    :: G
+  real, dimension(G%IsdB:G%IedB,G%JsdB:G%JedB), intent(inout) :: uret, vret
+  real, dimension(SZDIB_(G),SZDJB_(G)), intent(in) :: u_shlf, v_shlf
+  real, dimension(SZDIB_(G),SZDJB_(G)), intent(in) :: umask, vmask
+  real, dimension(SZDI_(G),SZDJ_(G)),   intent(in) :: hmask
+  type(unit_scale_type),  intent(in)    :: US
+  integer,                intent(in)    :: is, ie, js, je
+  logical,                intent(in)    :: use_newton  !< If true, apply Newton tangent correction
+
+  integer :: i, j, p, k, pp, n_p, Itgt, Jtgt
+  real :: N(4), dNdx(4), dNdy(4)
+  !real :: uSW, uSE, uNW, uNE, vSW, vSE, vNW, vNE
+  real :: ux, uy, vx, vy, uq, vq
+  real :: eta_p, detJ_eff, dx, dy, nvf
+  real :: xi_p, eta_l
+  real :: strx_n, stry_n, strsh_n, dstrain_n, inner_dot_n
+  real :: du(4), dv(4)  ! Local per-particle nodal contributions
+
+  do j = js, je ; do i = is, ie
+    ! Only process interior MPM cells (hmask==1, not front)
+    if (hmask(i,j) /= 1.0 .and. hmask(i,j) /= 3.0) cycle
+    if (MPM%is_front_cell(i,j)) cycle
+
+    dx = G%dxT(i,j) ; dy = G%dyT(i,j)
+
+    n_p = MPM%cell_count(i,j)
+    do pp = 0, n_p - 1
+      p = MPM%cell_list(MPM%cell_start(i,j) + pp)
+      if (MPM%status(p) /= 1) cycle  ! ALIVE = 1
+
+      xi_p  = MPM%xi(p)
+      eta_l = MPM%eta(p)
+
+      call smpm_shape(xi_p, eta_l, N)
+      call smpm_grad(xi_p, eta_l, dx, dy, dNdx, dNdy)
+
+      ! Integration weight: PVolume * reweight (particle area scaled to cell area)
+      ! reweight is used here (stiffness assembly) but NOT in P2G (Eq 29)
+      detJ_eff = MPM%PVolume(p) * MPM%reweight(i,j)
+      eta_p    = MPM%eta_visc(p)
+
+      ! B-grid corner velocities
+      ! uSW = u_shlf(I-1, J-1) ; vSW = v_shlf(I-1, J-1)
+      ! uSE = u_shlf(I,   J-1) ; vSE = v_shlf(I,   J-1)
+      ! uNW = u_shlf(I-1, J  ) ; vNW = v_shlf(I-1, J  )
+      ! uNE = u_shlf(I,   J  ) ; vNE = v_shlf(I,   J  )
+
+      ! Velocity at particle (for basal traction)
+      uq = (N(1)*u_shlf(I-1,J-1) + N(3)*u_shlf(I-1,J)) + (N(2)*u_shlf(I,J-1) + N(4)*u_shlf(I,J))
+      vq = (N(1)*v_shlf(I-1,J-1) + N(3)*v_shlf(I-1,J)) + (N(2)*v_shlf(I,J-1) + N(4)*v_shlf(I,J))
+
+      ! Velocity gradients at particle
+      ux   = (dNdx(1)*u_shlf(I-1,J-1) + dNdx(3)*u_shlf(I-1,J)) + (dNdx(2)*u_shlf(I,J-1) + dNdx(4)*u_shlf(I,J))
+      vy   = (dNdy(1)*v_shlf(I-1,J-1) + dNdy(3)*v_shlf(I-1,J)) + (dNdy(2)*v_shlf(I,J-1) + dNdy(4)*v_shlf(I,J))
+      uy   = (dNdy(1)*u_shlf(I-1,J-1) + dNdy(3)*u_shlf(I-1,J)) + (dNdy(2)*u_shlf(I,J-1) + dNdy(4)*u_shlf(I,J))
+      vx   = (dNdx(1)*v_shlf(I-1,J-1) + dNdx(3)*v_shlf(I-1,J)) + (dNdx(2)*v_shlf(I,J-1) + dNdx(4)*v_shlf(I,J))
+
+      ! --- Accumulate nodal contributions locally ---
+      do k = 1, 4
+        ! Viscous stress: η * [(4ux+2vy)∂N/∂x + (uy+vx)∂N/∂y]  (Glen's flow law)
+        du(k) = eta_p * ((4.0*ux + 2.0*vy) * dNdx(k) + (uy + vx) * dNdy(k)) * detJ_eff
+        dv(k) = eta_p * ((uy + vx) * dNdx(k) + (4.0*vy + 2.0*ux) * dNdy(k)) * detJ_eff
+      enddo
+
+      ! --- Newton tangent stiffness correction ---
+      ! Matches FEM formula in CG_action (lines 3873-3903):
+      !   dstrain_n = (2*str_ux + str_vy)*ux + (2*str_vy + str_ux)*vy + str_sh*(uy+vx)*0.5
+      !   u_newton(k) += nvf * dstrain_n * ((2*str_ux+str_vy)*dN/dx + str_sh*0.5*dN/dy)
+      !   v_newton(k) += nvf * dstrain_n * (str_sh*0.5*dN/dx + (2*str_vy+str_ux)*dN/dy)
+      if (use_newton) then
+        nvf    = MPM%newton_visc_factor(p)
+        strx_n = MPM%GradVel(1,p)          ! stored du/dx from previous iteration
+        stry_n = MPM%GradVel(2,p)          ! stored dv/dy
+        strsh_n = MPM%GradVel(3,p) + MPM%GradVel(4,p)  ! stored (du/dy + dv/dx)
+        dstrain_n = (2.0*strx_n + stry_n)*ux + (2.0*stry_n + strx_n)*vy + &
+                    strsh_n * (uy + vx) * 0.5
+        do k = 1, 4
+          du(k) = du(k) + nvf * dstrain_n * &
+            ((2.0*strx_n + stry_n) * dNdx(k) + strsh_n * 0.5 * dNdy(k)) * detJ_eff
+          dv(k) = dv(k) + nvf * dstrain_n * &
+            (strsh_n * 0.5 * dNdx(k) + (2.0*stry_n + strx_n) * dNdy(k)) * detJ_eff
+        enddo
+      endif
+
+      ! --- Per-particle basal traction (zero for floating particles) ---
+      ! MPM%basal_trac_p(p) = 0 for floating; computed by MPM_compute_basal_trac
+      if (MPM%basal_trac_p(p) /= 0.0) then
+        do k = 1, 4
+          du(k) = du(k) + MPM%basal_trac_p(p) * uq * N(k) * detJ_eff
+          dv(k) = dv(k) + MPM%basal_trac_p(p) * vq * N(k) * detJ_eff
+        enddo
+      endif
+
+      ! --- Newton basal drag tangent correction ---
+      ! Mirrors FEM: newton_drag_coef * u_mid * (u_mid . u_trial) * N(k)
+      ! where u_trial = uq,vq (the CG trial vector) and u_mid is from the Picard iterate
+      if (use_newton .and. MPM%newton_drag_coef_p(p) /= 0.0) then
+        inner_dot_n = MPM%up_mid(p) * uq + MPM%vp_mid(p) * vq
+        do k = 1, 4
+          du(k) = du(k) + MPM%newton_drag_coef_p(p) * MPM%up_mid(p) * inner_dot_n * N(k) * detJ_eff
+          dv(k) = dv(k) + MPM%newton_drag_coef_p(p) * MPM%vp_mid(p) * inner_dot_n * N(k) * detJ_eff
+        enddo
+      endif
+
+      ! --- Scatter local contributions to global uret/vret ---
+      do k = 1, 4
+        if (k == 1) then ; Itgt = i-1 ; Jtgt = j-1
+        elseif (k == 2) then ; Itgt = i   ; Jtgt = j-1
+        elseif (k == 3) then ; Itgt = i-1 ; Jtgt = j
+        else                 ; Itgt = i   ; Jtgt = j ; endif
+        if (umask(Itgt,Jtgt) == 1.0) uret(Itgt,Jtgt) = uret(Itgt,Jtgt) + du(k)
+        if (vmask(Itgt,Jtgt) == 1.0) vret(Itgt,Jtgt) = vret(Itgt,Jtgt) + dv(k)
+      enddo
+
+    enddo  ! pp particles
+  enddo ; enddo  ! j, i cells
+
+end subroutine CG_action_MPM
 
 subroutine CG_action_subgrid_basal(Phisub, H, U, V, bathyT, dens_ratio, Ucontr, Vcontr)
   real, dimension(:,:,:,:,:,:), &
@@ -4064,6 +4499,10 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
 
   do j=jsc-1,jec+1 ; do i=isc-1,iec+1 ; if (hmask(i,j) == 1 .or. hmask(i,j)==3) then
 
+    ! Skip interior MPM cells (handled by matrix_diagonal_MPM below)
+    if (CS%use_MPM .and. associated(CS%MPM) .and. (hmask(i,j) == 1 .or. hmask(i,j) ==3) &
+        .and. .not. CS%MPM%is_front_cell(i,j)) cycle
+
     ! Phi(2*i-1,j) gives d(Phi_i)/dx at quadrature point j
     ! Phi(2*i,j) gives d(Phi_i)/dy at quadrature point j
 
@@ -4211,7 +4650,108 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
     v_diagonal(I,J) = (v_diag_b(I,J,1)+v_diag_b(I,J,4)) + (v_diag_b(I,J,2)+v_diag_b(I,J,3))
   enddo ; enddo
 
+  ! Add MPM interior cell contributions (must be AFTER the FEM assignment above)
+  if (CS%use_MPM .and. associated(CS%MPM)) then
+    call matrix_diagonal_MPM(CS, CS%MPM, u_diagonal, v_diagonal, CS%umask, CS%vmask, &
+                              hmask, G, US, jsc-1, jec+1, isc-1, iec+1, do_newton_visc)
+  endif
+
 end subroutine matrix_diagonal
+
+!> Particle-based preconditioner diagonal for MPM interior cells.
+!! Mirrors matrix_diagonal for hmask==1 non-front cells, accumulating
+!! per-particle contributions to u_diagonal and v_diagonal.
+subroutine matrix_diagonal_MPM(CS, MPM, u_diagonal, v_diagonal, umask, vmask, &
+                                hmask, G, US, js, je, is, ie, use_newton)
+  type(ice_shelf_dyn_CS), intent(in)    :: CS
+  type(MPM_CS),           intent(in)    :: MPM
+  type(ocean_grid_type),  intent(in)    :: G
+  type(unit_scale_type),  intent(in)    :: US
+  real, dimension(SZDIB_(G),SZDJB_(G)), intent(inout) :: u_diagonal, v_diagonal
+  real, dimension(SZDIB_(G),SZDJB_(G)), intent(in)    :: umask, vmask
+  real, dimension(SZDI_(G),SZDJ_(G)),   intent(in)    :: hmask
+  integer, intent(in) :: js, je, is, ie
+  logical, intent(in) :: use_newton  !< If true, add Newton viscosity correction to diagonal
+
+  integer :: i, j, p, k, pp, n_p, Itgt, Jtgt
+  real :: N(4), dNdx(4), dNdy(4)
+  real :: eta_p, detJ_eff, dx, dy, nvf
+  real :: xi_p, eta_l
+  real :: strx_n, stry_n, strsh_n
+  real :: dstrain_diag_u, dstrain_diag_v
+  real :: du_diag(4), dv_diag(4)
+
+  do j = js, je ; do i = is, ie
+    if (hmask(i,j) /= 1.0 .and. hmask(i,j) /= 3.0) cycle
+    if (MPM%is_front_cell(i,j)) cycle
+
+    dx = G%dxT(i,j) ; dy = G%dyT(i,j)
+
+    n_p = MPM%cell_count(i,j)
+    do pp = 0, n_p - 1
+      p = MPM%cell_list(MPM%cell_start(i,j) + pp)
+      if (MPM%status(p) /= 1) cycle  ! ALIVE = 1
+
+      xi_p  = MPM%xi(p)
+      eta_l = MPM%eta(p)
+
+      call smpm_shape(xi_p, eta_l, N)
+      call smpm_grad(xi_p, eta_l, dx, dy, dNdx, dNdy)
+
+      detJ_eff = MPM%PVolume(p) * MPM%reweight(i,j)
+      eta_p    = MPM%eta_visc(p)
+
+      ! --- Viscous diagonal ---
+      do k = 1, 4
+        du_diag(k) = eta_p * (4.0*dNdx(k)*dNdx(k) + dNdy(k)*dNdy(k)) * detJ_eff
+        dv_diag(k) = eta_p * (dNdx(k)*dNdx(k) + 4.0*dNdy(k)*dNdy(k)) * detJ_eff
+      enddo
+
+      ! --- Newton viscosity diagonal correction ---
+      if (use_newton) then
+        nvf     = MPM%newton_visc_factor(p)
+        strx_n  = MPM%GradVel(1,p)
+        stry_n  = MPM%GradVel(2,p)
+        strsh_n = MPM%GradVel(3,p) + MPM%GradVel(4,p)
+        do k = 1, 4
+          dstrain_diag_u = (2.0*strx_n + stry_n) * dNdx(k) + strsh_n * 0.5 * dNdy(k)
+          dstrain_diag_v = strsh_n * 0.5 * dNdx(k) + (2.0*stry_n + strx_n) * dNdy(k)
+          du_diag(k) = du_diag(k) + nvf * dstrain_diag_u * dstrain_diag_u * detJ_eff
+          dv_diag(k) = dv_diag(k) + nvf * dstrain_diag_v * dstrain_diag_v * detJ_eff
+        enddo
+      endif
+
+      ! --- Per-particle basal traction diagonal ---
+      if (MPM%basal_trac_p(p) /= 0.0) then
+        do k = 1, 4
+          du_diag(k) = du_diag(k) + MPM%basal_trac_p(p) * N(k) * N(k) * detJ_eff
+          dv_diag(k) = dv_diag(k) + MPM%basal_trac_p(p) * N(k) * N(k) * detJ_eff
+        enddo
+      endif
+
+      ! --- Newton basal drag tangent diagonal ---
+      ! Diagonal approximation: newton_drag_coef_p * u_mid_i^2 * N(k)^2
+      if (use_newton .and. MPM%newton_drag_coef_p(p) /= 0.0) then
+        do k = 1, 4
+          du_diag(k) = du_diag(k) + MPM%newton_drag_coef_p(p) * MPM%up_mid(p)**2 * N(k)**2 * detJ_eff
+          dv_diag(k) = dv_diag(k) + MPM%newton_drag_coef_p(p) * MPM%vp_mid(p)**2 * N(k)**2 * detJ_eff
+        enddo
+      endif
+
+      ! --- Scatter to diagonal arrays ---
+      do k = 1, 4
+        if (k == 1) then ; Itgt = i-1 ; Jtgt = j-1
+        elseif (k == 2) then ; Itgt = i   ; Jtgt = j-1
+        elseif (k == 3) then ; Itgt = i-1 ; Jtgt = j
+        else                 ; Itgt = i   ; Jtgt = j ; endif
+        if (umask(Itgt,Jtgt) == 1.0) u_diagonal(Itgt,Jtgt) = u_diagonal(Itgt,Jtgt) + du_diag(k)
+        if (vmask(Itgt,Jtgt) == 1.0) v_diagonal(Itgt,Jtgt) = v_diagonal(Itgt,Jtgt) + dv_diag(k)
+      enddo
+
+    enddo  ! pp particles
+  enddo ; enddo  ! j, i cells
+
+end subroutine matrix_diagonal_MPM
 
 subroutine CG_diagonal_subgrid_basal (Phisub, H_node, bathyT, dens_ratio, f_grnd)
   real, dimension(:,:,:,:,:,:), &
@@ -4416,7 +4956,10 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
   real :: Visc_coef, n_g
   real :: ux, uy, vx, vy
   real :: eps_min   ! Velocity shears [T-1 ~> s-1]
+  real :: H_qp     ! Thickness interpolated to Gauss point from H_node [Z ~> m]
+  real :: xq(2)    ! 1-D Gauss-Legendre points in [0,1]
   logical :: model_qp1, model_qp4
+  logical :: use_Hnode  ! True when this front cell should use H_node for thickness
 
   isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
   iscq = G%iscB ; iecq = G%iecB ; jscq = G%jscB ; jecq = G%jecB
@@ -4437,6 +4980,8 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
   endif
 
   n_g = CS%n_glen; eps_min = CS%eps_glen_min
+  xq(1) = 0.5 * (1.0 - 1.0/sqrt(3.0))
+  xq(2) = 0.5 * (1.0 + 1.0/sqrt(3.0))
 
   do j=jsc,jec ; do i=isc,iec
 
@@ -4478,7 +5023,16 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
              ((v_shlf(I-1,J) * CS%PhiC(6,i,j)) + &
               (v_shlf(I,J-1) * CS%PhiC(4,i,j)))
 
-        CS%ice_visc(i,j,1) = (G%areaT(i,j) * max(ISS%h_shelf(i,j),CS%min_h_shelf)) * &
+        ! For MPM front cells, use H_node interpolated to cell center (= average of 4 corners)
+        if (CS%use_MPM .and. associated(CS%MPM) .and. &
+            CS%MPM%is_front_cell(i,j) .and. ISS%hmask(i,j) == 1) then
+          H_qp = max(0.25 * ((CS%MPM%H_node(I-1,J-1) + CS%MPM%H_node(I,J)) + &
+                              (CS%MPM%H_node(I,J-1) + CS%MPM%H_node(I-1,J))), CS%min_h_shelf)
+        else
+          H_qp = max(ISS%h_shelf(i,j), CS%min_h_shelf)
+        endif
+
+        CS%ice_visc(i,j,1) = (G%areaT(i,j) * H_qp) * &
             max(0.5 * Visc_coef * &
             (US%s_to_T**2 * (((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2)) + eps_min**2))**((1.-n_g)/(2.*n_g)) * &
             (US%Pa_to_RL2_T2*US%s_to_T),CS%min_ice_visc)  ! Rescale after the fractional power law.
@@ -4489,7 +5043,7 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
         CS%newton_str_ux(i,j,1) = ux ; CS%newton_str_vy(i,j,1) = vy
         CS%newton_str_sh(i,j,1) = uy + vx
         CS%newton_visc_factor(i,j,1) = 0.0
-        if (CS%ice_visc(i,j,1) > CS%min_ice_visc * (G%areaT(i,j) * max(ISS%h_shelf(i,j),CS%min_h_shelf))) then
+        if (CS%ice_visc(i,j,1) > CS%min_ice_visc * (G%areaT(i,j) * H_qp)) then
           CS%newton_visc_factor(i,j,1) = (0.5*(1./n_g - 1.) / &
               (((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2)) + eps_min**2)) * &
               CS%ice_visc(i,j,1)
@@ -4498,6 +5052,13 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
         !calculate viscosity at 4 quadrature points per cell
 
         Visc_coef = (CS%AGlen_visc(i,j))**(-1./n_g)
+
+        ! For MPM front cells, use H_node interpolated to each Gauss point
+        ! (Huth et al. 2021): partially-filled cells have variable thickness.
+        use_Hnode = .false.
+        if (CS%use_MPM .and. associated(CS%MPM)) then
+          if (CS%MPM%is_front_cell(i,j) .and. ISS%hmask(i,j) == 1) use_Hnode = .true.
+        endif
 
         do iq=1,2 ; do jq=1,2
 
@@ -4521,7 +5082,19 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
                ((v_shlf(I,J-1) * CS%Phi(4,2*(jq-1)+iq,i,j)) + &
                 (v_shlf(I-1,J) * CS%Phi(6,2*(jq-1)+iq,i,j)))
 
-          CS%ice_visc(i,j,2*(jq-1)+iq) = (G%areaT(i,j) * max(ISS%h_shelf(i,j),CS%min_h_shelf)) * &
+          ! Thickness at this Gauss point: use H_node for front cells (Huth et al. 2021),
+          ! standard h_shelf for all other cells.
+          if (use_Hnode) then
+            H_qp = ((CS%MPM%H_node(I-1,J-1) * (xq(3-iq) * xq(3-jq))) + &
+                    (CS%MPM%H_node(I,  J  ) * (xq(iq)   * xq(jq)  ))) + &
+                   ((CS%MPM%H_node(I,  J-1) * (xq(iq)   * xq(3-jq))) + &
+                    (CS%MPM%H_node(I-1,J  ) * (xq(3-iq) * xq(jq)  )))
+            H_qp = max(H_qp, CS%min_h_shelf)
+          else
+            H_qp = max(ISS%h_shelf(i,j), CS%min_h_shelf)
+          endif
+
+          CS%ice_visc(i,j,2*(jq-1)+iq) = (G%areaT(i,j) * H_qp) * &
               max(0.5 * Visc_coef * &
               (US%s_to_T**2*(((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2)) + eps_min**2))**((1.-n_g)/(2.*n_g)) * &
               (US%Pa_to_RL2_T2*US%s_to_T),CS%min_ice_visc)  ! Rescale after the fractional power law.
@@ -4530,7 +5103,7 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
           CS%newton_str_sh(i,j,2*(jq-1)+iq) = uy + vx
           CS%newton_visc_factor(i,j,2*(jq-1)+iq) = 0.0
           if (CS%ice_visc(i,j,2*(jq-1)+iq) > &
-              CS%min_ice_visc * (G%areaT(i,j) * max(ISS%h_shelf(i,j),CS%min_h_shelf))) then
+              CS%min_ice_visc * (G%areaT(i,j) * H_qp)) then
             CS%newton_visc_factor(i,j,2*(jq-1)+iq) = (0.5*(1./n_g - 1.) / &
                 (((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2)) + eps_min**2)) * &
                 CS%ice_visc(i,j,2*(jq-1)+iq)
@@ -5034,103 +5607,147 @@ subroutine update_velocity_masks(CS, G, hmask, umask, vmask, u_face_mask, v_face
     endif
   enddo; enddo
 
-  do j=js,G%jed
-    do i=is,G%ied
-
-      if ((hmask(i,j) == 1) .OR. (hmask(i,j) == 3)) then
-
-        do k=0,1
-
-          select case (int(CS%u_face_mask_bdry(I-1+k,j)))
-            case (5)
-              umask(I-1+k,J-1:J) = 3.
-              u_face_mask(I-1+k,j) = 5.
-            case (3)
-              umask(I-1+k,J-1:J) = 3.
-              vmask(I-1+k,J-1:J) = 3.
-              u_face_mask(I-1+k,j) = 3.
-            case (6)
-              vmask(I-1+k,J-1:J) = 3.
-              u_face_mask(I-1+k,j) = 6.
-            case (2)
-              u_face_mask(I-1+k,j) = 2.
-            case (4)
-              umask(I-1+k,J-1:J) = 0.
-              u_face_mask(I-1+k,j) = 4.
-            case (0)
-              umask(I-1+k,J-1:J) = 0.
-              u_face_mask(I-1+k,j) = 0.
-            case (1)  ! stress free x-boundary
-              umask(I-1+k,J-1:J) = 0.
-            case default
-              umask(I-1+k,J-1) = max(1. , umask(I-1+k,J-1))
-              umask(I-1+k,J)   = max(1. , umask(I-1+k,J))
-          end select
-        enddo
-
-        do k=0,1
-
-          select case (int(CS%v_face_mask_bdry(i,J-1+k)))
-            case (5)
-              vmask(I-1:I,J-1+k) = 3.
-              v_face_mask(i,J-1+k) = 5.
-            case (3)
-              vmask(I-1:I,J-1+k) = 3.
-              umask(I-1:I,J-1+k) = 3.
-              v_face_mask(i,J-1+k) = 3.
-            case (6)
-              umask(I-1:I,J-1+k) = 3.
-              v_face_mask(i,J-1+k) = 6.
-            case (2)
-              v_face_mask(i,J-1+k) = 2.
-            case (4)
-              vmask(I-1:I,J-1+k) = 0.
-              v_face_mask(i,J-1+k) = 4.
-            case (0)
-              vmask(I-1:I,J-1+k) = 0.
-              v_face_mask(i,J-1+k) = 0.
-            case (1) ! stress free y-boundary
-              vmask(I-1:I,J-1+k) = 0.
-            case default
-              vmask(I-1,J-1+k) = max(1. , vmask(I-1,J-1+k))
-              vmask(I,J-1+k)   = max(1. , vmask(I,J-1+k))
-          end select
-        enddo
-
-
+  if (CS%use_MPM) then
+    ! --- MPM path ---
+    ! Dirichlet BCs are specified via B-grid node masks (u_node_mask_MPM/v_node_mask_MPM),
+    ! not derived from C-grid face masks.  Only calving-front face masks are set here,
+    ! and only on faces whose adjacent nodes are NOT Dirichlet (inflow) nodes.
+    do j=js,G%jed ; do i=is,G%ied
+      if (hmask(i,j) == 1) then
+        ! East face: calving front unless both adjacent u-nodes are Dirichlet (inflow BC face)
         if (i < G%ied) then
-          if ((hmask(i+1,j) == 0) .OR. (hmask(i+1,j) == 2)) then
-            ! east boundary or adjacent to unfilled cell
+          if ((hmask(i+1,j) == 0 .OR. hmask(i+1,j) == 2) .AND. &
+              (CS%u_node_mask_MPM(I,J-1) == 0.0 .OR. CS%u_node_mask_MPM(I,J) == 0.0)) then
             u_face_mask(I,j) = 2.
           endif
         endif
-
+        ! West face: calving front unless both adjacent u-nodes are Dirichlet
         if (i > G%isd) then
-          if ((hmask(i-1,j) == 0) .OR. (hmask(i-1,j) == 2)) then
-            !adjacent to unfilled cell
+          if ((hmask(i-1,j) == 0 .OR. hmask(i-1,j) == 2) .AND. &
+              (CS%u_node_mask_MPM(I-1,J-1) == 0.0 .OR. CS%u_node_mask_MPM(I-1,J) == 0.0)) then
             u_face_mask(I-1,j) = 2.
           endif
         endif
-
+        ! South face: calving front unless both adjacent v-nodes are Dirichlet
         if (j > G%jsd) then
-          if ((hmask(i,j-1) == 0) .OR. (hmask(i,j-1) == 2)) then
-            !adjacent to unfilled cell
+          if ((hmask(i,j-1) == 0 .OR. hmask(i,j-1) == 2) .AND. &
+              (CS%v_node_mask_MPM(I-1,J-1) == 0.0 .OR. CS%v_node_mask_MPM(I,J-1) == 0.0)) then
             v_face_mask(i,J-1) = 2.
           endif
         endif
-
+        ! North face: calving front unless both adjacent v-nodes are Dirichlet
         if (j < G%jed) then
-          if ((hmask(i,j+1) == 0) .OR. (hmask(i,j+1) == 2)) then
-            !adjacent to unfilled cell
+          if ((hmask(i,j+1) == 0 .OR. hmask(i,j+1) == 2) .AND. &
+              (CS%v_node_mask_MPM(I-1,J) == 0.0 .OR. CS%v_node_mask_MPM(I,J) == 0.0)) then
             v_face_mask(i,j) = 2.
           endif
         endif
-
-
       endif
+    enddo ; enddo
+    ! Apply MPM velocity Dirichlet node masks directly
+    do J=jscq, jecq ; do I=iscq, iecq
+      if (CS%u_node_mask_MPM(I,J) == 1.0) umask(I,J) = 3.0
+      if (CS%v_node_mask_MPM(I,J) == 1.0) vmask(I,J) = 3.0
+    enddo ; enddo
 
+  else
+    ! --- Non-MPM path: derive Dirichlet umask/vmask from C-grid face masks ---
+    do j=js,G%jed
+      do i=is,G%ied
+
+        if ((hmask(i,j) == 1) .OR. (hmask(i,j) == 3)) then
+
+          do k=0,1
+
+            select case (int(CS%u_face_mask_bdry(I-1+k,j)))
+              case (5)
+                umask(I-1+k,J-1:J) = 3.
+                u_face_mask(I-1+k,j) = 5.
+              case (3)
+                umask(I-1+k,J-1:J) = 3.
+                vmask(I-1+k,J-1:J) = 3.
+                u_face_mask(I-1+k,j) = 3.
+              case (6)
+                vmask(I-1+k,J-1:J) = 3.
+                u_face_mask(I-1+k,j) = 6.
+              case (2)
+                u_face_mask(I-1+k,j) = 2.
+              case (4)
+                umask(I-1+k,J-1:J) = 0.
+                u_face_mask(I-1+k,j) = 4.
+              case (0)
+                umask(I-1+k,J-1:J) = 0.
+                u_face_mask(I-1+k,j) = 0.
+              case (1)  ! stress free x-boundary
+                umask(I-1+k,J-1:J) = 0.
+              case default
+                umask(I-1+k,J-1) = max(1. , umask(I-1+k,J-1))
+                umask(I-1+k,J)   = max(1. , umask(I-1+k,J))
+            end select
+          enddo
+
+          do k=0,1
+
+            select case (int(CS%v_face_mask_bdry(i,J-1+k)))
+              case (5)
+                vmask(I-1:I,J-1+k) = 3.
+                v_face_mask(i,J-1+k) = 5.
+              case (3)
+                vmask(I-1:I,J-1+k) = 3.
+                umask(I-1:I,J-1+k) = 3.
+                v_face_mask(i,J-1+k) = 3.
+              case (6)
+                umask(I-1:I,J-1+k) = 3.
+                v_face_mask(i,J-1+k) = 6.
+              case (2)
+                v_face_mask(i,J-1+k) = 2.
+              case (4)
+                vmask(I-1:I,J-1+k) = 0.
+                v_face_mask(i,J-1+k) = 4.
+              case (0)
+                vmask(I-1:I,J-1+k) = 0.
+                v_face_mask(i,J-1+k) = 0.
+              case (1) ! stress free y-boundary
+                vmask(I-1:I,J-1+k) = 0.
+              case default
+                vmask(I-1,J-1+k) = max(1. , vmask(I-1,J-1+k))
+                vmask(I,J-1+k)   = max(1. , vmask(I,J-1+k))
+            end select
+          enddo
+
+          ! Set calving-front (stress-free) face masks where ice borders ocean/unfilled,
+          ! but NOT for hmask=3 (Dirichlet) cells — those keep their prescribed BCs.
+          if (hmask(i,j) /= 3) then
+            if (i < G%ied) then
+              if ((hmask(i+1,j) == 0) .OR. (hmask(i+1,j) == 2)) then
+                u_face_mask(I,j) = 2.
+              endif
+            endif
+
+            if (i > G%isd) then
+              if ((hmask(i-1,j) == 0) .OR. (hmask(i-1,j) == 2)) then
+                u_face_mask(I-1,j) = 2.
+              endif
+            endif
+
+            if (j > G%jsd) then
+              if ((hmask(i,j-1) == 0) .OR. (hmask(i,j-1) == 2)) then
+                v_face_mask(i,J-1) = 2.
+              endif
+            endif
+
+            if (j < G%jed) then
+              if ((hmask(i,j+1) == 0) .OR. (hmask(i,j+1) == 2)) then
+                v_face_mask(i,j) = 2.
+              endif
+            endif
+          endif
+
+        endif
+
+      enddo
     enddo
-  enddo
+  endif ! CS%use_MPM
 
   ! note: if the grid is nonsymmetric, there is a part that will not be transferred with a halo update
   ! so this subroutine must update its own symmetric part of the halo
@@ -5212,6 +5829,8 @@ subroutine ice_shelf_dyn_end(CS)
   if (CS%use_MPM .and. associated(CS%MPM)) then
     call MPM_end(CS%MPM)
     deallocate(CS%MPM)
+    if (associated(CS%u_node_mask_MPM)) deallocate(CS%u_node_mask_MPM)
+    if (associated(CS%v_node_mask_MPM)) deallocate(CS%v_node_mask_MPM)
   endif
 
   deallocate(CS)
@@ -5623,5 +6242,30 @@ subroutine ice_shelf_advect_temp_y(CS, G, time_step, hmask, h_after_uflux, h_aft
   enddo ! i loop
 
 end subroutine ice_shelf_advect_temp_y
+
+! ============================================================
+!> Save MPM particle restart if MPM is active.
+!! This is a public wrapper that MOM_ice_shelf can call without
+!! accessing the private ice_shelf_dyn_CS components directly.
+subroutine IS_dyn_save_MPM_restart(CS, restart_dir)
+  type(ice_shelf_dyn_CS), intent(in)    :: CS          !< Ice shelf dynamics control structure
+  character(len=*),       intent(in)    :: restart_dir !< Directory for restart files
+  if (CS%use_MPM .and. associated(CS%MPM)) then
+    call MPM_save_restart(CS%MPM, restart_dir)
+  endif
+end subroutine IS_dyn_save_MPM_restart
+
+! ============================================================
+!> Restore MPM particle state from restart if MPM is active.
+!! This is a public wrapper that MOM_ice_shelf can call without
+!! accessing the private ice_shelf_dyn_CS components directly.
+subroutine IS_dyn_restore_MPM_restart(CS, G, restart_dir)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS          !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in)    :: G           !< Ocean grid
+  character(len=*),       intent(in)    :: restart_dir !< Directory for restart files
+  if (CS%use_MPM .and. associated(CS%MPM)) then
+    call MPM_restore_restart(CS%MPM, G, restart_dir)
+  endif
+end subroutine IS_dyn_restore_MPM_restart
 
 end module MOM_ice_shelf_dynamics
