@@ -41,7 +41,7 @@ use MOM_ice_shelf_MPM, only : MPM_CS, MPM_init, MPM_end, &
                                MPM_store_pre_solve_vel, &
                                MPM_P2G_velocity, MPM_compute_basal_trac, &
                                MPM_write_vtu, MPM_save_restart, MPM_restore_restart, &
-                               smpm_shape, smpm_grad
+                               smpm_shape, smpm_grad, gimp_nodes, gimp_ew_nodes
 implicit none ; private
 
 #include <MOM_memory.h>
@@ -3769,8 +3769,13 @@ subroutine calc_shelf_driving_stress_MPM(CS, ISS, G, US, taudx, taudy, OD)
   real :: detJ_eff                    ! Particle integration weight [L2 ~> m2]
   real :: fx, fy                      ! Particle driving force [R L3 Z T-2 ~> kg m s-2]
   real :: taud_qp_x(2,2,4), taud_qp_y(2,2,4)  ! Per-Gauss-point nodal contributions
-  real :: N(4)   ! Shape function values at particle position [nondim]
-  integer :: i, j, p, iq, jq, qp, iphi, jphi, Itgt, Jtgt, ilq, jlq
+  real :: Sw_g(9), dNdx_g(9), dNdy_g(9)
+  integer :: di_g(9), dj_g(9), ng, k_n
+  real :: Sw_c(4), dNdx_c(4), dNdy_c(4)
+  real :: dx, dy, dx_f, dy_f
+  real :: xp_phys, yp_phys, lp_x, lp_y, x0_f, x1_f, y0_f, y1_f
+  logical :: has_ovlp
+  integer :: i, j, p, iq, jq, qp, iphi, jphi, Itgt, Jtgt, ilq, jlq, fi, fj, dfi, dfj
   integer :: isc, iec, jsc, jec
   integer :: gisc, giec, gjsc, gjec, i_off, j_off
 
@@ -3785,30 +3790,64 @@ subroutine calc_shelf_driving_stress_MPM(CS, ISS, G, US, taudx, taudy, OD)
   xq(1) = 0.5 * (1.0 - 1.0/sqrt(3.0))
   xq(2) = 0.5 * (1.0 + 1.0/sqrt(3.0))
 
-  ! --- Part 2: Interior MPM cells (hmask==1, not front): particle quadrature ---
+  ! --- Part 2: Interior MPM cells (hmask==1, not front): GIMP particle quadrature ---
   ! Driving force at node k: f_kx = -Σ_p N_k(x_p) * ρ_i * g * H_p * GradZs_x(p) * V_p
-  ! where V_p = PVolume(p) * reweight(ic,jc)  (Huth et al. 2021 Eq. 31)
+  ! GIMP: use raw PVolume (no reweight); extended support up to 9 nodes.
+  ! For particles whose GIMP domain overlaps a front cell, subtract the element-wise
+  ! GIMP contribution for that overlap so the front FEM solver is not double-counted.
   do p = 1, CS%MPM%n_active
     if (CS%MPM%status(p) /= 1) cycle  ! ALIVE = 1
     i = CS%MPM%ci(p) ; j = CS%MPM%cj(p)
     if (ISS%hmask(i,j) == 0.0 .OR. ISS%hmask(i,j) == 2.0) cycle
     if (CS%MPM%is_front_cell(i,j)) cycle
 
-    call smpm_shape(CS%MPM%xi(p), CS%MPM%eta(p), N)
-    detJ_eff = CS%MPM%PVolume(p) * CS%MPM%reweight(i,j)
+    dx = G%dxT(i,j) ; dy = G%dyT(i,j)
+    call gimp_nodes(CS%MPM%xi(p), CS%MPM%eta(p), 0.5*CS%MPM%Lx(p), 0.5*CS%MPM%Ly(p), &
+                    dx, dy, Sw_g, dNdx_g, dNdy_g, di_g, dj_g, ng)
+    detJ_eff = CS%MPM%PVolume(p)
 
     fx = -rho * grav * CS%MPM%H(p) * CS%MPM%GradZs(1,p) * detJ_eff
     fy = -rho * grav * CS%MPM%H(p) * CS%MPM%GradZs(2,p) * detJ_eff
 
-    ! Scatter to 4 B-grid corners (SW, SE, NW, NE of T-cell i,j)
-    taudx(I-1,J-1) = taudx(I-1,J-1) + N(1)*fx
-    taudx(I,  J-1) = taudx(I,  J-1) + N(2)*fx
-    taudx(I-1,J  ) = taudx(I-1,J  ) + N(3)*fx
-    taudx(I,  J  ) = taudx(I,  J  ) + N(4)*fx
-    taudy(I-1,J-1) = taudy(I-1,J-1) + N(1)*fy
-    taudy(I,  J-1) = taudy(I,  J-1) + N(2)*fy
-    taudy(I-1,J  ) = taudy(I-1,J  ) + N(3)*fy
-    taudy(I,  J  ) = taudy(I,  J  ) + N(4)*fy
+    ! Scatter to all GIMP-contributing B-grid nodes
+    do k_n = 1, ng
+      Itgt = i - 1 + di_g(k_n) ; Jtgt = j - 1 + dj_g(k_n)
+      taudx(Itgt,Jtgt) = taudx(Itgt,Jtgt) + Sw_g(k_n)*fx
+      taudy(Itgt,Jtgt) = taudy(Itgt,Jtgt) + Sw_g(k_n)*fy
+    enddo
+
+    ! Subtract element-wise GIMP correction for overlapping front cells
+    xp_phys = CS%MPM%xi(p)  * 0.5 * dx
+    yp_phys = CS%MPM%eta(p) * 0.5 * dy
+    lp_x    = 0.5 * CS%MPM%Lx(p)
+    lp_y    = 0.5 * CS%MPM%Ly(p)
+
+    do dfi = -1, 1 ; do dfj = -1, 1
+      if (dfi == 0 .and. dfj == 0) cycle
+      fi = i + dfi ; fj = j + dfj
+      if (fi < G%isd .or. fi > G%ied) cycle
+      if (fj < G%jsd .or. fj > G%jed) cycle
+      if (.not. CS%MPM%is_front_cell(fi, fj)) cycle
+
+      dx_f = G%dxT(fi, fj) ; dy_f = G%dyT(fi, fj)
+      x0_f = real(dfi) * 0.5*(dx + dx_f) - 0.5*dx_f
+      x1_f = real(dfi) * 0.5*(dx + dx_f) + 0.5*dx_f
+      y0_f = real(dfj) * 0.5*(dy + dy_f) - 0.5*dy_f
+      y1_f = real(dfj) * 0.5*(dy + dy_f) + 0.5*dy_f
+
+      call gimp_ew_nodes(xp_phys, yp_phys, lp_x, lp_y, x0_f, x1_f, y0_f, y1_f, &
+                         Sw_c, dNdx_c, dNdy_c, has_ovlp)
+      if (.not. has_ovlp) cycle
+
+      do k_n = 1, 4
+        if (k_n == 1) then ; Itgt = fi-1 ; Jtgt = fj-1
+        elseif (k_n == 2) then ; Itgt = fi   ; Jtgt = fj-1
+        elseif (k_n == 3) then ; Itgt = fi-1 ; Jtgt = fj
+        else                    ; Itgt = fi   ; Jtgt = fj ; endif
+        taudx(Itgt,Jtgt) = taudx(Itgt,Jtgt) - Sw_c(k_n)*fx
+        taudy(Itgt,Jtgt) = taudy(Itgt,Jtgt) - Sw_c(k_n)*fy
+      enddo
+    enddo ; enddo  ! dfi, dfj
   enddo
 
   ! --- Part 3: Front cells (hmask==1, is_front_cell): FEM Gauss quadrature ---
@@ -4218,14 +4257,20 @@ subroutine CG_action_MPM(CS, MPM, uret, vret, u_shlf, v_shlf, umask, vmask, hmas
   integer,                intent(in)    :: is, ie, js, je
   logical,                intent(in)    :: use_newton  !< If true, apply Newton tangent correction
 
-  integer :: i, j, p, k, pp, n_p, Itgt, Jtgt
-  real :: N(4), dNdx(4), dNdy(4)
-  !real :: uSW, uSE, uNW, uNE, vSW, vSE, vNW, vNE
+  integer :: i, j, p, k, k_n, pp, n_p, Itgt, Jtgt, fi, fj, dfi, dfj
+  real :: Sw_g(9), dNdx_g(9), dNdy_g(9)
+  integer :: di_g(9), dj_g(9), ng
+  real :: Sw_c(4), dNdx_c(4), dNdy_c(4)
   real :: ux, uy, vx, vy, uq, vq
-  real :: eta_p, detJ_eff, dx, dy, nvf
-  real :: xi_p, eta_l
-  real :: strx_n, stry_n, strsh_n, dstrain_n, inner_dot_n
-  real :: du(4), dv(4)  ! Local per-particle nodal contributions
+  real :: ux_c, uy_c, vx_c, vy_c, uq_c, vq_c
+  real :: eta_p, detJ_eff, dx, dy, nvf, dx_f, dy_f
+  real :: xi_p, eta_l, xp_phys, yp_phys, lp_x, lp_y
+  real :: x0_f, x1_f, y0_f, y1_f
+  real :: strx_n, stry_n, strsh_n, dstrain_n, dstrain_c, inner_dot_n, inner_dot_c
+  real :: du(9), dv(9)  ! Local per-particle nodal contributions (up to 9 GIMP nodes)
+  real :: du_c, dv_c
+  logical :: has_ovlp
+  integer :: I_gn, J_gn
 
   do j = js, je ; do i = is, ie
     ! Only process interior MPM cells (hmask==1, not front)
@@ -4242,86 +4287,144 @@ subroutine CG_action_MPM(CS, MPM, uret, vret, u_shlf, v_shlf, umask, vmask, hmas
       xi_p  = MPM%xi(p)
       eta_l = MPM%eta(p)
 
-      call smpm_shape(xi_p, eta_l, N)
-      call smpm_grad(xi_p, eta_l, dx, dy, dNdx, dNdy)
+      ! GIMP shape functions: extended support up to 9 nodes
+      call gimp_nodes(xi_p, eta_l, 0.5*MPM%Lx(p), 0.5*MPM%Ly(p), dx, dy, &
+                      Sw_g, dNdx_g, dNdy_g, di_g, dj_g, ng)
 
-      ! Integration weight: PVolume * reweight (particle area scaled to cell area)
-      ! reweight is used here (stiffness assembly) but NOT in P2G (Eq 29)
-      detJ_eff = MPM%PVolume(p) * MPM%reweight(i,j)
+      ! Integration weight: raw PVolume (GIMP integrates domain directly, no reweight)
+      detJ_eff = MPM%PVolume(p)
       eta_p    = MPM%eta_visc(p)
+      nvf = 0.0 ; strx_n = 0.0 ; stry_n = 0.0 ; strsh_n = 0.0
 
-      ! B-grid corner velocities
-      ! uSW = u_shlf(I-1, J-1) ; vSW = v_shlf(I-1, J-1)
-      ! uSE = u_shlf(I,   J-1) ; vSE = v_shlf(I,   J-1)
-      ! uNW = u_shlf(I-1, J  ) ; vNW = v_shlf(I-1, J  )
-      ! uNE = u_shlf(I,   J  ) ; vNE = v_shlf(I,   J  )
-
-      ! Velocity at particle (for basal traction)
-      uq = (N(1)*u_shlf(I-1,J-1) + N(3)*u_shlf(I-1,J)) + (N(2)*u_shlf(I,J-1) + N(4)*u_shlf(I,J))
-      vq = (N(1)*v_shlf(I-1,J-1) + N(3)*v_shlf(I-1,J)) + (N(2)*v_shlf(I,J-1) + N(4)*v_shlf(I,J))
-
-      ! Velocity gradients at particle
-      ux   = (dNdx(1)*u_shlf(I-1,J-1) + dNdx(3)*u_shlf(I-1,J)) + (dNdx(2)*u_shlf(I,J-1) + dNdx(4)*u_shlf(I,J))
-      vy   = (dNdy(1)*v_shlf(I-1,J-1) + dNdy(3)*v_shlf(I-1,J)) + (dNdy(2)*v_shlf(I,J-1) + dNdy(4)*v_shlf(I,J))
-      uy   = (dNdy(1)*u_shlf(I-1,J-1) + dNdy(3)*u_shlf(I-1,J)) + (dNdy(2)*u_shlf(I,J-1) + dNdy(4)*u_shlf(I,J))
-      vx   = (dNdx(1)*v_shlf(I-1,J-1) + dNdx(3)*v_shlf(I-1,J)) + (dNdx(2)*v_shlf(I,J-1) + dNdx(4)*v_shlf(I,J))
+      ! Velocity at particle and gradients from all GIMP nodes
+      uq = 0.0 ; vq = 0.0
+      ux = 0.0 ; vy = 0.0 ; uy = 0.0 ; vx = 0.0
+      do k_n = 1, ng
+        I_gn = i - 1 + di_g(k_n) ; J_gn = j - 1 + dj_g(k_n)
+        uq = uq + Sw_g(k_n)   * u_shlf(I_gn, J_gn)
+        vq = vq + Sw_g(k_n)   * v_shlf(I_gn, J_gn)
+        ux = ux + dNdx_g(k_n) * u_shlf(I_gn, J_gn)
+        vy = vy + dNdy_g(k_n) * v_shlf(I_gn, J_gn)
+        uy = uy + dNdy_g(k_n) * u_shlf(I_gn, J_gn)
+        vx = vx + dNdx_g(k_n) * v_shlf(I_gn, J_gn)
+      enddo
 
       ! --- Accumulate nodal contributions locally ---
-      do k = 1, 4
+      do k_n = 1, ng
         ! Viscous stress: η * [(4ux+2vy)∂N/∂x + (uy+vx)∂N/∂y]  (Glen's flow law)
-        du(k) = eta_p * ((4.0*ux + 2.0*vy) * dNdx(k) + (uy + vx) * dNdy(k)) * detJ_eff
-        dv(k) = eta_p * ((uy + vx) * dNdx(k) + (4.0*vy + 2.0*ux) * dNdy(k)) * detJ_eff
+        du(k_n) = eta_p * ((4.0*ux + 2.0*vy) * dNdx_g(k_n) + (uy+vx) * dNdy_g(k_n)) * detJ_eff
+        dv(k_n) = eta_p * ((uy+vx) * dNdx_g(k_n) + (4.0*vy + 2.0*ux) * dNdy_g(k_n)) * detJ_eff
       enddo
 
       ! --- Newton tangent stiffness correction ---
-      ! Matches FEM formula in CG_action (lines 3873-3903):
-      !   dstrain_n = (2*str_ux + str_vy)*ux + (2*str_vy + str_ux)*vy + str_sh*(uy+vx)*0.5
-      !   u_newton(k) += nvf * dstrain_n * ((2*str_ux+str_vy)*dN/dx + str_sh*0.5*dN/dy)
-      !   v_newton(k) += nvf * dstrain_n * (str_sh*0.5*dN/dx + (2*str_vy+str_ux)*dN/dy)
       if (use_newton) then
-        nvf    = MPM%newton_visc_factor(p)
-        strx_n = MPM%GradVel(1,p)          ! stored du/dx from previous iteration
-        stry_n = MPM%GradVel(2,p)          ! stored dv/dy
-        strsh_n = MPM%GradVel(3,p) + MPM%GradVel(4,p)  ! stored (du/dy + dv/dx)
+        nvf     = MPM%newton_visc_factor(p)
+        strx_n  = MPM%GradVel(1,p)
+        stry_n  = MPM%GradVel(2,p)
+        strsh_n = MPM%GradVel(3,p) + MPM%GradVel(4,p)
         dstrain_n = (2.0*strx_n + stry_n)*ux + (2.0*stry_n + strx_n)*vy + &
                     strsh_n * (uy + vx) * 0.5
-        do k = 1, 4
-          du(k) = du(k) + nvf * dstrain_n * &
-            ((2.0*strx_n + stry_n) * dNdx(k) + strsh_n * 0.5 * dNdy(k)) * detJ_eff
-          dv(k) = dv(k) + nvf * dstrain_n * &
-            (strsh_n * 0.5 * dNdx(k) + (2.0*stry_n + strx_n) * dNdy(k)) * detJ_eff
+        do k_n = 1, ng
+          du(k_n) = du(k_n) + nvf * dstrain_n * &
+            ((2.0*strx_n + stry_n) * dNdx_g(k_n) + strsh_n * 0.5 * dNdy_g(k_n)) * detJ_eff
+          dv(k_n) = dv(k_n) + nvf * dstrain_n * &
+            (strsh_n * 0.5 * dNdx_g(k_n) + (2.0*stry_n + strx_n) * dNdy_g(k_n)) * detJ_eff
         enddo
       endif
 
       ! --- Per-particle basal traction (zero for floating particles) ---
-      ! MPM%basal_trac_p(p) = 0 for floating; computed by MPM_compute_basal_trac
       if (MPM%basal_trac_p(p) /= 0.0) then
-        do k = 1, 4
-          du(k) = du(k) + MPM%basal_trac_p(p) * uq * N(k) * detJ_eff
-          dv(k) = dv(k) + MPM%basal_trac_p(p) * vq * N(k) * detJ_eff
+        do k_n = 1, ng
+          du(k_n) = du(k_n) + MPM%basal_trac_p(p) * uq * Sw_g(k_n) * detJ_eff
+          dv(k_n) = dv(k_n) + MPM%basal_trac_p(p) * vq * Sw_g(k_n) * detJ_eff
         enddo
       endif
 
       ! --- Newton basal drag tangent correction ---
-      ! Mirrors FEM: newton_drag_coef * u_mid * (u_mid . u_trial) * N(k)
-      ! where u_trial = uq,vq (the CG trial vector) and u_mid is from the Picard iterate
       if (use_newton .and. MPM%newton_drag_coef_p(p) /= 0.0) then
         inner_dot_n = MPM%up_mid(p) * uq + MPM%vp_mid(p) * vq
-        do k = 1, 4
-          du(k) = du(k) + MPM%newton_drag_coef_p(p) * MPM%up_mid(p) * inner_dot_n * N(k) * detJ_eff
-          dv(k) = dv(k) + MPM%newton_drag_coef_p(p) * MPM%vp_mid(p) * inner_dot_n * N(k) * detJ_eff
+        do k_n = 1, ng
+          du(k_n) = du(k_n) + MPM%newton_drag_coef_p(p)*MPM%up_mid(p)*inner_dot_n*Sw_g(k_n)*detJ_eff
+          dv(k_n) = dv(k_n) + MPM%newton_drag_coef_p(p)*MPM%vp_mid(p)*inner_dot_n*Sw_g(k_n)*detJ_eff
         enddo
       endif
 
-      ! --- Scatter local contributions to global uret/vret ---
-      do k = 1, 4
-        if (k == 1) then ; Itgt = i-1 ; Jtgt = j-1
-        elseif (k == 2) then ; Itgt = i   ; Jtgt = j-1
-        elseif (k == 3) then ; Itgt = i-1 ; Jtgt = j
-        else                 ; Itgt = i   ; Jtgt = j ; endif
-        if (umask(Itgt,Jtgt) == 1.0) uret(Itgt,Jtgt) = uret(Itgt,Jtgt) + du(k)
-        if (vmask(Itgt,Jtgt) == 1.0) vret(Itgt,Jtgt) = vret(Itgt,Jtgt) + dv(k)
+      ! --- Scatter GIMP contributions to global uret/vret ---
+      do k_n = 1, ng
+        Itgt = i - 1 + di_g(k_n) ; Jtgt = j - 1 + dj_g(k_n)
+        if (umask(Itgt,Jtgt) == 1.0) uret(Itgt,Jtgt) = uret(Itgt,Jtgt) + du(k_n)
+        if (vmask(Itgt,Jtgt) == 1.0) vret(Itgt,Jtgt) = vret(Itgt,Jtgt) + dv(k_n)
       enddo
+
+      ! --- Subtract element-wise GIMP contribution for overlapping front cells ---
+      ! For any ice-front neighbour whose FEM solver already handles its domain,
+      ! remove the portion of the GIMP contribution that falls within that element.
+      ! Particle centre in home-cell-centred physical coordinates [L]:
+      xp_phys = xi_p * 0.5 * dx
+      yp_phys = eta_l * 0.5 * dy
+      lp_x    = 0.5 * MPM%Lx(p)
+      lp_y    = 0.5 * MPM%Ly(p)
+
+      do dfi = -1, 1 ; do dfj = -1, 1
+        if (dfi == 0 .and. dfj == 0) cycle
+        fi = i + dfi ; fj = j + dfj
+        if (fi < G%isd .or. fi > G%ied) cycle
+        if (fj < G%jsd .or. fj > G%jed) cycle
+        if (.not. MPM%is_front_cell(fi, fj)) cycle
+
+        ! Front cell bounds in home-cell-centred frame
+        dx_f = G%dxT(fi, fj) ; dy_f = G%dyT(fi, fj)
+        x0_f = real(dfi) * 0.5*(dx + dx_f) - 0.5*dx_f
+        x1_f = real(dfi) * 0.5*(dx + dx_f) + 0.5*dx_f
+        y0_f = real(dfj) * 0.5*(dy + dy_f) - 0.5*dy_f
+        y1_f = real(dfj) * 0.5*(dy + dy_f) + 0.5*dy_f
+
+        call gimp_ew_nodes(xp_phys, yp_phys, lp_x, lp_y, x0_f, x1_f, y0_f, y1_f, &
+                           Sw_c, dNdx_c, dNdy_c, has_ovlp)
+        if (.not. has_ovlp) cycle
+
+        ! Velocity gradients from front cell nodes using element-wise GIMP
+        ux_c = dNdx_c(1)*u_shlf(fi-1,fj-1) + dNdx_c(2)*u_shlf(fi,fj-1) + &
+               dNdx_c(3)*u_shlf(fi-1,fj  ) + dNdx_c(4)*u_shlf(fi,fj  )
+        vy_c = dNdy_c(1)*v_shlf(fi-1,fj-1) + dNdy_c(2)*v_shlf(fi,fj-1) + &
+               dNdy_c(3)*v_shlf(fi-1,fj  ) + dNdy_c(4)*v_shlf(fi,fj  )
+        uy_c = dNdy_c(1)*u_shlf(fi-1,fj-1) + dNdy_c(2)*u_shlf(fi,fj-1) + &
+               dNdy_c(3)*u_shlf(fi-1,fj  ) + dNdy_c(4)*u_shlf(fi,fj  )
+        vx_c = dNdx_c(1)*v_shlf(fi-1,fj-1) + dNdx_c(2)*v_shlf(fi,fj-1) + &
+               dNdx_c(3)*v_shlf(fi-1,fj  ) + dNdx_c(4)*v_shlf(fi,fj  )
+        uq_c = Sw_c(1)*u_shlf(fi-1,fj-1) + Sw_c(2)*u_shlf(fi,fj-1) + &
+               Sw_c(3)*u_shlf(fi-1,fj  ) + Sw_c(4)*u_shlf(fi,fj  )
+        vq_c = Sw_c(1)*v_shlf(fi-1,fj-1) + Sw_c(2)*v_shlf(fi,fj-1) + &
+               Sw_c(3)*v_shlf(fi-1,fj  ) + Sw_c(4)*v_shlf(fi,fj  )
+
+        do k = 1, 4
+          if (k == 1) then ; Itgt = fi-1 ; Jtgt = fj-1
+          elseif (k == 2) then ; Itgt = fi   ; Jtgt = fj-1
+          elseif (k == 3) then ; Itgt = fi-1 ; Jtgt = fj
+          else                  ; Itgt = fi   ; Jtgt = fj ; endif
+          du_c = eta_p * ((4.0*ux_c+2.0*vy_c)*dNdx_c(k) + (uy_c+vx_c)*dNdy_c(k)) * detJ_eff
+          dv_c = eta_p * ((uy_c+vx_c)*dNdx_c(k) + (4.0*vy_c+2.0*ux_c)*dNdy_c(k)) * detJ_eff
+          if (use_newton) then
+            dstrain_c = (2.0*strx_n+stry_n)*ux_c + (2.0*stry_n+strx_n)*vy_c + &
+                         strsh_n*(uy_c+vx_c)*0.5
+            du_c = du_c + nvf * dstrain_c * &
+                   ((2.0*strx_n+stry_n)*dNdx_c(k) + strsh_n*0.5*dNdy_c(k)) * detJ_eff
+            dv_c = dv_c + nvf * dstrain_c * &
+                   (strsh_n*0.5*dNdx_c(k) + (2.0*stry_n+strx_n)*dNdy_c(k)) * detJ_eff
+          endif
+          if (MPM%basal_trac_p(p) /= 0.0) then
+            du_c = du_c + MPM%basal_trac_p(p) * uq_c * Sw_c(k) * detJ_eff
+            dv_c = dv_c + MPM%basal_trac_p(p) * vq_c * Sw_c(k) * detJ_eff
+          endif
+          if (use_newton .and. MPM%newton_drag_coef_p(p) /= 0.0) then
+            inner_dot_c = MPM%up_mid(p)*uq_c + MPM%vp_mid(p)*vq_c
+            du_c = du_c + MPM%newton_drag_coef_p(p)*MPM%up_mid(p)*inner_dot_c*Sw_c(k)*detJ_eff
+            dv_c = dv_c + MPM%newton_drag_coef_p(p)*MPM%vp_mid(p)*inner_dot_c*Sw_c(k)*detJ_eff
+          endif
+          if (umask(Itgt,Jtgt) == 1.0) uret(Itgt,Jtgt) = uret(Itgt,Jtgt) - du_c
+          if (vmask(Itgt,Jtgt) == 1.0) vret(Itgt,Jtgt) = vret(Itgt,Jtgt) - dv_c
+        enddo
+      enddo ; enddo  ! dfi, dfj
 
     enddo  ! pp particles
   enddo ; enddo  ! j, i cells
@@ -4673,13 +4776,18 @@ subroutine matrix_diagonal_MPM(CS, MPM, u_diagonal, v_diagonal, umask, vmask, &
   integer, intent(in) :: js, je, is, ie
   logical, intent(in) :: use_newton  !< If true, add Newton viscosity correction to diagonal
 
-  integer :: i, j, p, k, pp, n_p, Itgt, Jtgt
-  real :: N(4), dNdx(4), dNdy(4)
-  real :: eta_p, detJ_eff, dx, dy, nvf
-  real :: xi_p, eta_l
+  integer :: i, j, p, k, k_n, pp, n_p, Itgt, Jtgt, fi, fj, dfi, dfj
+  real :: Sw_g(9), dNdx_g(9), dNdy_g(9)
+  integer :: di_g(9), dj_g(9), ng
+  real :: Sw_c(4), dNdx_c(4), dNdy_c(4)
+  real :: eta_p, detJ_eff, dx, dy, nvf, dx_f, dy_f
+  real :: xi_p, eta_l, xp_phys, yp_phys, lp_x, lp_y
+  real :: x0_f, x1_f, y0_f, y1_f
   real :: strx_n, stry_n, strsh_n
   real :: dstrain_diag_u, dstrain_diag_v
-  real :: du_diag(4), dv_diag(4)
+  real :: du_diag(9), dv_diag(9)
+  real :: du_diag_c, dv_diag_c, dstrain_c_u, dstrain_c_v
+  logical :: has_ovlp
 
   do j = js, je ; do i = is, ie
     if (hmask(i,j) /= 1.0 .and. hmask(i,j) /= 3.0) cycle
@@ -4695,16 +4803,18 @@ subroutine matrix_diagonal_MPM(CS, MPM, u_diagonal, v_diagonal, umask, vmask, &
       xi_p  = MPM%xi(p)
       eta_l = MPM%eta(p)
 
-      call smpm_shape(xi_p, eta_l, N)
-      call smpm_grad(xi_p, eta_l, dx, dy, dNdx, dNdy)
+      ! GIMP shape functions
+      call gimp_nodes(xi_p, eta_l, 0.5*MPM%Lx(p), 0.5*MPM%Ly(p), dx, dy, &
+                      Sw_g, dNdx_g, dNdy_g, di_g, dj_g, ng)
 
-      detJ_eff = MPM%PVolume(p) * MPM%reweight(i,j)
+      detJ_eff = MPM%PVolume(p)
       eta_p    = MPM%eta_visc(p)
+      nvf = 0.0 ; strx_n = 0.0 ; stry_n = 0.0 ; strsh_n = 0.0
 
       ! --- Viscous diagonal ---
-      do k = 1, 4
-        du_diag(k) = eta_p * (4.0*dNdx(k)*dNdx(k) + dNdy(k)*dNdy(k)) * detJ_eff
-        dv_diag(k) = eta_p * (dNdx(k)*dNdx(k) + 4.0*dNdy(k)*dNdy(k)) * detJ_eff
+      do k_n = 1, ng
+        du_diag(k_n) = eta_p * (4.0*dNdx_g(k_n)**2 + dNdy_g(k_n)**2) * detJ_eff
+        dv_diag(k_n) = eta_p * (dNdx_g(k_n)**2 + 4.0*dNdy_g(k_n)**2) * detJ_eff
       enddo
 
       ! --- Newton viscosity diagonal correction ---
@@ -4713,40 +4823,89 @@ subroutine matrix_diagonal_MPM(CS, MPM, u_diagonal, v_diagonal, umask, vmask, &
         strx_n  = MPM%GradVel(1,p)
         stry_n  = MPM%GradVel(2,p)
         strsh_n = MPM%GradVel(3,p) + MPM%GradVel(4,p)
-        do k = 1, 4
-          dstrain_diag_u = (2.0*strx_n + stry_n) * dNdx(k) + strsh_n * 0.5 * dNdy(k)
-          dstrain_diag_v = strsh_n * 0.5 * dNdx(k) + (2.0*stry_n + strx_n) * dNdy(k)
-          du_diag(k) = du_diag(k) + nvf * dstrain_diag_u * dstrain_diag_u * detJ_eff
-          dv_diag(k) = dv_diag(k) + nvf * dstrain_diag_v * dstrain_diag_v * detJ_eff
+        do k_n = 1, ng
+          dstrain_diag_u = (2.0*strx_n+stry_n)*dNdx_g(k_n) + strsh_n*0.5*dNdy_g(k_n)
+          dstrain_diag_v = strsh_n*0.5*dNdx_g(k_n) + (2.0*stry_n+strx_n)*dNdy_g(k_n)
+          du_diag(k_n) = du_diag(k_n) + nvf * dstrain_diag_u**2 * detJ_eff
+          dv_diag(k_n) = dv_diag(k_n) + nvf * dstrain_diag_v**2 * detJ_eff
         enddo
       endif
 
       ! --- Per-particle basal traction diagonal ---
       if (MPM%basal_trac_p(p) /= 0.0) then
-        do k = 1, 4
-          du_diag(k) = du_diag(k) + MPM%basal_trac_p(p) * N(k) * N(k) * detJ_eff
-          dv_diag(k) = dv_diag(k) + MPM%basal_trac_p(p) * N(k) * N(k) * detJ_eff
+        do k_n = 1, ng
+          du_diag(k_n) = du_diag(k_n) + MPM%basal_trac_p(p) * Sw_g(k_n)**2 * detJ_eff
+          dv_diag(k_n) = dv_diag(k_n) + MPM%basal_trac_p(p) * Sw_g(k_n)**2 * detJ_eff
         enddo
       endif
 
       ! --- Newton basal drag tangent diagonal ---
-      ! Diagonal approximation: newton_drag_coef_p * u_mid_i^2 * N(k)^2
       if (use_newton .and. MPM%newton_drag_coef_p(p) /= 0.0) then
-        do k = 1, 4
-          du_diag(k) = du_diag(k) + MPM%newton_drag_coef_p(p) * MPM%up_mid(p)**2 * N(k)**2 * detJ_eff
-          dv_diag(k) = dv_diag(k) + MPM%newton_drag_coef_p(p) * MPM%vp_mid(p)**2 * N(k)**2 * detJ_eff
+        do k_n = 1, ng
+          du_diag(k_n) = du_diag(k_n) + &
+            MPM%newton_drag_coef_p(p) * MPM%up_mid(p)**2 * Sw_g(k_n)**2 * detJ_eff
+          dv_diag(k_n) = dv_diag(k_n) + &
+            MPM%newton_drag_coef_p(p) * MPM%vp_mid(p)**2 * Sw_g(k_n)**2 * detJ_eff
         enddo
       endif
 
       ! --- Scatter to diagonal arrays ---
-      do k = 1, 4
-        if (k == 1) then ; Itgt = i-1 ; Jtgt = j-1
-        elseif (k == 2) then ; Itgt = i   ; Jtgt = j-1
-        elseif (k == 3) then ; Itgt = i-1 ; Jtgt = j
-        else                 ; Itgt = i   ; Jtgt = j ; endif
-        if (umask(Itgt,Jtgt) == 1.0) u_diagonal(Itgt,Jtgt) = u_diagonal(Itgt,Jtgt) + du_diag(k)
-        if (vmask(Itgt,Jtgt) == 1.0) v_diagonal(Itgt,Jtgt) = v_diagonal(Itgt,Jtgt) + dv_diag(k)
+      do k_n = 1, ng
+        Itgt = i - 1 + di_g(k_n) ; Jtgt = j - 1 + dj_g(k_n)
+        if (umask(Itgt,Jtgt) == 1.0) u_diagonal(Itgt,Jtgt) = u_diagonal(Itgt,Jtgt) + du_diag(k_n)
+        if (vmask(Itgt,Jtgt) == 1.0) v_diagonal(Itgt,Jtgt) = v_diagonal(Itgt,Jtgt) + dv_diag(k_n)
       enddo
+
+      ! --- Subtract element-wise GIMP diagonal correction for overlapping front cells ---
+      xp_phys = xi_p * 0.5 * dx
+      yp_phys = eta_l * 0.5 * dy
+      lp_x    = 0.5 * MPM%Lx(p)
+      lp_y    = 0.5 * MPM%Ly(p)
+
+      do dfi = -1, 1 ; do dfj = -1, 1
+        if (dfi == 0 .and. dfj == 0) cycle
+        fi = i + dfi ; fj = j + dfj
+        if (fi < G%isd .or. fi > G%ied) cycle
+        if (fj < G%jsd .or. fj > G%jed) cycle
+        if (.not. MPM%is_front_cell(fi, fj)) cycle
+
+        dx_f = G%dxT(fi, fj) ; dy_f = G%dyT(fi, fj)
+        x0_f = real(dfi) * 0.5*(dx + dx_f) - 0.5*dx_f
+        x1_f = real(dfi) * 0.5*(dx + dx_f) + 0.5*dx_f
+        y0_f = real(dfj) * 0.5*(dy + dy_f) - 0.5*dy_f
+        y1_f = real(dfj) * 0.5*(dy + dy_f) + 0.5*dy_f
+
+        call gimp_ew_nodes(xp_phys, yp_phys, lp_x, lp_y, x0_f, x1_f, y0_f, y1_f, &
+                           Sw_c, dNdx_c, dNdy_c, has_ovlp)
+        if (.not. has_ovlp) cycle
+
+        do k = 1, 4
+          if (k == 1) then ; Itgt = fi-1 ; Jtgt = fj-1
+          elseif (k == 2) then ; Itgt = fi   ; Jtgt = fj-1
+          elseif (k == 3) then ; Itgt = fi-1 ; Jtgt = fj
+          else                  ; Itgt = fi   ; Jtgt = fj ; endif
+          du_diag_c = eta_p * (4.0*dNdx_c(k)**2 + dNdy_c(k)**2) * detJ_eff
+          dv_diag_c = eta_p * (dNdx_c(k)**2 + 4.0*dNdy_c(k)**2) * detJ_eff
+          if (use_newton) then
+            dstrain_c_u = (2.0*strx_n+stry_n)*dNdx_c(k) + strsh_n*0.5*dNdy_c(k)
+            dstrain_c_v = strsh_n*0.5*dNdx_c(k) + (2.0*stry_n+strx_n)*dNdy_c(k)
+            du_diag_c = du_diag_c + nvf * dstrain_c_u**2 * detJ_eff
+            dv_diag_c = dv_diag_c + nvf * dstrain_c_v**2 * detJ_eff
+          endif
+          if (MPM%basal_trac_p(p) /= 0.0) then
+            du_diag_c = du_diag_c + MPM%basal_trac_p(p) * Sw_c(k)**2 * detJ_eff
+            dv_diag_c = dv_diag_c + MPM%basal_trac_p(p) * Sw_c(k)**2 * detJ_eff
+          endif
+          if (use_newton .and. MPM%newton_drag_coef_p(p) /= 0.0) then
+            du_diag_c = du_diag_c + &
+              MPM%newton_drag_coef_p(p) * MPM%up_mid(p)**2 * Sw_c(k)**2 * detJ_eff
+            dv_diag_c = dv_diag_c + &
+              MPM%newton_drag_coef_p(p) * MPM%vp_mid(p)**2 * Sw_c(k)**2 * detJ_eff
+          endif
+          if (umask(Itgt,Jtgt) == 1.0) u_diagonal(Itgt,Jtgt) = u_diagonal(Itgt,Jtgt) - du_diag_c
+          if (vmask(Itgt,Jtgt) == 1.0) v_diagonal(Itgt,Jtgt) = v_diagonal(Itgt,Jtgt) - dv_diag_c
+        enddo
+      enddo ; enddo  ! dfi, dfj
 
     enddo  ! pp particles
   enddo ; enddo  ! j, i cells

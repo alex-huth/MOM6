@@ -31,7 +31,7 @@ public :: MPM_compute_visc, MPM_compute_is_front_cell
 public :: MPM_store_pre_solve_vel
 public :: MPM_P2G_velocity, MPM_compute_basal_trac
 public :: MPM_write_vtu, MPM_save_restart, MPM_restore_restart
-public :: smpm_shape, smpm_grad, gimp_nodes
+public :: smpm_shape, smpm_grad, gimp_nodes, gimp_ew_nodes
 
 #include <MOM_memory.h>
 
@@ -2467,6 +2467,91 @@ subroutine gimp_nodes(xi, eta, lp_x, lp_y, dx, dy, Sw_g, dNdx_g, dNdy_g, di_g, d
   enddo
 
 end subroutine gimp_nodes
+
+! ============================================================
+!> Element-wise GIMP basis functions for a single target element.
+!!
+!! Computes the element-wise GIMP weighting functions and gradients
+!! for the overlap between a particle's domain and a given element,
+!! following Charlton et al. (2017) equations (7)-(10).
+!!
+!! All coordinates are in the same physical length units [L], defined
+!! in a frame relative to the particle's home cell centre.
+!! The particle centre (xp, yp) need not lie inside [x0,x1]×[y0,y1].
+!!
+!! Node ordering (matches smpm_shape / CG_action_MPM convention):
+!!   1 = SW (x0, y0),  2 = SE (x1, y0),
+!!   3 = NW (x0, y1),  4 = NE (x1, y1)
+!!
+!! If the particle domain does not overlap the element, has_overlap is .false.
+!! and all output arrays are set to zero.
+subroutine gimp_ew_nodes(xp, yp, lp_x, lp_y, x0, x1, y0, y1, &
+                          Sw, dNdx_e, dNdy_e, has_overlap)
+  real,    intent(in)  :: xp, yp       !< Particle centre [L]
+  real,    intent(in)  :: lp_x, lp_y  !< Particle half-widths [L]
+  real,    intent(in)  :: x0, x1      !< Element x-bounds [L] (x1 > x0)
+  real,    intent(in)  :: y0, y1      !< Element y-bounds [L] (y1 > y0)
+  real,    intent(out) :: Sw(4)       !< Element-wise GIMP basis values [nondim]
+  real,    intent(out) :: dNdx_e(4)   !< d(basis)/dx at each node [L-1]
+  real,    intent(out) :: dNdy_e(4)   !< d(basis)/dy at each node [L-1]
+  logical, intent(out) :: has_overlap !< .true. if particle domain intersects element
+
+  real :: dx_e, dy_e
+  real :: ovlp_x0, ovlp_x1, ovlp_y0, ovlp_y1
+  real :: pg_x, pg_y, Lg_x, Lg_y
+  real :: pl_x, pl_y, Ll_x, Ll_y
+  real :: E1x, E2x, E1y, E2y
+  real :: Sa_x, Sb_x, Sa_y, Sb_y
+  real :: dSa_x, dSb_x, dSa_y, dSb_y
+
+  Sw(:) = 0.0 ; dNdx_e(:) = 0.0 ; dNdy_e(:) = 0.0
+  has_overlap = .false.
+
+  dx_e = x1 - x0 ; dy_e = y1 - y0
+
+  ! x-direction overlap
+  ovlp_x0 = max(xp - lp_x, x0) ; ovlp_x1 = min(xp + lp_x, x1)
+  if (ovlp_x1 <= ovlp_x0) return
+
+  ! y-direction overlap
+  ovlp_y0 = max(yp - lp_y, y0) ; ovlp_y1 = min(yp + lp_y, y1)
+  if (ovlp_y1 <= ovlp_y0) return
+
+  has_overlap = .true.
+
+  ! x: element-wise GIMP (Charlton et al. 2017, Eqs. 7-10)
+  pg_x = 0.5*(ovlp_x0 + ovlp_x1) ; Lg_x = ovlp_x1 - ovlp_x0
+  pl_x = 2.0*(pg_x - x0)/dx_e - 1.0
+  Ll_x = 2.0*Lg_x / dx_e
+  E1x  = max(-1.0, pl_x - 0.5*Ll_x)
+  E2x  = min( 1.0, pl_x + 0.5*Ll_x)
+  Sa_x  = (1.0/(4.0*Ll_x)) * ((2.0*E2x - E2x*E2x) - (2.0*E1x - E1x*E1x))
+  Sb_x  = (1.0/(4.0*Ll_x)) * ((2.0*E2x + E2x*E2x) - (2.0*E1x + E1x*E1x))
+  dSa_x = (E1x - E2x) / (2.0*Lg_x)
+  dSb_x = (E2x - E1x) / (2.0*Lg_x)
+
+  ! y: element-wise GIMP
+  pg_y = 0.5*(ovlp_y0 + ovlp_y1) ; Lg_y = ovlp_y1 - ovlp_y0
+  pl_y = 2.0*(pg_y - y0)/dy_e - 1.0
+  Ll_y = 2.0*Lg_y / dy_e
+  E1y  = max(-1.0, pl_y - 0.5*Ll_y)
+  E2y  = min( 1.0, pl_y + 0.5*Ll_y)
+  Sa_y  = (1.0/(4.0*Ll_y)) * ((2.0*E2y - E2y*E2y) - (2.0*E1y - E1y*E1y))
+  Sb_y  = (1.0/(4.0*Ll_y)) * ((2.0*E2y + E2y*E2y) - (2.0*E1y + E1y*E1y))
+  dSa_y = (E1y - E2y) / (2.0*Lg_y)
+  dSb_y = (E2y - E1y) / (2.0*Lg_y)
+
+  ! 2D tensor product → 4 nodal contributions
+  ! Node 1: SW (x0, y0)
+  Sw(1) = Sa_x*Sa_y ; dNdx_e(1) = dSa_x*Sa_y ; dNdy_e(1) = Sa_x*dSa_y
+  ! Node 2: SE (x1, y0)
+  Sw(2) = Sb_x*Sa_y ; dNdx_e(2) = dSb_x*Sa_y ; dNdy_e(2) = Sb_x*dSa_y
+  ! Node 3: NW (x0, y1)
+  Sw(3) = Sa_x*Sb_y ; dNdx_e(3) = dSa_x*Sb_y ; dNdy_e(3) = Sa_x*dSb_y
+  ! Node 4: NE (x1, y1)
+  Sw(4) = Sb_x*Sb_y ; dNdx_e(4) = dSb_x*Sb_y ; dNdy_e(4) = Sb_x*dSb_y
+
+end subroutine gimp_ew_nodes
 
 ! ============================================================
 ! Private helper: swap all fields of particles pa and pb.
