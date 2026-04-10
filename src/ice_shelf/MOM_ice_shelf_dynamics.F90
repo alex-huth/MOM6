@@ -2835,11 +2835,11 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
           ! Newton tangent stiffness correction: add (dη/dε_e^2) * (g·δε) * (g·φ_m) term
           if (do_newton_visc) then
             if (umask(Itgt,Jtgt) == 1) uret_qp(iphi,jphi,qp) = uret_qp(iphi,jphi,qp) + &
-              CS%newton_visc_factor(i,j,qpv) * dstrain_n * &
+              CS%newton_visc_factor(i,j,qpv) * dstrain_n * 2.0 * &
               ((2.*strx_n + stry_n) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
                strsh_n * 0.5 * Phi(2*(2*(jphi-1)+iphi),qp,i,j))
             if (vmask(Itgt,Jtgt) == 1) vret_qp(iphi,jphi,qp) = vret_qp(iphi,jphi,qp) + &
-              CS%newton_visc_factor(i,j,qpv) * dstrain_n * &
+              CS%newton_visc_factor(i,j,qpv) * dstrain_n * 2.0 * &
               (strsh_n * 0.5 * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
                (2.*stry_n + strx_n) * Phi(2*(2*(jphi-1)+iphi),qp,i,j))
           endif
@@ -3139,7 +3139,7 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
             dstrain_diag_u = (2.*strx_n + stry_n) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
                              strsh_n * 0.5 * Phi(2*(2*(jphi-1)+iphi),qp,i,j)
             u_diag_qp(iphi,jphi,qp) = u_diag_qp(iphi,jphi,qp) + &
-              CS%newton_visc_factor(i,j,qpv) * dstrain_diag_u**2
+              CS%newton_visc_factor(i,j,qpv) * 2.0 * dstrain_diag_u**2
           endif
 
           if (float_cond(i,j) == 0) then
@@ -3170,7 +3170,7 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
             dstrain_diag_v = strsh_n * 0.5 * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j) + &
                              (2.*stry_n + strx_n) * Phi(2*(2*(jphi-1)+iphi),qp,i,j)
             v_diag_qp(iphi,jphi,qp) = v_diag_qp(iphi,jphi,qp) + &
-              CS%newton_visc_factor(i,j,qpv) * dstrain_diag_v**2
+              CS%newton_visc_factor(i,j,qpv) * 2.0 * dstrain_diag_v**2
           endif
 
           if (float_cond(i,j) == 0) then
