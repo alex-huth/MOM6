@@ -220,6 +220,8 @@ type, public :: ice_shelf_dyn_CS ; private
   real :: newton_after_tolerance !< The fractional nonlinear tolerance, relative to the initial error, at
                                  !! which to switch from Picard to Newton iterations in the velocity solver [nondim]
   logical :: newton_adapt_cg_tol !< Use an adaptive CG tolerance during Newton iterations
+  real :: ew_gamma !< Gamma in Eisenstat-Walker adaptive Newton tolerance [nondim].
+  real :: ew_alpha !< Alpha in Eisenstat-Walker adaptive Newton tolerance [nondim].
   integer :: cg_max_iterations !< The maximum number of iterations that can be used in the CG solver
   integer :: nonlin_solve_err_mode  !< 1: exit vel solve based on nonlin residual
                     !! 2: exit based on "fixed point" metric (|u - u_last| / |u| < tol) where | | is infty-norm
@@ -602,6 +604,10 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                 units="none", default=CS%nonlinear_tolerance)
     call get_param(param_file, mdl, "NEWTON_ADAPT_CG_TOL", CS%newton_adapt_cg_tol, &
                 "Use an adaptive CG tolerance during Newton iterations.", default=.true.)
+    call get_param(param_file, mdl, "NEWTON_EW_GAMMA", CS%ew_gamma, &
+                "Gamma in Eisenstat-Walker adaptive Newton tolerance", units="nondim", default=0.9)
+    call get_param(param_file, mdl, "NEWTON_EW_ALPHA", CS%ew_alpha, &
+                "Alpha in Eisenstat-Walker adaptive Newton tolerance", units="nondim", default=2.0)
     call get_param(param_file, mdl, "CONJUGATE_GRADIENT_MAXIT", CS%cg_max_iterations, &
                 "max iteratiions in CG solver", default=2000)
     call get_param(param_file, mdl, "THRESH_FLOAT_COL_DEPTH", CS%thresh_float_col_depth, &
@@ -1506,7 +1512,8 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   integer :: Isdq, Iedq, Jsdq, Jedq, isd, ied, jsd, jed
   integer :: Iscq, Iecq, Jscq, Jecq, isc, iec, jsc, jec
   real    :: err_max, err_tempu, err_tempv, err_init ! Errors in [R L3 Z T-2 ~> kg m s-2] or [L T-1 ~> m s-1]
-  real    :: ew_prev_err  ! Previous outer residual for Eisenstat-Walker CG tolerance (same units as err_max)
+  real    :: ew_resid      = 0.0  ! L2 norm of stress residual ||A(u)u - tau|| for Eisenstat-Walker [kg m s-2]
+  real    :: ew_prev_resid = 0.0  ! Previous ew_resid; 0.0 flags first Newton call [kg m s-2]
   real    :: max_vel  ! The maximum velocity magnitude [L T-1 ~> m s-1]
   real    :: tempu, tempv   ! Temporary variables with velocity magnitudes [L T-1 ~> m s-1]
   real    :: Norm, PrevNorm ! Velocities used to assess convergence [L T-1 ~> m s-1]
@@ -1621,7 +1628,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
   u_last(:,:) = u_shlf(:,:) ; v_last(:,:) = v_shlf(:,:)
   CS%cg_tol_newton = CS%cg_tolerance
-  ew_prev_err = err_init
+  ew_prev_resid = 0.0
 
   !! begin loop
 
@@ -1711,19 +1718,36 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
     if (err_max <= CS%newton_after_tolerance * err_init .and. .not. CS%doing_newton) then
       CS%doing_newton = .true.
-      ew_prev_err = err_max  ! seed Eisenstat-Walker with residual at the Newton switch point
       write(mesg,*) "ice_shelf_solve_outer: switching to Newton iterations at iter = ", iter
       call MOM_mesg(mesg, 5)
     endif
 
     ! Eisenstat-Walker Choice II (Eisenstat & Walker 1994): η_k = γ*(||F_k||/||F_{k-1}||)^α
-    ! with γ=0.9, α=2.  Uses the ratio of consecutive outer residuals so that the CG
-    ! tolerance scales linearly with the current error (enabling quadratic outer convergence)
-    ! without over-tightening at later Newton steps.  The first Newton step uses the standard
-    ! cg_tolerance (ratio = 1 on entry).
+    ! with γ=0.9, α=2.  Uses the L2 norm of the nonlinear stress residual ||Au - tau||_2,
+    ! consistent with the inner CG solver's convergence check (sv3dsums(3)).  For mode 1,
+    ! Au/Av are already available from the residual evaluation above; modes 2/3 require an
+    ! extra CG_action call.  The first Newton step uses the standard cg_tolerance.
     if (CS%doing_newton .and. CS%newton_adapt_cg_tol) then
-      CS%cg_tol_newton = min(CS%cg_tolerance, 0.9 * (err_max / ew_prev_err)**2)
-      ew_prev_err = err_max
+      if (CS%nonlin_solve_err_mode /= 1) then
+        Au(:,:) = 0 ; Av(:,:) = 0
+        call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, &
+                       H_node, CS%ice_visc, CS%float_cond, CS%bed_elev, u_shlf, v_shlf, &
+                       G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow, use_newton_in=.false.)
+        call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
+      endif
+      Normvec(:,:) = 0.0
+      do J=G%jscB,G%jecB ; do I=G%iscB,G%iecB
+        if (CS%umask(I,J) == 1) Normvec(I,J) = (Au(I,J) - taudx(I,J))**2
+        if (CS%vmask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + (Av(I,J) - taudy(I,J))**2
+      enddo ; enddo
+      ew_resid = sqrt(reproducing_sum(Normvec, Is_sum, Ie_sum, Js_sum, Je_sum, &
+                                      unscale=((US%RZ_to_kg_m2*US%L_to_m)*US%L_T_to_m_s**2)**2))
+      if (ew_prev_resid == 0.0) then
+        ew_prev_resid = ew_resid  ! first Newton iteration: seed; use standard cg_tolerance this step
+      else
+        CS%cg_tol_newton = min(CS%cg_tolerance, CS%ew_gamma * (ew_resid / ew_prev_resid)**CS%ew_alpha)
+        ew_prev_resid = ew_resid
+      endif
     endif
 
     if (err_max <= CS%nonlinear_tolerance * err_init) then
