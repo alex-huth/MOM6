@@ -124,12 +124,14 @@ type, public :: ice_shelf_dyn_CS ; private
                                                        !! the same as G%bathyT+Z_ref, when below sea-level.
                                                        !! Sign convention: positive below sea-level, negative above.
 
-  real, pointer, dimension(:,:) :: basal_traction => NULL() !< The area-integrated taub_beta field
-                                                            !! (m2 Pa s m-1, or kg s-1) related to the nonlinear part
-                                                            !! of "linearized" basal stress (Pa) [R Z L2 T-1 ~> kg s-1]
-                !!  The exact form depends on basal law exponent and/or whether flow is "hybridized" a la Goldberg 2011
   real, pointer, dimension(:,:) :: C_basal_friction => NULL()!< Coefficient in sliding law tau_b = C u^(n_basal_fric),
                                !! units of [R L Z T-2 (s m-1)^(n_basal_fric) ~> Pa (s m-1)^(n_basal_fric)]
+  real, pointer, dimension(:,:) :: coef_prefactor => NULL() !< Pre-computed area*C_basal_friction*L_T_to_m_s for
+                               !! basal friction quadrature evaluation [R L2 Z T-1 ~> kg s-1].
+  real, pointer, dimension(:,:) :: fB_elem => NULL()        !< Pre-computed element-level Coulomb fB parameter
+                               !! [(T L-1)^CF_PostPeak]; 0 for Weertman.
+                               !! Updated each outer iteration by calc_shelf_basal_prefactors.
+  real :: alpha_coulomb = 1.0  !< Coulomb prefactor (CF_PostPeak-1)^(CF_PostPeak-1)/CF_PostPeak^CF_PostPeak [nondim]
   real, pointer, dimension(:,:) :: OD_rt => NULL()         !< A running total for calculating OD_av [Z ~> m].
   real, pointer, dimension(:,:) :: ground_frac_rt => NULL() !< A running total for calculating ground_frac.
   real, pointer, dimension(:,:) :: OD_av => NULL()         !< The time average open ocean depth [Z ~> m].
@@ -393,9 +395,10 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%newton_vmid(isd:ied,jsd:jed), source=0.0)
     allocate(CS%newton_drag_coef(isd:ied,jsd:jed), source=0.0)
     allocate(CS%AGlen_visc(isd:ied,jsd:jed), source=2.261e-25) ! [Pa-3 s-1]
-    allocate(CS%basal_traction(isd:ied,jsd:jed), source=0.0)   ! [R Z L2 T-1 ~> kg s-1]
     allocate(CS%C_basal_friction(isd:ied,jsd:jed), source=5.0e10*US%Pa_to_RLZ_T2)
              ! Units of [R L Z T-2 (s m-1)^n_sliding ~> Pa (s m-1)^n_sliding]
+    allocate(CS%coef_prefactor(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%fB_elem(isd:ied,jsd:jed), source=0.0)
     allocate(CS%OD_av(isd:ied,jsd:jed), source=0.0)
     allocate(CS%ground_frac(isd:ied,jsd:jed), source=0.0)
     allocate(CS%taudx_shelf(IsdB:IedB,JsdB:JedB), source=0.0)
@@ -581,6 +584,10 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     call get_param(param_file, mdl, "CF_Max", CS%CF_Max, &
                  "Coulomb friction maximum coefficient", &
                  units="none", default=0.5, fail_if_missing=.false.)
+    ! Pre-compute Coulomb prefactor alpha = (q-1)^(q-1)/q^q for q=CF_PostPeak [nondim].
+    ! Default is 1.0; only update when Coulomb is active and q /= 1.
+    if (CS%CoulombFriction .and. CS%CF_PostPeak /= 1.0) &
+      CS%alpha_coulomb = (CS%CF_PostPeak-1.0)**(CS%CF_PostPeak-1.0) / CS%CF_PostPeak**CS%CF_PostPeak
 
     call get_param(param_file, mdl, "DENSITY_ICE", CS%density_ice, &
                  "A typical density of ice.", units="kg m-3", default=917.0, scale=US%kg_m3_to_R)
@@ -735,7 +742,6 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
 
     call pass_var(CS%OD_av,G%domain, complete=.false.)
     call pass_var(CS%ground_frac, G%domain, complete=.false.)
-    call pass_var(CS%basal_traction, G%domain, complete=.false.)
     call pass_var(CS%AGlen_visc, G%domain, complete=.false.)
     call pass_var(CS%bed_elev, G%domain, complete=.false.)
     call pass_var(CS%C_basal_friction, G%domain, complete=.false.)
@@ -925,8 +931,6 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     !IS_dynamics_post_data is called before update_ice_shelf
     if (CS%id_taudx_shelf>0 .or. CS%id_taudy_shelf>0) &
       call calc_shelf_driving_stress(CS, ISS, G, US, CS%taudx_shelf, CS%taudy_shelf, CS%OD_av)
-    if (CS%id_taub>0) &
-      call calc_shelf_taub(CS, ISS, G, US, CS%u_shelf, CS%v_shelf)
     if (CS%id_visc_shelf>0) &
       call calc_shelf_visc(CS, ISS, G, US, CS%u_shelf, CS%v_shelf)
   endif
@@ -1187,9 +1191,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       call post_data(CS%id_visc_shelf, ice_visc, CS%diag)
     endif
     if (CS%id_taub > 0) then
-      do j=G%jsc,G%jec ; do i=G%isc,G%iec
-        basal_tr(i,j) = CS%basal_traction(i,j)*G%IareaT(i,j)
-      enddo ; enddo
+      call calc_shelf_taub(CS, ISS, G, basal_tr)
       call post_data(CS%id_taub, basal_tr, CS%diag)
     endif
     if (CS%id_u_mask > 0) call post_data(CS%id_u_mask, CS%umask, CS%diag)
@@ -1563,32 +1565,20 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     enddo ; enddo
 
     call pass_var(CS%float_cond, G%Domain, complete=.false.)
-    call pass_var(CS%ground_frac, G%domain, complete=.false.)
+    call pass_var(CS%ground_frac, G%domain, complete=.true.)
 
   endif
 
-  call calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
-  call pass_var(CS%basal_traction, G%domain, complete=.true.)
+  call calc_shelf_basal_prefactors(CS, ISS, G, US)
   call calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
   call pass_var(CS%ice_visc, G%domain)
-
-  ! This makes sure basal stress is only applied when it is supposed to be
-  if (CS%GL_regularize) then
-    do j=G%jsd,G%jed ; do i=G%isd,G%ied
-      if (CS%ground_frac(i,j)/=1.0) CS%basal_traction(i,j) = 0.0
-    enddo ; enddo
-  else
-    do j=G%jsd,G%jed ; do i=G%isd,G%ied
-      CS%basal_traction(i,j) = CS%basal_traction(i,j) * CS%ground_frac(i,j)
-    enddo ; enddo
-  endif
 
   if (CS%nonlin_solve_err_mode == 1) then
 
     Au(:,:) = 0.0 ; Av(:,:) = 0.0
 
     call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, H_node, &
-                   CS%ice_visc, CS%float_cond, CS%bed_elev, CS%basal_traction, &
+                   CS%ice_visc, CS%float_cond, CS%bed_elev, u_shlf, v_shlf, &
                    G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow, use_newton_in=.false.)
     call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
 
@@ -1648,33 +1638,19 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     write(mesg,*) "ice_shelf_solve_outer: linear solve done in ",iters," iterations"
     call MOM_mesg(mesg, 5)
 
-    call calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
-    call pass_var(CS%basal_traction, G%domain, complete=.true.)
+    call calc_shelf_basal_prefactors(CS, ISS, G, US)
     call calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
     call pass_var(CS%ice_visc, G%domain, complete=.false.)
     call pass_var(CS%newton_str_sh, G%domain, complete=.false.)
     call pass_var(CS%newton_visc_factor, G%domain, complete=.true.)
-    call pass_var(CS%newton_drag_coef, G%domain)
     call pass_vector(CS%newton_str_ux, CS%newton_str_vy, G%domain, TO_ALL, AGRID)
-    call pass_vector(CS%newton_umid, CS%newton_vmid, G%domain, TO_ALL, AGRID)
-
-    ! makes sure basal stress is only applied when it is supposed to be
-    if (CS%GL_regularize) then
-      do j=G%jsd,G%jed ; do i=G%isd,G%ied
-        if (CS%ground_frac(i,j)/=1.0) CS%basal_traction(i,j) = 0.0
-      enddo ; enddo
-    else
-      do j=G%jsd,G%jed ; do i=G%isd,G%ied
-        CS%basal_traction(i,j) = CS%basal_traction(i,j) * CS%ground_frac(i,j)
-      enddo ; enddo
-    endif
 
     if (CS%nonlin_solve_err_mode == 1) then
 
       Au(:,:) = 0 ; Av(:,:) = 0
 
       call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, H_node, &
-                     CS%ice_visc, CS%float_cond, CS%bed_elev, CS%basal_traction, &
+                     CS%ice_visc, CS%float_cond, CS%bed_elev, u_shlf, v_shlf, &
                      G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow, use_newton_in=.false.)
 
       call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
@@ -1808,6 +1784,7 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
 
 ! assumed - u, v, taud, visc, basal_traction are valid on the halo
 
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: u_curr_k, v_curr_k  ! Frozen u^k for Newton-Krylov CG [L T-1 ~> m s-1]
   real, dimension(SZDIB_(G),SZDJB_(G)) ::  &
                         Ru, Rv, &     ! Residuals in the stress calculations [R L3 Z T-2 ~> m kg s-2]
                         Ru_old, Rv_old, & ! Previous values of Ru and Rv [R L3 Z T-2 ~> m kg s-2]
@@ -1870,16 +1847,19 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
 
   call pass_vector(RHSu, RHSv, G%domain, TO_ALL, BGRID_NE, complete=.false.)
 
-  call matrix_diagonal(CS, G, US, float_cond, H_node, CS%ice_visc, CS%basal_traction, &
+  call matrix_diagonal(CS, G, US, float_cond, H_node, CS%ice_visc, u_shlf, v_shlf, &
                        hmask, rhoi_rhow, Phi, Phisub, DIAGu, DIAGv)
 
   call pass_vector(DIAGu, DIAGv, G%domain, TO_ALL, BGRID_NE, complete=.false.)
 
   call CG_action(CS, Au, Av, u_shlf, v_shlf, Phi, Phisub, CS%umask, CS%vmask, hmask, &
-                 H_node, CS%ice_visc, float_cond, CS%bed_elev, CS%basal_traction, &
+                 H_node, CS%ice_visc, float_cond, CS%bed_elev, u_shlf, v_shlf, &
                  G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, use_newton_in=.false.)
 
   call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE, complete=.true.)
+
+  ! Save the frozen current iterate for the Newton-Krylov CG inner iterations
+  u_curr_k(:,:) = u_shlf(:,:) ; v_curr_k(:,:) = v_shlf(:,:)
 
   Ru(:,:) = (RHSu(:,:) - Au(:,:)) ; Rv(:,:) = (RHSv(:,:) - Av(:,:))
   resid_scale = US%s_to_T*(US%RZL2_to_kg*US%L_T_to_m_s**2)
@@ -1928,7 +1908,7 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
     Au(:,:) = 0 ; Av(:,:) = 0
 
     call CG_action(CS, Au, Av, Du, Dv, Phi, Phisub, CS%umask, CS%vmask, hmask, &
-                   H_node, CS%ice_visc, float_cond, CS%bed_elev, CS%basal_traction, &
+                   H_node, CS%ice_visc, float_cond, CS%bed_elev, u_curr_k, v_curr_k, &
                    G, US, is, ie, js, je, rhoi_rhow)
 
     ! Au, Av valid region moves in by 1
@@ -2670,7 +2650,7 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
 end subroutine calc_shelf_driving_stress
 
 subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, hmask, H_node, &
-                     ice_visc, float_cond, bathyT, basal_trac, G, US, is, ie, js, je, dens_ratio, use_newton_in)
+                     ice_visc, float_cond, bathyT, u_curr, v_curr, G, US, is, ie, js, je, dens_ratio, use_newton_in)
 
   type(ice_shelf_dyn_CS), intent(in)    :: CS !< A pointer to the ice shelf control structure
   type(ocean_grid_type), intent(in) :: G  !< The grid structure used by the ice shelf.
@@ -2704,14 +2684,17 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
                          intent(in)    :: ice_visc !< A field related to the ice viscosity from Glen's
                                                !! flow law [R L4 Z T-1 ~> kg m2 s-1].
   real, dimension(SZDI_(G),SZDJ_(G)), &
-                         intent(in)    :: float_cond !< If GL_regularize=true, an array indicating where the ice
-                                                !! shelf is floating: 0 if floating, 1 if not
+                         intent(in)    :: float_cond !< If GL_regularize=true, indicates cells containing
+                                                !! the grounding line (float_cond=1) or not (float_cond=0)
   real, dimension(SZDI_(G),SZDJ_(G)), &
                          intent(in)    :: bathyT !< The depth of ocean bathymetry at tracer points
                                                  !! relative to sea-level [Z ~> m].
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                         intent(in)    :: basal_trac  !< Area-integrated taub_beta field related to the nonlinear
-                                                !! part of the "linearized" basal stress [R Z L2 T-1 ~> kg s-1].
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                         intent(in)    :: u_curr  !< Frozen current iterate u^k, used to evaluate basal friction
+                                               !! at quadrature points [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                         intent(in)    :: v_curr  !< Frozen current iterate v^k, used to evaluate basal friction
+                                               !! at quadrature points [L T-1 ~> m s-1]
 
   real,                  intent(in)    :: dens_ratio !< The density of ice divided by the density
                                                      !! of seawater, nondimensional
@@ -2742,15 +2725,24 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
 ! Phi_k is equal to 1 at vertex k, and 0 at vertex l /= k, and bilinear
 
   real :: ux, uy, vx, vy ! Components of velocity shears or divergence [T-1 ~> s-1]
-  real :: uq, vq  ! Interpolated velocities [L T-1 ~> m s-1]
-  real :: strx_n, stry_n, strsh_n, dstrain_n, inner_dot_n  ! Newton correction variables [T-1 ~> s-1], [T-2 ~> s-2]
+  real :: uq, vq  ! Interpolated direction-vector δu at quadrature point [L T-1 ~> m s-1]
+  real :: strx_n, stry_n, strsh_n, dstrain_n  ! Newton viscosity correction variables [T-1 ~> s-1], [T-2 ~> s-2]
+  real :: u_curr_qp, v_curr_qp  ! Current iterate u^k at quadrature point [L T-1 ~> m s-1]
+  real :: unorm2_qp  ! Regularized squared speed of u^k at quadrature point [L2 T-2 ~> m2 s-2]
+  real :: basal_coef_qp  ! Picard basal friction coefficient at quadrature point [R L2 Z T-1 ~> kg s-1]
+  real :: drag_newt_qp   ! Newton basal drag coefficient at quadrature point [R Z T-1 ~> kg m-2 s-1]
+  real :: inner_dot_qp   ! u^k_qp · δu_qp inner product for Newton basal drag [L2 T-2 ~> m2 s-2]
+  real :: coef_prefactor_e  ! Pre-computed area * C_basal_friction * L_T_to_m_s [R L2 Z T-1 ~> kg s-1]
+  real :: eps_vel2_e     ! Velocity regularization squared for current element [L2 T-2 ~> m2 s-2]
+  real :: min_trac_e     ! min_basal_traction * areaT for current element [R L2 Z T-1 ~> kg s-1]
+  real :: fB_e           ! Pre-computed Coulomb fB for element; 0 for Weertman [(T L-1)^CF_PostPeak]
   integer :: iq, jq, iphi, jphi, i, j, ilq, jlq, Itgt, Jtgt, qp, qpv
   logical :: visc_qp4
   logical :: use_newton  ! Whether to apply Newton tangent stiffness corrections
   logical :: do_newton_visc  ! Whether to apply viscosity-related Newton tangent stiffness corrections
   real, dimension(2) :: xquad  ! Nondimensional quadrature ratios [nondim]
-  real, dimension(2,2) :: Ucell, Vcell, Usub, Vsub  ! Velocities at the nodal points around the cell [L T-1 ~> m s-1]
-  real, dimension(2,2) :: Hcell   ! Ice shelf thickness at notal (corner) points [Z ~> m]
+  real, dimension(2,2) :: Usub, Vsub  ! Subgrid nodal contributions to basal traction [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(2,2) :: Hcell   ! Ice shelf thickness at nodal (corner) points [Z ~> m]
   real, dimension(2,2,4) :: uret_qp, vret_qp                ! Temporary arrays in [R Z L3 T-2 ~> kg m s-2]
   real, dimension(SZDIB_(G),SZDJB_(G),4) :: uret_b, vret_b  ! Temporary arrays in [R Z L3 T-2 ~> kg m s-2]
 
@@ -2773,6 +2765,13 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   do j=js,je ; do i=is,ie ; if (hmask(i,j) == 1 .or. hmask(i,j)==3) then
 
     uret_qp(:,:,:) = 0.0 ; vret_qp(:,:,:) = 0.0
+
+      ! Pre-computed element-level basal friction quantities (updated each outer Newton iteration
+      ! by calc_shelf_basal_prefactors; avoids O(N_cg) recomputation of expensive prefactors).
+      coef_prefactor_e = CS%coef_prefactor(i,j)
+      eps_vel2_e = CS%eps_glen_min**2 * ((G%dxT(i,j)**2) + (G%dyT(i,j)**2))
+      min_trac_e = CS%min_basal_traction * G%areaT(i,j)
+      fB_e = CS%fB_elem(i,j)  ! 0 for Weertman; non-zero for Coulomb
 
       do iq=1,2 ; do jq=1,2
 
@@ -2819,9 +2818,27 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
                       strsh_n * (uy + vx) * 0.5
         endif
 
-        ! Newton correction for basal drag: compute inner_dot_n once per quadrature point
-        if (use_newton) then
-          inner_dot_n = CS%newton_umid(i,j)*uq + CS%newton_vmid(i,j)*vq
+        ! Basal friction and Newton Jacobian evaluated at this quadrature point (fully grounded cells only).
+        ! Evaluating at quadrature points rather than cell-averaged ensures the Newton correction is the
+        ! exact Jacobian of the Picard residual, enabling quadratic convergence for all friction exponents.
+        if (float_cond(i,j) == 0  .and. CS%ground_frac(i,j)>0) then
+          u_curr_qp = ((u_curr(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
+                       (u_curr(I,J) * (xquad(iq) * xquad(jq)))) + &
+                      ((u_curr(I,J-1) * (xquad(iq) * xquad(3-jq))) + &
+                       (u_curr(I-1,J) * (xquad(3-iq) * xquad(jq))))
+          v_curr_qp = ((v_curr(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
+                       (v_curr(I,J) * (xquad(iq) * xquad(jq)))) + &
+                      ((v_curr(I,J-1) * (xquad(iq) * xquad(3-jq))) + &
+                       (v_curr(I-1,J) * (xquad(3-iq) * xquad(jq))))
+          unorm2_qp = (u_curr_qp**2 + v_curr_qp**2) + eps_vel2_e
+          call compute_basal_coef(unorm2_qp, coef_prefactor_e, min_trac_e, fB_e, &
+              CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, use_newton, &
+              basal_coef_qp, drag_newt_qp)
+          ! Apply ground fraction scaling (replaces external scaling of basal_traction)
+          basal_coef_qp = basal_coef_qp * CS%ground_frac(i,j)
+          if (use_newton) drag_newt_qp = drag_newt_qp * CS%ground_frac(i,j)
+          ! Inner product u^k_qp . delta_u_qp for the Newton correction.
+          inner_dot_qp = (u_curr_qp * uq) + (v_curr_qp * vq)
         endif
 
         do jphi=1,2 ; Jtgt = J-2+jphi ; do iphi=1,2 ; Itgt = I-2+iphi
@@ -2832,7 +2849,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
             (((uy+vx) * Phi(2*(2*(jphi-1)+iphi)-1,qp,i,j)) + &
             ((4*vy+2*ux) * Phi(2*(2*(jphi-1)+iphi),qp,i,j)))
 
-          ! Newton tangent stiffness correction: add (dη/dε_e^2) * (g·δε) * (g·φ_m) term
+          ! Newton viscosity tangent stiffness: 2*(dη/dε_e^2) * (g·δε) * (g·φ_m).
           if (do_newton_visc) then
             if (umask(Itgt,Jtgt) == 1) uret_qp(iphi,jphi,qp) = uret_qp(iphi,jphi,qp) + &
               CS%newton_visc_factor(i,j,qpv) * dstrain_n * 2.0 * &
@@ -2844,19 +2861,21 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
                (2.*stry_n + strx_n) * Phi(2*(2*(jphi-1)+iphi),qp,i,j))
           endif
 
-          if (float_cond(i,j) == 0) then
+          if (float_cond(i,j) == 0 .and. CS%ground_frac(i,j)>0) then
             ilq = 1 ; if (iq == iphi) ilq = 2
             jlq = 1 ; if (jq == jphi) jlq = 2
-            if (umask(Itgt,Jtgt) == 1) uret_qp(iphi,jphi,qp) = uret_qp(iphi,jphi,qp) +  &
-              ((basal_trac(i,j) * uq) * (xquad(ilq) * xquad(jlq)))
-            if (vmask(Itgt,Jtgt) == 1) vret_qp(iphi,jphi,qp) = vret_qp(iphi,jphi,qp) +  &
-              ((basal_trac(i,j) * vq) * (xquad(ilq) * xquad(jlq)))
-            ! Newton basal drag tangent stiffness: (m-1)*basal_trac/|u|^2 * u_i * (u . delta_u) contribution
+            ! Picard basal drag: C*|u^k|^(m-1) * δu evaluated at quadrature point, weighted by φ_m
+            if (umask(Itgt,Jtgt) == 1) uret_qp(iphi,jphi,qp) = uret_qp(iphi,jphi,qp) + &
+              basal_coef_qp * uq * (xquad(ilq) * xquad(jlq))
+            if (vmask(Itgt,Jtgt) == 1) vret_qp(iphi,jphi,qp) = vret_qp(iphi,jphi,qp) + &
+              basal_coef_qp * vq * (xquad(ilq) * xquad(jlq))
+            ! Newton basal drag: pointwise Jacobian of the Picard residual.
+            ! Tangent stiffness = basal_coef_qp*I + drag_newt_qp * u^k_qp ⊗ u^k_qp
             if (use_newton) then
               if (umask(Itgt,Jtgt) == 1) uret_qp(iphi,jphi,qp) = uret_qp(iphi,jphi,qp) + &
-                CS%newton_drag_coef(i,j) * CS%newton_umid(i,j) * inner_dot_n * (xquad(ilq) * xquad(jlq))
+                drag_newt_qp * u_curr_qp * inner_dot_qp * (xquad(ilq) * xquad(jlq))
               if (vmask(Itgt,Jtgt) == 1) vret_qp(iphi,jphi,qp) = vret_qp(iphi,jphi,qp) + &
-                CS%newton_drag_coef(i,j) * CS%newton_vmid(i,j) * inner_dot_n * (xquad(ilq) * xquad(jlq))
+                drag_newt_qp * v_curr_qp * inner_dot_qp * (xquad(ilq) * xquad(jlq))
             endif
           endif
         enddo ; enddo
@@ -2879,45 +2898,21 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
       vret_b(I  ,J  ,1) = 0.25*((vret_qp(2,2,1)+vret_qp(2,2,4))+(vret_qp(2,2,2)+vret_qp(2,2,3)))
 
       if (float_cond(i,j) == 1) then
-        Ucell(:,:) = u_shlf(I-1:I,J-1:J) ; Vcell(:,:) = v_shlf(I-1:I,J-1:J)
+        ! Subgrid grounding-line: evaluate basal friction at each grounded sub-quadrature point.
+        ! Picard and Newton Jacobian are both computed inside CG_action_subgrid_basal.
         Hcell(:,:) = H_node(I-1:I,J-1:J)
-
-        call CG_action_subgrid_basal(Phisub, Hcell, Ucell, Vcell, &
-                                     bathyT(i,j), dens_ratio, Usub, Vsub)
-
-        if (umask(I-1,J-1) == 1) uret_b(I-1,J-1,4) = uret_b(I-1,J-1,4) + (Usub(1,1) * basal_trac(i,j))
-        if (umask(I-1,J  ) == 1) uret_b(I-1,J  ,2) = uret_b(I-1,J  ,2) + (Usub(1,2) * basal_trac(i,j))
-        if (umask(I  ,J-1) == 1) uret_b(I  ,J-1,3) = uret_b(I  ,J-1,3) + (Usub(2,1) * basal_trac(i,j))
-        if (umask(I  ,J  ) == 1) uret_b(I  ,J  ,1) = uret_b(I  ,J  ,1) + (Usub(2,2) * basal_trac(i,j))
-
-        if (vmask(I-1,J-1) == 1) vret_b(I-1,J-1,4) = vret_b(I-1,J-1,4) + (Vsub(1,1) * basal_trac(i,j))
-        if (vmask(I-1,J  ) == 1) vret_b(I-1,J  ,2) = vret_b(I-1,J  ,2) + (Vsub(1,2) * basal_trac(i,j))
-        if (vmask(I  ,J-1) == 1) vret_b(I  ,J-1,3) = vret_b(I  ,J-1,3) + (Vsub(2,1) * basal_trac(i,j))
-        if (vmask(I  ,J  ) == 1) vret_b(I  ,J  ,1) = vret_b(I  ,J  ,1) + (Vsub(2,2) * basal_trac(i,j))
-
-        ! Newton basal drag correction for subgrid grounding line cells.
-        ! inner_dot_sub(m,n) = sum over grounded sub-QPs of (u^k . delta_u) * phi_{m,n} * weight
-        !                    = newton_umid * Usub(m,n) + newton_vmid * Vsub(m,n)
-        ! Correction to u-node (m,n): newton_drag_coef * newton_umid * inner_dot_sub(m,n)
-        ! Correction to v-node (m,n): newton_drag_coef * newton_vmid * inner_dot_sub(m,n)
-        if (use_newton) then
-          if (umask(I-1,J-1)==1) uret_b(I-1,J-1,4) = uret_b(I-1,J-1,4) + CS%newton_drag_coef(i,j) * &
-            CS%newton_umid(i,j) * ((CS%newton_umid(i,j)*Usub(1,1)) + (CS%newton_vmid(i,j)*Vsub(1,1)))
-          if (umask(I-1,J  )==1) uret_b(I-1,J  ,2) = uret_b(I-1,J  ,2) + CS%newton_drag_coef(i,j) * &
-            CS%newton_umid(i,j) * ((CS%newton_umid(i,j)*Usub(1,2)) + (CS%newton_vmid(i,j)*Vsub(1,2)))
-          if (umask(I  ,J-1)==1) uret_b(I  ,J-1,3) = uret_b(I  ,J-1,3) + CS%newton_drag_coef(i,j) * &
-            CS%newton_umid(i,j) * ((CS%newton_umid(i,j)*Usub(2,1)) + (CS%newton_vmid(i,j)*Vsub(2,1)))
-          if (umask(I  ,J  )==1) uret_b(I  ,J  ,1) = uret_b(I  ,J  ,1) + CS%newton_drag_coef(i,j) * &
-            CS%newton_umid(i,j) * ((CS%newton_umid(i,j)*Usub(2,2)) + (CS%newton_vmid(i,j)*Vsub(2,2)))
-          if (vmask(I-1,J-1)==1) vret_b(I-1,J-1,4) = vret_b(I-1,J-1,4) + CS%newton_drag_coef(i,j) * &
-            CS%newton_vmid(i,j) * ((CS%newton_umid(i,j)*Usub(1,1)) + (CS%newton_vmid(i,j)*Vsub(1,1)))
-          if (vmask(I-1,J  )==1) vret_b(I-1,J  ,2) = vret_b(I-1,J  ,2) + CS%newton_drag_coef(i,j) * &
-            CS%newton_vmid(i,j) * ((CS%newton_umid(i,j)*Usub(1,2)) + (CS%newton_vmid(i,j)*Vsub(1,2)))
-          if (vmask(I  ,J-1)==1) vret_b(I  ,J-1,3) = vret_b(I  ,J-1,3) + CS%newton_drag_coef(i,j) * &
-            CS%newton_vmid(i,j) * ((CS%newton_umid(i,j)*Usub(2,1)) + (CS%newton_vmid(i,j)*Vsub(2,1)))
-          if (vmask(I  ,J  )==1) vret_b(I  ,J  ,1) = vret_b(I  ,J  ,1) + CS%newton_drag_coef(i,j) * &
-            CS%newton_vmid(i,j) * ((CS%newton_umid(i,j)*Usub(2,2)) + (CS%newton_vmid(i,j)*Vsub(2,2)))
-        endif
+        call CG_action_subgrid_basal(CS, G, US, Phisub, Hcell, &
+                                     u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+                                     u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
+                                     bathyT(i,j), dens_ratio, i, j, fB_e, use_newton, Usub, Vsub)
+        if (umask(I-1,J-1) == 1) uret_b(I-1,J-1,4) = uret_b(I-1,J-1,4) + Usub(1,1)
+        if (umask(I-1,J  ) == 1) uret_b(I-1,J  ,2) = uret_b(I-1,J  ,2) + Usub(1,2)
+        if (umask(I  ,J-1) == 1) uret_b(I  ,J-1,3) = uret_b(I  ,J-1,3) + Usub(2,1)
+        if (umask(I  ,J  ) == 1) uret_b(I  ,J  ,1) = uret_b(I  ,J  ,1) + Usub(2,2)
+        if (vmask(I-1,J-1) == 1) vret_b(I-1,J-1,4) = vret_b(I-1,J-1,4) + Vsub(1,1)
+        if (vmask(I-1,J  ) == 1) vret_b(I-1,J  ,2) = vret_b(I-1,J  ,2) + Vsub(1,2)
+        if (vmask(I  ,J-1) == 1) vret_b(I  ,J-1,3) = vret_b(I  ,J-1,3) + Vsub(2,1)
+        if (vmask(I  ,J  ) == 1) vret_b(I  ,J  ,1) = vret_b(I  ,J  ,1) + Vsub(2,2)
       endif
   endif ; enddo ; enddo
 
@@ -2928,67 +2923,158 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
 
 end subroutine CG_action
 
-subroutine CG_action_subgrid_basal(Phisub, H, U, V, bathyT, dens_ratio, Ucontr, Vcontr)
-  real, dimension(:,:,:,:,:,:), &
-                        intent(in)    :: Phisub !< Quadrature structure weights at subgridscale
-                                            !! locations for finite element calculations [nondim]
-  real, dimension(2,2), intent(in)    :: H  !< The ice shelf thickness at nodal (corner) points [Z ~> m].
-  real, dimension(2,2), intent(in)    :: U  !< The zonal ice shelf velocity at vertices [L T-1 ~> m s-1]
-  real, dimension(2,2), intent(in)    :: V  !< The meridional ice shelf velocity at vertices [L T-1 ~> m s-1]
-  real,                 intent(in)    :: bathyT !< The depth of ocean bathymetry at tracer points
-                                            !! relative to sea-level [Z ~> m].
-  real,                 intent(in)    :: dens_ratio !< The density of ice divided by the density
-                                            !! of seawater [nondim]
-  real, dimension(2,2), intent(out)   :: Ucontr !< The areal average of u-velocities where the ice shelf
-                                            !! is grounded, or 0 where it is floating [L T-1 ~> m s-1].
-  real, dimension(2,2), intent(out)   :: Vcontr !< The areal average of v-velocities where the ice shelf
-                                            !! is grounded, or 0 where it is floating [L T-1 ~> m s-1].
+!> Compute subgrid grounding-line basal traction nodal contributions for a CG action.
+!! Evaluates basal friction (Picard and Newton Jacobian) at each grounded sub-quadrature point.
+!! The sub-qp flotation test accounts for partial grounding; no external ground_frac scaling needed.
+subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta, V_delta, &
+    bathyT, dens_ratio, i_elem, j_elem, fB_e, use_newton, Ucontr, Vcontr)
+  type(ice_shelf_dyn_CS), intent(in) :: CS      !< Ice shelf control structure
+  type(ocean_grid_type),  intent(in) :: G       !< The grid structure
+  type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
+  real, dimension(:,:,:,:,:,:), intent(in) :: Phisub !< Sub-grid quadrature weights [nondim]
+  real, dimension(2,2),   intent(in) :: H       !< Ice thickness at element corners [Z ~> m]
+  real, dimension(2,2),   intent(in) :: U_curr  !< Frozen u^k at element corners [L T-1 ~> m s-1]
+  real, dimension(2,2),   intent(in) :: V_curr  !< Frozen v^k at element corners [L T-1 ~> m s-1]
+  real, dimension(2,2),   intent(in) :: U_delta !< Search direction δu at element corners [L T-1 ~> m s-1]
+  real, dimension(2,2),   intent(in) :: V_delta !< Search direction δv at element corners [L T-1 ~> m s-1]
+  real,                   intent(in) :: bathyT  !< Ocean bathymetry depth at tracer point [Z ~> m]
+  real,                   intent(in) :: dens_ratio !< Ice density / water density [nondim]
+  integer,                intent(in) :: i_elem  !< Tracer-grid i-index of the element
+  integer,                intent(in) :: j_elem  !< Tracer-grid j-index of the element
+  real,                   intent(in) :: fB_e    !< Element Coulomb parameter fB; 0 for Weertman [(T L-1)^CF_PostPeak]
+  logical,                intent(in) :: use_newton !< If true, include Newton basal drag correction
+  real, dimension(2,2),   intent(out) :: Ucontr !< Nodal u-contributions with friction applied [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(2,2),   intent(out) :: Vcontr !< Nodal v-contributions with friction applied [R L3 Z T-2 ~> kg m s-2]
 
-  real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: Ucontr_sub, Vcontr_sub ! The contributions to Ucontr and Vcontr
-                                                                               !! at each sub-cell
-  real, dimension(2,2,SIZE(Phisub,3),SIZE(Phisub,3)) :: uloc_arr !The local sub-cell u-velocity [L T-1 ~> m s-1]
-  real, dimension(2,2,SIZE(Phisub,3),SIZE(Phisub,3)) :: vloc_arr !The local sub-cell v-velocity [L T-1 ~> m s-1]
-  real, dimension(2,2) :: Ucontr_q, Vcontr_q !Contributions to a node from each quadrature point in a sub-grid cell
-  real    :: subarea ! The fractional sub-cell area [nondim]
-  real    :: hloc    ! The local sub-cell ice thickness [Z ~> m]
+  real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: Ucontr_sub, Vcontr_sub
+  real :: hloc          ! Local sub-cell ice thickness [Z ~> m]
+  real :: u_curr_loc    ! Frozen u^k interpolated to sub-qp [L T-1 ~> m s-1]
+  real :: v_curr_loc    ! Frozen v^k interpolated to sub-qp [L T-1 ~> m s-1]
+  real :: u_delta_loc   ! Search direction δu interpolated to sub-qp [L T-1 ~> m s-1]
+  real :: v_delta_loc   ! Search direction δv interpolated to sub-qp [L T-1 ~> m s-1]
+  real :: unorm2_loc    ! Regularized |u^k|^2 at sub-qp [L2 T-2 ~> m2 s-2]
+  real :: basal_coef_loc ! Picard friction coefficient at sub-qp [R L2 Z T-1 ~> kg s-1]
+  real :: drag_newt_loc  ! Newton drag coefficient at sub-qp [R Z T-1 ~> kg m-2 s-1]
+  real :: inner_dot_loc  ! u^k · δu inner product at sub-qp [L2 T-2 ~> m2 s-2]
+  real :: phi_mn         ! Basis function value at sub-qp [nondim]
+  real :: contrib        ! Quadrature weight contribution [nondim]
+  real :: coef_prefactor ! Pre-computed area * C_basal_friction * L_T_to_m_s [R L2 Z T-1 ~> kg s-1]
+  real :: min_trac_area  ! Minimum area-integrated traction floor [R L2 Z T-1 ~> kg s-1]
+  real :: eps_vel2       ! Velocity regularization squared [L2 T-2 ~> m2 s-2]
+  real :: subarea        ! Fractional sub-cell area [nondim]
   integer :: nsub, i, j, qx, qy, m, n
 
-  nsub = size(Phisub,3)
+  nsub    = size(Phisub, 3)
   subarea = 1.0 / (nsub**2)
 
-  uloc_arr(:,:,:,:) = 0.0 ; vloc_arr(:,:,:,:)=0.0
+  coef_prefactor = CS%coef_prefactor(i_elem,j_elem)
+  min_trac_area  = CS%min_basal_traction * G%areaT(i_elem,j_elem)
+  eps_vel2 = CS%eps_glen_min**2 * ((G%dxT(i_elem,j_elem)**2) + (G%dyT(i_elem,j_elem)**2))
+
+  Ucontr_sub(:,:,:,:) = 0.0
+  Vcontr_sub(:,:,:,:) = 0.0
 
   do j=1,nsub ; do i=1,nsub ; do qy=1,2 ; do qx=1,2
     hloc = ((Phisub(qx,qy,i,j,1,1)*H(1,1)) + (Phisub(qx,qy,i,j,2,2)*H(2,2))) + &
            ((Phisub(qx,qy,i,j,1,2)*H(1,2)) + (Phisub(qx,qy,i,j,2,1)*H(2,1)))
-    if (dens_ratio * hloc - bathyT > 0) then
-      uloc_arr(qx,qy,i,j) = (((Phisub(qx,qy,i,j,1,1) * U(1,1)) + (Phisub(qx,qy,i,j,2,2) * U(2,2))) + &
-                             ((Phisub(qx,qy,i,j,1,2) * U(1,2)) + (Phisub(qx,qy,i,j,2,1) * U(2,1))))
-      vloc_arr(qx,qy,i,j) = (((Phisub(qx,qy,i,j,1,1) * V(1,1)) + (Phisub(qx,qy,i,j,2,2) * V(2,2))) + &
-                             ((Phisub(qx,qy,i,j,1,2) * V(1,2)) + (Phisub(qx,qy,i,j,2,1) * V(2,1))))
+    if (dens_ratio * hloc - bathyT > 0) then  ! grounded sub-qp
+      u_curr_loc  = (((Phisub(qx,qy,i,j,1,1)*U_curr(1,1))  + (Phisub(qx,qy,i,j,2,2)*U_curr(2,2)))  + &
+                     ((Phisub(qx,qy,i,j,1,2)*U_curr(1,2))  + (Phisub(qx,qy,i,j,2,1)*U_curr(2,1))))
+      v_curr_loc  = (((Phisub(qx,qy,i,j,1,1)*V_curr(1,1))  + (Phisub(qx,qy,i,j,2,2)*V_curr(2,2)))  + &
+                     ((Phisub(qx,qy,i,j,1,2)*V_curr(1,2))  + (Phisub(qx,qy,i,j,2,1)*V_curr(2,1))))
+      u_delta_loc = (((Phisub(qx,qy,i,j,1,1)*U_delta(1,1)) + (Phisub(qx,qy,i,j,2,2)*U_delta(2,2))) + &
+                     ((Phisub(qx,qy,i,j,1,2)*U_delta(1,2)) + (Phisub(qx,qy,i,j,2,1)*U_delta(2,1))))
+      v_delta_loc = (((Phisub(qx,qy,i,j,1,1)*V_delta(1,1)) + (Phisub(qx,qy,i,j,2,2)*V_delta(2,2))) + &
+                     ((Phisub(qx,qy,i,j,1,2)*V_delta(1,2)) + (Phisub(qx,qy,i,j,2,1)*V_delta(2,1))))
+
+      unorm2_loc = (u_curr_loc**2 + v_curr_loc**2) + eps_vel2
+      call compute_basal_coef(unorm2_loc, coef_prefactor, min_trac_area, fB_e, &
+          CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, use_newton, &
+          basal_coef_loc, drag_newt_loc)
+      inner_dot_loc = (u_curr_loc * u_delta_loc) + (v_curr_loc * v_delta_loc)
+
+      do n=1,2 ; do m=1,2
+        phi_mn  = Phisub(qx,qy,i,j,m,n)
+        contrib = (subarea * 0.25) * phi_mn
+        ! Picard: friction matrix applied to search direction δu
+        Ucontr_sub(i,j,m,n) = Ucontr_sub(i,j,m,n) + (contrib * (basal_coef_loc * u_delta_loc))
+        Vcontr_sub(i,j,m,n) = Vcontr_sub(i,j,m,n) + (contrib * (basal_coef_loc * v_delta_loc))
+        ! Newton: Jacobian d(tau_b_i)/d(u_j) = basal_coef*I + drag_newt*u^k_i*u^k_j
+        if (use_newton) then
+          Ucontr_sub(i,j,m,n) = Ucontr_sub(i,j,m,n) + (contrib * (drag_newt_loc * u_curr_loc * inner_dot_loc))
+          Vcontr_sub(i,j,m,n) = Vcontr_sub(i,j,m,n) + (contrib * (drag_newt_loc * v_curr_loc * inner_dot_loc))
+        endif
+      enddo ; enddo
     endif
   enddo ; enddo ; enddo ; enddo
 
-  do n=1,2 ; do m=1,2 ; do j=1,nsub ; do i=1,nsub
-    do qy=1,2 ; do qx=1,2
-      !calculate quadrature point contributions for the sub-cell, to each node
-        Ucontr_q(qx,qy) = Phisub(qx,qy,i,j,m,n) * uloc_arr(qx,qy,i,j)
-        Vcontr_q(qx,qy) = Phisub(qx,qy,i,j,m,n) * vloc_arr(qx,qy,i,j)
-    enddo ; enddo
-
-    !calculate sub-cell contribution to each node by summing up quadrature point contributions from the sub-cell
-    Ucontr_sub(i,j,m,n) = (subarea * 0.25) * ((Ucontr_q(1,1) + Ucontr_q(2,2)) + (Ucontr_q(1,2)+Ucontr_q(2,1)))
-    Vcontr_sub(i,j,m,n) = (subarea * 0.25) * ((Vcontr_q(1,1) + Vcontr_q(2,2)) + (Vcontr_q(1,2)+Vcontr_q(2,1)))
-  enddo ; enddo ; enddo ; enddo
-
-  !sum up the sub-cell contributions to each node
   do n=1,2 ; do m=1,2
-    call sum_square_matrix(Ucontr(m,n),Ucontr_sub(:,:,m,n),nsub)
-    call sum_square_matrix(Vcontr(m,n),Vcontr_sub(:,:,m,n),nsub)
+    call sum_square_matrix(Ucontr(m,n), Ucontr_sub(:,:,m,n), nsub)
+    call sum_square_matrix(Vcontr(m,n), Vcontr_sub(:,:,m,n), nsub)
   enddo ; enddo
 
 end subroutine CG_action_subgrid_basal
 
+!> Compute the Picard basal friction coefficient and Newton drag coefficient at a
+!! single quadrature point. Encapsulates the 3-path dispatch (linear Weertman / nonlinear
+!! Weertman / Coulomb) so that CG_action, matrix_diagonal, and their subgrid equivalents
+!! remain readable. The ground_frac scaling is NOT applied here; callers do it after the call.
+pure subroutine compute_basal_coef(unorm2_qp, coef_prefactor, min_trac_area, fB_e, &
+    n_basal_fric, CoulombFriction, CF_PostPeak, L_T_to_m_s, use_newton, &
+    basal_coef, drag_newt)
+  real,    intent(in)  :: unorm2_qp      !< Regularized |u^k|^2 at quadrature point [L2 T-2 ~> m2 s-2]
+  real,    intent(in)  :: coef_prefactor !< Pre-computed area * C_basal_friction * L_T_to_m_s [R L2 Z T-1 ~> kg s-1]
+  real,    intent(in)  :: min_trac_area  !< Pre-computed min_basal_traction * areaT floor [R L2 Z T-1 ~> kg s-1]
+  real,    intent(in)  :: fB_e           !< Element-level Coulomb fB; 0 for Weertman [(T L-1)^CF_PostPeak]
+  real,    intent(in)  :: n_basal_fric   !< Friction sliding exponent m [nondim]
+  logical, intent(in)  :: CoulombFriction !< True if using Coulomb friction
+  real,    intent(in)  :: CF_PostPeak    !< Coulomb post-peak exponent q [nondim]
+  real,    intent(in)  :: L_T_to_m_s    !< Unit conversion factor from internal [L T-1] to [m s-1]
+  logical, intent(in)  :: use_newton     !< If true, evaluate drag_newt; otherwise set to 0
+  real,    intent(out) :: basal_coef     !< Picard friction coefficient at quadrature point [R L2 Z T-1 ~> kg s-1]
+  real,    intent(out) :: drag_newt      !< Newton drag coefficient [R Z T-1 ~> kg m-2 s-1]; 0 without Newton
+
+  real :: unorm    ! |u^k| at quadrature point in physical units [m s-1]
+  real :: raw_coef ! Pre-floor friction coefficient [R L2 Z T-1 ~> kg s-1]
+  real :: fBuq     ! fB_e * |u^k|^q [nondim]
+
+  if (n_basal_fric == 1.0 .and. .not. CoulombFriction) then
+    ! Linear Weertman: coef is independent of |u|; sqrt and Newton correction not needed
+    basal_coef = max(coef_prefactor, min_trac_area)
+    drag_newt  = 0.0
+  elseif (CoulombFriction) then
+    ! Schoof/Gagliardini Coulomb friction
+    unorm    = L_T_to_m_s * sqrt(unorm2_qp)
+    fBuq     = fB_e * unorm**CF_PostPeak
+    raw_coef = coef_prefactor * (unorm**(n_basal_fric-1.0)) / (1.0 + fBuq)**n_basal_fric
+    if (raw_coef < min_trac_area) then
+      basal_coef = min_trac_area  ;  drag_newt = 0.0
+    else
+      basal_coef = raw_coef
+      if (use_newton) then
+        drag_newt = (1.0/max(unorm2_qp,epsilon(unorm2_qp))) * raw_coef * &
+            ((n_basal_fric-1.0) - n_basal_fric * CF_PostPeak * fBuq / (1.0 + fBuq))
+      else
+        drag_newt = 0.0
+      endif
+    endif
+  else
+    ! Nonlinear Weertman (m > 1)
+    unorm    = L_T_to_m_s * sqrt(unorm2_qp)
+    raw_coef = coef_prefactor * (unorm**(n_basal_fric-1.0))
+    if (raw_coef < min_trac_area) then
+      basal_coef = min_trac_area  ;  drag_newt = 0.0
+    else
+      basal_coef = raw_coef
+      if (use_newton) then
+        drag_newt = (n_basal_fric-1.0) / max(unorm2_qp, epsilon(unorm2_qp)) * raw_coef
+      else
+        drag_newt = 0.0
+      endif
+    endif
+  endif
+
+end subroutine compute_basal_coef
 
 !! Returns the sum of the elements in a square matrix. This sum is bitwise identical even if the matrices are rotated.
 subroutine sum_square_matrix(sum_out, mat_in, n)
@@ -3030,8 +3116,8 @@ subroutine sum_square_matrix(sum_out, mat_in, n)
 end subroutine sum_square_matrix
 
 !> returns the diagonal entries of the matrix for a Jacobi preconditioning
-subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, hmask, dens_ratio, &
-                           Phi, Phisub, u_diagonal, v_diagonal)
+subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, u_curr, v_curr, &
+                           hmask, dens_ratio, Phi, Phisub, u_diagonal, v_diagonal)
 
   type(ice_shelf_dyn_CS), intent(in)    :: CS !< A pointer to the ice shelf control structure
   type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
@@ -3045,9 +3131,12 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
   real, dimension(SZDI_(G),SZDJ_(G),CS%visc_qps), &
                           intent(in)    :: ice_visc !< A field related to the ice viscosity from Glen's
                                                 !! flow law [R L4 Z T-1 ~> kg m2 s-1].
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(in)    :: basal_trac !< Area-integrated taub_beta field related to the nonlinear
-                                                !! part of the "linearized" basal stress [R L3 T-1 ~> kg s-1].
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in)    :: u_curr  !< Frozen current iterate u^k, used to evaluate basal friction
+                                               !! at quadrature points [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in)    :: v_curr  !< Frozen current iterate v^k, used to evaluate basal friction
+                                               !! at quadrature points [L T-1 ~> m s-1]
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(in)    :: hmask !< A mask indicating which tracer points are
                                              !! partly or fully covered by an ice-shelf
@@ -3069,12 +3158,19 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
 ! returns the diagonal entries of the matrix for a Jacobi preconditioning
 
   real :: ux, uy, vx, vy ! Interpolated weight gradients [L-1 ~> m-1]
-  real :: uq, vq
   real :: strx_n, stry_n, strsh_n  ! Newton viscosity strain rates [T-1 ~> s-1]
   real :: dstrain_diag_u, dstrain_diag_v  ! Newton viscosity diagonal correction factors [T-1 L-1 ~> s-1 m-1]
   real :: phi_m_sq  ! Squared basis function value at quadrature point [nondim]
+  real :: u_curr_qp, v_curr_qp  ! Current iterate u^k at quadrature point [L T-1 ~> m s-1]
+  real :: unorm2_qp  ! Regularized squared speed of u^k at quadrature point [L2 T-2 ~> m2 s-2]
+  real :: basal_coef_qp  ! Picard basal friction coefficient at quadrature point [R L2 Z T-1 ~> kg s-1]
+  real :: drag_newt_qp   ! Newton basal drag coefficient at quadrature point [R Z T-1 ~> kg m-2 s-1]
+  real :: coef_prefactor_e  ! Pre-computed area * C_basal_friction * L_T_to_m_s [R L2 Z T-1 ~> kg s-1]
+  real :: eps_vel2_e     ! Velocity regularization squared for current element [L2 T-2 ~> m2 s-2]
+  real :: min_trac_e     ! min_basal_traction * areaT for current element [R L2 Z T-1 ~> kg s-1]
+  real :: fB_e           ! Pre-computed Coulomb fB for element; 0 for Weertman [(T L-1)^CF_PostPeak]
   real, dimension(2)   :: xquad
-  real, dimension(2,2) :: Hcell, sub_ground
+  real, dimension(2,2) :: Hcell, u_diag_sub, v_diag_sub  ! Subgrid diagonal contributions [R L2 Z T-1 ~> kg s-1]
   real, dimension(2,2,4) :: u_diag_qp, v_diag_qp
   real, dimension(SZDIB_(G),SZDJB_(G),4) :: u_diag_b, v_diag_b
   logical :: do_newton_visc  ! Whether to apply viscosity-related Newton tangent stiffness corrections
@@ -3104,16 +3200,40 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
 
     u_diag_qp(:,:,:) = 0.0 ; v_diag_qp(:,:,:) = 0.0
 
+      ! Pre-computed element-level basal friction quantities (updated each outer iteration).
+      coef_prefactor_e = CS%coef_prefactor(i,j)
+      eps_vel2_e = CS%eps_glen_min**2 * ((G%dxT(i,j)**2) + (G%dyT(i,j)**2))
+      min_trac_e = CS%min_basal_traction * G%areaT(i,j)
+      fB_e = CS%fB_elem(i,j)  ! 0 for Weertman; non-zero for Coulomb
+
     do iq=1,2 ; do jq=1,2
 
       qp = 2*(jq-1)+iq !current quad point
       if (visc_qp4) qpv = qp !current quad point for viscosity
 
-      ! Pre-compute Newton strain data for this QP (for viscosity diagonal correction)
+      ! Pre-compute Newton viscosity strain data for this quadrature point
       if (do_newton_visc) then
         strx_n = CS%newton_str_ux(i,j,qpv)
         stry_n = CS%newton_str_vy(i,j,qpv)
         strsh_n = CS%newton_str_sh(i,j,qpv)
+      endif
+
+      ! Basal friction coefficients at this quadrature point (fully grounded cells only)
+      if (float_cond(i,j) == 0 .and. CS%ground_frac(i,j)>0) then
+        u_curr_qp = ((u_curr(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
+                     (u_curr(I,J) * (xquad(iq) * xquad(jq)))) + &
+                    ((u_curr(I,J-1) * (xquad(iq) * xquad(3-jq))) + &
+                     (u_curr(I-1,J) * (xquad(3-iq) * xquad(jq))))
+        v_curr_qp = ((v_curr(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
+                     (v_curr(I,J) * (xquad(iq) * xquad(jq)))) + &
+                    ((v_curr(I,J-1) * (xquad(iq) * xquad(3-jq))) + &
+                     (v_curr(I-1,J) * (xquad(3-iq) * xquad(jq))))
+        unorm2_qp = (u_curr_qp**2 + v_curr_qp**2) + eps_vel2_e
+        call compute_basal_coef(unorm2_qp, coef_prefactor_e, min_trac_e, fB_e, &
+            CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .true., &
+            basal_coef_qp, drag_newt_qp)
+        basal_coef_qp = basal_coef_qp * CS%ground_frac(i,j)
+        drag_newt_qp  = drag_newt_qp  * CS%ground_frac(i,j)
       endif
 
       do jphi=1,2 ; Jtgt = J-2+jphi ; do iphi=1,2 ; Itgt = I-2+iphi
@@ -3142,15 +3262,11 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
               CS%newton_visc_factor(i,j,qpv) * 2.0 * dstrain_diag_u**2
           endif
 
-          if (float_cond(i,j) == 0) then
-            uq = xquad(ilq) * xquad(jlq)
-            u_diag_qp(iphi,jphi,qp) = u_diag_qp(iphi,jphi,qp) + &
-              (basal_trac(i,j) * uq) * (xquad(ilq) * xquad(jlq))
-            ! Newton basal drag diagonal correction: newton_drag_coef * (umid_i)^2 * phi_m^2
-            if (CS%doing_newton) then
-              u_diag_qp(iphi,jphi,qp) = u_diag_qp(iphi,jphi,qp) + &
-                CS%newton_drag_coef(i,j) * CS%newton_umid(i,j)**2 * phi_m_sq
-            endif
+          if (float_cond(i,j) == 0 .and. CS%ground_frac(i,j)>0) then
+            ! Picard diagonal: basal_coef_qp * phi_m^2; Newton diagonal adds drag_newt_qp * u^k_qp^2 * phi_m^2.
+            u_diag_qp(iphi,jphi,qp) = u_diag_qp(iphi,jphi,qp) + basal_coef_qp * phi_m_sq
+            if (CS%doing_newton) &
+              u_diag_qp(iphi,jphi,qp) = u_diag_qp(iphi,jphi,qp) + drag_newt_qp * u_curr_qp**2 * phi_m_sq
           endif
         endif
 
@@ -3173,15 +3289,10 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
               CS%newton_visc_factor(i,j,qpv) * 2.0 * dstrain_diag_v**2
           endif
 
-          if (float_cond(i,j) == 0) then
-            vq = xquad(ilq) * xquad(jlq)
-            v_diag_qp(iphi,jphi,qp) = v_diag_qp(iphi,jphi,qp) + &
-              (basal_trac(i,j) * vq) * (xquad(ilq) * xquad(jlq))
-            ! Newton basal drag diagonal correction: newton_drag_coef * (vmid_i)^2 * phi_m^2
-            if (CS%doing_newton) then
-              v_diag_qp(iphi,jphi,qp) = v_diag_qp(iphi,jphi,qp) + &
-                CS%newton_drag_coef(i,j) * CS%newton_vmid(i,j)**2 * phi_m_sq
-            endif
+          if (float_cond(i,j) == 0 .and. CS%ground_frac(i,j)>0) then
+            v_diag_qp(iphi,jphi,qp) = v_diag_qp(iphi,jphi,qp) + basal_coef_qp * phi_m_sq
+            if (CS%doing_newton) &
+              v_diag_qp(iphi,jphi,qp) = v_diag_qp(iphi,jphi,qp) + drag_newt_qp * v_curr_qp**2 * phi_m_sq
           endif
         endif
       enddo ; enddo
@@ -3204,40 +3315,21 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
     v_diag_b(I  ,J  ,1) = 0.25*((v_diag_qp(2,2,1)+v_diag_qp(2,2,4))+(v_diag_qp(2,2,2)+v_diag_qp(2,2,3)))
 
     if (float_cond(i,j) == 1) then
-      Hcell(:,:) = H_node(i-1:i,j-1:j)
-      call CG_diagonal_subgrid_basal(Phisub, Hcell, CS%bed_elev(i,j), dens_ratio, sub_ground)
-
-        if (CS%umask(I-1,J-1) == 1) u_diag_b(I-1,J-1,4) = u_diag_b(I-1,J-1,4) + (sub_ground(1,1) * basal_trac(i,j))
-        if (CS%umask(I-1,J  ) == 1) u_diag_b(I-1,J  ,2) = u_diag_b(I-1,J  ,2) + (sub_ground(1,2) * basal_trac(i,j))
-        if (CS%umask(I  ,J-1) == 1) u_diag_b(I  ,J-1,3) = u_diag_b(I  ,J-1,3) + (sub_ground(2,1) * basal_trac(i,j))
-        if (CS%umask(I  ,J  ) == 1) u_diag_b(I  ,J  ,1) = u_diag_b(I  ,J  ,1) + (sub_ground(2,2) * basal_trac(i,j))
-
-        if (CS%vmask(I-1,J-1) == 1) v_diag_b(I-1,J-1,4) = v_diag_b(I-1,J-1,4) + (sub_ground(1,1) * basal_trac(i,j))
-        if (CS%vmask(I-1,J  ) == 1) v_diag_b(I-1,J  ,2) = v_diag_b(I-1,J  ,2) + (sub_ground(1,2) * basal_trac(i,j))
-        if (CS%vmask(I  ,J-1) == 1) v_diag_b(I  ,J-1,3) = v_diag_b(I  ,J-1,3) + (sub_ground(2,1) * basal_trac(i,j))
-        if (CS%vmask(I  ,J  ) == 1) v_diag_b(I  ,J  ,1) = v_diag_b(I  ,J  ,1) + (sub_ground(2,2) * basal_trac(i,j))
-
-        ! Newton basal drag diagonal correction for subgrid grounding line cells.
-        ! sub_ground(m,n) = sum over grounded sub-QPs of phi_{m,n}^2 * weight, computed by
-        ! CG_diagonal_subgrid_basal. Newton diagonal = newton_drag_coef * umid^2 * sub_ground (for u-block).
-        if (CS%doing_newton) then
-          if (CS%umask(I-1,J-1)==1) u_diag_b(I-1,J-1,4) = u_diag_b(I-1,J-1,4) + &
-            CS%newton_drag_coef(i,j) * CS%newton_umid(i,j)**2 * sub_ground(1,1)
-          if (CS%umask(I-1,J  )==1) u_diag_b(I-1,J  ,2) = u_diag_b(I-1,J  ,2) + &
-            CS%newton_drag_coef(i,j) * CS%newton_umid(i,j)**2 * sub_ground(1,2)
-          if (CS%umask(I  ,J-1)==1) u_diag_b(I  ,J-1,3) = u_diag_b(I  ,J-1,3) + &
-            CS%newton_drag_coef(i,j) * CS%newton_umid(i,j)**2 * sub_ground(2,1)
-          if (CS%umask(I  ,J  )==1) u_diag_b(I  ,J  ,1) = u_diag_b(I  ,J  ,1) + &
-            CS%newton_drag_coef(i,j) * CS%newton_umid(i,j)**2 * sub_ground(2,2)
-          if (CS%vmask(I-1,J-1)==1) v_diag_b(I-1,J-1,4) = v_diag_b(I-1,J-1,4) + &
-            CS%newton_drag_coef(i,j) * CS%newton_vmid(i,j)**2 * sub_ground(1,1)
-          if (CS%vmask(I-1,J  )==1) v_diag_b(I-1,J  ,2) = v_diag_b(I-1,J  ,2) + &
-            CS%newton_drag_coef(i,j) * CS%newton_vmid(i,j)**2 * sub_ground(1,2)
-          if (CS%vmask(I  ,J-1)==1) v_diag_b(I  ,J-1,3) = v_diag_b(I  ,J-1,3) + &
-            CS%newton_drag_coef(i,j) * CS%newton_vmid(i,j)**2 * sub_ground(2,1)
-          if (CS%vmask(I  ,J  )==1) v_diag_b(I  ,J  ,1) = v_diag_b(I  ,J  ,1) + &
-            CS%newton_drag_coef(i,j) * CS%newton_vmid(i,j)**2 * sub_ground(2,2)
-        endif
+      ! Subgrid grounding-line: evaluate basal friction diagonal at each grounded sub-quadrature point.
+      ! Returns separate u_diag_sub and v_diag_sub (differ in Newton term: u^2 vs v^2).
+      ! The sub-qp flotation test handles grounding fraction; no external ground_frac scaling needed.
+      Hcell(:,:) = H_node(I-1:I,J-1:J)
+      call CG_diagonal_subgrid_basal(CS, G, US, Phisub, Hcell, &
+          u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+          CS%bed_elev(i,j), dens_ratio, i, j, fB_e, u_diag_sub, v_diag_sub)
+      if (CS%umask(I-1,J-1)==1) u_diag_b(I-1,J-1,4) = u_diag_b(I-1,J-1,4) + u_diag_sub(1,1)
+      if (CS%umask(I-1,J  )==1) u_diag_b(I-1,J  ,2) = u_diag_b(I-1,J  ,2) + u_diag_sub(1,2)
+      if (CS%umask(I  ,J-1)==1) u_diag_b(I  ,J-1,3) = u_diag_b(I  ,J-1,3) + u_diag_sub(2,1)
+      if (CS%umask(I  ,J  )==1) u_diag_b(I  ,J  ,1) = u_diag_b(I  ,J  ,1) + u_diag_sub(2,2)
+      if (CS%vmask(I-1,J-1)==1) v_diag_b(I-1,J-1,4) = v_diag_b(I-1,J-1,4) + v_diag_sub(1,1)
+      if (CS%vmask(I-1,J  )==1) v_diag_b(I-1,J  ,2) = v_diag_b(I-1,J  ,2) + v_diag_sub(1,2)
+      if (CS%vmask(I  ,J-1)==1) v_diag_b(I  ,J-1,3) = v_diag_b(I  ,J-1,3) + v_diag_sub(2,1)
+      if (CS%vmask(I  ,J  )==1) v_diag_b(I  ,J  ,1) = v_diag_b(I  ,J  ,1) + v_diag_sub(2,2)
     endif
   endif ; enddo ; enddo
 
@@ -3248,48 +3340,84 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, basal_trac, 
 
 end subroutine matrix_diagonal
 
-subroutine CG_diagonal_subgrid_basal (Phisub, H_node, bathyT, dens_ratio, f_grnd)
-  real, dimension(:,:,:,:,:,:), &
-                        intent(in) :: Phisub !< Quadrature structure weights at subgridscale
-                                             !! locations for finite element calculations [nondim]
-  real, dimension(2,2), intent(in) :: H_node !< The ice shelf thickness at nodal (corner)
-                                             !! points [Z ~> m].
-  real,              intent(in)    :: bathyT !< The depth of ocean bathymetry at tracer points [Z ~> m].
-  real,              intent(in)    :: dens_ratio !< The density of ice divided by the density
-                                                 !! of seawater [nondim]
-  real, dimension(2,2), intent(out) :: f_grnd !< The weighted fraction of the sub-cell where the ice shelf
-                                              !! is grounded [nondim]
+!> Compute subgrid grounding-line basal traction contributions for the preconditioner diagonal.
+!! Evaluates friction at each grounded sub-quadrature point. Returns separate u and v diagonals
+!! because the Newton term uses u^2 for the u-block and v^2 for the v-block.
+!! The sub-qp flotation test handles partial grounding; no external ground_frac scaling needed.
+subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, &
+    bathyT, dens_ratio, i_elem, j_elem, fB_e, u_diag, v_diag)
+  type(ice_shelf_dyn_CS), intent(in) :: CS      !< Ice shelf control structure
+  type(ocean_grid_type),  intent(in) :: G       !< The grid structure
+  type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
+  real, dimension(:,:,:,:,:,:), intent(in) :: Phisub  !< Sub-grid quadrature weights [nondim]
+  real, dimension(2,2),   intent(in) :: H_node  !< Ice thickness at element corners [Z ~> m]
+  real, dimension(2,2),   intent(in) :: U_curr  !< Frozen u^k at element corners [L T-1 ~> m s-1]
+  real, dimension(2,2),   intent(in) :: V_curr  !< Frozen v^k at element corners [L T-1 ~> m s-1]
+  real,                   intent(in) :: bathyT  !< Ocean bathymetry depth at tracer point [Z ~> m]
+  real,                   intent(in) :: dens_ratio !< Ice density / water density [nondim]
+  integer,                intent(in) :: i_elem  !< Tracer-grid i-index of the element
+  integer,                intent(in) :: j_elem  !< Tracer-grid j-index of the element
+  real,                   intent(in) :: fB_e    !< Element Coulomb parameter fB; 0 for Weertman [(T L-1)^CF_PostPeak]
+  real, dimension(2,2),   intent(out) :: u_diag !< Nodal u-diagonal entries [R L2 Z T-1 ~> kg s-1]
+  real, dimension(2,2),   intent(out) :: v_diag !< Nodal v-diagonal entries [R L2 Z T-1 ~> kg s-1]
 
-  real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: f_grnd_sub ! The contributions to nodal f_grnd
-                                                                   !! from each sub-cell
-  integer, dimension(2,2,SIZE(Phisub,3),SIZE(Phisub,3)) :: grnd_stat !0 at floating quad points, 1 at grounded
-  real, dimension(2,2) :: f_grnd_q  !Contributions to a node from each quadrature point in a sub-grid cell
-  real    :: subarea ! The fractional sub-cell area [nondim]
-  real    :: hloc    ! The local sub-region thickness [Z ~> m]
+  real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: u_diag_sub, v_diag_sub
+  real :: hloc           ! Local sub-cell ice thickness [Z ~> m]
+  real :: u_curr_loc     ! Frozen u^k interpolated to sub-qp [L T-1 ~> m s-1]
+  real :: v_curr_loc     ! Frozen v^k interpolated to sub-qp [L T-1 ~> m s-1]
+  real :: unorm2_loc     ! Regularized |u^k|^2 at sub-qp [L2 T-2 ~> m2 s-2]
+  real :: basal_coef_loc ! Picard friction coefficient at sub-qp [R L2 Z T-1 ~> kg s-1]
+  real :: drag_newt_loc  ! Newton drag coefficient at sub-qp [R Z T-1 ~> kg m-2 s-1]
+  real :: phi_mn_sq      ! Squared basis function value at sub-qp [nondim]
+  real :: contrib        ! Quadrature weight contribution [nondim]
+  real :: coef_prefactor ! Pre-computed area * C_basal_friction * L_T_to_m_s [R L2 Z T-1 ~> kg s-1]
+  real :: min_trac_area  ! Minimum area-integrated traction floor [R L2 Z T-1 ~> kg s-1]
+  real :: eps_vel2       ! Velocity regularization squared [L2 T-2 ~> m2 s-2]
+  real :: subarea        ! Fractional sub-cell area [nondim]
   integer :: nsub, i, j, qx, qy, m, n
 
-  nsub = size(Phisub,3)
+  nsub    = size(Phisub, 3)
   subarea = 1.0 / (nsub**2)
 
-  grnd_stat(:,:,:,:)=0
+  coef_prefactor = CS%coef_prefactor(i_elem,j_elem)
+  min_trac_area  = CS%min_basal_traction * G%areaT(i_elem,j_elem)
+  eps_vel2 = CS%eps_glen_min**2 * ((G%dxT(i_elem,j_elem)**2) + (G%dyT(i_elem,j_elem)**2))
+
+  u_diag_sub(:,:,:,:) = 0.0
+  v_diag_sub(:,:,:,:) = 0.0
 
   do j=1,nsub ; do i=1,nsub ; do qy=1,2 ; do qx=1,2
     hloc = ((Phisub(qx,qy,i,j,1,1)*H_node(1,1)) + (Phisub(qx,qy,i,j,2,2)*H_node(2,2))) + &
            ((Phisub(qx,qy,i,j,1,2)*H_node(1,2)) + (Phisub(qx,qy,i,j,2,1)*H_node(2,1)))
-    if (dens_ratio * hloc - bathyT > 0) grnd_stat(qx,qy,i,j) = 1
+    if (dens_ratio * hloc - bathyT > 0) then  ! grounded sub-qp
+      u_curr_loc = (((Phisub(qx,qy,i,j,1,1)*U_curr(1,1)) + (Phisub(qx,qy,i,j,2,2)*U_curr(2,2))) + &
+                    ((Phisub(qx,qy,i,j,1,2)*U_curr(1,2)) + (Phisub(qx,qy,i,j,2,1)*U_curr(2,1))))
+      v_curr_loc = (((Phisub(qx,qy,i,j,1,1)*V_curr(1,1)) + (Phisub(qx,qy,i,j,2,2)*V_curr(2,2))) + &
+                    ((Phisub(qx,qy,i,j,1,2)*V_curr(1,2)) + (Phisub(qx,qy,i,j,2,1)*V_curr(2,1))))
+
+      unorm2_loc = (u_curr_loc**2 + v_curr_loc**2) + eps_vel2
+      call compute_basal_coef(unorm2_loc, coef_prefactor, min_trac_area, fB_e, &
+          CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .true., &
+          basal_coef_loc, drag_newt_loc)
+
+      do n=1,2 ; do m=1,2
+        phi_mn_sq = Phisub(qx,qy,i,j,m,n)**2
+        contrib   = (subarea * 0.25) * phi_mn_sq
+        ! Picard diagonal + Newton diagonal (u_curr^2 for u-block, v_curr^2 for v-block)
+        if (CS%doing_newton) then
+          u_diag_sub(i,j,m,n) = u_diag_sub(i,j,m,n) + contrib * (basal_coef_loc + drag_newt_loc * u_curr_loc**2)
+          v_diag_sub(i,j,m,n) = v_diag_sub(i,j,m,n) + contrib * (basal_coef_loc + drag_newt_loc * v_curr_loc**2)
+        else
+          u_diag_sub(i,j,m,n) = u_diag_sub(i,j,m,n) + contrib * basal_coef_loc
+          v_diag_sub(i,j,m,n) = v_diag_sub(i,j,m,n) + contrib * basal_coef_loc
+        endif
+      enddo ; enddo
+    endif
   enddo ; enddo ; enddo ; enddo
 
-  do n=1,2 ; do m=1,2 ; do j=1,nsub ; do i=1,nsub
-    do qy=1,2 ; do qx = 1,2
-        f_grnd_q(qx,qy) = grnd_stat(qx,qy,i,j) * Phisub(qx,qy,i,j,m,n)**2
-    enddo ; enddo
-    !calculate sub-cell contribution to each node by summing up quadrature point contributions from the sub-cell
-    f_grnd_sub(i,j,m,n) = (subarea * 0.25) * ((f_grnd_q(1,1) + f_grnd_q(2,2)) + (f_grnd_q(1,2)+f_grnd_q(2,1)))
-  enddo ; enddo ; enddo ; enddo
-
-  !sum up the sub-cell contributions to each node
   do n=1,2 ; do m=1,2
-   call sum_square_matrix(f_grnd(m,n),f_grnd_sub(:,:,m,n),nsub)
+    call sum_square_matrix(u_diag(m,n), u_diag_sub(:,:,m,n), nsub)
+    call sum_square_matrix(v_diag(m,n), v_diag_sub(:,:,m,n), nsub)
   enddo ; enddo
 
 end subroutine CG_diagonal_subgrid_basal
@@ -3577,103 +3705,95 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
 
 end subroutine calc_shelf_visc
 
+!> Pre-compute element-level basal friction prefactors for quadrature-point evaluation.
+subroutine calc_shelf_basal_prefactors(CS, ISS, G, US)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS  !< Ice shelf dynamics control structure
+  type(ice_shelf_state),  intent(in)    :: ISS !< Ice shelf state (hmask, h_shelf)
+  type(ocean_grid_type),  intent(in)    :: G   !< The grid structure
+  type(unit_scale_type),  intent(in)    :: US  !< Unit conversion factors
 
-!> Update basal shear
-subroutine calc_shelf_taub(CS, ISS, G, US, u_shlf, v_shlf)
-  type(ice_shelf_dyn_CS), intent(inout) :: CS !< A pointer to the ice shelf control structure
-  type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe
-                                               !! the ice-shelf state
-  type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
-  type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
-  real, dimension(G%IsdB:G%IedB,G%JsdB:G%JedB), &
-                          intent(inout) :: u_shlf !< The zonal ice shelf velocity [L T-1 ~> m s-1].
-  real, dimension(G%IsdB:G%IedB,G%JsdB:G%JedB), &
-                          intent(inout) :: v_shlf !< The meridional ice shelf velocity [L T-1 ~> m s-1].
+  integer :: i, j, isd, ied, jsd, jed
+  real :: Hf  ! Floatation thickness [Z ~> m]
+  real :: fN  ! Effective pressure for Coulomb friction [R Z L T-2 ~> Pa]
 
-! also this subroutine updates the nonlinear part of the basal traction
+  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
 
-! this may be subject to change later... to make it "hybrid"
+  do j = jsd, jed ; do i = isd, ied
+    CS%coef_prefactor(i,j) = G%areaT(i,j) * CS%C_basal_friction(i,j) * US%L_T_to_m_s
+    if (CS%CoulombFriction .and. (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3)) then
+      Hf = max((CS%density_ocean_avg/CS%density_ice) * CS%bed_elev(i,j), 0.0)
+      fN = max((US%L_to_Z*(CS%density_ice * CS%g_Earth) * &
+                (max(ISS%h_shelf(i,j), CS%min_h_shelf) - Hf)), CS%CF_MinN)
+      CS%fB_elem(i,j) = CS%alpha_coulomb * &
+          (CS%C_basal_friction(i,j) / (CS%CF_Max * fN))**(CS%CF_PostPeak/CS%n_basal_fric)
+    else
+      CS%fB_elem(i,j) = 0.0
+    endif
+  enddo ; enddo
 
-  integer :: i, j, iscq, iecq, jscq, jecq, isd, jsd, ied, jed, iegq, jegq
-  integer :: giec, gjec, gisc, gjsc, isc, jsc, iec, jec, is, js
-  real :: umid, vmid ! Velocities [L T-1 ~> m s-1]
-  real :: eps_min ! A minimal strain rate used in the Glens flow law expression [T-1 ~> s-1]
-  real :: unorm ! The magnitude of the velocity in mks units for use with fractional powers [m s-1]
-  real :: alpha ! Coulomb coefficient [nondim]
-  real :: Hf !"floatation thickness" for Coulomb friction [Z ~> m]
-  real :: fN ! Effective pressure (ice pressure - ocean pressure) for Coulomb friction [R Z L T-2 ~> Pa]
-  real :: fB !for Coulomb Friction [(T L-1)^CS%CF_PostPeak ~> (s m-1)^CS%CF_PostPeak]
-  real :: fBuq ! fB * unorm^CF_PostPeak, for Coulomb Newton correction [nondim]
-  real :: unorm_code2 ! Squared velocity magnitude in code units [L2 T-2 ~> m2 s-2]
+end subroutine calc_shelf_basal_prefactors
 
-  isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
-  iscq = G%iscB ; iecq = G%iecB ; jscq = G%jscB ; jecq = G%jecB
-  isd = G%isd ; jsd = G%jsd ; ied = G%ied ; jed = G%jed
-  iegq = G%iegB ; jegq = G%jegB
-  gisc = G%domain%nihalo+1 ; gjsc = G%domain%njhalo+1
-  giec = G%domain%niglobal+gisc ; gjec = G%domain%njglobal+gjsc
-  is = iscq - 1 ; js = jscq - 1
+!> Compute area-averaged basal shear stress [R L T-1 ~> Pa s m-1] and return it in basal_tr.
+!! Uses CS%u_shelf and CS%v_shelf for velocities and G%US for unit conversions.
+subroutine calc_shelf_taub(CS, ISS, G, basal_tr)
+  type(ice_shelf_dyn_CS), intent(in)  :: CS  !< Ice shelf dynamics control structure
+  type(ice_shelf_state),  intent(in)  :: ISS !< A structure with elements that describe
+                                             !! the ice-shelf state
+  type(ocean_grid_type),  intent(in)  :: G   !< The grid structure used by the ice shelf.
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(out) :: basal_tr !< Area-averaged basal traction [R L T-1 ~> Pa s m-1]
+
+  integer :: i, j
+  real :: umid, vmid    ! Cell-center velocity averages [L T-1 ~> m s-1]
+  real :: eps_min       ! Minimal strain rate [T-1 ~> s-1]
+  real :: unorm         ! Velocity magnitude in mks units [m s-1]
+  real :: alpha         ! Coulomb coefficient [nondim]
+  real :: Hf            ! Floatation thickness for Coulomb friction [Z ~> m]
+  real :: fN            ! Effective pressure for Coulomb friction [R Z L T-2 ~> Pa]
+  real :: fB            ! Coulomb friction factor [(T L-1)^CS%CF_PostPeak]
+  real :: fBuq          ! fB * unorm^CF_PostPeak [nondim]
+  real :: unorm_code2   ! Squared velocity magnitude in code units [L2 T-2 ~> m2 s-2]
+  real :: basal_trac    ! Area-integrated traction coefficient [R Z L2 T-1 ~> kg s-1]
 
   eps_min = CS%eps_glen_min
 
   if (CS%CoulombFriction) then
-    if (CS%CF_PostPeak/=1.0) THEN
-      alpha = (CS%CF_PostPeak-1.0)**(CS%CF_PostPeak-1.0) / CS%CF_PostPeak**CS%CF_PostPeak ![nondim]
+    if (CS%CF_PostPeak /= 1.0) then
+      alpha = (CS%CF_PostPeak-1.0)**(CS%CF_PostPeak-1.0) / CS%CF_PostPeak**CS%CF_PostPeak
     else
       alpha = 1.0
     endif
   endif
 
-  do j=jsd+1,jed
-    do i=isd+1,ied
-      CS%newton_drag_coef(i,j) = 0.0
-      if ((ISS%hmask(i,j) == 1) .OR. (ISS%hmask(i,j) == 3)) then
-        umid = ((u_shlf(I,J) + u_shlf(I-1,J-1)) + (u_shlf(I,J-1) + u_shlf(I-1,J))) * 0.25
-        vmid = ((v_shlf(I,J) + v_shlf(I-1,J-1)) + (v_shlf(I,J-1) + v_shlf(I-1,J))) * 0.25
-        unorm_code2 = ((umid**2) + (vmid**2)) + (eps_min**2 * ((G%dxT(i,j)**2) + (G%dyT(i,j)**2)))
-        unorm = US%L_T_to_m_s * sqrt( unorm_code2 )
+  basal_tr(:,:) = 0.0
 
-        !Coulomb friction (Schoof 2005, Gagliardini et al 2007)
-        if (CS%CoulombFriction) then
-          !Effective pressure
-          Hf = max((CS%density_ocean_avg/CS%density_ice) * CS%bed_elev(i,j), 0.0)
-          fN = max((US%L_to_Z*(CS%density_ice * CS%g_Earth) * (max(ISS%h_shelf(i,j),CS%min_h_shelf) - Hf)), CS%CF_MinN)
-          fB = alpha * (CS%C_basal_friction(i,j) / (CS%CF_Max * fN))**(CS%CF_PostPeak/CS%n_basal_fric)
-          fBuq = fB * unorm**CS%CF_PostPeak
+  do j=G%jsc,G%jec ; do i=G%isc,G%iec
+    if ((ISS%hmask(i,j) == 1) .OR. (ISS%hmask(i,j) == 3)) then
+      umid = ((CS%u_shelf(I,J) + CS%u_shelf(I-1,J-1)) + (CS%u_shelf(I,J-1) + CS%u_shelf(I-1,J))) * 0.25
+      vmid = ((CS%v_shelf(I,J) + CS%v_shelf(I-1,J-1)) + (CS%v_shelf(I,J-1) + CS%v_shelf(I-1,J))) * 0.25
+      unorm_code2 = ((umid**2) + (vmid**2)) + (eps_min**2 * ((G%dxT(i,j)**2) + (G%dyT(i,j)**2)))
+      unorm = G%US%L_T_to_m_s * sqrt(unorm_code2)
 
-          CS%basal_traction(i,j) = ((G%areaT(i,j) * CS%C_basal_friction(i,j)) * &
-              (unorm**(CS%n_basal_fric-1.0) / (1.0 + fBuq)**(CS%n_basal_fric))) * &
-              US%L_T_to_m_s   ! Restore the scaling after the fractional power law.
-        else
-          !linear (CS%n_basal_fric=1) or "Weertman"/power-law (CS%n_basal_fric /= 1)
-          fBuq = 0.0
-          CS%basal_traction(i,j) = ((G%areaT(i,j) * CS%C_basal_friction(i,j)) * (unorm**(CS%n_basal_fric-1))) * &
-                                   US%L_T_to_m_s ! Rescale after the fractional power law.
-        endif
-
-        CS%basal_traction(i,j)=max(CS%basal_traction(i,j), CS%min_basal_traction * G%areaT(i,j))
-
-        ! Store Newton basal drag data for Newton tangent stiffness correction.
-        ! newton_drag_coef = 2 * d(basal_trac)/d(|u|^2),
-        ! where d(tau_b_i)/d(u_j) = basal_trac*delta_ij + newton_drag_coef*u_i*u_j
-        ! This is the coefficient of the rank-1 correction u_i*(u.delta_u) to the Picard basal stiffness.
-        ! For Weertman: newton_drag_coef = (m-1) * basal_trac/|u|^2
-        ! For Coulomb:  newton_drag_coef = basal_trac/|u|^2 * [(m-1) - m*q*fB*|u|^q/(1+fB*|u|^q)]
-        CS%newton_umid(i,j) = umid
-        CS%newton_vmid(i,j) = vmid
-        ! unorm_code2: squared velocity magnitude in code units [L2 T-2], including regularization
-        ! (same expression as inside the sqrt in unorm, without US%L_T_to_m_s factor)
-        if (CS%CoulombFriction) then
-          CS%newton_drag_coef(i,j) = (1.0 / max(unorm_code2, epsilon(unorm_code2))) * &
-              CS%basal_traction(i,j) * ((CS%n_basal_fric - 1.) - &
-              CS%n_basal_fric * CS%CF_PostPeak * fBuq / (1. + fBuq))
-        else
-          CS%newton_drag_coef(i,j) = real(CS%n_basal_fric - 1.) * CS%basal_traction(i,j) / &
-              max(unorm_code2, epsilon(unorm_code2))
-        endif
+      !Coulomb friction (Schoof 2005, Gagliardini et al 2007)
+      if (CS%CoulombFriction) then
+        !Effective pressure
+        Hf = max((CS%density_ocean_avg/CS%density_ice) * CS%bed_elev(i,j), 0.0)
+        fN = max((G%US%L_to_Z*(CS%density_ice * CS%g_Earth) * (max(ISS%h_shelf(i,j),CS%min_h_shelf) - Hf)), CS%CF_MinN)
+        fB = alpha * (CS%C_basal_friction(i,j) / (CS%CF_Max * fN))**(CS%CF_PostPeak/CS%n_basal_fric)
+        fBuq = fB * unorm**CS%CF_PostPeak
+        basal_trac = ((G%areaT(i,j) * CS%C_basal_friction(i,j)) * &
+            (unorm**(CS%n_basal_fric-1.0) / (1.0 + fBuq)**(CS%n_basal_fric))) * &
+            G%US%L_T_to_m_s   ! Restore the scaling after the fractional power law.
+      else
+        !linear (CS%n_basal_fric = 1) or "Weertman"/power-law (CS%n_basal_fric /= 1)
+        basal_trac = ((G%areaT(i,j) * CS%C_basal_friction(i,j)) * (unorm**(CS%n_basal_fric-1))) * &
+                     G%US%L_T_to_m_s ! Rescale after the fractional power law.
       endif
-    enddo
-  enddo
+
+      basal_trac = max(basal_trac, CS%min_basal_traction * G%areaT(i,j))
+      basal_tr(i,j) = basal_trac * G%IareaT(i,j) * CS%ground_frac(i,j)
+    endif
+  enddo ; enddo
 
 end subroutine calc_shelf_taub
 
@@ -4239,7 +4359,8 @@ subroutine ice_shelf_dyn_end(CS)
   deallocate(CS%ice_visc, CS%AGlen_visc)
   deallocate(CS%newton_visc_factor, CS%newton_str_ux, CS%newton_str_vy, CS%newton_str_sh)
   deallocate(CS%newton_umid, CS%newton_vmid, CS%newton_drag_coef)
-  deallocate(CS%basal_traction,CS%C_basal_friction)
+  deallocate(CS%C_basal_friction)
+  deallocate(CS%coef_prefactor, CS%fB_elem)
   deallocate(CS%OD_rt, CS%OD_av)
   deallocate(CS%t_bdry_val, CS%bed_elev)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
