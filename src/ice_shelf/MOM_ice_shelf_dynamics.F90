@@ -1660,8 +1660,6 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
                      CS%ice_visc, CS%float_cond, CS%bed_elev, u_shlf, v_shlf, &
                      G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow, use_newton_in=.false.)
 
-      call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
-
       err_max = 0
 
       do J=G%jscB,G%jecB ; do I=G%iscB,G%iecB
@@ -1713,45 +1711,45 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
       err_max = 2.*abs(Norm-PrevNorm) ; err_init = Norm+PrevNorm
     endif
 
-    write(mesg,*) "ice_shelf_solve_outer: nonlinear fractional residual = ", err_max/err_init
-    call MOM_mesg(mesg, 5)
-
-    if (err_max <= CS%newton_after_tolerance * err_init .and. .not. CS%doing_newton) then
-      CS%doing_newton = .true.
-      write(mesg,*) "ice_shelf_solve_outer: switching to Newton iterations at iter = ", iter
-      call MOM_mesg(mesg, 5)
-    endif
-
-    ! Eisenstat-Walker Choice II (Eisenstat & Walker 1994): η_k = γ*(||F_k||/||F_{k-1}||)^α
-    ! with γ=0.9, α=2.  Uses the L2 norm of the nonlinear stress residual ||Au - tau||_2,
-    ! consistent with the inner CG solver's convergence check (sv3dsums(3)).  For mode 1,
-    ! Au/Av are already available from the residual evaluation above; modes 2/3 require an
-    ! extra CG_action call.  The first Newton step uses the standard cg_tolerance.
-    if (CS%doing_newton .and. CS%newton_adapt_cg_tol) then
-      if (CS%nonlin_solve_err_mode /= 1) then
-        Au(:,:) = 0 ; Av(:,:) = 0
-        call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, &
-                       H_node, CS%ice_visc, CS%float_cond, CS%bed_elev, u_shlf, v_shlf, &
-                       G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow, use_newton_in=.false.)
-        call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
-      endif
-      Normvec(:,:) = 0.0
-      do J=G%jscB,G%jecB ; do I=G%iscB,G%iecB
-        if (CS%umask(I,J) == 1) Normvec(I,J) = (Au(I,J) - taudx(I,J))**2
-        if (CS%vmask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + (Av(I,J) - taudy(I,J))**2
-      enddo ; enddo
-      ew_resid = sqrt(reproducing_sum(Normvec, Is_sum, Ie_sum, Js_sum, Je_sum, &
-                                      unscale=((US%RZ_to_kg_m2*US%L_to_m)*US%L_T_to_m_s**2)**2))
-      if (ew_prev_resid == 0.0) then
-        ew_prev_resid = ew_resid  ! first Newton iteration: seed; use standard cg_tolerance this step
-      else
-        CS%cg_tol_newton = min(CS%cg_tolerance, CS%ew_gamma * (ew_resid / ew_prev_resid)**CS%ew_alpha)
-        ew_prev_resid = ew_resid
-      endif
-    endif
-
     if (err_max <= CS%nonlinear_tolerance * err_init) then
       exit
+    else
+
+      write(mesg,*) "ice_shelf_solve_outer: nonlinear fractional residual = ", err_max/err_init
+      call MOM_mesg(mesg, 5)
+
+      if (err_max <= CS%newton_after_tolerance * err_init .and. .not. CS%doing_newton) then
+        CS%doing_newton = .true.
+        write(mesg,*) "ice_shelf_solve_outer: switching to Newton iterations at iter = ", iter
+        call MOM_mesg(mesg, 5)
+      endif
+
+      ! Eisenstat-Walker Choice II (Eisenstat & Walker 1994): η_k = γ*(||F_k||/||F_{k-1}||)^α
+      ! with γ=0.9, α=2.  Uses the L2 norm of the nonlinear stress residual ||Au - tau||_2,
+      ! consistent with the inner CG solver's convergence check (sv3dsums(3)).  For mode 1,
+      ! Au/Av are already available from the residual evaluation above; modes 2/3 require an
+      ! extra CG_action call.  The first Newton step uses the standard cg_tolerance.
+      if (CS%doing_newton .and. CS%newton_adapt_cg_tol) then
+        if (CS%nonlin_solve_err_mode /= 1) then
+          Au(:,:) = 0 ; Av(:,:) = 0
+          call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, &
+            H_node, CS%ice_visc, CS%float_cond, CS%bed_elev, u_shlf, v_shlf, &
+            G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow, use_newton_in=.false.)
+         endif
+        Normvec(:,:) = 0.0
+        do J=G%jscB,G%jecB ; do I=G%iscB,G%iecB
+          if (CS%umask(I,J) == 1) Normvec(I,J) = (Au(I,J) - taudx(I,J))**2
+          if (CS%vmask(I,J) == 1) Normvec(I,J) = Normvec(I,J) + (Av(I,J) - taudy(I,J))**2
+        enddo; enddo
+        ew_resid = sqrt(reproducing_sum(Normvec, Is_sum, Ie_sum, Js_sum, Je_sum, &
+          unscale=((US%RZ_to_kg_m2*US%L_to_m)*US%L_T_to_m_s**2)**2))
+        if (ew_prev_resid == 0.0) then
+          ew_prev_resid = ew_resid  ! first Newton iteration: seed; use standard cg_tolerance this step
+        else
+          CS%cg_tol_newton = min(CS%cg_tolerance, CS%ew_gamma * (ew_resid / ew_prev_resid)**CS%ew_alpha)
+          ew_prev_resid = ew_resid
+        endif
+      endif
     endif
 
   enddo
