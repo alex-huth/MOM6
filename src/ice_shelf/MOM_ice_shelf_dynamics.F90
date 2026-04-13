@@ -1721,7 +1721,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
       if (err_max <= CS%newton_after_tolerance * err_init .and. .not. CS%doing_newton) then
         CS%doing_newton = .true.
         write(mesg,*) "ice_shelf_solve_outer: switching to Newton iterations at iter = ", iter
-        call MOM_mesg(mesg, 5)
+        call MOM_mesg(mesg, 7)
       endif
 
       ! Eisenstat-Walker Choice II (Eisenstat & Walker 1994): η_k = γ*(||F_k||/||F_{k-1}||)^α
@@ -1748,6 +1748,8 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
         else
           CS%cg_tol_newton = min(CS%cg_tolerance, CS%ew_gamma * (ew_resid / ew_prev_resid)**CS%ew_alpha)
           ew_prev_resid = ew_resid
+          write(mesg,*) "ice_shelf_solve_outer: New inner tolerance = ", CS%cg_tol_newton
+          call MOM_mesg(mesg, 7)
         endif
       endif
     endif
