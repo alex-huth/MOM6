@@ -405,7 +405,6 @@ program Shelf_main
 
     ! This call steps the model over a time time_step.
     Time1 = Master_Time ; Time = Master_Time
-    call solo_step_ice_shelf(ice_shelf_CSp, Time_step_shelf, ns_ice, Time, fluxes_in=fluxes)
 
 !   Time = Time + Time_step_shelf
 !   This is here to enable fractional-second time steps.
@@ -425,6 +424,28 @@ program Shelf_main
     else
       Master_Time = Master_Time + Time_step_shelf
     endif
+
+    call solo_step_ice_shelf(ice_shelf_CSp, Time_step_shelf, ns_ice, Master_Time, &
+                             min_time_step_in=0., fluxes_in=fluxes)
+
+!   Time = Time + Time_step_shelf
+!   This is here to enable fractional-second time steps.
+    ! elapsed_time = elapsed_time + time_step
+    ! if (elapsed_time > 2.0e9*US%s_to_T) then
+    !   ! This is here to ensure that the conversion from a real to an integer can be accurately
+    !   ! represented in long runs (longer than ~63 years). It will also ensure that elapsed time
+    !   ! does not lose resolution of order the timetype's resolution, provided that the timestep and
+    !   ! tick are larger than 10-5 seconds.  If a clock with a finer resolution is used, a smaller
+    !   ! value would be required.
+    !   time_chg = real_to_time(elapsed_time, unscale=US%T_to_s)
+    !   segment_start_time = segment_start_time + time_chg
+    !   elapsed_time = elapsed_time - time_to_real(time_chg, scale=US%s_to_T)
+    ! endif
+    ! if (elapsed_time_master) then
+    !   Master_Time = segment_start_time + real_to_time(elapsed_time, unscale=US%T_to_s)
+    ! else
+    !   Master_Time = Master_Time + Time_step_shelf
+    ! endif
     Time = Master_Time
 
     if (cpu_steps > 0) then ; if (MOD(ns, cpu_steps) == 0) then

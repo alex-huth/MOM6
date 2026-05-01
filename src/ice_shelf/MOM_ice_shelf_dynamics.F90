@@ -293,7 +293,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_strainrate_xx = -1, id_strainrate_yy = -1, id_strainrate_xy = -1, &
              id_pstrainrate_1 = -1, id_pstrainrate_2, &
              id_devstress_xx = -1, id_devstress_yy = -1, id_devstress_xy = -1, &
-             id_pdevstress_1 = -1, id_pdevstress_2 = -1
+             id_pdevstress_1 = -1, id_pdevstress_2 = -1, id_aglen = -1, id_cbasal = -1
 
   !>@}
   ! ids for outputting intermediate thickness in advection subroutine (debugging)
@@ -981,6 +981,11 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
        'taub', units='MPa yr m-1', conversion=1e-6*US%RLZ_T2_to_Pa/(365.0*86400.0*US%L_T_to_m_s))
     CS%id_OD_av = register_diag_field('ice_shelf_model','OD_av',CS%diag%axesT1, Time, &
        'intermediate ocean column thickness passed to ice model', 'm', conversion=US%Z_to_m)
+    CS%id_aglen = register_diag_field('ice_shelf_model','a_glen',CS%diag%axesT1, Time, &
+      'Glen ice stiffness A', 'Pa-n_g s-1')
+    CS%id_cbasal = register_diag_field('ice_shelf_model','c_basal',CS%diag%axesT1, Time, &
+      'Ice basal friction','Pa (s m-1)^(n_basal_fric)', conversion=US%RLZ_T2_to_Pa)
+
 
     CS%id_duHdx = register_diag_field('ice_shelf_model','duHdx',CS%diag%axesT1, Time, &
        'x-component of ice-sheet flux divergence', 'm yr-1', conversion=365.0*86400.0*US%Z_to_m*US%s_to_T)
@@ -1276,6 +1281,10 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       call calc_shelf_taub(CS, ISS, G, basal_tr)
       call post_data(CS%id_taub, basal_tr, CS%diag)
     endif
+
+    if (CS%id_aglen > 0) call post_data(CS%id_aglen, CS%AGlen_visc, CS%diag)
+    if (CS%id_cbasal > 0) call post_data(CS%id_cbasal, CS%C_basal_friction, CS%diag)
+
     if (CS%id_u_mask > 0) call post_data(CS%id_u_mask, CS%umask, CS%diag)
     if (CS%id_v_mask > 0) call post_data(CS%id_v_mask, CS%vmask, CS%diag)
     if (CS%id_ufb_mask > 0) call post_data(CS%id_ufb_mask, CS%u_face_mask_bdry, CS%diag)
@@ -1648,10 +1657,6 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   ! Warning: This turns off Picard entirely and may not converge.
   if (CS%newton_after_tolerance<=0.0) CS%doing_newton=.true.
 
-  ! Calculate RHS
-  call calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, CS%OD_av)
-  call pass_vector(taudx, taudy, G%domain, TO_ALL, BGRID_NE)
-
   ! This is to determine which cells contain the grounding line, the criterion being that the cell
   ! is ice-covered, with some nodes floating and some grounded flotation condition is estimated by
   ! assuming topography is cellwise constant and H is bilinear in a cell; floating where
@@ -1672,7 +1677,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
       enddo ; enddo
       if ((nodefloat > 0) .and. (nodefloat < 4)) then
         CS%float_cond(i,j) = 1.0
-        CS%ground_frac(i,j) = 1.0
+        !CS%ground_frac(i,j) = 1.0
       endif
     enddo ; enddo
 
@@ -1680,6 +1685,14 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     call pass_var(CS%ground_frac, G%domain, complete=.true.)
 
   endif
+
+  ! Calculate RHS
+  call calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, CS%OD_av)
+  call pass_vector(taudx, taudy, G%domain, TO_ALL, BGRID_NE)
+
+  do j=G%jsd,G%jed ; do i=G%isd,G%ied
+    if (CS%float_cond(i,j)==1.0) CS%ground_frac(i,j)=1.0
+  enddo ; enddo
 
   ! Calculate basal drag constants and initial velocity
   call calc_shelf_basal_prefactors(CS, ISS, G, US)
@@ -1760,6 +1773,16 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   calc_Au_for_convergence = (CS%nonlin_solve_err_mode == 1 .or. CS%nonlin_solve_err_mode == 4 .or. &
                              CS%nonlin_solve_err_mode == 5 .or. CS%ssa_add_rel_resid)
 
+  ! call qchksum(u_shlf, "u shelf INIT", G%HI, haloshift=2, unscale=US%L_T_to_m_s)
+  ! call qchksum(v_shlf, "v shelf INIT", G%HI, haloshift=0, unscale=US%L_T_to_m_s)
+
+  ! write(mesg,*) "INIT RESID = ", err_init
+  ! call MOM_mesg(mesg, 5)
+  ! if (CS%SSA_add_rel_resid) then
+  !   write(mesg,*) "NORM TAU = ", norm_tau
+  !   call MOM_mesg(mesg, 5)
+  ! endif
+
   !! begin loop
 
   do iter=1,50
@@ -1770,7 +1793,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
     if (CS%debug) then
       call qchksum(u_shlf, "u shelf", G%HI, haloshift=2, unscale=US%L_T_to_m_s)
-      call qchksum(v_shlf, "v shelf", G%HI, haloshift=2, unscale=US%L_T_to_m_s)
+      call qchksum(v_shlf, "v shelf", G%HI, haloshift=0, unscale=US%L_T_to_m_s)
     endif
 
     write(mesg,*) "ice_shelf_solve_outer: linear solve done in ",iters," iterations"
@@ -3347,9 +3370,9 @@ subroutine calve_to_mask(G, h_shelf, area_shelf_h, hmask, calve_mask)
 
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
     if ((calve_mask(i,j) == 0.0) .and. (hmask(i,j) /= 0.0)) then
-      h_shelf(i,j) = 0.0
+      !h_shelf(i,j) = 0.0
       area_shelf_h(i,j) = 0.0
-      hmask(i,j) = 0.0
+      !hmask(i,j) = 0.0
     endif
   enddo ; enddo
 
@@ -3382,6 +3405,7 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
 !    (it is assumed that base_ice = bed + OD)
 
   real, dimension(SIZE(OD,1),SIZE(OD,2))  :: S     ! surface elevation [Z ~> m].
+  real, dimension(SIZE(OD,1),SIZE(OD,2))  :: Sf     ! surface elevation if ice was floating [Z ~> m].
   real, dimension(SZDI_(G),SZDJ_(G)) :: sx_e, sy_e !element contributions to driving stress
   real    :: rho, rhow, rhoi_rhow ! Ice and ocean densities [R ~> kg m-3]
   real    :: sx, sy    ! Ice shelf top slopes at tracer points [Z L-1 ~> nondim]
@@ -3391,7 +3415,9 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
   logical :: valid_N, valid_S, valid_E, valid_W
   integer :: i, j, iscq, iecq, jscq, jecq, isd, jsd, ied, jed, is, js, iegq, jegq
   integer :: giec, gjec, gisc, gjsc, isc, jsc, iec, jec
-  integer :: i_off, j_off
+  integer :: i_off, j_off, i2, j2
+  real :: av_float_h, count
+  real :: Sl,Sr
 
   isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
 !  iscq = G%iscB ; iecq = G%iecB ; jscq = G%jscB ; jecq = G%jecB
@@ -3418,15 +3444,47 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
   else
     ! check whether the ice is floating or grounded
     do j=jsc-2,jec+2 ; do i=isc-2,iec+2
+      !set cells beyond ice front to average thickness of surrounding floating cells
+      if (CS%calve_to_mask) then
+        if (ISS%hmask(i,j)==0 .or. ISS%hmask(i,j)==2) then
+          av_float_h=0; count=0.
+          do j2=j-1,j+1 ; do i2=i-1,i+1
+            if ((ISS%hmask(i2,j2)==1 .or. ISS%hmask(i2,j2)==3) &
+              .and. (CS%ground_frac(i2,j2)==0 .or. CS%float_cond(i2,j2)==1.0)) then
+              av_float_h = av_float_h+ISS%h_shelf(i2,j2)
+              count=count+1
+            endif
+          enddo ; enddo
+          if (count>0) then
+            ISS%h_shelf(i,j)=av_float_h/count
+            ISS%hmask(i,j)=2
+          endif
+        endif
+      endif
       if (rhoi_rhow * max(ISS%h_shelf(i,j),CS%min_h_shelf) - CS%bed_elev(i,j) <= 0) then
         S(i,j) = (1 - rhoi_rhow)*max(ISS%h_shelf(i,j),CS%min_h_shelf)
+        Sf(i,j) = S(i,j)
       else
         S(i,j) = max(ISS%h_shelf(i,j),CS%min_h_shelf)-CS%bed_elev(i,j)
+        Sf(i,j) = (1 - rhoi_rhow)*max(ISS%h_shelf(i,j),CS%min_h_shelf)
       endif
     enddo ; enddo
   endif
 
-  call pass_var(S, G%domain)
+  call pass_var(S, G%domain, complete=.false.)
+  call pass_var(Sf, G%domain, complete=.true.)
+
+  !Clear unneeded temporary thickness beyond ice front
+  if (CS%calve_to_mask) then
+    do j=jsc,jec ; do i=isc,iec
+      if (ISS%hmask(i,j)==2) then
+        ISS%h_shelf(i,j)=0.
+        ISS%mass_shelf(i,j)=0.
+      endif
+    enddo ; enddo
+    call pass_var(ISS%h_shelf, G%domain, complete=.false.)
+    call pass_var(ISS%mass_shelf, G%domain, complete=.true.)
+  endif
 
   do j=jsc-1,jec+1
     do i=isc-1,iec+1
@@ -3436,8 +3494,10 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
 
         ! Calculate the x-direction surface slope at tracer points.
         sx = 0.0
-        valid_E = (ISS%hmask(i+1,j) == 1 .or. ISS%hmask(i+1,j) == 3)
-        valid_W = (ISS%hmask(i-1,j) == 1 .or. ISS%hmask(i-1,j) == 3)
+        valid_E = (ISS%hmask(i+1,j) == 1 .or. ISS%hmask(i+1,j) == 3)! .or. &
+          ! ((CS%ground_frac(i,j)==0 .or. CS%float_cond(i,j)==0) .and. ISS%hmask(i+1,j)==2 .and. CS%calve_to_mask))
+        valid_W = (ISS%hmask(i-1,j) == 1 .or. ISS%hmask(i-1,j) == 3)! .or. &
+          ! ((CS%ground_frac(i,j)==0 .or. CS%float_cond(i,j)==0) .and. ISS%hmask(i-1,j)==2 .and. CS%calve_to_mask))
         if (CS%shelf_top_slope_bugs) then
           if (((i+i_off) == gisc) .and. (.not.CS%reentrant_x)) then ! at west computational bdry
             if (valid_E) sx = (S(i+1,j)-S(i,j)) / G%dxT(i,j)
@@ -3452,24 +3512,47 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
             sx = (S(i,j) - S(i-1,j)) / (G%dxT(i,j) + G%dxT(i-1,j))
           endif
         else ! Correct the bugs in the version above.
+          Sr=S(i+1,j)
+          Sl=S(i-1,j)
+          if (CS%ground_frac(i,j)==0 .and. CS%float_cond(i,j)==0) then
+            if (CS%float_cond(i+1,j)==1 .or. CS%ground_frac(i+1,j)==1) Sr=Sf(i+1,j)
+            if (CS%float_cond(i-1,j)==1 .or. CS%ground_frac(i-1,j)==1) Sl=Sf(i-1,j)
+          endif
           if (((i+i_off) == gisc) .and. (.not.CS%reentrant_x)) then ! at west computational bdry
-            if (valid_E) sx = (S(i+1,j) - S(i,j)) * G%IdxCu(I,j)
+            if (valid_E) sx = (Sr - S(i,j)) * G%IdxCu(I,j)
           elseif (((i+i_off) == giec) .and. (.not.CS%reentrant_x)) then ! at east computational bdry
-            if (valid_W) sx = (S(i,j) - S(i-1,j)) * G%IdxCu(I-1,j)
+            if (valid_W) sx = (S(i,j) - Sl) * G%IdxCu(I-1,j)
           elseif (valid_E .and. valid_W) then
             ! This is the usual interior point
-            sx = 0.5*(S(i+1,j) - S(i-1,j)) * G%IdxT(i,j)
+            sx = 0.5*(Sr - Sl) * G%IdxT(i,j)
           elseif (valid_E) then ! Use a one-sided estimate from the east.
-            sx = (S(i+1,j) - S(i,j)) * G%IdxCu(I,j)
+            !sx = (S(i+1,j) - S(i,j)) * G%IdxCu(I,j)
+
+            ! For floating cells, if the neighbor is grounded, use a ghost cell so that the slope is smaller
+            if ((CS%ground_frac(i,j)==0 .and. (CS%ground_frac(i+1,j)==1 .or. CS%float_cond(i+1,j)==1)) &
+              .or. CS%float_cond(i,j)==1) then
+              sx = 0.5*(Sr - S(i,j)) * G%IdxT(i,j)
+            else
+              sx = (Sr - S(i,j)) * G%IdxCu(I,j)
+            endif
+
           elseif (valid_W) then ! Use a one-sided estimate from the west.
             sx = (S(i,j) - S(i-1,j)) * G%IdxCu(I-1,j)
+            if ((CS%ground_frac(i,j)==0 .and. (CS%ground_frac(i-1,j)==1 .or. CS%float_cond(i-1,j)==1)) &
+              .or. CS%float_cond(i,j)==1) then
+              sx = 0.5*(S(i,j) - Sl) * G%IdxT(i,j)
+            else
+              sx = (S(i,j) - Sl) * G%IdxCu(I-1,j)
+            endif
           endif
         endif
 
         ! Calculate the y-direction surface slope at tracer points.
         sy = 0.0
-        valid_N = (ISS%hmask(i,j+1) == 1 .or. ISS%hmask(i,j+1) == 3)
-        valid_S = (ISS%hmask(i,j-1) == 1 .or. ISS%hmask(i,j-1) == 3)
+        valid_N = (ISS%hmask(i,j+1) == 1 .or. ISS%hmask(i,j+1) == 3)! .or. &
+          ! ((CS%ground_frac(i,j)==0 .or. CS%float_cond(i,j)==0) .and. ISS%hmask(i,j+1)==2 .and. CS%calve_to_mask))
+        valid_S = (ISS%hmask(i,j-1) == 1 .or. ISS%hmask(i,j-1) == 3)! .or. &
+          ! ((CS%ground_frac(i,j)==0 .or. CS%float_cond(i,j)==0) .and. ISS%hmask(i,j-1)==2 .and. CS%calve_to_mask))
         if (CS%shelf_top_slope_bugs) then
           if (((j+j_off) == gjsc) .and. (.not. CS%reentrant_y)) then ! at south computational bdry
             if (valid_N) sy = (S(i,j+1)-S(i,j)) / G%dyT(i,j)
@@ -3484,17 +3567,35 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
             sy = (S(i,j) - S(i,j-1)) / (G%dyT(i,j) + G%dyT(i,j-1))
           endif
         else ! Correct the bugs in the version above.
+          Sr=S(i,j+1)
+          Sl=S(i,j-1)
+          if (CS%ground_frac(i,j)==0 .and. CS%float_cond(i,j)==0) then
+            if (CS%float_cond(i,j+1)==1 .or. CS%ground_frac(i,j+1)==1) Sr=Sf(i,j+1)
+            if (CS%float_cond(i,j-1)==1 .or. CS%ground_frac(i,j-1)==1) Sl=Sf(i,j-1)
+          endif
           if (((j+j_off) == gjsc) .and. (.not. CS%reentrant_y)) then ! at south computational bdry
-            if (valid_N) sy = (S(i,j+1) - S(i,j)) * G%IdyCv(i,J)
+            if (valid_N) sy = (Sr - S(i,j)) * G%IdyCv(i,J)
           elseif (((j+j_off) == gjec) .and. (.not. CS%reentrant_y)) then ! at north computational bdry
-            if (valid_S) sy = (S(i,j) - S(i,j-1)) * G%IdyCv(i,J-1)
+            if (valid_S) sy = (S(i,j) - Sl) * G%IdyCv(i,J-1)
           elseif (valid_N .and. valid_S) then
             ! This is the usual interior point
-            sy = 0.5*(S(i,j+1) - S(i,j-1)) * G%IdyT(i,j)
+            sy = 0.5*(Sr - Sl) * G%IdyT(i,j)
           elseif (valid_N) then ! Use a one-sided estimate from the north.
             sy = (S(i,j+1) - S(i,j)) * G%IdyCv(i,J)
+            if ((CS%ground_frac(i,j)==0 .and. (CS%ground_frac(i,j+1)==1 .or. CS%float_cond(i,j+1)==1)) &
+              .or. CS%float_cond(i,j)==1) then
+              sy = 0.5*(Sr - S(i,j)) * G%IdyT(i,j)
+            else
+              sy = (Sr - S(i,j)) * G%IdyCv(i,J)
+            endif
           elseif (valid_S) then ! Use a one-sided estimate from the south.
             sy = (S(i,j) - S(i,j-1)) * G%IdyCv(i,J-1)
+            if ((CS%ground_frac(i,j)==0 .and. (CS%ground_frac(i,j-1)==1 .or. CS%float_cond(i,j-1)==1)) &
+              .or. CS%float_cond(i,j)==1) then
+              sy = 0.5*(S(i,j) - Sl) * G%IdyT(i,j)
+            else
+              sy = (S(i,j) - Sl) * G%IdyCv(i,J-1)
+            endif
           endif
         endif
 
@@ -3933,7 +4034,7 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
         a = (dxCv_S * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1))) + &  ! (1-y) * dxCv_S
             (dxCv_N * (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2)))      !  + y  * dxCv_N
         d = (dyCu_W * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2))) + &  ! (1-x) * dyCu_W
-            (dyCu_E * (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)))      !  + x  * dyCu_E
+            (dyCu_E * (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)))      !   + x * dyCu_E
         jac_sub_wt = 0.25 * subarea * (a * d) * IareaT
 
         do n=1,2 ; do m=1,2
@@ -5087,35 +5188,10 @@ subroutine bilinear_shape_fn_grid_1qp(G, i, j, Phi)
     enddo
 end subroutine bilinear_shape_fn_grid_1qp
 
-
 subroutine bilinear_shape_functions_subgrid(Phisub, nsub)
-  integer, intent(in)    :: nsub   !< The number of subgridscale quadrature locations in each direction
+  integer, intent(in)    :: nsub
   real, dimension(2,2,nsub,nsub,2,2), &
-           intent(inout) :: Phisub !< Quadrature structure weights at subgridscale
-                                   !! locations for finite element calculations [nondim]
-
-  ! this subroutine is a helper for interpolation of floatation condition
-  ! for the purposes of evaluating the terms \int (u,v) \phi_i dx dy in a cell that is
-  !     in partial floatation
-  ! the array Phisub contains the values of \phi_i (where i is a node of the cell)
-  !     at quad point j
-  ! i think this general approach may not work for nonrectangular elements...
-  !
-
-  ! Phisub(q1,q2,i,j,k,l)
-  !  q1: quad point x-index
-  !  q2: quad point y-index
-  !  i: subgrid index in x-direction
-  !  j: subgrid index in y-direction
-  !  k: basis function x-index
-  !  l: basis function y-index
-
-  ! e.g. k=1,l=1 => node 1
-  !      q1=2,q2=1 => quad point 2
-
-    !  3 - 4
-    !  |   |
-    !  1 - 2
+           intent(inout) :: Phisub
 
   integer :: i, j, qx, qy
   real,dimension(2)    :: xquad
@@ -5126,7 +5202,8 @@ subroutine bilinear_shape_functions_subgrid(Phisub, nsub)
   ! of Phisub for any nsub.
   real, dimension(2,nsub) :: a_left, a_right
 
-  xquad(1) = .5 * (1-sqrt(1./3)) ; xquad(2) = .5 * (1+sqrt(1./3))
+  xquad(1) = .5 * (1.0-sqrt(1./3.))
+  xquad(2) = .5 * (1.0+sqrt(1./3.))
   fracx = 1.0/real(nsub)
 
   do i=1,nsub ; do qx=1,2
