@@ -1042,8 +1042,13 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         call calc_shelf_driving_stress(CS, ISS, G, US, CS%taudx_shelf, CS%taudy_shelf, CS%OD_av)
       endif
     endif
-    if (CS%id_visc_shelf>0) &
-      call calc_shelf_visc(CS, ISS, G, US, CS%u_shelf, CS%v_shelf)
+    if (CS%id_visc_shelf>0) then
+      if (CS%use_DG_thickness) then
+        call calc_shelf_visc_DG(CS, ISS, G, US, CS%u_shelf, CS%v_shelf)
+      else
+        call calc_shelf_visc(CS, ISS, G, US, CS%u_shelf, CS%v_shelf)
+      endif
+    endif
   endif
 
   if (new_sim) then
@@ -1748,7 +1753,11 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
   ! Calculate basal drag constants and initial velocity
   call calc_shelf_basal_prefactors(CS, ISS, G, US)
-  call calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
+  if (CS%use_DG_thickness) then
+    call calc_shelf_visc_DG(CS, ISS, G, US, u_shlf, v_shlf)
+  else
+    call calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
+  endif
   if (CS%doing_newton) then
     call pass_var(CS%ice_visc, G%domain, complete=.false.)
     call pass_var(CS%newton_str_sh, G%domain, complete=.false.)
@@ -1843,7 +1852,11 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     call MOM_mesg(mesg, 5)
 
     ! Update viscosity
-    call calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
+    if (CS%use_DG_thickness) then
+      call calc_shelf_visc_DG(CS, ISS, G, US, u_shlf, v_shlf)
+    else
+      call calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
+    endif
 
     if (CS%doing_newton) then
       call pass_var(CS%ice_visc, G%domain, complete=.false.)
@@ -4997,6 +5010,153 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
 
 end subroutine calc_shelf_visc
 
+!> DG(1) variant of calc_shelf_visc. Identical to calc_shelf_visc except the
+!! ice thickness used to form the depth-integrated viscosity is evaluated from
+!! the DG(1) polynomial h(xi,eta) = h_shelf + h_x*xi + h_y*eta at each
+!! quadrature point. For CONSTANT/OBS/qp1 paths the QP is the cell centre
+!! (xi=eta=0), so h_gp reduces to h_shelf — present here for consistency with
+!! the qp4 path. Called when CS%use_DG_thickness is true.
+subroutine calc_shelf_visc_DG(CS, ISS, G, US, u_shlf, v_shlf)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS !< A pointer to the ice shelf control structure
+  type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe
+                                               !! the ice-shelf state
+  type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
+  type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
+  real, dimension(G%IsdB:G%IedB,G%JsdB:G%JedB), &
+                          intent(inout) :: u_shlf !< The zonal ice shelf velocity [L T-1 ~> m s-1].
+  real, dimension(G%IsdB:G%IedB,G%JsdB:G%JedB), &
+                          intent(inout) :: v_shlf !< The meridional ice shelf velocity [L T-1 ~> m s-1].
+
+  integer :: i, j, iscq, iecq, jscq, jecq, isd, jsd, ied, jed, iegq, jegq, iq, jq
+  integer :: giec, gjec, gisc, gjsc, isc, jsc, iec, jec, is, js
+  real :: Visc_coef, n_g
+  real :: ux, uy, vx, vy
+  real :: eps_min   ! Velocity shears [T-1 ~> s-1]
+  real :: h_gp      ! DG-evaluated ice thickness at quadrature point [Z ~> m]
+  real :: xi_gp, eta_gp ! Reference element coordinates at Gauss point [nondim]
+  real, dimension(2) :: xquad ! Gauss quadrature positions on [0,1] [nondim]
+  logical :: model_qp1, model_qp4
+
+  isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
+  iscq = G%iscB ; iecq = G%iecB ; jscq = G%jscB ; jecq = G%jecB
+  isd = G%isd ; jsd = G%jsd ; ied = G%ied ; jed = G%jed
+  iegq = G%iegB ; jegq = G%jegB
+  gisc = G%domain%nihalo+1 ; gjsc = G%domain%njhalo+1
+  giec = G%domain%niglobal+gisc ; gjec = G%domain%njglobal+gjsc
+  is = iscq - 1 ; js = jscq - 1
+
+  if (trim(CS%ice_viscosity_compute) == "MODEL") then
+    if (CS%visc_qps==1) then
+      model_qp1=.true.
+      model_qp4=.false.
+    else
+      model_qp1=.false.
+      model_qp4=.true.
+    endif
+  endif
+
+  n_g = CS%n_glen ; eps_min = CS%eps_glen_min
+  xquad(1) = 0.5 * (1.0 - sqrt(1.0/3.0)) ; xquad(2) = 0.5 * (1.0 + sqrt(1.0/3.0))
+
+  do j=jsc,jec ; do i=isc,iec
+
+    if ((ISS%hmask(i,j) == 1) .OR. (ISS%hmask(i,j) == 3)) then
+
+      ! DG cell-centre value (xi=eta=0): h_gp = h_shelf by construction.
+      h_gp = max(ISS%h_shelf(i,j), CS%min_h_shelf)
+
+      if (trim(CS%ice_viscosity_compute) == "CONSTANT") then
+        CS%ice_visc(i,j,1) = 1e15 * (US%kg_m3_to_R*US%m_to_L*US%m_s_to_L_T) * &
+                             (G%areaT(i,j) * h_gp)
+      elseif (trim(CS%ice_viscosity_compute) == "OBS") then
+        if (CS%AGlen_visc(i,j) >0) then
+          CS%ice_visc(i,j,1) = (G%areaT(i,j) * h_gp) * &
+                               max(CS%AGlen_visc(i,j) ,CS%min_ice_visc)
+        endif
+      elseif (model_qp1) then
+        Visc_coef = (CS%AGlen_visc(i,j))**(-1./n_g)
+
+        ux = ((u_shlf(I-1,J-1) * CS%PhiC(1,i,j)) + &
+              (u_shlf(I,J) * CS%PhiC(7,i,j))) + &
+             ((u_shlf(I-1,J) * CS%PhiC(5,i,j)) + &
+              (u_shlf(I,J-1) * CS%PhiC(3,i,j)))
+
+        vx = ((v_shlf(I-1,J-1) * CS%PhiC(1,i,j)) + &
+              (v_shlf(I,J) * CS%PhiC(7,i,j))) + &
+             ((v_shlf(I-1,J) * CS%PhiC(5,i,j)) + &
+              (v_shlf(I,J-1) * CS%PhiC(3,i,j)))
+
+        uy = ((u_shlf(I-1,J-1) * CS%PhiC(2,i,j)) + &
+              (u_shlf(I,J) * CS%PhiC(8,i,j))) + &
+             ((u_shlf(I-1,J) * CS%PhiC(6,i,j)) + &
+              (u_shlf(I,J-1) * CS%PhiC(4,i,j)))
+
+        vy = ((v_shlf(I-1,J-1) * CS%PhiC(2,i,j)) + &
+              (v_shlf(I,J) * CS%PhiC(8,i,j))) + &
+             ((v_shlf(I-1,J) * CS%PhiC(6,i,j)) + &
+              (v_shlf(I,J-1) * CS%PhiC(4,i,j)))
+
+        CS%ice_visc(i,j,1) = (G%areaT(i,j) * h_gp) * &
+            max(0.5 * Visc_coef * &
+            (US%s_to_T**2 * (((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2)) + eps_min**2))**((1.-n_g)/(2.*n_g)) * &
+            (US%Pa_to_RL2_T2*US%s_to_T),CS%min_ice_visc)
+        CS%newton_str_ux(i,j,1) = ux ; CS%newton_str_vy(i,j,1) = vy
+        CS%newton_str_sh(i,j,1) = uy + vx
+        CS%newton_visc_factor(i,j,1) = 0.0
+        if (CS%ice_visc(i,j,1) > CS%min_ice_visc * (G%areaT(i,j) * h_gp)) then
+          CS%newton_visc_factor(i,j,1) = ((1./n_g - 1.) / &
+              (((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2)) + eps_min**2)) * &
+              CS%ice_visc(i,j,1)
+        endif
+      elseif (model_qp4) then
+        Visc_coef = (CS%AGlen_visc(i,j))**(-1./n_g)
+
+        do iq=1,2 ; do jq=1,2
+
+          ! Always evaluate ice thickness at Gauss point from DG(1) polynomial
+          xi_gp  = xquad(iq) - 0.5
+          eta_gp = xquad(jq) - 0.5
+          h_gp = max(ISS%h_shelf(i,j) + CS%h_x(i,j)*xi_gp + CS%h_y(i,j)*eta_gp, CS%min_h_shelf)
+
+          ux = ((u_shlf(I-1,J-1) * CS%Phi(1,2*(jq-1)+iq,i,j)) + &
+                (u_shlf(I,J) * CS%Phi(7,2*(jq-1)+iq,i,j))) + &
+               ((u_shlf(I,J-1) * CS%Phi(3,2*(jq-1)+iq,i,j)) + &
+                (u_shlf(I-1,J) * CS%Phi(5,2*(jq-1)+iq,i,j)))
+
+          vx = ((v_shlf(I-1,J-1) * CS%Phi(1,2*(jq-1)+iq,i,j)) + &
+                (v_shlf(I,J) * CS%Phi(7,2*(jq-1)+iq,i,j))) + &
+               ((v_shlf(I,J-1) * CS%Phi(3,2*(jq-1)+iq,i,j)) + &
+                (v_shlf(I-1,J) * CS%Phi(5,2*(jq-1)+iq,i,j)))
+
+          uy = ((u_shlf(I-1,J-1) * CS%Phi(2,2*(jq-1)+iq,i,j)) + &
+                (u_shlf(I,J) * CS%Phi(8,2*(jq-1)+iq,i,j))) + &
+               ((u_shlf(I,J-1) * CS%Phi(4,2*(jq-1)+iq,i,j)) + &
+                (u_shlf(I-1,J) * CS%Phi(6,2*(jq-1)+iq,i,j)))
+
+          vy = ((v_shlf(I-1,J-1) * CS%Phi(2,2*(jq-1)+iq,i,j)) + &
+                (v_shlf(I,J) * CS%Phi(8,2*(jq-1)+iq,i,j))) + &
+               ((v_shlf(I,J-1) * CS%Phi(4,2*(jq-1)+iq,i,j)) + &
+                (v_shlf(I-1,J) * CS%Phi(6,2*(jq-1)+iq,i,j)))
+
+          CS%ice_visc(i,j,2*(jq-1)+iq) = (G%areaT(i,j) * h_gp) * &
+              max(0.5 * Visc_coef * &
+              (US%s_to_T**2*(((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2)) + eps_min**2))**((1.-n_g)/(2.*n_g)) * &
+              (US%Pa_to_RL2_T2*US%s_to_T),CS%min_ice_visc)
+          CS%newton_str_ux(i,j,2*(jq-1)+iq) = ux ; CS%newton_str_vy(i,j,2*(jq-1)+iq) = vy
+          CS%newton_str_sh(i,j,2*(jq-1)+iq) = (uy + vx)
+          CS%newton_visc_factor(i,j,2*(jq-1)+iq) = 0.0
+          if (CS%ice_visc(i,j,2*(jq-1)+iq) > CS%min_ice_visc * (G%areaT(i,j) * h_gp)) then
+            CS%newton_visc_factor(i,j,2*(jq-1)+iq) = (0.5*(1./n_g - 1.) / &
+                (((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2)) + eps_min**2)) * &
+                CS%ice_visc(i,j,2*(jq-1)+iq)
+          endif
+        enddo ; enddo
+      endif
+    endif
+  enddo ; enddo
+
+end subroutine calc_shelf_visc_DG
+
 !> Pre-compute element-level basal friction prefactors for quadrature-point evaluation.
 subroutine calc_shelf_basal_prefactors(CS, ISS, G, US)
   type(ice_shelf_dyn_CS), intent(inout) :: CS  !< Ice shelf dynamics control structure
@@ -6522,7 +6682,14 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   ! Local variables
   real :: rho, rhow, rhoi_rhow  ! Ice and ocean densities [R ~> kg m-3] and ratio [nondim]
   real :: grav       ! Gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
-  real :: neumann_val ! Neumann boundary stress [R Z L2 T-2 ~> kg s-2]
+  real :: h_nA, h_nB ! DG nodal thickness at face endpoints [Z ~> m]
+  real :: b_nA, b_nB ! Bed elevation at face endpoints [Z ~> m]
+  real :: h_face, b_face ! Face-quadrature thickness, bed [Z ~> m]
+  real :: nv_face    ! Face Neumann integrand [R Z2 L2 T-2]
+  real :: t_face     ! Face parameter in [0,1] [nondim]
+  real :: phi_A, phi_B ! Linear basis at face [nondim]
+  integer :: gp_face   ! Face Gauss-point index
+  logical :: grounded
 
   ! Sub-element quadrature variables
   real :: xi_gp, eta_gp        ! Local coordinates at Gauss point [nondim]
@@ -6675,37 +6842,100 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
 
       enddo ; enddo ; enddo ; enddo  ! quadrature + sub-cell loops
 
-      ! Neumann (stress) boundary conditions — same logic as calc_shelf_driving_stress
-      if (CS%ground_frac(i,j) == 1) then
-        neumann_val = (0.5 * grav) * (rho * max(ISS%h_shelf(i,j),CS%min_h_shelf)**2 - &
-                       rhow * CS%bed_elev(i,j)**2)
-      else
-        neumann_val = (0.5 * grav) * ((1.0-rho/rhow) * (rho * max(ISS%h_shelf(i,j),CS%min_h_shelf)**2))
-      endif
+      ! Neumann (stress) boundary conditions — face-integrated using DG nodal
+      ! thickness h(xi,eta) = h_shelf + h_x*xi + h_y*eta and bed_node corners.
+      ! On each face, h and b vary linearly along the face parameter s in [0,1];
+      ! integrate Phi_node * 0.5*g*(rho*h^2 - rhow*b^2) (grounded) or
+      ! Phi_node * 0.5*g*(1-rho/rhow)*rho*h^2 (floating) using 2-pt Gauss
+      ! (weight 0.5 each on [0,1]). min_h_shelf floor applied per nodal h.
+      grounded = (CS%ground_frac(i,j) == 1)
 
+      ! West face (I-1): nodes (I-1,J-1) [s=0] -> (I-1,J) [s=1], xi=-0.5
       if ((CS%u_face_mask_bdry(I-1,j) == 2) .or. &
         ((ISS%hmask(i-1,j) == 0 .or. ISS%hmask(i-1,j) == 2) .and. &
          (CS%reentrant_x .or. (i+i_off /= gisc)))) then
-        taudx(I-1,J-1) = taudx(I-1,J-1) - 0.5 * G%dyT(i,j) * neumann_val
-        taudx(I-1,J)   = taudx(I-1,J)   - 0.5 * G%dyT(i,j) * neumann_val
+        h_nA = max(ISS%h_shelf(i,j) - 0.5*CS%h_x(i,j) - 0.5*CS%h_y(i,j), CS%min_h_shelf)
+        h_nB = max(ISS%h_shelf(i,j) - 0.5*CS%h_x(i,j) + 0.5*CS%h_y(i,j), CS%min_h_shelf)
+        b_nA = bed_corners(1,1) ; b_nB = bed_corners(1,2)
+        do gp_face=1,2
+          t_face = xquad(gp_face)
+          h_face = (1.0 - t_face)*h_nA + t_face*h_nB
+          b_face = (1.0 - t_face)*b_nA + t_face*b_nB
+          if (grounded) then
+            nv_face = 0.5*grav*(rho*h_face**2 - rhow*b_face**2)
+          else
+            nv_face = 0.5*grav*((1.0 - rhoi_rhow)*rho*h_face**2)
+          endif
+          phi_A = 1.0 - t_face ; phi_B = t_face
+          taudx(I-1,J-1) = taudx(I-1,J-1) - 0.5*G%dyT(i,j) * phi_A * nv_face
+          taudx(I-1,J)   = taudx(I-1,J)   - 0.5*G%dyT(i,j) * phi_B * nv_face
+        enddo
       endif
+
+      ! East face (I): nodes (I,J-1) [s=0] -> (I,J) [s=1], xi=+0.5
       if ((CS%u_face_mask_bdry(I,j) == 2) .or. &
         ((ISS%hmask(i+1,j) == 0 .or. ISS%hmask(i+1,j) == 2) .and. &
          (CS%reentrant_x .or. (i+i_off /= giec)))) then
-        taudx(I,J-1) = taudx(I,J-1) + 0.5 * G%dyT(i,j) * neumann_val
-        taudx(I,J)   = taudx(I,J)   + 0.5 * G%dyT(i,j) * neumann_val
+        h_nA = max(ISS%h_shelf(i,j) + 0.5*CS%h_x(i,j) - 0.5*CS%h_y(i,j), CS%min_h_shelf)
+        h_nB = max(ISS%h_shelf(i,j) + 0.5*CS%h_x(i,j) + 0.5*CS%h_y(i,j), CS%min_h_shelf)
+        b_nA = bed_corners(2,1) ; b_nB = bed_corners(2,2)
+        do gp_face=1,2
+          t_face = xquad(gp_face)
+          h_face = (1.0 - t_face)*h_nA + t_face*h_nB
+          b_face = (1.0 - t_face)*b_nA + t_face*b_nB
+          if (grounded) then
+            nv_face = 0.5*grav*(rho*h_face**2 - rhow*b_face**2)
+          else
+            nv_face = 0.5*grav*((1.0 - rhoi_rhow)*rho*h_face**2)
+          endif
+          phi_A = 1.0 - t_face ; phi_B = t_face
+          taudx(I,J-1) = taudx(I,J-1) + 0.5*G%dyT(i,j) * phi_A * nv_face
+          taudx(I,J)   = taudx(I,J)   + 0.5*G%dyT(i,j) * phi_B * nv_face
+        enddo
       endif
+
+      ! South face (J-1): nodes (I-1,J-1) [s=0] -> (I,J-1) [s=1], eta=-0.5
       if ((CS%v_face_mask_bdry(i,J-1) == 2) .or. &
         ((ISS%hmask(i,j-1) == 0 .or. ISS%hmask(i,j-1) == 2) .and. &
          (CS%reentrant_y .or. (j+j_off /= gjsc)))) then
-        taudy(I-1,J-1) = taudy(I-1,J-1) - 0.5 * G%dxT(i,j) * neumann_val
-        taudy(I,J-1)   = taudy(I,J-1)   - 0.5 * G%dxT(i,j) * neumann_val
+        h_nA = max(ISS%h_shelf(i,j) - 0.5*CS%h_x(i,j) - 0.5*CS%h_y(i,j), CS%min_h_shelf)
+        h_nB = max(ISS%h_shelf(i,j) + 0.5*CS%h_x(i,j) - 0.5*CS%h_y(i,j), CS%min_h_shelf)
+        b_nA = bed_corners(1,1) ; b_nB = bed_corners(2,1)
+        do gp_face=1,2
+          t_face = xquad(gp_face)
+          h_face = (1.0 - t_face)*h_nA + t_face*h_nB
+          b_face = (1.0 - t_face)*b_nA + t_face*b_nB
+          if (grounded) then
+            nv_face = 0.5*grav*(rho*h_face**2 - rhow*b_face**2)
+          else
+            nv_face = 0.5*grav*((1.0 - rhoi_rhow)*rho*h_face**2)
+          endif
+          phi_A = 1.0 - t_face ; phi_B = t_face
+          taudy(I-1,J-1) = taudy(I-1,J-1) - 0.5*G%dxT(i,j) * phi_A * nv_face
+          taudy(I,J-1)   = taudy(I,J-1)   - 0.5*G%dxT(i,j) * phi_B * nv_face
+        enddo
       endif
+
+      ! North face (J): nodes (I-1,J) [s=0] -> (I,J) [s=1], eta=+0.5
       if ((CS%v_face_mask_bdry(i,J) == 2) .or. &
         ((ISS%hmask(i,j+1) == 0 .or. ISS%hmask(i,j+1) == 2) .and. &
          (CS%reentrant_y .or. (j+j_off /= gjec)))) then
-        taudy(I-1,J) = taudy(I-1,J) + 0.5 * G%dxT(i,j) * neumann_val
-        taudy(I,J)   = taudy(I,J)   + 0.5 * G%dxT(i,j) * neumann_val
+        h_nA = max(ISS%h_shelf(i,j) - 0.5*CS%h_x(i,j) + 0.5*CS%h_y(i,j), CS%min_h_shelf)
+        h_nB = max(ISS%h_shelf(i,j) + 0.5*CS%h_x(i,j) + 0.5*CS%h_y(i,j), CS%min_h_shelf)
+        b_nA = bed_corners(1,2) ; b_nB = bed_corners(2,2)
+        do gp_face=1,2
+          t_face = xquad(gp_face)
+          h_face = (1.0 - t_face)*h_nA + t_face*h_nB
+          b_face = (1.0 - t_face)*b_nA + t_face*b_nB
+          if (grounded) then
+            nv_face = 0.5*grav*(rho*h_face**2 - rhow*b_face**2)
+          else
+            nv_face = 0.5*grav*((1.0 - rhoi_rhow)*rho*h_face**2)
+          endif
+          phi_A = 1.0 - t_face ; phi_B = t_face
+          taudy(I-1,J) = taudy(I-1,J) + 0.5*G%dxT(i,j) * phi_A * nv_face
+          taudy(I,J)   = taudy(I,J)   + 0.5*G%dxT(i,j) * phi_B * nv_face
+        enddo
       endif
 
     endif
