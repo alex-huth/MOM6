@@ -1682,9 +1682,10 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     enddo ; enddo
 
     call pass_var(CS%float_cond, G%Domain, complete=.false.)
-    call pass_var(CS%ground_frac, G%domain, complete=.true.)
 
   endif
+
+  call pass_var(CS%ground_frac, G%domain, complete=.true.)
 
   ! Calculate RHS
   call calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, CS%OD_av)
@@ -3468,6 +3469,7 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
         S(i,j) = max(ISS%h_shelf(i,j),CS%min_h_shelf)-CS%bed_elev(i,j)
         Sf(i,j) = (1 - rhoi_rhow)*max(ISS%h_shelf(i,j),CS%min_h_shelf)
       endif
+      ! if (CS%float_cond(i,j)==1.0) S(i,j)=Sf(i,j)
     enddo ; enddo
   endif
 
@@ -3514,18 +3516,25 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
         else ! Correct the bugs in the version above.
           Sr=S(i+1,j)
           Sl=S(i-1,j)
+
+          ! if (CS%ground_frac(i,j)==0) then
+          !   if (valid_E .and. (CS%ground_frac(i+1,j)==1)) valid_E=.false. !Sr=Sf(i+1,j)
+          !   if (valid_W .and. (CS%ground_frac(i-1,j)==1)) valid_W=.false. !Sl=Sf(i-1,j)
+          ! endif
+
           ! if (CS%ground_frac(i,j)==0 .or. CS%float_cond(i,j)==1) then
           !   if (valid_E .and. (CS%float_cond(i+1,j)==1 .or. CS%ground_frac(i+1,j)==1)) valid_E=.false. !Sr=Sf(i+1,j)
           !   if (valid_W .and. (CS%float_cond(i-1,j)==1 .or. CS%ground_frac(i-1,j)==1)) valid_W=.false. !Sl=Sf(i-1,j)
           ! endif
-          if (CS%ground_frac(i,j)==0) then
-            if (valid_E .and. (CS%float_cond(i+1,j)==1 .or. CS%ground_frac(i+1,j)==1)) valid_E=.false. !Sr=Sf(i+1,j)
-            if (valid_W .and. (CS%float_cond(i-1,j)==1 .or. CS%ground_frac(i-1,j)==1)) valid_W=.false. !Sl=Sf(i-1,j)
-          endif
+
           if (CS%float_cond(i,j)==1) then
-            if (valid_E .and. (CS%ground_frac(i+1,j)==1)) valid_E=.false. !Sr=Sf(i+1,j)
-            if (valid_W .and. (CS%ground_frac(i-1,j)==1)) valid_W=.false. !Sl=Sf(i-1,j)
+            if (valid_E .and. (CS%ground_frac(i+1,j)==1 .and. CS%float_cond(i+1,j)==0)) valid_E=.false. !Sr=Sf(i+1,j)
+            if (valid_W .and. (CS%ground_frac(i-1,j)==1 .and. CS%float_cond(i-1,j)==0)) valid_W=.false. !Sl=Sf(i-1,j)
+          elseif (CS%ground_frac(i,j)==0) then
+            if (valid_E .and. CS%ground_frac(i+1,j)==1) valid_E=.false. !Sr=Sf(i+1,j)
+            if (valid_W .and. CS%ground_frac(i-1,j)==1) valid_W=.false. !Sl=Sf(i-1,j)
           endif
+
           if (((i+i_off) == gisc) .and. (.not.CS%reentrant_x)) then ! at west computational bdry
             if (valid_E) sx = (Sr - S(i,j)) * G%IdxCu(I,j)
           elseif (((i+i_off) == giec) .and. (.not.CS%reentrant_x)) then ! at east computational bdry
@@ -3536,22 +3545,22 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
           elseif (valid_E) then ! Use a one-sided estimate from the east.
             sx = (S(i+1,j) - S(i,j)) * G%IdxCu(I,j)
 
-            ! For floating cells, if the neighbor is grounded, use a ghost cell so that the slope is smaller
-            if ((CS%ground_frac(i,j)==0 .and. (CS%ground_frac(i+1,j)==1 .or. CS%float_cond(i+1,j)==1)) &
-              .or. CS%float_cond(i,j)==1) then
-              !sx = 0.5*(Sr - S(i,j)) * G%IdxT(i,j)
-            else
-              sx = (Sr - S(i,j)) * G%IdxCu(I,j)
-            endif
+            ! ! For floating cells, if the neighbor is grounded, use a ghost cell so that the slope is smaller
+            ! if ((CS%ground_frac(i,j)==0 .and. (CS%ground_frac(i+1,j)==1 .or. CS%float_cond(i+1,j)==1)) &
+            !   .or. CS%float_cond(i,j)==1) then
+            !   sx = 0.5*(Sr - S(i,j)) * G%IdxT(i,j)
+            ! else
+            !   sx = (Sr - S(i,j)) * G%IdxCu(I,j)
+            ! endif
 
           elseif (valid_W) then ! Use a one-sided estimate from the west.
             sx = (S(i,j) - S(i-1,j)) * G%IdxCu(I-1,j)
-            if ((CS%ground_frac(i,j)==0 .and. (CS%ground_frac(i-1,j)==1 .or. CS%float_cond(i-1,j)==1)) &
-              .or. CS%float_cond(i,j)==1) then
-              !sx = 0.5*(S(i,j) - Sl) * G%IdxT(i,j)
-            else
-              sx = (S(i,j) - Sl) * G%IdxCu(I-1,j)
-            endif
+            ! if ((CS%ground_frac(i,j)==0 .and. (CS%ground_frac(i-1,j)==1 .or. CS%float_cond(i-1,j)==1)) &
+            !   .or. CS%float_cond(i,j)==1) then
+            !   sx = 0.5*(S(i,j) - Sl) * G%IdxT(i,j)
+            ! else
+            !   sx = (S(i,j) - Sl) * G%IdxCu(I-1,j)
+            ! endif
           endif
         endif
 
@@ -3577,18 +3586,24 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
         else ! Correct the bugs in the version above.
           Sr=S(i,j+1)
           Sl=S(i,j-1)
+
+          ! if (CS%ground_frac(i,j)==0) then
+          !   if (valid_N .and. CS%ground_frac(i,j+1)==1) valid_N=.false.
+          !   if (valid_S .and. CS%ground_frac(i,j-1)==1) valid_S=.false.
+          ! endif
           ! if (CS%ground_frac(i,j)==0 .or. CS%float_cond(i,j)==1) then
           !   if (valid_N .and. (CS%float_cond(i,j+1)==1 .or. CS%ground_frac(i,j+1)==1)) valid_N=.false. !Sr=Sf(i,j+1)
           !   if (valid_S .and. (CS%float_cond(i,j-1)==1 .or. CS%ground_frac(i,j-1)==1)) valid_S=.false. !Sl=Sf(i,j-1)
           ! endif
-          if (CS%ground_frac(i,j)==0) then
-            if (valid_N .and. (CS%float_cond(i,j+1)==1 .or. CS%ground_frac(i,j+1)==1)) valid_N=.false. !Sr=Sf(i,j+1)
-            if (valid_S .and. (CS%float_cond(i,j-1)==1 .or. CS%ground_frac(i,j-1)==1)) valid_S=.false. !Sl=Sf(i,j-1)
-          endif
+
           if (CS%float_cond(i,j)==1) then
-            if (valid_N .and. (CS%ground_frac(i,j+1)==1)) valid_N=.false. !Sr=Sf(i,j+1)
-            if (valid_S .and. (CS%ground_frac(i,j-1)==1)) valid_S=.false. !Sl=Sf(i,j-1)
+            if (valid_N .and. (CS%ground_frac(i,j+1)==1 .and. CS%float_cond(i,j+1)==0)) valid_N=.false. !Sr=Sf(i,j+1)
+            if (valid_S .and. (CS%ground_frac(i,j-1)==1 .and. CS%float_cond(i,j-1)==0)) valid_S=.false. !Sl=Sf(i,j-1)
+          elseif (CS%ground_frac(i,j)==0) then
+            if (valid_N .and. CS%ground_frac(i,j+1)==1) valid_N=.false. !Sr=Sf(i,j+1)
+            if (valid_S .and. CS%ground_frac(i,j-1)==1) valid_S=.false. !Sl=Sf(i,j-1)
           endif
+
           if (((j+j_off) == gjsc) .and. (.not. CS%reentrant_y)) then ! at south computational bdry
             if (valid_N) sy = (Sr - S(i,j)) * G%IdyCv(i,J)
           elseif (((j+j_off) == gjec) .and. (.not. CS%reentrant_y)) then ! at north computational bdry
@@ -3598,20 +3613,20 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
             sy = 0.5*(Sr - Sl) * G%IdyT(i,j)
           elseif (valid_N) then ! Use a one-sided estimate from the north.
             sy = (S(i,j+1) - S(i,j)) * G%IdyCv(i,J)
-            if ((CS%ground_frac(i,j)==0 .and. (CS%ground_frac(i,j+1)==1 .or. CS%float_cond(i,j+1)==1)) &
-              .or. CS%float_cond(i,j)==1) then
-              !sy = 0.5*(Sr - S(i,j)) * G%IdyT(i,j)
-            else
-              sy = (Sr - S(i,j)) * G%IdyCv(i,J)
-            endif
+            ! if ((CS%ground_frac(i,j)==0 .and. (CS%ground_frac(i,j+1)==1 .or. CS%float_cond(i,j+1)==1)) &
+            !   .or. CS%float_cond(i,j)==1) then
+            !   sy = 0.5*(Sr - S(i,j)) * G%IdyT(i,j)
+            ! else
+            !   sy = (Sr - S(i,j)) * G%IdyCv(i,J)
+            ! endif
           elseif (valid_S) then ! Use a one-sided estimate from the south.
             sy = (S(i,j) - S(i,j-1)) * G%IdyCv(i,J-1)
-            if ((CS%ground_frac(i,j)==0 .and. (CS%ground_frac(i,j-1)==1 .or. CS%float_cond(i,j-1)==1)) &
-              .or. CS%float_cond(i,j)==1) then
-              !sy = 0.5*(S(i,j) - Sl) * G%IdyT(i,j)
-            else
-              sy = (S(i,j) - Sl) * G%IdyCv(i,J-1)
-            endif
+            ! if ((CS%ground_frac(i,j)==0 .and. (CS%ground_frac(i,j-1)==1 .or. CS%float_cond(i,j-1)==1)) &
+            !   .or. CS%float_cond(i,j)==1) then
+            !   sy = 0.5*(S(i,j) - Sl) * G%IdyT(i,j)
+            ! else
+            !   sy = (S(i,j) - Sl) * G%IdyCv(i,J-1)
+            ! endif
           endif
         endif
 
@@ -3626,7 +3641,7 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
         CS%sx_shelf(i,j) = sx ; CS%sy_shelf(i,j) = sy
 
         !Stress (Neumann) boundary conditions
-        if (CS%ground_frac(i,j) == 1) then
+        if (CS%ground_frac(i,j) == 1 .and. CS%float_cond(i,j)==0) then
           neumann_val = ((.5 * grav) * (rho * max(ISS%h_shelf(i,j),CS%min_h_shelf)**2 - rhow * CS%bed_elev(i,j)**2))
         else
           neumann_val = (.5 * grav) * ((1-rho/rhow) * (rho * max(ISS%h_shelf(i,j),CS%min_h_shelf)**2))
