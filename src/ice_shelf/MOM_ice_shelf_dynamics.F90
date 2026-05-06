@@ -1960,6 +1960,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
         call pass_var(CS%newton_str_sh, G%domain, complete=.false.)
         call pass_var(CS%newton_visc_factor, G%domain, complete=.true.)
         call pass_vector(CS%newton_str_ux, CS%newton_str_vy, G%domain, TO_ALL, AGRID)
+        CS%cg_tol_current = CS%cg_newton_tolerance
       endif
 
       ! Inexact Newton: Adapt inner solver tolerance to prevent oversolving
@@ -1968,10 +1969,13 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
       ! consistent with the inner solver's convergence check (sv3dsums(3)).
       ! The first Newton step uses the standard cg_tolerance.
       if (CS%doing_newton .and. CS%newton_adapt_cg_tol) then
-        if (CS%nonlin_solve_err_mode == 4) then
+        !calculate residual needed for EW; some convergence criteria already did this
+        if (CS%nonlin_solve_err_mode >= 4) then
           ew_resid=err_max
+        elseif (CS%ssa_add_rel_resid) then
+          ew_resid=err_rr
         else
-          if (CS%nonlin_solve_err_mode /= 1) then
+          if (.not. calc_Au_for_convergence) then
             Au(:,:) = 0 ; Av(:,:) = 0
             call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, &
               H_node, CS%ice_visc, CS%float_cond, CS%bed_elev, u_shlf, v_shlf, &
@@ -1986,6 +1990,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
           ew_resid = sqrt(reproducing_sum(Normvec, Is_sum, Ie_sum, Js_sum, Je_sum, &
             unscale=((US%RZ_to_kg_m2*US%L_to_m)*US%L_T_to_m_s**2)**2))
         endif
+
         if (ew_prev_resid == 0.0) then
           ! First Newton iteration: seed residuals; use initial newton cg_tolerance this step
           ew_prev_resid  = ew_resid
@@ -2085,7 +2090,7 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
         IDIAGu, IDIAGv     ! Reciprocal diagonals [R-1 L-2 Z-1 T ~> kg-1 s]
   real    :: rhoi_rhow     ! The density of ice divided by a typical water density [nondim]
   real    :: resid_scale   ! A scaling factor for redimensionalizing the global residuals
-                           ! [L T-1 ~> m s-1] [R L3 Z T-2 ~> m kg s-2]
+                           ! [T3 kg m2 R-1 Z-1 L-4 s-3 ~> 1]
   integer :: Is_sum, Js_sum, Ie_sum, Je_sum ! Loop bounds for global sums or arrays starting at 1.
   integer :: Iscq_sv, Jscq_sv ! Starting loop bound for sum_vec arrays
   integer :: I, J
@@ -2215,7 +2220,7 @@ subroutine ice_shelf_solve_inner_CG(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, A
                           intent(in)    :: hmask !< Ice shelf coverage mask
   real,                   intent(in)    :: rhoi_rhow !< Ice-to-ocean density ratio [nondim]
   real,                   intent(in)    :: resid_scale !< Scaling for inner products
-                                                       !! [L T-1 ~> m s-1] [R L3 Z T-2 ~> m kg s-2]
+                                                       !! [T3 kg m2 R-1 Z-1 L-4 s-3 ~> 1]
   real, dimension(8,4,SZDI_(G),SZDJ_(G)), &
                           intent(in)    :: Phi !< Basis element gradients at quadrature points [L-1 ~> m-1]
   real, dimension(:,:,:,:,:,:), &
@@ -2240,21 +2245,21 @@ subroutine ice_shelf_solve_inner_CG(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, A
                         Zu, Zv, &     ! Preconditioned residuals [L T-1 ~> m s-1]
                         Du, Dv        ! Search directions [L T-1 ~> m s-1]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: sum_vec ! Pointwise D·A products for the alpha_k global sum
-                                                  ! [R L4 Z T-3 ~> m2 kg s-3]
+                                                  ! [kg m2 s-3]
   real, dimension(SZDIB_(G),SZDJB_(G),2) :: sum_vec_3d ! Array used for various residuals
-                                                       ! sum_vec_3d(:,:,1) [m s-1] [m kg s-2]
-                                                       ! sum_vec_3d(:,:,2) [m2 kg2 s-4]
+                                                       ! sum_vec_3d(:,:,1) [kg m2 s-3]
+                                                       ! sum_vec_3d(:,:,2) [kg2 m2 s-4]
   real    :: beta_k      ! Ratio of residuals used to update search direction [nondim]
   real    :: resid0tol2  ! Convergence tolerance times the initial residual [m2 kg2 s-4]
   real    :: sv3dsum     ! An unused variable returned when taking global sum of residuals [various]
   real    :: sv3dsums(2) ! The index-wise global sums of sum_vec_3d
-                         ! sv3dsums(1) [R L4 Z T-3 ~> m2 kg s-3]
-                         ! sv3dsums(2) [m2 kg2 s-4]
+                         ! sv3dsums(1) [kg m2 s-3]
+                         ! sv3dsums(2) [kg2 m2 s-4]
   real    :: alpha_k     ! A scaling factor for iterative corrections [nondim]
   real    :: rho_old     ! The preconditioned residual inner product Z·R from the previous CG
-                         ! iteration, scaled by resid_scale [R L4 Z T-3 ~> m2 kg s-3]
+                         ! iteration, scaled by resid_scale [kg m2 s-3]
   real    :: resid2_scale ! A scaling factor for redimensionalizing the global squared residuals
-                         ! [R2 L6 Z2 T-4 ~> m2 kg2 s-4]
+                          ! [T4 kg2 m2 R-2 Z-2 L-6 s-4 ~> 1]
   integer :: cg_halo     ! Number of halo vertices to include during a CG iteration
   integer :: max_cg_halo ! Maximum possible number of halo vertices to include in the CG iterations
   integer :: iter, i, j, isc, iec, jsc, jec, is, js, ie, je, is2, ie2, js2, je2
@@ -2449,7 +2454,7 @@ subroutine ice_shelf_solve_inner_MINRES(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, A
                           intent(in)    :: hmask !< Ice shelf coverage mask
   real,                   intent(in)    :: rhoi_rhow !< Ice-to-ocean density ratio [nondim]
   real,                   intent(in)    :: resid_scale !< Scaling for inner products
-                                                       !! [L T-1 ~> m s-1] [R L3 Z T-2 ~> m kg s-2]
+                                                       !! [T3 kg m2 R-1 Z-1 L-4 s-3 ~> 1]
   real, dimension(8,4,SZDI_(G),SZDJ_(G)), &
                           intent(in)    :: Phi !< Basis element gradients at quadrature points [L-1 ~> m-1]
   real, dimension(:,:,:,:,:,:), &
@@ -2475,19 +2480,22 @@ subroutine ice_shelf_solve_inner_MINRES(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, A
         W_old_u, W_old_v, W_curr_u, W_curr_v, W_new_u, W_new_v, & ! MINRES search directions [L T-1 ~> m s-1]
         Qu, Qv            ! A * Z_curr [R L3 Z T-2 ~> m kg s-2]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: sum_vec_3d ! Pointwise products for global sums
-                                                     ! [R L4 Z T-3 ~> m2 kg s-3]
-  real    :: alpha       ! Lanczos diagonal element (Rayleigh quotient) [R L4 Z T-3 ~> m2 kg s-3]
-  real    :: beta1       ! Current Lanczos off-diagonal coefficient [R L4 Z T-3 ~> m2 kg s-3]
-  real    :: beta2       ! Next Lanczos off-diagonal coefficient [R L4 Z T-3 ~> m2 kg s-3]
-  real    :: eta         ! MINRES residual norm estimate [R L4 Z T-3 ~> m2 kg s-3]
-  real    :: eta_curr    ! Effective step magnitude for current iteration [R L4 Z T-3 ~> m2 kg s-3]
+                                                     ! [kg m2 s-3] before normalization;
+                                                     ! [nondim] inside loop (after Lanczos normalization)
+  real    :: alpha       ! Lanczos diagonal element (Rayleigh quotient) [nondim]
+  real    :: beta1       ! Current Lanczos off-diagonal coefficient;
+                         ! initial value [kg^1/2 m s^-3/2], then [nondim] after iter 1
+  real    :: beta2       ! Next Lanczos off-diagonal coefficient [nondim]
+  real    :: eta         ! MINRES residual norm estimate [kg^1/2 m s^-3/2]
+  real    :: eta_curr    ! Effective step magnitude for current iteration [kg^1/2 m s^-3/2]
   real    :: c0, s0, c1, s1, c2, s2  ! Givens rotation cosines and sines [nondim]
-  real    :: d0, d1, d2  ! Tridiagonal QR factorization coefficients [R L4 Z T-3 ~> m2 kg s-3]
-  real    :: resid0tol   ! Convergence tolerance (CS%cg_tol_current * beta1) [R L4 Z T-3 ~> m2 kg s-3]
-  real    :: current_norm ! Current MINRES residual norm estimate [R L4 Z T-3 ~> m2 kg s-3]
-  real    :: sv3dsum     ! Global reproducing sum of sum_vec_3d [R L4 Z T-3 ~> m2 kg s-3]
-  real    :: Ibeta1      ! Reciprocal of beta1 [nondim]
-  real    :: Ibeta2      ! Reciprocal of beta2  [nondim]
+  real    :: d0, d1, d2  ! Tridiagonal QR factorization coefficients [nondim]
+  real    :: resid0tol   ! Convergence tolerance (CS%cg_tol_newton * beta1) [kg^1/2 m s^-3/2]
+  real    :: current_norm ! Current MINRES residual norm estimate [kg^1/2 m s^-3/2]
+  real    :: sv3dsum     ! Global reproducing sum of sum_vec_3d;
+                         ! [kg m2 s-3] before normalization, [nondim] inside loop
+  real    :: Ibeta1      ! Reciprocal of initial beta1 [kg^-1/2 m-1 s^3/2]
+  real    :: Ibeta2      ! Reciprocal of beta2 [nondim]
   real    :: Id1         ! Reciprocal of d1 [nondim]
   integer :: iter, i, j, isc, iec, jsc, jec
   integer :: Isdq, Iedq, Jsdq, Jedq, Iscq, Iecq, Jscq, Jecq
@@ -2641,15 +2649,15 @@ subroutine ice_shelf_solve_inner_MINRES(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, A
        endif
     enddo ; enddo
 
-    ! Sync Z_curr for the next iteration's CG_action
-    call pass_vector(Z_curr_u, Z_curr_v, G%domain, TO_ALL, BGRID_NE)
-
     ! --- STEP 8: Check Convergence ---
     if (current_norm <= resid0tol .or. beta2 == 0.0) then
       iters = iter
       conv_flag = 1
       exit
     endif
+
+    ! Sync Z_curr for the next iteration's CG_action
+    call pass_vector(Z_curr_u, Z_curr_v, G%domain, TO_ALL, BGRID_NE)
 
     beta1 = beta2
     c0 = c1 ; c1 = c2
@@ -2692,7 +2700,7 @@ subroutine ice_shelf_solve_inner_CR(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, A
                           intent(in)    :: hmask !< Ice shelf coverage mask
   real,                   intent(in)    :: rhoi_rhow !< Ice-to-ocean density ratio [nondim]
   real,                   intent(in)    :: resid_scale !< Scaling for inner products
-                                           !! [L T-1 ~> m s-1] [R L3 Z T-2 ~> m kg s-2]
+                                                       !! [T3 kg m2 R-1 Z-1 L-4 s-3 ~> 1]
   real, dimension(8,4,SZDI_(G),SZDJ_(G)), &
                           intent(in)    :: Phi !< Basis element gradients at quadrature points [L-1 ~> m-1]
   real, dimension(:,:,:,:,:,:), &
@@ -2718,22 +2726,21 @@ subroutine ice_shelf_solve_inner_CR(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, A
                         Du, Dv, &         ! Search directions (p) [L T-1 ~> m s-1]
                         Qu, Qv            ! A * p [R L3 Z T-2 ~> m kg s-2]
   real, dimension(SZDIB_(G),SZDJB_(G),2) :: sum_vec_3d ! Pointwise products for global sums.
-                                ! sum_vec_3d(:,:,1): r^2 [R2 L6 Z2 T-4 ~> m2 kg2 s-4] or
-                                !                   z·q [R L4 Z T-3 ~> m2 kg s-3] (context-dependent)
-                                ! sum_vec_3d(:,:,2): z·w or q·(M^-1 q) [R L4 Z T-3 ~> m2 kg s-3]
+                                ! sum_vec_3d(:,:,1): r^2 [kg2 m2 s-4] or z·q [kg m2 s-3] (context-dependent)
+                                ! sum_vec_3d(:,:,2): z·w or q·(M^-1 q) [kg m2 s-3]
   real    :: alpha        ! Step length [nondim]
   real    :: beta         ! Direction update coefficient [nondim]
-  real    :: r_norm_sq    ! Squared residual norm [R2 L6 Z2 T-4 ~> m2 kg2 s-4]
-  real    :: z_w_sum      ! Inner product (z_k, A z_k); beta numerator [R L4 Z T-3 ~> m2 kg s-3]
-  real    :: z_w_sum_new  ! Inner product (z_{k+1}, A z_{k+1}) [R L4 Z T-3 ~> m2 kg s-3]
-  real    :: z_q_sum      ! Inner product (z_k, A p_k); alpha numerator [R L4 Z T-3 ~> m2 kg s-3]
-  real    :: q_s_sum      ! Inner product (A p_k, M^-1 A p_k); alpha denom [R L4 Z T-3 ~> m2 kg s-3]
-  real    :: resid0tol2   ! Convergence threshold: tol^2 * ||r_0||^2 [R2 L6 Z2 T-4 ~> m2 kg2 s-4]
+  real    :: r_norm_sq    ! Squared residual norm [kg2 m2 s-4]
+  real    :: z_w_sum      ! Inner product (z_k, A z_k); beta denominator [kg m2 s-3]
+  real    :: z_w_sum_new  ! Inner product (z_{k+1}, A z_{k+1}); beta numerator [kg m2 s-3]
+  real    :: z_q_sum      ! Inner product (z_k, A p_k); alpha numerator [kg m2 s-3]
+  real    :: q_s_sum      ! Inner product (A p_k, M^-1 A p_k); alpha denom [kg m2 s-3]
+  real    :: resid0tol2   ! Convergence threshold: tol^2 * ||r_0||^2 [kg2 m2 s-4]
   real    :: sv3dsum      ! Unused scalar return from reproducing_sum [various]
   real    :: sv3dsums(2)  ! Component sums from reproducing_sum
-                          ! sv3dsums(1): r^2 or z·q [R2 L6 Z2 T-4 or R L4 Z T-3] (context-dependent)
-                          ! sv3dsums(2): z·w or q·M^-1 q [R L4 Z T-3 ~> m2 kg s-3]
-  real    :: resid2_scale ! Scaling for squared-stress inner products [R2 L6 Z2 T-4 ~> m2 kg2 s-4]
+                          ! sv3dsums(1): r^2 or z·q [kg2 m2 s-4 or kg m2 s-3] (context-dependent)
+                          ! sv3dsums(2): z·w or q·M^-1 q [kg m2 s-3]
+  real    :: resid2_scale ! Scaling for squared-stress inner products [T4 kg2 m2 R-2 Z-2 L-6 s-4 ~> 1]
   integer :: iter, i, j, isc, iec, jsc, jec
   integer :: Isdq, Iedq, Jsdq, Jedq, Iscq, Iecq, Jscq, Jecq
 
@@ -4014,7 +4021,7 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
   real :: v_delta_loc   ! Search direction δv interpolated to sub-qp [L T-1 ~> m s-1]
   real :: unorm2_loc    ! Regularized |u^k|^2 at sub-qp [L2 T-2 ~> m2 s-2]
   real :: basal_coef_loc ! Picard friction coefficient at sub-qp [R L2 Z T-1 ~> kg s-1]
-  real :: drag_newt_loc  ! Newton drag coefficient at sub-qp [R Z T-1 ~> kg m-2 s-1]
+  real :: drag_newt_loc  ! Newton drag coefficient at sub-qp [R Z T ~> kg m-2 s]
   real :: inner_dot_loc  ! u^k · δu inner product at sub-qp [L2 T-2 ~> m2 s-2]
   real :: phi_mn         ! Basis function value at sub-qp [nondim]
   real :: contrib        ! Quadrature weight contribution [nondim]
@@ -4103,9 +4110,9 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
         ! weights: sum over k=1 nodes gives (1-y); k=2 gives y; l=1 gives (1-x); l=2 gives x.
         ! This is analogous to jac_wt = CS%Jac(qp,i,j) * G%IareaT(i,j) in the regular routines.
         a = (dxCv_S * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1))) + &  ! (1-y) * dxCv_S
-            (dxCv_N * (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2)))        ! + y * dxCv_N
+            (dxCv_N * (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2)))      !  + y  * dxCv_N
         d = (dyCu_W * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2))) + &  ! (1-x) * dyCu_W
-            (dyCu_E * (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)))        ! + x * dyCu_E
+            (dyCu_E * (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)))      !  + x  * dyCu_E
         jac_sub_wt = 0.25 * subarea * (a * d) * IareaT
 
         do n=1,2 ; do m=1,2
@@ -4142,10 +4149,10 @@ end subroutine CG_action_subgrid_basal
 !! single quadrature point. Encapsulates the 3-path dispatch (linear Weertman / nonlinear
 !! Weertman / Coulomb) so that CG_action, matrix_diagonal, and their subgrid equivalents
 !! remain readable. The ground_frac scaling is NOT applied here; callers do it after the call.
-pure subroutine compute_basal_coef(unorm2_qp, coef_prefactor, min_trac_area, fB_e, &
+subroutine compute_basal_coef(unorm2_qp, coef_prefactor, min_trac_area, fB_e, &
     n_basal_fric, CoulombFriction, CF_PostPeak, L_T_to_m_s, use_newton, &
     basal_coef, drag_newt)
-  real,    intent(in)  :: unorm2_qp      !< Regularized |u^k|^2 at quadrature point [L2 T-2 ~> m2 s-2]
+  real,    intent(in)  :: unorm2_qp      !< Regularized |u^k|^2 > 0 at quadrature point [L2 T-2 ~> m2 s-2]
   real,    intent(in)  :: coef_prefactor !< Pre-computed area * C_basal_friction * L_T_to_m_s [R L2 Z T-1 ~> kg s-1]
   real,    intent(in)  :: min_trac_area  !< Pre-computed min_basal_traction * areaT floor [R L2 Z T-1 ~> kg s-1]
   real,    intent(in)  :: fB_e           !< Element-level Coulomb fB; 0 for Weertman [(T L-1)^CF_PostPeak]
@@ -4155,7 +4162,7 @@ pure subroutine compute_basal_coef(unorm2_qp, coef_prefactor, min_trac_area, fB_
   real,    intent(in)  :: L_T_to_m_s    !< Unit conversion factor from internal [L T-1] to [m s-1]
   logical, intent(in)  :: use_newton     !< If true, evaluate drag_newt; otherwise set to 0
   real,    intent(out) :: basal_coef     !< Picard friction coefficient at quadrature point [R L2 Z T-1 ~> kg s-1]
-  real,    intent(out) :: drag_newt      !< Newton drag coefficient [R Z T-1 ~> kg m-2 s-1]; 0 without Newton
+  real,    intent(out) :: drag_newt      !< Newton drag coefficient [R Z T ~> kg m-2 s]; 0 without Newton
 
   real :: unorm    ! |u^k| at quadrature point in physical units [m s-1]
   real :: raw_coef ! Pre-floor friction coefficient [R L2 Z T-1 ~> kg s-1]
@@ -4175,7 +4182,7 @@ pure subroutine compute_basal_coef(unorm2_qp, coef_prefactor, min_trac_area, fB_
     else
       basal_coef = raw_coef
       if (use_newton) then
-        drag_newt = (1.0/max(unorm2_qp,epsilon(unorm2_qp))) * raw_coef * &
+        drag_newt = (1.0/unorm2_qp) * raw_coef * &
             ((n_basal_fric-1.0) - n_basal_fric * CF_PostPeak * fBuq / (1.0 + fBuq))
       else
         drag_newt = 0.0
@@ -4190,7 +4197,7 @@ pure subroutine compute_basal_coef(unorm2_qp, coef_prefactor, min_trac_area, fB_
     else
       basal_coef = raw_coef
       if (use_newton) then
-        drag_newt = (n_basal_fric-1.0) / max(unorm2_qp, epsilon(unorm2_qp)) * raw_coef
+        drag_newt = (n_basal_fric-1.0) / unorm2_qp * raw_coef
       else
         drag_newt = 0.0
       endif
@@ -4580,7 +4587,7 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
   real :: v_curr_loc     ! Frozen v^k interpolated to sub-qp [L T-1 ~> m s-1]
   real :: unorm2_loc     ! Regularized |u^k|^2 at sub-qp [L2 T-2 ~> m2 s-2]
   real :: basal_coef_loc ! Picard friction coefficient at sub-qp [R L2 Z T-1 ~> kg s-1]
-  real :: drag_newt_loc  ! Newton drag coefficient at sub-qp [R Z T-1 ~> kg m-2 s-1]
+  real :: drag_newt_loc  ! Newton drag coefficient at sub-qp [R Z T ~> kg m-2 s]
   real :: phi_mn_sq      ! Squared basis function value at sub-qp [nondim]
   real :: contrib        ! Quadrature weight contribution [nondim]
   real :: coef_prefactor ! Pre-computed area * C_basal_friction * L_T_to_m_s [R L2 Z T-1 ~> kg s-1]
@@ -4656,11 +4663,14 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
         call compute_basal_coef(unorm2_loc, coef_prefactor, min_trac_area, fB_local, &
             CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .true., &
             basal_coef_loc, drag_newt_loc)
-        ! Interpolate cell-edge metrics to the sub-cell QP
-        a = dxCv_S * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1)) + &
-          dxCv_N * (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2))
-        d = dyCu_W * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2)) + &
-          dyCu_E * (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2))
+        ! Interpolate cell-edge metrics to the sub-cell QP using the bilinear shape function values
+        ! from bilinear_shape_functions_subgrid.  Marginal sums of Phisub give the interpolation
+        ! weights: sum over k=1 nodes gives (1-y); k=2 gives y; l=1 gives (1-x); l=2 gives x.
+        ! This is analogous to jac_wt = CS%Jac(qp,i,j) * G%IareaT(i,j) in the regular routines.
+        a = (dxCv_S * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1))) + &  ! (1-y) * dxCv_S
+            (dxCv_N * (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2)))      !  + y  * dxCv_N
+        d = (dyCu_W * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2))) + &  ! (1-x) * dyCu_W
+            (dyCu_E * (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)))      !  + x  * dyCu_E
         jac_sub_wt = 0.25 * subarea * (a * d) * IareaT
 
         do n=1,2 ; do m=1,2
@@ -5275,7 +5285,7 @@ subroutine bilinear_shape_fn_grid(G, i, j, Phi, Jac)
   real, dimension(8,4),  intent(inout) :: Phi !< The gradients of bilinear basis elements at Gaussian
                                               !! quadrature points surrounding the cell vertices [L-1 ~> m-1].
   real, dimension(4), optional, intent(out) :: Jac !< Jacobian determinant |J_q| = a_q*d_q at each
-                                              !! Gaussian quadrature point [L2 ~> m2].
+                                                   !! Gaussian quadrature point [L2 ~> m2].
 
 ! This subroutine calculates the gradients of bilinear basis elements that
 ! that are centered at the vertices of the cell.  The values are calculated at
@@ -5289,6 +5299,11 @@ subroutine bilinear_shape_fn_grid(G, i, j, Phi, Jac)
 ! This should be a one-off; once per nonlinear solve? once per lifetime?
 
   real, dimension(4) :: xquad, yquad ! [nondim]
+  ! Mirror lookups: xquad_m(qp) == 1 - xquad(qp), yquad_m(qp) == 1 - yquad(qp) mathematically,
+  ! but each mirror entry is the stored value at the x- or y-mirrored quadrature point. This
+  ! ensures rotation-paired QPs read bit-identical operand values (avoids the (1 - v) vs v_other
+  ! 1-ulp asymmetry that breaks rotation invariance)
+  real, dimension(4) :: xquad_m, yquad_m
   real :: a, d       ! Interpolated grid spacings [L ~> m]
   real :: xexp, yexp ! [nondim]
   integer :: node, qpoint, xnode, ynode
@@ -5296,31 +5311,33 @@ subroutine bilinear_shape_fn_grid(G, i, j, Phi, Jac)
   xquad(1:3:2) = .5 * (1-sqrt(1./3)) ; yquad(1:2) = .5 * (1-sqrt(1./3))
   xquad(2:4:2) = .5 * (1+sqrt(1./3)) ; yquad(3:4) = .5 * (1+sqrt(1./3))
 
+  ! x-mirror swaps qp 1<->2 and 3<->4; y-mirror swaps 1<->3 and 2<->4
+  xquad_m(1) = xquad(2) ; xquad_m(2) = xquad(1) ; xquad_m(3) = xquad(4) ; xquad_m(4) = xquad(3)
+  yquad_m(1) = yquad(3) ; yquad_m(2) = yquad(4) ; yquad_m(3) = yquad(1) ; yquad_m(4) = yquad(2)
+
   do qpoint=1,4
     if (J>1) then
-      a = (G%dxCv(i,J-1) * (1-yquad(qpoint))) + (G%dxCv(i,J) * yquad(qpoint)) ! d(x)/d(x*)
+      a = (G%dxCv(i,J-1) * yquad_m(qpoint)) + (G%dxCv(i,J) * yquad(qpoint)) ! d(x)/d(x*)
     else
       a = G%dxCv(i,J) !* yquad(qpoint) ! d(x)/d(x*)
     endif
     if (I>1) then
-      d = (G%dyCu(I-1,j) * (1-xquad(qpoint))) + (G%dyCu(I,j) * xquad(qpoint)) ! d(y)/d(y*)
+      d = (G%dyCu(I-1,j) * xquad_m(qpoint)) + (G%dyCu(I,j) * xquad(qpoint)) ! d(y)/d(y*)
     else
       d = G%dyCu(I,j) !* xquad(qpoint)
     endif
-!    a = G%dxCv(i,J-1) * (1-yquad(qpoint)) + G%dxCv(i,J) * yquad(qpoint) ! d(x)/d(x*)
-!    d = G%dyCu(I-1,j) * (1-xquad(qpoint)) + G%dyCu(I,j) * xquad(qpoint) ! d(y)/d(y*)
 
     do node=1,4
       xnode = 2-mod(node,2) ; ynode = ceiling(REAL(node)/2)
 
       if (ynode == 1) then
-        yexp = 1-yquad(qpoint)
+        yexp = yquad_m(qpoint)
       else
         yexp = yquad(qpoint)
       endif
 
       if (1 == xnode) then
-        xexp = 1-xquad(qpoint)
+        xexp = xquad_m(qpoint)
       else
         xexp = xquad(qpoint)
       endif
@@ -5410,20 +5427,27 @@ subroutine bilinear_shape_functions_subgrid(Phisub, nsub)
 
   integer :: i, j, qx, qy
   real,dimension(2)    :: xquad
-  real                 :: x0, y0, x, y, fracx
+  real                 :: fracx
+  ! Mirror-symmetric per-direction node weights: a_left == 1-x_global, a_right == x_global
+  ! mathematically, but constructed so that a_right(qx,i) is computed by exactly the same
+  ! operand sequence as a_left(3-qx, nsub+1-i). This guarantees bit-exact rotation symmetry
+  ! of Phisub for any nsub.
+  real, dimension(2,nsub) :: a_left, a_right
 
   xquad(1) = .5 * (1-sqrt(1./3)) ; xquad(2) = .5 * (1+sqrt(1./3))
   fracx = 1.0/real(nsub)
 
+  do i=1,nsub ; do qx=1,2
+    a_left (qx,i) = (real(nsub-i) + xquad(3-qx)) * fracx
+    a_right(qx,i) = (real(i-1)    + xquad(qx))   * fracx
+  enddo ; enddo
+
   do j=1,nsub ; do i=1,nsub
-    x0 = (i-1) * fracx ; y0 = (j-1) * fracx
     do qy=1,2 ; do qx=1,2
-      x = x0 + fracx*xquad(qx)
-      y = y0 + fracx*xquad(qy)
-      Phisub(qx,qy,i,j,1,1) = (1.0-x) * (1.0-y)
-      Phisub(qx,qy,i,j,1,2) = (1.0-x) * y
-      Phisub(qx,qy,i,j,2,1) = x * (1.0-y)
-      Phisub(qx,qy,i,j,2,2) = x * y
+      Phisub(qx,qy,i,j,1,1) = a_left (qx,i) * a_left (qy,j)
+      Phisub(qx,qy,i,j,1,2) = a_left (qx,i) * a_right(qy,j)
+      Phisub(qx,qy,i,j,2,1) = a_right(qx,i) * a_left (qy,j)
+      Phisub(qx,qy,i,j,2,2) = a_right(qx,i) * a_right(qy,j)
     enddo ; enddo
   enddo ; enddo
 
