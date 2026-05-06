@@ -953,7 +953,17 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       call pass_vector(CS%u_shelf, CS%v_shelf, G%domain, TO_ALL, BGRID_NE, complete=.true.)
       call pass_var(CS%ground_frac, G%domain, complete=.false.)
       call pass_var(CS%bed_elev, G%domain, complete=.true.)
-      if (CS%use_DG_thickness) call reconstruct_bed_to_nodes(CS, G, ISS%hmask)
+      if (CS%use_DG_thickness) then
+        call reconstruct_bed_to_nodes(CS, G, ISS%hmask)
+        ! DG(1) cold-start slope init: zero, then populate from neighbour
+        ! cell-mean differences via the limiter. On restart h_x,h_y come from
+        ! the restart file and this branch is skipped.
+        call pass_var(ISS%h_shelf, G%domain)
+        CS%h_x(:,:) = 0.0 ; CS%h_y(:,:) = 0.0
+        call DG1_slope_limit(G, ISS%h_shelf, CS%h_x, CS%h_y, ISS%hmask)
+        call pass_var(CS%h_x, G%domain, complete=.false.)
+        call pass_var(CS%h_y, G%domain, complete=.true.)
+      endif
       call update_velocity_masks(CS, G, ISS%hmask, CS%umask, CS%vmask, CS%u_face_mask, CS%v_face_mask)
 
       do J=Jsdq,Jedq ; do I=Isdq,Iedq
