@@ -995,10 +995,22 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
             else
               h_S = ISS%h_shelf(i,j-1)
             endif
-            if (valid_E .and. valid_W) &
+            ! Centred difference where both neighbours are valid; one-sided
+            ! difference at the ice front so the slope is preserved.
+            if (valid_E .and. valid_W) then
               CS%h_x(i,j) = 0.5 * (h_E - h_W)
-            if (valid_N .and. valid_S) &
+            elseif (valid_W) then
+              CS%h_x(i,j) = ISS%h_shelf(i,j) - h_W
+            elseif (valid_E) then
+              CS%h_x(i,j) = h_E - ISS%h_shelf(i,j)
+            endif
+            if (valid_N .and. valid_S) then
               CS%h_y(i,j) = 0.5 * (h_N - h_S)
+            elseif (valid_S) then
+              CS%h_y(i,j) = ISS%h_shelf(i,j) - h_S
+            elseif (valid_N) then
+              CS%h_y(i,j) = h_N - ISS%h_shelf(i,j)
+            endif
           endif
         enddo ; enddo
         call DG1_slope_limit(G, ISS%h_shelf, CS%h_x, CS%h_y, ISS%hmask, CS%h_bdry_val)
@@ -6544,40 +6556,55 @@ subroutine DG1_slope_limit(G, h_bar, h_x, h_y, hmask, h_bdry_val)
     ! (see ice_shelf_advect_thickness_x). The cell-mean difference across one
     ! cell width is therefore 2*(h_bar(i) - h_bdry_val) on that side.
 
-    ! X-direction limiter
-    if (valid_E .and. valid_W) then
+    ! X-direction limiter. Use a one-sided difference when only one neighbour
+    ! is valid (e.g. cell adjacent to the ice front) so the slope is preserved
+    ! rather than zeroed: zeroing biases the cell-face value used for outflow
+    ! and pollutes the SSA driving stress at the adjacent corner nodes.
+    if (valid_E) then
       if (hmask(i+1,j) == 3) then
         diff_E = 2.0 * (h_bdry_val(i+1,j) - h_bar(i,j))
       else
         diff_E = h_bar(i+1,j) - h_bar(i,j)
       endif
+    endif
+    if (valid_W) then
       if (hmask(i-1,j) == 3) then
         diff_W = 2.0 * (h_bar(i,j) - h_bdry_val(i-1,j))
       else
         diff_W = h_bar(i,j) - h_bar(i-1,j)
       endif
-      ! Minmod of the two differences and the current slope
-      slope_x_max = minmod3(h_x(i,j), diff_E, diff_W)
-      h_x(i,j) = slope_x_max
+    endif
+    if (valid_E .and. valid_W) then
+      h_x(i,j) = minmod3(h_x(i,j), diff_E, diff_W)
+    elseif (valid_W) then
+      h_x(i,j) = minmod2(h_x(i,j), diff_W)
+    elseif (valid_E) then
+      h_x(i,j) = minmod2(h_x(i,j), diff_E)
     else
-      ! Near ice front: degrade to first order
       h_x(i,j) = 0.0
     endif
 
-    ! Y-direction limiter
-    if (valid_N .and. valid_S) then
+    ! Y-direction limiter (same one-sided handling as X)
+    if (valid_N) then
       if (hmask(i,j+1) == 3) then
         diff_N = 2.0 * (h_bdry_val(i,j+1) - h_bar(i,j))
       else
         diff_N = h_bar(i,j+1) - h_bar(i,j)
       endif
+    endif
+    if (valid_S) then
       if (hmask(i,j-1) == 3) then
         diff_S = 2.0 * (h_bar(i,j) - h_bdry_val(i,j-1))
       else
         diff_S = h_bar(i,j) - h_bar(i,j-1)
       endif
-      slope_y_max = minmod3(h_y(i,j), diff_N, diff_S)
-      h_y(i,j) = slope_y_max
+    endif
+    if (valid_N .and. valid_S) then
+      h_y(i,j) = minmod3(h_y(i,j), diff_N, diff_S)
+    elseif (valid_S) then
+      h_y(i,j) = minmod2(h_y(i,j), diff_S)
+    elseif (valid_N) then
+      h_y(i,j) = minmod2(h_y(i,j), diff_N)
     else
       h_y(i,j) = 0.0
     endif
@@ -6602,6 +6629,23 @@ pure real function minmod3(a, b, c)
     minmod3 = 0.0
   endif
 end function minmod3
+
+
+!> Two-argument minmod: returns 0 if arguments have different signs, otherwise
+!! the argument with the smaller absolute value. Used for one-sided slope
+!! limiting at cells adjacent to the ice front.
+pure real function minmod2(a, b)
+  real, intent(in) :: a !< First argument [Z ~> m]
+  real, intent(in) :: b !< Second argument [Z ~> m]
+
+  if (a > 0.0 .and. b > 0.0) then
+    minmod2 = min(a, b)
+  elseif (a < 0.0 .and. b < 0.0) then
+    minmod2 = max(a, b)
+  else
+    minmod2 = 0.0
+  endif
+end function minmod2
 
 
 !> Compute driving stress at B-grid nodes using sub-element Gauss-point evaluation.
