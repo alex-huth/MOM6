@@ -821,7 +821,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     allocate(CS%Jac(1:4,isd:ied,jsd:jed), source=0.0)
     do j=G%jsd,G%jed ; do i=G%isd,G%ied
       call bilinear_shape_fn_grid(G, i, j, CS%Phi(:,:,i,j), CS%Jac(:,i,j))
-    enddo; enddo
+    enddo ; enddo
 
     if (CS%GL_regularize) then
       allocate(CS%Phisub(2,2,CS%n_sub_regularize,CS%n_sub_regularize,2,2), source=0.0)
@@ -5596,13 +5596,12 @@ subroutine bilinear_shape_functions_subgrid(Phisub, nsub)
     !  1 - 2
 
   integer :: i, j, qx, qy
-  real,dimension(2)    :: xquad
-  real                 :: fracx
+  real,dimension(2)    :: xquad ! [nondim]
+  real                 :: fracx ! The fractional sub-cell area in reference space [nondim]
   ! Mirror-symmetric per-direction node weights: a_left == 1-x_global, a_right == x_global
   ! mathematically, but constructed so that a_right(qx,i) is computed by exactly the same
-  ! operand sequence as a_left(3-qx, nsub+1-i). This guarantees bit-exact rotation symmetry
-  ! of Phisub for any nsub.
-  real, dimension(2,nsub) :: a_left, a_right
+  ! operand sequence as a_left(3-qx, nsub+1-i). This guarantees bit-exact rotation symmetry.
+  real, dimension(2,nsub) :: a_left, a_right ! [nondim]
 
   xquad(1) = .5 * (1-sqrt(1./3)) ; xquad(2) = .5 * (1+sqrt(1./3))
   fracx = 1.0/real(nsub)
