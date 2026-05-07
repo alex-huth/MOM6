@@ -530,6 +530,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   logical :: debug
   integer :: i, j, isd, ied, jsd, jed, Isdq, Iedq, Jsdq, Jedq, iters
   logical :: valid_E, valid_W, valid_N, valid_S ! DG cold-start neighbour-mask checks
+  real :: h_E, h_W, h_N, h_S ! Effective neighbour cell-mean thickness for DG cold-start [Z ~> m]
   character(len=200) :: IS_energyfile  ! The name of the energy file.
   character(len=32) :: filename_appendix = '' ! FMS appendix to filename for ensemble runs
   character(len=16) :: inner_solver_str ! The type of inner solver to use for the SSA
@@ -971,13 +972,36 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
             valid_W = (ISS%hmask(i-1,j) == 1 .or. ISS%hmask(i-1,j) == 3)
             valid_N = (ISS%hmask(i,j+1) == 1 .or. ISS%hmask(i,j+1) == 3)
             valid_S = (ISS%hmask(i,j-1) == 1 .or. ISS%hmask(i,j-1) == 3)
+            ! For hmask==3 neighbours, h_bdry_val is the FACE value at distance
+            ! dx/2 (see ice_shelf_advect_thickness_x). Mirror through the face
+            ! to get an effective cell-mean at distance dx for centred FD.
+            if (ISS%hmask(i+1,j) == 3) then
+              h_E = 2.0 * CS%h_bdry_val(i+1,j) - ISS%h_shelf(i,j)
+            else
+              h_E = ISS%h_shelf(i+1,j)
+            endif
+            if (ISS%hmask(i-1,j) == 3) then
+              h_W = 2.0 * CS%h_bdry_val(i-1,j) - ISS%h_shelf(i,j)
+            else
+              h_W = ISS%h_shelf(i-1,j)
+            endif
+            if (ISS%hmask(i,j+1) == 3) then
+              h_N = 2.0 * CS%h_bdry_val(i,j+1) - ISS%h_shelf(i,j)
+            else
+              h_N = ISS%h_shelf(i,j+1)
+            endif
+            if (ISS%hmask(i,j-1) == 3) then
+              h_S = 2.0 * CS%h_bdry_val(i,j-1) - ISS%h_shelf(i,j)
+            else
+              h_S = ISS%h_shelf(i,j-1)
+            endif
             if (valid_E .and. valid_W) &
-              CS%h_x(i,j) = 0.5 * (ISS%h_shelf(i+1,j) - ISS%h_shelf(i-1,j))
+              CS%h_x(i,j) = 0.5 * (h_E - h_W)
             if (valid_N .and. valid_S) &
-              CS%h_y(i,j) = 0.5 * (ISS%h_shelf(i,j+1) - ISS%h_shelf(i,j-1))
+              CS%h_y(i,j) = 0.5 * (h_N - h_S)
           endif
         enddo ; enddo
-        call DG1_slope_limit(G, ISS%h_shelf, CS%h_x, CS%h_y, ISS%hmask)
+        call DG1_slope_limit(G, ISS%h_shelf, CS%h_x, CS%h_y, ISS%hmask, CS%h_bdry_val)
         call pass_var(CS%h_x, G%domain, complete=.false.)
         call pass_var(CS%h_y, G%domain, complete=.true.)
       endif
@@ -6186,7 +6210,7 @@ subroutine ice_shelf_advect_DG1(CS, ISS, G, time_step, hmask, h_shelf, h_x, h_y,
   enddo ; enddo
 
   ! --- SSP-RK2 Stage 1: h1 = h0 + dt * L(h0) ---
-  call DG1_slope_limit(G, h0, hx0, hy0, hmask)
+  call DG1_slope_limit(G, h0, hx0, hy0, hmask, CS%h_bdry_val)
   call DG1_spatial_operator(CS, G, hmask, h0, hx0, hy0, Rhs_h, Rhs_hx, Rhs_hy, uh_ice, vh_ice)
 
   do j=jsc,jec ; do i=isc,iec
@@ -6203,7 +6227,7 @@ subroutine ice_shelf_advect_DG1(CS, ISS, G, time_step, hmask, h_shelf, h_x, h_y,
   call pass_var(hy1, G%domain)
 
   ! --- SSP-RK2 Stage 2: h_new = 0.5*h0 + 0.5*(h1 + dt * L(h1)) ---
-  call DG1_slope_limit(G, h1, hx1, hy1, hmask)
+  call DG1_slope_limit(G, h1, hx1, hy1, hmask, CS%h_bdry_val)
   call DG1_spatial_operator(CS, G, hmask, h1, hx1, hy1, Rhs_h, Rhs_hx, Rhs_hy, uh_ice, vh_ice)
 
   do j=jsc,jec ; do i=isc,iec
@@ -6218,7 +6242,7 @@ subroutine ice_shelf_advect_DG1(CS, ISS, G, time_step, hmask, h_shelf, h_x, h_y,
   call pass_var(h_y, G%domain)
 
   ! Final slope limit
-  call DG1_slope_limit(G, h_shelf, h_x, h_y, hmask)
+  call DG1_slope_limit(G, h_shelf, h_x, h_y, hmask, CS%h_bdry_val)
 
   ! Scale uh_ice, vh_ice: the spatial operator accumulated fluxes from both RK stages,
   ! so average them (SSP-RK2 gives equal weight to each stage)
@@ -6272,6 +6296,8 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
   real :: flux_hy       ! Flux contribution to y-moment [Z L2 T-1 ~> m3 s-1]
   real :: eta_gp        ! Gauss point coordinate along face [nondim]
   real :: face_flux_total ! Total volume flux through a face [Z L2 T-1 ~> m3 s-1]
+  real :: u_c, u_xi, u_eta ! Bilinear u modes on a cell from B-grid corners [L T-1 ~> m s-1]
+  real :: v_c, v_xi, v_eta ! Bilinear v modes on a cell from B-grid corners [L T-1 ~> m s-1]
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed, gp
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
@@ -6435,19 +6461,33 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
   !   integration by parts: integral(div(u*h)*test, dA) = boundary(u*h*test, ds) - integral(u*h*grad(test), dA)
   ! The above face flux terms are the boundary integral. We need to add the volume integral.
 
-  ! Volume integral contribution: + integral(u*h * d(phi)/dx, dA) for each test function
-  ! For test xi: d(xi)/dx ~ 1/dx, d(xi)/dy = 0
-  ! For test eta: d(eta)/dx = 0, d(eta)/dy ~ 1/dy
-  ! Approximate with cell-center values:
+  ! Volume integral contribution: + integral(u*h * d(phi)/dx, dA) for each test function.
+  ! For test xi: d(xi)/dx = 1/dx, d(xi)/dy = 0; for test eta: vice versa.
+  ! With bilinear u(xi,eta) = u_c + u_xi*xi + u_eta*eta + u_xieta*xi*eta from B-grid
+  ! corners, and linear h(xi,eta) = h_bar + h_x*xi + h_y*eta, the integral over
+  ! [-0.5,0.5]^2 evaluates to:
+  !   integral(u*h, dxi deta) = u_c*h_bar + (u_xi*h_x + u_eta*h_y)/12
+  ! (odd-power terms vanish; the xi*eta cross term contributes nothing because it
+  ! pairs only with odd-power h modes). Same form for v in the y-moment.
   do j=jsc,jec ; do i=isc,iec
     if (hmask(i,j) == 1) then
-      ! Cell-center velocity
-      Rhs_hx(i,j) = Rhs_hx(i,j) + h_bar(i,j) * &
-        0.25 * ((CS%u_shelf(I-1,J-1) + CS%u_shelf(I,J-1)) + &
-                (CS%u_shelf(I-1,J)   + CS%u_shelf(I,J))) * G%IdxT(i,j)
-      Rhs_hy(i,j) = Rhs_hy(i,j) + h_bar(i,j) * &
-        0.25 * ((CS%v_shelf(I-1,J-1) + CS%v_shelf(I,J-1)) + &
-                (CS%v_shelf(I-1,J)   + CS%v_shelf(I,J))) * G%IdyT(i,j)
+      u_c   = 0.25 * ((CS%u_shelf(I-1,J-1) + CS%u_shelf(I,J-1)) + &
+                      (CS%u_shelf(I-1,J)   + CS%u_shelf(I,J)))
+      u_xi  = 0.5  * ((CS%u_shelf(I,J-1)   + CS%u_shelf(I,J)) - &
+                      (CS%u_shelf(I-1,J-1) + CS%u_shelf(I-1,J)))
+      u_eta = 0.5  * ((CS%u_shelf(I-1,J)   + CS%u_shelf(I,J)) - &
+                      (CS%u_shelf(I-1,J-1) + CS%u_shelf(I,J-1)))
+      v_c   = 0.25 * ((CS%v_shelf(I-1,J-1) + CS%v_shelf(I,J-1)) + &
+                      (CS%v_shelf(I-1,J)   + CS%v_shelf(I,J)))
+      v_xi  = 0.5  * ((CS%v_shelf(I,J-1)   + CS%v_shelf(I,J)) - &
+                      (CS%v_shelf(I-1,J-1) + CS%v_shelf(I-1,J)))
+      v_eta = 0.5  * ((CS%v_shelf(I-1,J)   + CS%v_shelf(I,J)) - &
+                      (CS%v_shelf(I-1,J-1) + CS%v_shelf(I,J-1)))
+
+      Rhs_hx(i,j) = Rhs_hx(i,j) + &
+        (u_c * h_bar(i,j) + (u_xi * h_x(i,j) + u_eta * h_y(i,j)) / 12.0) * G%IdxT(i,j)
+      Rhs_hy(i,j) = Rhs_hy(i,j) + &
+        (v_c * h_bar(i,j) + (v_xi * h_x(i,j) + v_eta * h_y(i,j)) / 12.0) * G%IdyT(i,j)
     endif
   enddo ; enddo
 
@@ -6467,7 +6507,7 @@ end subroutine DG1_spatial_operator
 !> Apply a minmod slope limiter to the DG(1) slope moments to prevent oscillations.
 !! Limits h_x and h_y so that the polynomial value at face centers does not
 !! create new extrema relative to neighboring cell averages.
-subroutine DG1_slope_limit(G, h_bar, h_x, h_y, hmask)
+subroutine DG1_slope_limit(G, h_bar, h_x, h_y, hmask, h_bdry_val)
   type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(in)    :: h_bar !< Cell-averaged thickness [Z ~> m]
@@ -6477,6 +6517,9 @@ subroutine DG1_slope_limit(G, h_bar, h_x, h_y, hmask)
                           intent(inout) :: h_y  !< DG y-slope moment [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(in)    :: hmask !< Ice shelf mask
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(in)    :: h_bdry_val !< Dirichlet boundary thickness, used as
+                                              !! a face value at hmask==3 cells [Z ~> m]
 
   real :: diff_E, diff_W, diff_N, diff_S ! Neighbor differences [Z ~> m]
   real :: slope_x_max, slope_y_max       ! Maximum allowed slopes [Z ~> m]
@@ -6497,10 +6540,22 @@ subroutine DG1_slope_limit(G, h_bar, h_x, h_y, hmask)
     valid_N = (hmask(i,j+1) == 1 .or. hmask(i,j+1) == 3)
     valid_S = (hmask(i,j-1) == 1 .or. hmask(i,j-1) == 3)
 
+    ! At hmask==3 neighbours, h_bdry_val is the FACE value at distance dx/2
+    ! (see ice_shelf_advect_thickness_x). The cell-mean difference across one
+    ! cell width is therefore 2*(h_bar(i) - h_bdry_val) on that side.
+
     ! X-direction limiter
     if (valid_E .and. valid_W) then
-      diff_E = h_bar(i+1,j) - h_bar(i,j)
-      diff_W = h_bar(i,j) - h_bar(i-1,j)
+      if (hmask(i+1,j) == 3) then
+        diff_E = 2.0 * (h_bdry_val(i+1,j) - h_bar(i,j))
+      else
+        diff_E = h_bar(i+1,j) - h_bar(i,j)
+      endif
+      if (hmask(i-1,j) == 3) then
+        diff_W = 2.0 * (h_bar(i,j) - h_bdry_val(i-1,j))
+      else
+        diff_W = h_bar(i,j) - h_bar(i-1,j)
+      endif
       ! Minmod of the two differences and the current slope
       slope_x_max = minmod3(h_x(i,j), diff_E, diff_W)
       h_x(i,j) = slope_x_max
@@ -6511,8 +6566,16 @@ subroutine DG1_slope_limit(G, h_bar, h_x, h_y, hmask)
 
     ! Y-direction limiter
     if (valid_N .and. valid_S) then
-      diff_N = h_bar(i,j+1) - h_bar(i,j)
-      diff_S = h_bar(i,j) - h_bar(i,j-1)
+      if (hmask(i,j+1) == 3) then
+        diff_N = 2.0 * (h_bdry_val(i,j+1) - h_bar(i,j))
+      else
+        diff_N = h_bar(i,j+1) - h_bar(i,j)
+      endif
+      if (hmask(i,j-1) == 3) then
+        diff_S = 2.0 * (h_bar(i,j) - h_bdry_val(i,j-1))
+      else
+        diff_S = h_bar(i,j) - h_bar(i,j-1)
+      endif
       slope_y_max = minmod3(h_y(i,j), diff_N, diff_S)
       h_y(i,j) = slope_y_max
     else
