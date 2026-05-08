@@ -230,6 +230,11 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: moving_shelf_front  !< Specify whether to advance shelf front (and calve).
   logical :: use_DG_thickness     !< If true, use DG(1) representation for ice thickness with
                                   !! unsplit advection scheme and sub-element driving stress quadrature.
+  integer :: dg1_limiter_choice   !< Slope-limiter choice for DG(1) thickness:
+                                  !! 0 = none, 1 = minmod (legacy), 2 = Venkatakrishnan.
+  real :: dg1_limiter_M           !< TVB-style curvature bound for the Venkatakrishnan
+                                  !! smooth-extremum protection band: eps = M * dx_local^2
+                                  !! [Z L-2 ~> m-1].
   logical :: calve_to_mask       !< If true, calve off the ice shelf when it passes the edge of a mask.
   real :: min_thickness_simple_calve !< min. ice shelf thickness criteria for calving [Z ~> m].
   real :: T_shelf_missing   !< An ice shelf temperature to use where there is no ice shelf [C ~> degC]
@@ -310,7 +315,20 @@ type, public :: ice_shelf_dyn_CS ; private
   !>@{ Diagnostic handles for debugging
   integer :: id_h_after_uflux = -1, id_h_after_vflux = -1, id_h_after_adv = -1, &
              id_visc_shelf = -1, id_taub = -1, &
-             id_bed_node = -1, id_h_x = -1, id_h_y = -1
+             id_bed_node = -1, id_h_x = -1, id_h_y = -1, &
+             id_phi_x_DG = -1, id_phi_y_DG = -1, &
+             id_phi_x_FV = -1, id_phi_y_FV = -1
+  real, pointer, dimension(:,:) :: phi_x_DG => NULL() !< DG(1) limiter factor in x at last advection
+                                                       !! call [nondim], in [0,1].
+  real, pointer, dimension(:,:) :: phi_y_DG => NULL() !< DG(1) limiter factor in y at last advection
+                                                       !! call [nondim], in [0,1].
+  real, pointer, dimension(:,:) :: phi_x_FV => NULL() !< Van Leer slope-limiter factor at each u-face
+                                                       !! from ice_shelf_advect_thickness_x [nondim],
+                                                       !! in [0,2]. Faces where the limiter branch was
+                                                       !! not taken (incomplete stencil, inactive face)
+                                                       !! report 1.0.
+  real, pointer, dimension(:,:) :: phi_y_FV => NULL() !< Van Leer slope-limiter factor at each v-face
+                                                       !! from ice_shelf_advect_thickness_y [nondim].
   !>@}
   type(diag_ctrl), pointer :: diag => NULL() !< A structure that is used to control diagnostic output.
 
@@ -451,6 +469,10 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%bed_node(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%h_x(isd:ied,jsd:jed), source=0.0)
     allocate(CS%h_y(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%phi_x_DG(isd:ied,jsd:jed), source=1.0)
+    allocate(CS%phi_y_DG(isd:ied,jsd:jed), source=1.0)
+    allocate(CS%phi_x_FV(IsdB:IedB,jsd:jed), source=1.0)
+    allocate(CS%phi_y_FV(isd:ied,JsdB:JedB), source=1.0)
     allocate(CS%u_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%v_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%u_face_mask_bdry(IsdB:IedB,JsdB:JedB), source=-2.0)
@@ -727,6 +749,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "with unsplit RK2 advection and sub-element Gauss quadrature for "//&
                  "driving stress. Requires h_x and h_y slope moments.", &
                  default=.false.)
+    call read_dg1_limiter_params(param_file, mdl, CS, US)
     call get_param(param_file, mdl, "REENTRANT_X", CS%reentrant_x, &
                  " If true, the domain is zonally reentrant.", &
                  default=.false.)
@@ -1013,7 +1036,8 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
             endif
           endif
         enddo ; enddo
-        call DG1_slope_limit(G, ISS%h_shelf, CS%h_x, CS%h_y, ISS%hmask, CS%h_bdry_val)
+        call DG1_slope_limit(G, ISS%h_shelf, CS%h_x, CS%h_y, ISS%hmask, CS%h_bdry_val, &
+                             CS%dg1_limiter_choice, CS%dg1_limiter_M)
         call pass_var(CS%h_x, G%domain, complete=.false.)
         call pass_var(CS%h_y, G%domain, complete=.true.)
       endif
@@ -1077,6 +1101,18 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          'm', conversion=US%Z_to_m)
       CS%id_h_y = register_diag_field('ice_shelf_model','h_y',CS%diag%axesT1, Time, &
          'DG(1) y-slope moment of ice thickness', 'm', conversion=US%Z_to_m)
+      CS%id_phi_x_DG = register_diag_field('ice_shelf_model','phi_x_DG',CS%diag%axesT1, Time, &
+         'DG(1) slope-limiter factor in x at end-of-timestep (1=no clip, 0=full clip)', 'nondim')
+      CS%id_phi_y_DG = register_diag_field('ice_shelf_model','phi_y_DG',CS%diag%axesT1, Time, &
+         'DG(1) slope-limiter factor in y at end-of-timestep (1=no clip, 0=full clip)', 'nondim')
+    else
+      CS%id_phi_x_FV = register_diag_field('ice_shelf_model','phi_x_FV',CS%diag%axesCu1, Time, &
+         'Van Leer slope-limiter factor at each u-face from ice_shelf_advect_thickness_x '//&
+         '(1=no clip / smooth balanced, 0=full clip, 2=max compressive; faces where the limiter '//&
+         'branch was not taken report 1.0)', 'nondim')
+      CS%id_phi_y_FV = register_diag_field('ice_shelf_model','phi_y_FV',CS%diag%axesCv1, Time, &
+         'Van Leer slope-limiter factor at each v-face from ice_shelf_advect_thickness_y '//&
+         '(range [0,2])', 'nondim')
     endif
 
     CS%id_duHdx = register_diag_field('ice_shelf_model','duHdx',CS%diag%axesT1, Time, &
@@ -1382,6 +1418,14 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
     if (CS%id_bed_node > 0) call post_data(CS%id_bed_node, CS%bed_node, CS%diag)
     if (CS%id_h_x > 0) call post_data(CS%id_h_x, CS%h_x, CS%diag)
     if (CS%id_h_y > 0) call post_data(CS%id_h_y, CS%h_y, CS%diag)
+    if (CS%id_phi_x_DG > 0 .and. associated(CS%phi_x_DG)) &
+        call post_data(CS%id_phi_x_DG, CS%phi_x_DG, CS%diag)
+    if (CS%id_phi_y_DG > 0 .and. associated(CS%phi_y_DG)) &
+        call post_data(CS%id_phi_y_DG, CS%phi_y_DG, CS%diag)
+    if (CS%id_phi_x_FV > 0 .and. associated(CS%phi_x_FV)) &
+        call post_data(CS%id_phi_x_FV, CS%phi_x_FV, CS%diag)
+    if (CS%id_phi_y_FV > 0 .and. associated(CS%phi_y_FV)) &
+        call post_data(CS%id_phi_y_FV, CS%phi_y_FV, CS%diag)
     if (CS%id_u_mask > 0) call post_data(CS%id_u_mask, CS%umask, CS%diag)
     if (CS%id_v_mask > 0) call post_data(CS%id_v_mask, CS%vmask, CS%diag)
     if (CS%id_ufb_mask > 0) call post_data(CS%id_ufb_mask, CS%u_face_mask_bdry, CS%diag)
@@ -1602,6 +1646,11 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
     call pass_var(CS%h_x, G%domain)
     call pass_var(CS%h_y, G%domain)
   else
+    ! Reset FV slope-limiter face diagnostic; advect_thickness_x/y writes slope_lim
+    ! at each face where the limiter branch is taken. Faces not visited (incomplete
+    ! stencil at front, inactive face) report 1.0.
+    if (associated(CS%phi_x_FV)) CS%phi_x_FV(:,:) = 1.0
+    if (associated(CS%phi_y_FV)) CS%phi_y_FV(:,:) = 1.0
     stencil = 2
     if (modulo(CS%first_direction_IS,2)==0) then
       !x first
@@ -1629,6 +1678,7 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
         if (ISS%hmask(i,j) == 1) ISS%h_shelf(i,j) = h_after_flux2(i,j)
       enddo
     enddo
+
   endif
 
   if (CS%calc_flux_inout) call calculate_flux_inout(CS, ISS, G, uh_ice, vh_ice)
@@ -3023,6 +3073,7 @@ subroutine ice_shelf_advect_thickness_x(CS, G, LB, time_step, hmask, h0, h_after
             slope_lim = slope_limiter(h0(i,j)-h0(i-1,j), h0(i+1,j)-h0(i,j))
             ! This is a 2nd-order centered scheme with a slope limiter.  We could try PPM here.
             h_face = h0(i,j) - slope_lim * (0.5 * (h0(i,j)-h0(i+1,j)))
+            if (associated(CS%phi_x_FV)) CS%phi_x_FV(I,j) = slope_lim
           else
             h_face = h0(i,j)
           endif
@@ -3035,6 +3086,7 @@ subroutine ice_shelf_advect_thickness_x(CS, G, LB, time_step, hmask, h0, h_after
             (hmask(i+2,j) == 1 .or. hmask(i+2,j) == 3)) then
             slope_lim = slope_limiter(h0(i+1,j)-h0(i,j), h0(i+2,j)-h0(i+1,j))
             h_face = h0(i+1,j) - slope_lim * (0.5 * (h0(i+2,j)-h0(i+1,j)))
+            if (associated(CS%phi_x_FV)) CS%phi_x_FV(I,j) = slope_lim
           else
             h_face = h0(i+1,j)
           endif
@@ -3104,6 +3156,7 @@ subroutine ice_shelf_advect_thickness_y(CS, G, LB, time_step, hmask, h0, h_after
             slope_lim = slope_limiter(h0(i,j)-h0(i,j-1), h0(i,j+1)-h0(i,j))
             ! This is a 2nd-order centered scheme with a slope limiter.  We could try PPM here.
             h_face = h0(i,j) - slope_lim * (0.5 * (h0(i,j)-h0(i,j+1)))
+            if (associated(CS%phi_y_FV)) CS%phi_y_FV(i,J) = slope_lim
           else
             h_face = h0(i,j)
           endif
@@ -3116,6 +3169,7 @@ subroutine ice_shelf_advect_thickness_y(CS, G, LB, time_step, hmask, h0, h_after
             (hmask(i,j+2) == 1 .or. hmask(i,j+2) == 3)) then
             slope_lim = slope_limiter(h0(i,j+1)-h0(i,j), h0(i,j+2)-h0(i,j+1))
             h_face = h0(i,j+1) - slope_lim * (0.5 * (h0(i,j+2)-h0(i,j+1)))
+            if (associated(CS%phi_y_FV)) CS%phi_y_FV(i,J) = slope_lim
           else
             h_face = h0(i,j+1)
           endif
@@ -5755,6 +5809,10 @@ subroutine ice_shelf_dyn_end(CS)
   deallocate(CS%OD_rt, CS%OD_av)
   deallocate(CS%t_bdry_val, CS%bed_elev, CS%bed_node)
   deallocate(CS%h_x, CS%h_y)
+  if (associated(CS%phi_x_DG)) deallocate(CS%phi_x_DG)
+  if (associated(CS%phi_y_DG)) deallocate(CS%phi_y_DG)
+  if (associated(CS%phi_x_FV)) deallocate(CS%phi_x_FV)
+  if (associated(CS%phi_y_FV)) deallocate(CS%phi_y_FV)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
   if (associated(CS%Jac)) deallocate(CS%Jac)
   if (associated(CS%Phi)) deallocate(CS%Phi)
@@ -6222,7 +6280,8 @@ subroutine ice_shelf_advect_DG1(CS, ISS, G, time_step, hmask, h_shelf, h_x, h_y,
   enddo ; enddo
 
   ! --- SSP-RK2 Stage 1: h1 = h0 + dt * L(h0) ---
-  call DG1_slope_limit(G, h0, hx0, hy0, hmask, CS%h_bdry_val)
+  call DG1_slope_limit(G, h0, hx0, hy0, hmask, CS%h_bdry_val, &
+                       CS%dg1_limiter_choice, CS%dg1_limiter_M)
   call DG1_spatial_operator(CS, G, hmask, h0, hx0, hy0, Rhs_h, Rhs_hx, Rhs_hy, uh_ice, vh_ice)
 
   do j=jsc,jec ; do i=isc,iec
@@ -6239,7 +6298,8 @@ subroutine ice_shelf_advect_DG1(CS, ISS, G, time_step, hmask, h_shelf, h_x, h_y,
   call pass_var(hy1, G%domain)
 
   ! --- SSP-RK2 Stage 2: h_new = 0.5*h0 + 0.5*(h1 + dt * L(h1)) ---
-  call DG1_slope_limit(G, h1, hx1, hy1, hmask, CS%h_bdry_val)
+  call DG1_slope_limit(G, h1, hx1, hy1, hmask, CS%h_bdry_val, &
+                       CS%dg1_limiter_choice, CS%dg1_limiter_M)
   call DG1_spatial_operator(CS, G, hmask, h1, hx1, hy1, Rhs_h, Rhs_hx, Rhs_hy, uh_ice, vh_ice)
 
   do j=jsc,jec ; do i=isc,iec
@@ -6253,8 +6313,11 @@ subroutine ice_shelf_advect_DG1(CS, ISS, G, time_step, hmask, h_shelf, h_x, h_y,
   call pass_var(h_x, G%domain)
   call pass_var(h_y, G%domain)
 
-  ! Final slope limit
-  call DG1_slope_limit(G, h_shelf, h_x, h_y, hmask, CS%h_bdry_val)
+  ! Final slope limit. Capture the limiter factors here so they reflect the
+  ! limiter's effect on the state stored at end-of-timestep.
+  call DG1_slope_limit(G, h_shelf, h_x, h_y, hmask, CS%h_bdry_val, &
+                       CS%dg1_limiter_choice, CS%dg1_limiter_M, &
+                       phi_x_out=CS%phi_x_DG, phi_y_out=CS%phi_y_DG)
 
   ! Scale uh_ice, vh_ice: the spatial operator accumulated fluxes from both RK stages,
   ! so average them (SSP-RK2 gives equal weight to each stage)
@@ -6516,10 +6579,17 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
 end subroutine DG1_spatial_operator
 
 
-!> Apply a minmod slope limiter to the DG(1) slope moments to prevent oscillations.
-!! Limits h_x and h_y so that the polynomial value at face centers does not
-!! create new extrema relative to neighboring cell averages.
-subroutine DG1_slope_limit(G, h_bar, h_x, h_y, hmask, h_bdry_val)
+!> Apply a slope limiter to the DG(1) slope moments to control oscillations.
+!! Operates per-direction on h_x and h_y so the algorithm is symmetric in
+!! x and y (rotation-invariant under 90-degree grid rotations).
+!! Dispatches on limiter_choice:
+!!  0 = no limiting,
+!!  1 = minmod (legacy),
+!!  2 = Venkatakrishnan with TVB-Cockburn-Shu eps band eps = M*dx**2.
+!! When phi_x_out / phi_y_out are present, the limiter factors that were
+!! applied to h_x, h_y are returned (1 = no clipping, 0 = full clip).
+subroutine DG1_slope_limit(G, h_bar, h_x, h_y, hmask, h_bdry_val, &
+                           limiter_choice, vk_M, phi_x_out, phi_y_out)
   type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(in)    :: h_bar !< Cell-averaged thickness [Z ~> m]
@@ -6532,18 +6602,36 @@ subroutine DG1_slope_limit(G, h_bar, h_x, h_y, hmask, h_bdry_val)
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(in)    :: h_bdry_val !< Dirichlet boundary thickness, used as
                                               !! a face value at hmask==3 cells [Z ~> m]
+  integer,                intent(in)    :: limiter_choice !< 0=none, 1=minmod, 2=Venkatakrishnan
+  real,                   intent(in)    :: vk_M !< TVB curvature bound [Z L-2 ~> m-1]
+                                              !! used when limiter_choice == 2.
+  real, dimension(SZDI_(G),SZDJ_(G)), optional, &
+                          intent(out)   :: phi_x_out !< x limiter factor [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G)), optional, &
+                          intent(out)   :: phi_y_out !< y limiter factor [nondim]
 
   real :: diff_E, diff_W, diff_N, diff_S ! Neighbor differences [Z ~> m]
-  real :: slope_x_max, slope_y_max       ! Maximum allowed slopes [Z ~> m]
-  real :: alpha                          ! Limiter reduction factor [nondim]
+  real :: h_E_eff, h_W_eff, h_N_eff, h_S_eff ! Effective neighbour means [Z ~> m]
+  real :: h_max_x, h_min_x, h_max_y, h_min_y ! Cell-neighbourhood envelope [Z ~> m]
+  real :: delta1_E, delta1_W, delta1_N, delta1_S ! Allowed face increments [Z ~> m]
+  real :: delta2_E, delta2_W, delta2_N, delta2_S ! Predicted face increments [Z ~> m]
+  real :: phi_E, phi_W, phi_N, phi_S, phi_x, phi_y ! Per-face/cell Venk factors [nondim]
+  real :: eps_sq_x, eps_sq_y             ! Smooth-extremum band squared [Z2 ~> m2]
   integer :: i, j, isc, iec, jsc, jec
   logical :: valid_E, valid_W, valid_N, valid_S
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
 
+  if (present(phi_x_out)) phi_x_out(:,:) = 1.0
+  if (present(phi_y_out)) phi_y_out(:,:) = 1.0
+
+  if (limiter_choice == 0) return ! "none"
+
   do j=jsc,jec ; do i=isc,iec
     if (hmask(i,j) /= 1) then
       h_x(i,j) = 0.0 ; h_y(i,j) = 0.0
+      ! if (present(phi_x_out)) phi_x_out(i,j) = 0.0
+      ! if (present(phi_y_out)) phi_y_out(i,j) = 0.0
       cycle
     endif
 
@@ -6552,65 +6640,270 @@ subroutine DG1_slope_limit(G, h_bar, h_x, h_y, hmask, h_bdry_val)
     valid_N = (hmask(i,j+1) == 1 .or. hmask(i,j+1) == 3)
     valid_S = (hmask(i,j-1) == 1 .or. hmask(i,j-1) == 3)
 
-    ! At hmask==3 neighbours, h_bdry_val is the FACE value at distance dx/2
-    ! (see ice_shelf_advect_thickness_x). The cell-mean difference across one
-    ! cell width is therefore 2*(h_bar(i) - h_bdry_val) on that side.
+    if (limiter_choice == 1) then
+      ! ---- Minmod (legacy) ----
+      ! At hmask==3 neighbours, h_bdry_val is the FACE value at distance dx/2
+      ! (see ice_shelf_advect_thickness_x). The cell-mean difference across one
+      ! cell width is therefore 2*(h_bar(i) - h_bdry_val) on that side.
 
-    ! X-direction limiter. Use a one-sided difference when only one neighbour
-    ! is valid (e.g. cell adjacent to the ice front) so the slope is preserved
-    ! rather than zeroed: zeroing biases the cell-face value used for outflow
-    ! and pollutes the SSA driving stress at the adjacent corner nodes.
-    if (valid_E) then
-      if (hmask(i+1,j) == 3) then
-        diff_E = 2.0 * (h_bdry_val(i+1,j) - h_bar(i,j))
-      else
-        diff_E = h_bar(i+1,j) - h_bar(i,j)
+      ! X-direction limiter. Use a one-sided difference when only one neighbour
+      ! is valid (e.g. cell adjacent to the ice front) so the slope is preserved
+      ! rather than zeroed: zeroing biases the cell-face value used for outflow
+      ! and pollutes the SSA driving stress at the adjacent corner nodes.
+      if (valid_E) then
+        if (hmask(i+1,j) == 3) then
+          diff_E = 2.0 * (h_bdry_val(i+1,j) - h_bar(i,j))
+        else
+          diff_E = h_bar(i+1,j) - h_bar(i,j)
+        endif
       endif
-    endif
-    if (valid_W) then
-      if (hmask(i-1,j) == 3) then
-        diff_W = 2.0 * (h_bar(i,j) - h_bdry_val(i-1,j))
-      else
-        diff_W = h_bar(i,j) - h_bar(i-1,j)
+      if (valid_W) then
+        if (hmask(i-1,j) == 3) then
+          diff_W = 2.0 * (h_bar(i,j) - h_bdry_val(i-1,j))
+        else
+          diff_W = h_bar(i,j) - h_bar(i-1,j)
+        endif
       endif
-    endif
-    if (valid_E .and. valid_W) then
-      h_x(i,j) = minmod3(h_x(i,j), diff_E, diff_W)
-    elseif (valid_W) then
-      h_x(i,j) = minmod2(h_x(i,j), diff_W)
-    elseif (valid_E) then
-      h_x(i,j) = minmod2(h_x(i,j), diff_E)
-    else
-      h_x(i,j) = 0.0
-    endif
+      if (valid_E .and. valid_W) then
+        h_x(i,j) = minmod3(h_x(i,j), diff_E, diff_W)
+      elseif (valid_W) then
+        h_x(i,j) = minmod2(h_x(i,j), diff_W)
+      elseif (valid_E) then
+        h_x(i,j) = minmod2(h_x(i,j), diff_E)
+      else
+        h_x(i,j) = 0.0
+      endif
 
-    ! Y-direction limiter (same one-sided handling as X)
-    if (valid_N) then
-      if (hmask(i,j+1) == 3) then
-        diff_N = 2.0 * (h_bdry_val(i,j+1) - h_bar(i,j))
-      else
-        diff_N = h_bar(i,j+1) - h_bar(i,j)
+      ! Y-direction limiter (same one-sided handling as X)
+      if (valid_N) then
+        if (hmask(i,j+1) == 3) then
+          diff_N = 2.0 * (h_bdry_val(i,j+1) - h_bar(i,j))
+        else
+          diff_N = h_bar(i,j+1) - h_bar(i,j)
+        endif
       endif
-    endif
-    if (valid_S) then
-      if (hmask(i,j-1) == 3) then
-        diff_S = 2.0 * (h_bar(i,j) - h_bdry_val(i,j-1))
-      else
-        diff_S = h_bar(i,j) - h_bar(i,j-1)
+      if (valid_S) then
+        if (hmask(i,j-1) == 3) then
+          diff_S = 2.0 * (h_bar(i,j) - h_bdry_val(i,j-1))
+        else
+          diff_S = h_bar(i,j) - h_bar(i,j-1)
+        endif
       endif
-    endif
-    if (valid_N .and. valid_S) then
-      h_y(i,j) = minmod3(h_y(i,j), diff_N, diff_S)
-    elseif (valid_S) then
-      h_y(i,j) = minmod2(h_y(i,j), diff_S)
-    elseif (valid_N) then
-      h_y(i,j) = minmod2(h_y(i,j), diff_N)
+      if (valid_N .and. valid_S) then
+        h_y(i,j) = minmod3(h_y(i,j), diff_N, diff_S)
+      elseif (valid_S) then
+        h_y(i,j) = minmod2(h_y(i,j), diff_S)
+      elseif (valid_N) then
+        h_y(i,j) = minmod2(h_y(i,j), diff_N)
+      else
+        h_y(i,j) = 0.0
+      endif
+
     else
-      h_y(i,j) = 0.0
+      ! ---- Venkatakrishnan with TVB-Cockburn-Shu eps band ----
+      ! eps = M * dx_local**2 (separately in x and y). Per-direction structure
+      ! is symmetric in x and y so the algorithm is invariant under 90-degree
+      ! grid rotations.
+
+      ! Effective neighbour cell-mean values via face-mirror at hmask==3.
+      if (valid_E) then
+        if (hmask(i+1,j) == 3) then
+          h_E_eff = 2.0 * h_bdry_val(i+1,j) - h_bar(i,j)
+        else
+          h_E_eff = h_bar(i+1,j)
+        endif
+      endif
+      if (valid_W) then
+        if (hmask(i-1,j) == 3) then
+          h_W_eff = 2.0 * h_bdry_val(i-1,j) - h_bar(i,j)
+        else
+          h_W_eff = h_bar(i-1,j)
+        endif
+      endif
+      if (valid_N) then
+        if (hmask(i,j+1) == 3) then
+          h_N_eff = 2.0 * h_bdry_val(i,j+1) - h_bar(i,j)
+        else
+          h_N_eff = h_bar(i,j+1)
+        endif
+      endif
+      if (valid_S) then
+        if (hmask(i,j-1) == 3) then
+          h_S_eff = 2.0 * h_bdry_val(i,j-1) - h_bar(i,j)
+        else
+          h_S_eff = h_bar(i,j-1)
+        endif
+      endif
+
+      ! ---- X-direction limiter ----
+      ! Cell-neighbourhood envelope (cell mean + valid x-neighbours):
+      h_max_x = h_bar(i,j) ; h_min_x = h_bar(i,j)
+      if (valid_E) then
+        h_max_x = max(h_max_x, h_E_eff) ; h_min_x = min(h_min_x, h_E_eff)
+      endif
+      if (valid_W) then
+        h_max_x = max(h_max_x, h_W_eff) ; h_min_x = min(h_min_x, h_W_eff)
+      endif
+
+      ! Predicted face increments (basis: face = h_bar +/- h_x/2):
+      delta2_E = +0.5 * h_x(i,j)
+      delta2_W = -0.5 * h_x(i,j)
+
+      ! TVB-Cockburn-Shu eps band, cell-local in dx:
+      eps_sq_x = (vk_M * G%dxT(i,j)*G%dxT(i,j))**2
+
+      ! Per-face Venkatakrishnan factor:
+      if (valid_E) then
+        if (delta2_E > 0.0) then
+          delta1_E = h_max_x - h_bar(i,j)
+        else
+          delta1_E = h_min_x - h_bar(i,j)
+        endif
+        phi_E = venk_factor(delta1_E, delta2_E, eps_sq_x)
+      else
+        phi_E = huge(1.0)
+      endif
+      if (valid_W) then
+        if (delta2_W > 0.0) then
+          delta1_W = h_max_x - h_bar(i,j)
+        else
+          delta1_W = h_min_x - h_bar(i,j)
+        endif
+        phi_W = venk_factor(delta1_W, delta2_W, eps_sq_x)
+      else
+        phi_W = huge(1.0)
+      endif
+      if (valid_E .or. valid_W) then
+        phi_x = min(phi_E, phi_W)
+      else
+        phi_x = 0.0
+      endif
+      h_x(i,j) = phi_x * h_x(i,j)
+      if (present(phi_x_out)) phi_x_out(i,j) = phi_x
+
+      ! ---- Y-direction limiter ----
+      ! Cell-neighbourhood envelope (cell mean + valid y-neighbours):
+      h_max_y = h_bar(i,j) ; h_min_y = h_bar(i,j)
+      if (valid_N) then
+        h_max_y = max(h_max_y, h_N_eff) ; h_min_y = min(h_min_y, h_N_eff)
+      endif
+      if (valid_S) then
+        h_max_y = max(h_max_y, h_S_eff) ; h_min_y = min(h_min_y, h_S_eff)
+      endif
+
+      delta2_N = +0.5 * h_y(i,j)
+      delta2_S = -0.5 * h_y(i,j)
+
+      eps_sq_y = (vk_M * G%dyT(i,j)*G%dyT(i,j))**2
+
+      if (valid_N) then
+        if (delta2_N > 0.0) then
+          delta1_N = h_max_y - h_bar(i,j)
+        else
+          delta1_N = h_min_y - h_bar(i,j)
+        endif
+        phi_N = venk_factor(delta1_N, delta2_N, eps_sq_y)
+      else
+        phi_N = huge(1.0)
+      endif
+      if (valid_S) then
+        if (delta2_S > 0.0) then
+          delta1_S = h_max_y - h_bar(i,j)
+        else
+          delta1_S = h_min_y - h_bar(i,j)
+        endif
+        phi_S = venk_factor(delta1_S, delta2_S, eps_sq_y)
+      else
+        phi_S = huge(1.0)
+      endif
+      if (valid_N .or. valid_S) then
+        phi_y = min(phi_N, phi_S)
+      else
+        phi_y = 0.0
+      endif
+      h_y(i,j) = phi_y * h_y(i,j)
+      if (present(phi_y_out)) phi_y_out(i,j) = phi_y
     endif
   enddo ; enddo
 
 end subroutine DG1_slope_limit
+
+
+!> Smooth Venkatakrishnan limiter factor for one face of a DG cell.
+!! Returns phi in [0, 1]: 1 means no clipping (predicted face value lies
+!! safely inside the cell-neighbourhood envelope, or both delta1 and delta2
+!! are small relative to eps so the face is treated as a smooth extremum);
+!! 0 means full clip; intermediate values smoothly clip.
+pure real function venk_factor(delta1, delta2, eps_sq)
+  real, intent(in) :: delta1   !< Allowed increment to local max/min [Z ~> m]
+  real, intent(in) :: delta2   !< Predicted increment from DG slope [Z ~> m]
+  real, intent(in) :: eps_sq   !< Smooth-extremum band squared [Z2 ~> m2]
+  real :: num, denom
+
+  if (delta2 == 0.0) then
+    venk_factor = 1.0
+    return
+  endif
+
+  num   = (delta1*delta1 + eps_sq) * delta2 + 2.0 * delta2*delta2 * delta1
+  denom = delta2 * (delta1*delta1 + 2.0*delta2*delta2 + delta1*delta2 + eps_sq)
+
+  if (denom == 0.0) then
+    venk_factor = 1.0
+  else
+    venk_factor = num / denom
+  endif
+  ! Clamp to [0, 1]; the analytic value is in this range when delta1 and
+  ! delta2 agree in sign, but eps>0 can produce tiny floating-point drift.
+  venk_factor = max(0.0, min(1.0, venk_factor))
+end function venk_factor
+
+
+!> Read DG(1) slope-limiter runtime parameters and map the choice string
+!! to the integer enum stored in CS%dg1_limiter_choice.
+subroutine read_dg1_limiter_params(param_file, mdl, CS, US)
+  type(param_file_type),   intent(in)    :: param_file !< Parameter file
+  character(len=*),        intent(in)    :: mdl        !< Module name
+  type(ice_shelf_dyn_CS),  intent(inout) :: CS         !< Ice-shelf control structure
+  type(unit_scale_type),   intent(in)    :: US         !< Unit scaling structure
+
+  character(len=40) :: limiter_str
+
+  call get_param(param_file, mdl, "DG1_LIMITER", limiter_str, &
+                 "Slope limiter for DG(1) ice thickness. One of: "//&
+                 "'venkatakrishnan' (default), 'minmod' (legacy, biased "//&
+                 "on smooth concave-monotone flow), 'none' (no limiting). "//&
+                 "Venkatakrishnan returns the DG-evolved slope unchanged when "//&
+                 "the predicted face value lies safely inside the cell-"//&
+                 "neighbourhood envelope, smoothly clips when it doesn't, "//&
+                 "and protects smooth interior extrema via the eps band set "//&
+                 "by DG1_LIMITER_M.", &
+                 default="venkatakrishnan", do_not_log=.not.CS%use_DG_thickness)
+  select case (trim(limiter_str))
+  case ("none");            CS%dg1_limiter_choice = 0
+  case ("minmod");          CS%dg1_limiter_choice = 1
+  case ("venkatakrishnan"); CS%dg1_limiter_choice = 2
+  case default
+    call MOM_error(FATAL, "read_dg1_limiter_params: DG1_LIMITER must be "//&
+                          "one of: none, minmod, venkatakrishnan.")
+  end select
+
+  call get_param(param_file, mdl, "DG1_LIMITER_M", CS%dg1_limiter_M, &
+                 "TVB-style curvature bound for the Venkatakrishnan smooth-"//&
+                 "extremum protection band. The local band is set as eps = "//&
+                 "M * dx_local^2; M is the user's upper bound on |d^2 h / "//&
+                 "dx^2| in smooth regions of the solution. Larger M widens "//&
+                 "the bypass (more smooth extrema protected); smaller M "//&
+                 "tightens it (more clipping). M=0 recovers pure smooth "//&
+                 "Venkatakrishnan with no extremum protection; M very "//&
+                 "large effectively disables the limiter. Only used when "//&
+                 "DG1_LIMITER=venkatakrishnan.", &
+                 units="m-1", default=1.0e-6, &
+                 scale=US%m_to_Z/(US%m_to_L*US%m_to_L), &
+                 do_not_log=(.not.CS%use_DG_thickness) .or. &
+                            (CS%dg1_limiter_choice /= 2))
+
+end subroutine read_dg1_limiter_params
 
 
 !> Three-argument minmod function used by the DG slope limiter.
