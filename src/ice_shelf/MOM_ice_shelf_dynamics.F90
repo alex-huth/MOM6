@@ -7406,9 +7406,12 @@ subroutine reconstruct_bed_to_nodes(CS, G, hmask)
   real    :: tol          ! Convergence tolerance [Z ~> m]
   real    :: c00, c10, c01, c11 ! Per-cell-of-node contributions, used to assemble
                                 ! a rotation-invariant 4-element reduction [Z ~> m]
+  real :: damping ! Damps the step size each iteration [nondim]
+
   integer :: i, j, iter, num_cells
   integer :: isc, iec, jsc, jec, IsdB, IedB, JsdB, JedB
-  integer, parameter :: max_iter = 100
+  integer, parameter :: max_iter = 1000
+  character(len=160) :: mesg  ! The text of a MOM message
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   IsdB = G%IsdB ; IedB = G%IedB ; JsdB = G%JsdB ; JedB = G%JedB
@@ -7475,7 +7478,7 @@ subroutine reconstruct_bed_to_nodes(CS, G, hmask)
       residual = (c00 + c11) + (c10 + c01)
 
       if (num_cells > 0) then
-        bed_node_new(I,J) = CS%bed_node(I,J) + residual / real(num_cells)
+        bed_node_new(I,J) = CS%bed_node(I,J) + damping * residual / real(num_cells)
       endif
     enddo ; enddo
 
@@ -7495,6 +7498,9 @@ subroutine reconstruct_bed_to_nodes(CS, G, hmask)
 
     if (max_err < tol) exit
   enddo
+
+  write(mesg,*) "reconstruct_bed_to_nodes max error ", max_err
+  call MOM_mesg(mesg)
 
   if (max_err >= tol) then
     call MOM_mesg("reconstruct_bed_to_nodes: WARNING - did not converge after max_iter iterations")
