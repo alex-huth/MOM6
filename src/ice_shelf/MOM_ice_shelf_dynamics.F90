@@ -3930,11 +3930,12 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
         if (grounded_qp) then
           ! DG mode: per-Gauss-point grounding check and fB computation
           if (do_DG) then
-            h_gp = max(h_shelf(i,j) + CS%h_x(i,j)*(xquad(iq)-0.5) + CS%h_y(i,j)*(xquad(jq)-0.5), CS%min_h_shelf)
-            bed_gp = (1.0-xquad(iq))*(1.0-xquad(jq))*CS%bed_node(I-1,J-1) + &
-                     xquad(iq)*(1.0-xquad(jq))*CS%bed_node(I,J-1) + &
-                     (1.0-xquad(iq))*xquad(jq)*CS%bed_node(I-1,J) + &
-                     xquad(iq)*xquad(jq)*CS%bed_node(I,J)
+            h_gp = max(h_shelf(i,j) + ((CS%h_x(i,j)*(xquad(iq)-0.5)) + (CS%h_y(i,j)*(xquad(jq)-0.5))), &
+                       CS%min_h_shelf)
+            bed_gp = (((1.0-xquad(iq))*(1.0-xquad(jq))*CS%bed_node(I-1,J-1))  &
+                    + ( xquad(iq)     * xquad(jq)     *CS%bed_node(I,J)))   &
+                   + (( xquad(iq)     *(1.0-xquad(jq))*CS%bed_node(I,J-1)) &
+                    + ((1.0-xquad(iq))* xquad(jq)     *CS%bed_node(I-1,J)))
             grounded_qp = (dens_ratio * h_gp - bed_gp > 0)
             if (grounded_qp .and. CS%CoulombFriction) then
               fB_local = compute_fB_local(h_gp, bed_gp, rho_oi_ratio, rho_ice_g_LtoZ, &
@@ -4166,9 +4167,11 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
         yp = (real(j-1) + xquad_sub(qy)) * fracx
         xi_sub  = xp - 0.5   ! map to [-0.5, 0.5]
         eta_sub = yp - 0.5
-        hloc = max(h_shelf_cell + h_x_cell*xi_sub + h_y_cell*eta_sub, CS%min_h_shelf)
-        bed_sub = ((1.0-xp)*(1.0-yp)*bed_corners(1,1) + xp*(1.0-yp)*bed_corners(2,1) + &
-                   (1.0-xp)*yp*bed_corners(1,2) + xp*yp*bed_corners(2,2))
+        hloc = max(h_shelf_cell + ((h_x_cell*xi_sub) + (h_y_cell*eta_sub)), CS%min_h_shelf)
+        bed_sub = (((1.0-xp)*(1.0-yp)*bed_corners(1,1))  &
+                 + ( xp     * yp     *bed_corners(2,2))) &
+                + (( xp     *(1.0-yp)*bed_corners(2,1)) &
+                 + ((1.0-xp)* yp     *bed_corners(1,2)))
       else
         ! Standard mode: bilinear H interpolation, cell-averaged bed
         hloc = ((Phisub(qx,qy,i,j,1,1)*H(1,1)) + (Phisub(qx,qy,i,j,2,2)*H(2,2))) + &
@@ -4493,11 +4496,12 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, u_curr, v_cu
       grounded_qp = (float_cond(i,j) == 0 .and. CS%ground_frac(i,j) > 0)
       if (grounded_qp) then
         if (do_DG) then
-          h_gp = max(h_shelf(i,j) + CS%h_x(i,j)*(xquad(iq)-0.5) + CS%h_y(i,j)*(xquad(jq)-0.5), CS%min_h_shelf)
-          bed_gp = (1.0-xquad(iq))*(1.0-xquad(jq))*CS%bed_node(I-1,J-1) + &
-                   xquad(iq)*(1.0-xquad(jq))*CS%bed_node(I,J-1) + &
-                   (1.0-xquad(iq))*xquad(jq)*CS%bed_node(I-1,J) + &
-                   xquad(iq)*xquad(jq)*CS%bed_node(I,J)
+          h_gp = max(h_shelf(i,j) + ((CS%h_x(i,j)*(xquad(iq)-0.5)) + (CS%h_y(i,j)*(xquad(jq)-0.5))), &
+                     CS%min_h_shelf)
+          bed_gp = (((1.0-xquad(iq))*(1.0-xquad(jq))*CS%bed_node(I-1,J-1))  &
+                  + ( xquad(iq)     * xquad(jq)     *CS%bed_node(I,J)))   &
+                 + (( xquad(iq)     *(1.0-xquad(jq))*CS%bed_node(I,J-1)) &
+                  + ((1.0-xquad(iq))* xquad(jq)     *CS%bed_node(I-1,J)))
           grounded_qp = (dens_ratio * h_gp - bed_gp > 0)
           if (grounded_qp .and. CS%CoulombFriction) then
             fB_local = compute_fB_local(h_gp, bed_gp, rho_oi_ratio, rho_ice_g_LtoZ, &
@@ -4731,9 +4735,11 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
         yp = (real(j-1) + xquad_sub(qy)) * fracx
         xi_sub  = xp - 0.5
         eta_sub = yp - 0.5
-        hloc = max(h_shelf_cell + h_x_cell*xi_sub + h_y_cell*eta_sub, CS%min_h_shelf)
-        bed_sub = ((1.0-xp)*(1.0-yp)*bed_corners(1,1) + xp*(1.0-yp)*bed_corners(2,1) + &
-                   (1.0-xp)*yp*bed_corners(1,2) + xp*yp*bed_corners(2,2))
+        hloc = max(h_shelf_cell + ((h_x_cell*xi_sub) + (h_y_cell*eta_sub)), CS%min_h_shelf)
+        bed_sub = (((1.0-xp)*(1.0-yp)*bed_corners(1,1))  &
+                 + ( xp     * yp     *bed_corners(2,2))) &
+                + (( xp     *(1.0-yp)*bed_corners(2,1)) &
+                 + ((1.0-xp)* yp     *bed_corners(1,2)))
       else
         hloc = ((Phisub(qx,qy,i,j,1,1)*H_node(1,1)) + (Phisub(qx,qy,i,j,2,2)*H_node(2,2))) + &
                ((Phisub(qx,qy,i,j,1,2)*H_node(1,2)) + (Phisub(qx,qy,i,j,2,1)*H_node(2,1)))
@@ -5049,7 +5055,8 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
           if (CS%use_DG_thickness) then
             xi_gp  = xquad(iq) - 0.5  ! map [0,1] Gauss node to [-0.5,0.5] ref coords
             eta_gp = xquad(jq) - 0.5
-            h_gp = max(ISS%h_shelf(i,j) + CS%h_x(i,j)*xi_gp + CS%h_y(i,j)*eta_gp, CS%min_h_shelf)
+            h_gp = max(ISS%h_shelf(i,j) + ((CS%h_x(i,j)*xi_gp) + (CS%h_y(i,j)*eta_gp)), &
+                       CS%min_h_shelf)
           else
             h_gp = max(ISS%h_shelf(i,j), CS%min_h_shelf)
           endif
@@ -5321,19 +5328,20 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
         if (CS%use_DG_thickness) then
           xi_gp  = xp - 0.5
           eta_gp = yp - 0.5
-          h_ip = max(ISS%h_shelf(i,j) + CS%h_x(i,j)*xi_gp + CS%h_y(i,j)*eta_gp, CS%min_h_shelf)
+          h_ip = max(ISS%h_shelf(i,j) + ((CS%h_x(i,j)*xi_gp) + (CS%h_y(i,j)*eta_gp)), &
+                     CS%min_h_shelf)
         else
-          h_ip = ((H_corners(1,1) * ((1.0-xp)*(1.0-yp))) + &
-                  (H_corners(2,1) * (xp        *(1.0-yp)))) + &
-                 ((H_corners(1,2) * ((1.0-xp)*yp))         + &
-                  (H_corners(2,2) * (xp        *yp)))
+          h_ip = ((H_corners(1,1) * ((1.0-xp)*(1.0-yp)))  &
+                + (H_corners(2,2) * ( xp     * yp     ))) &
+               + ((H_corners(2,1) * ( xp     *(1.0-yp))) &
+                + (H_corners(1,2) * ((1.0-xp)* yp     )))
           h_ip = max(h_ip, CS%min_h_shelf)
         endif
 
-        bed_ip = ((bed_corners(1,1) * ((1.0-xp)*(1.0-yp))) + &
-                  (bed_corners(2,1) * (xp        *(1.0-yp)))) + &
-                 ((bed_corners(1,2) * ((1.0-xp)*yp))         + &
-                  (bed_corners(2,2) * (xp        *yp)))
+        bed_ip = ((bed_corners(1,1) * ((1.0-xp)*(1.0-yp)))  &
+                + (bed_corners(2,2) * ( xp     * yp     ))) &
+               + ((bed_corners(2,1) * ( xp     *(1.0-yp))) &
+                + (bed_corners(1,2) * ((1.0-xp)* yp     )))
 
         if (rhoi_rhow * h_ip - bed_ip > 0.0) n_grounded = n_grounded + 1
       enddo ; enddo
@@ -6465,7 +6473,7 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
             h_upwind = CS%h_bdry_val(i,j)
           elseif (hmask(i,j) == 1) then
             ! Evaluate left cell polynomial at (xi=+0.5, eta=eta_gp)
-            h_upwind = h_bar(i,j) + h_x(i,j) * 0.5 + h_y(i,j) * eta_gp
+            h_upwind = h_bar(i,j) + ((h_x(i,j) * 0.5) + (h_y(i,j) * eta_gp))
           else
             h_upwind = 0.0
           endif
@@ -6474,7 +6482,7 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
             h_upwind = CS%h_bdry_val(i+1,j)
           elseif (hmask(i+1,j) == 1) then
             ! Evaluate right cell polynomial at (xi=-0.5, eta=eta_gp)
-            h_upwind = h_bar(i+1,j) + h_x(i+1,j) * (-0.5) + h_y(i+1,j) * eta_gp
+            h_upwind = h_bar(i+1,j) + ((h_x(i+1,j) * (-0.5)) + (h_y(i+1,j) * eta_gp))
           else
             h_upwind = 0.0
           endif
@@ -6541,7 +6549,7 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
             h_upwind = CS%h_bdry_val(i,j)
           elseif (hmask(i,j) == 1) then
             ! Evaluate south cell polynomial at (xi=eta_gp, eta=+0.5)
-            h_upwind = h_bar(i,j) + h_x(i,j) * eta_gp + h_y(i,j) * 0.5
+            h_upwind = h_bar(i,j) + ((h_x(i,j) * eta_gp) + (h_y(i,j) * 0.5))
           else
             h_upwind = 0.0
           endif
@@ -6550,7 +6558,7 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
             h_upwind = CS%h_bdry_val(i,j+1)
           elseif (hmask(i,j+1) == 1) then
             ! Evaluate north cell polynomial at (xi=eta_gp, eta=-0.5)
-            h_upwind = h_bar(i,j+1) + h_x(i,j+1) * eta_gp + h_y(i,j+1) * (-0.5)
+            h_upwind = h_bar(i,j+1) + ((h_x(i,j+1) * eta_gp) + (h_y(i,j+1) * (-0.5)))
           else
             h_upwind = 0.0
           endif
@@ -6614,9 +6622,9 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
                       (CS%v_shelf(I-1,J-1) + CS%v_shelf(I,J-1)))
 
       Rhs_hx(i,j) = Rhs_hx(i,j) + &
-        (u_c * h_bar(i,j) + (u_xi * h_x(i,j) + u_eta * h_y(i,j)) / 12.0) * G%IdxT(i,j)
+        ((u_c * h_bar(i,j)) + (((u_xi * h_x(i,j)) + (u_eta * h_y(i,j))) / 12.0)) * G%IdxT(i,j)
       Rhs_hy(i,j) = Rhs_hy(i,j) + &
-        (v_c * h_bar(i,j) + (v_xi * h_x(i,j) + v_eta * h_y(i,j)) / 12.0) * G%IdyT(i,j)
+        ((v_c * h_bar(i,j)) + (((v_xi * h_x(i,j)) + (v_eta * h_y(i,j))) / 12.0)) * G%IdyT(i,j)
     endif
   enddo ; enddo
 
@@ -7101,12 +7109,12 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         eta_gp = yp - 0.5
 
         ! Quadrature weight with per-QP Jacobian from interpolated cell-edge metrics
-        a_metric = dxCv_S * (1.0 - yp) + dxCv_N * yp
-        d_metric = dyCu_W * (1.0 - xp) + dyCu_E * xp
+        a_metric = (dxCv_S * (1.0 - yp)) + (dxCv_N * yp)
+        d_metric = (dyCu_W * (1.0 - xp)) + (dyCu_E * xp)
         weight_sub = 0.25 * fracx * fracx * (a_metric * d_metric)
 
         ! Evaluate DG(1) thickness at this Gauss point
-        h_gp = max(ISS%h_shelf(i,j) + CS%h_x(i,j) * xi_gp + CS%h_y(i,j) * eta_gp, &
+        h_gp = max(ISS%h_shelf(i,j) + ((CS%h_x(i,j) * xi_gp) + (CS%h_y(i,j) * eta_gp)), &
                    CS%min_h_shelf)
 
         ! Thickness gradients from DG polynomial (in physical coordinates)
@@ -7114,16 +7122,18 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         dhdy_gp = CS%h_y(i,j) * G%IdyT(i,j)
 
         ! Evaluate bilinear bed at this Gauss point using [0,1] coordinates
-        bed_gp = bed_corners(1,1) * ((1.0-xp) * (1.0-yp)) + &
-                 bed_corners(2,1) * (xp * (1.0-yp)) + &
-                 bed_corners(1,2) * ((1.0-xp) * yp) + &
-                 bed_corners(2,2) * (xp * yp)
+        ! (diagonal + off-diagonal grouping for rotation-invariant FP order)
+        bed_gp = ((bed_corners(1,1) * ((1.0-xp) * (1.0-yp)))  &
+                + (bed_corners(2,2) * ( xp      *  yp     ))) &
+               + ((bed_corners(2,1) * ( xp      * (1.0-yp))) &
+                + (bed_corners(1,2) * ((1.0-xp) *  yp     )))
 
-        ! Bed gradients from bilinear interpolation
-        dbdx_gp = ((-bed_corners(1,1)*(1.0-yp) + bed_corners(2,1)*(1.0-yp)) + &
-                   (-bed_corners(1,2)*yp + bed_corners(2,2)*yp)) * G%IdxT(i,j)
-        dbdy_gp = ((-bed_corners(1,1)*(1.0-xp) - bed_corners(2,1)*xp) + &
-                   ( bed_corners(1,2)*(1.0-xp) + bed_corners(2,2)*xp)) * G%IdyT(i,j)
+        ! Bed gradients from bilinear interpolation (mirror-symmetric form so the
+        ! x and y versions are token-for-token swaps of each other)
+        dbdx_gp = (((bed_corners(2,1) - bed_corners(1,1)) * (1.0-yp))  &
+                 + ((bed_corners(2,2) - bed_corners(1,2)) *  yp     )) * G%IdxT(i,j)
+        dbdy_gp = (((bed_corners(1,2) - bed_corners(1,1)) * (1.0-xp))  &
+                 + ((bed_corners(2,2) - bed_corners(2,1)) *  xp     )) * G%IdyT(i,j)
 
         ! Compute surface elevation and its gradient
         if (CS%GL_couple) then
@@ -7147,7 +7157,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
 
         ! Apply maximum surface slope limit
         if (CS%max_surface_slope > 0.0) then
-          slope_mag = sqrt(dsdx_gp**2 + dsdy_gp**2)
+          slope_mag = sqrt((dsdx_gp*dsdx_gp) + (dsdy_gp*dsdy_gp))
           scale = CS%max_surface_slope / max(slope_mag, CS%max_surface_slope)
           dsdx_gp = scale * dsdx_gp
           dsdy_gp = scale * dsdy_gp
@@ -7188,8 +7198,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       if ((CS%u_face_mask_bdry(I-1,j) == 2) .or. &
         ((ISS%hmask(i-1,j) == 0 .or. ISS%hmask(i-1,j) == 2) .and. &
          (CS%reentrant_x .or. (i+i_off /= gisc)))) then
-        h_nA = max(ISS%h_shelf(i,j) - 0.5*CS%h_x(i,j) - 0.5*CS%h_y(i,j), CS%min_h_shelf)
-        h_nB = max(ISS%h_shelf(i,j) - 0.5*CS%h_x(i,j) + 0.5*CS%h_y(i,j), CS%min_h_shelf)
+        h_nA = max(ISS%h_shelf(i,j) + (((-0.5)*CS%h_x(i,j)) + ((-0.5)*CS%h_y(i,j))), &
+                   CS%min_h_shelf)
+        h_nB = max(ISS%h_shelf(i,j) + (((-0.5)*CS%h_x(i,j)) + (( 0.5)*CS%h_y(i,j))), &
+                   CS%min_h_shelf)
         b_nA = bed_corners(1,1) ; b_nB = bed_corners(1,2)
         do gp_face=1,2
           t_face = xquad(gp_face)
@@ -7210,8 +7222,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       if ((CS%u_face_mask_bdry(I,j) == 2) .or. &
         ((ISS%hmask(i+1,j) == 0 .or. ISS%hmask(i+1,j) == 2) .and. &
          (CS%reentrant_x .or. (i+i_off /= giec)))) then
-        h_nA = max(ISS%h_shelf(i,j) + 0.5*CS%h_x(i,j) - 0.5*CS%h_y(i,j), CS%min_h_shelf)
-        h_nB = max(ISS%h_shelf(i,j) + 0.5*CS%h_x(i,j) + 0.5*CS%h_y(i,j), CS%min_h_shelf)
+        h_nA = max(ISS%h_shelf(i,j) + ((( 0.5)*CS%h_x(i,j)) + ((-0.5)*CS%h_y(i,j))), &
+                   CS%min_h_shelf)
+        h_nB = max(ISS%h_shelf(i,j) + ((( 0.5)*CS%h_x(i,j)) + (( 0.5)*CS%h_y(i,j))), &
+                   CS%min_h_shelf)
         b_nA = bed_corners(2,1) ; b_nB = bed_corners(2,2)
         do gp_face=1,2
           t_face = xquad(gp_face)
@@ -7232,8 +7246,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       if ((CS%v_face_mask_bdry(i,J-1) == 2) .or. &
         ((ISS%hmask(i,j-1) == 0 .or. ISS%hmask(i,j-1) == 2) .and. &
          (CS%reentrant_y .or. (j+j_off /= gjsc)))) then
-        h_nA = max(ISS%h_shelf(i,j) - 0.5*CS%h_x(i,j) - 0.5*CS%h_y(i,j), CS%min_h_shelf)
-        h_nB = max(ISS%h_shelf(i,j) + 0.5*CS%h_x(i,j) - 0.5*CS%h_y(i,j), CS%min_h_shelf)
+        h_nA = max(ISS%h_shelf(i,j) + (((-0.5)*CS%h_x(i,j)) + ((-0.5)*CS%h_y(i,j))), &
+                   CS%min_h_shelf)
+        h_nB = max(ISS%h_shelf(i,j) + ((( 0.5)*CS%h_x(i,j)) + ((-0.5)*CS%h_y(i,j))), &
+                   CS%min_h_shelf)
         b_nA = bed_corners(1,1) ; b_nB = bed_corners(2,1)
         do gp_face=1,2
           t_face = xquad(gp_face)
@@ -7254,8 +7270,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       if ((CS%v_face_mask_bdry(i,J) == 2) .or. &
         ((ISS%hmask(i,j+1) == 0 .or. ISS%hmask(i,j+1) == 2) .and. &
          (CS%reentrant_y .or. (j+j_off /= gjec)))) then
-        h_nA = max(ISS%h_shelf(i,j) - 0.5*CS%h_x(i,j) + 0.5*CS%h_y(i,j), CS%min_h_shelf)
-        h_nB = max(ISS%h_shelf(i,j) + 0.5*CS%h_x(i,j) + 0.5*CS%h_y(i,j), CS%min_h_shelf)
+        h_nA = max(ISS%h_shelf(i,j) + (((-0.5)*CS%h_x(i,j)) + (( 0.5)*CS%h_y(i,j))), &
+                   CS%min_h_shelf)
+        h_nB = max(ISS%h_shelf(i,j) + ((( 0.5)*CS%h_x(i,j)) + (( 0.5)*CS%h_y(i,j))), &
+                   CS%min_h_shelf)
         b_nA = bed_corners(1,2) ; b_nB = bed_corners(2,2)
         do gp_face=1,2
           t_face = xquad(gp_face)
@@ -7335,8 +7353,8 @@ subroutine reconstruct_bed_to_nodes(CS, G, hmask)
       residual = 0.0
       do l=0,1 ; do k=0,1
         if (hmask(I+k,J+l) == 1.0 .or. hmask(I+k,J+l) == 3.0) then
-          bilinear_avg = (CS%bed_node(I+k-1,J+l-1) + CS%bed_node(I+k,J+l-1) + &
-                          CS%bed_node(I+k-1,J+l) + CS%bed_node(I+k,J+l)) * 0.25
+          bilinear_avg = ((CS%bed_node(I+k-1,J+l-1) + CS%bed_node(I+k,J+l)) + &
+                          (CS%bed_node(I+k,J+l-1)   + CS%bed_node(I+k-1,J+l))) * 0.25
           residual = residual + (CS%bed_elev(I+k,J+l) - bilinear_avg)
           num_cells = num_cells + 1
         endif
@@ -7354,8 +7372,8 @@ subroutine reconstruct_bed_to_nodes(CS, G, hmask)
     max_err = 0.0
     do j=jsc,jec ; do i=isc,iec
       if (hmask(i,j) == 1.0 .or. hmask(i,j) == 3.0) then
-        bilinear_avg = (CS%bed_node(I-1,J-1) + CS%bed_node(I,J-1) + &
-                        CS%bed_node(I-1,J) + CS%bed_node(I,J)) * 0.25
+        bilinear_avg = ((CS%bed_node(I-1,J-1) + CS%bed_node(I,J)) + &
+                        (CS%bed_node(I,J-1)   + CS%bed_node(I-1,J))) * 0.25
         max_err = max(max_err, abs(CS%bed_elev(i,j) - bilinear_avg))
       endif
     enddo ; enddo
