@@ -13,6 +13,7 @@ use MOM_io, only: MOM_read_data, file_exists, field_exists, slasher, CORNER
 use MOM_error_handler, only : MOM_error, MOM_mesg, FATAL, WARNING, is_root_pe
 use MOM_unit_scaling, only : unit_scale_type
 use user_shelf_init, only: USER_init_ice_thickness
+use MOM_domains, only : pass_var, CORNER
 
 implicit none ; private
 
@@ -21,6 +22,7 @@ implicit none ; private
 public initialize_ice_thickness
 public initialize_ice_shelf_boundary_channel
 public initialize_ice_flow_from_file
+public initialize_bed_node_from_file
 public initialize_ice_shelf_boundary_from_file
 public initialize_ice_C_basal_friction
 public initialize_ice_AGlen
@@ -485,6 +487,52 @@ subroutine initialize_ice_flow_from_file(bed_elev,u_shelf, v_shelf,float_cond,&
 
 
 end subroutine initialize_ice_flow_from_file
+
+!> Read node-based bed elevation from NODAL_BED_FILE into CS%bed_node, then
+!! derive the cell-centered CS%bed_elev by bilinear averaging the four
+!! surrounding nodes. Replaces the reconstruct_bed_to_nodes Jacobi inversion
+!! when an authoritative nodal bed product is available.
+subroutine initialize_bed_node_from_file(bed_node, bed_elev, G, US, PF)
+  type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                         intent(inout) :: bed_node !< The nodal bed elevation [Z ~> m].
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                         intent(inout) :: bed_elev !< The cell-averaged bed elevation [Z ~> m].
+  type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
+  type(param_file_type),  intent(in)    :: PF !< A structure to parse for run-time parameters
+
+  character(len=200) :: filename, inputdir, nodal_bed_file
+  character(len=200) :: bed_node_varname
+  character(len=40)  :: mdl = "initialize_bed_node_from_file"
+  integer :: i, j
+
+  call get_param(PF, mdl, "INPUTDIR", inputdir, default=".", do_not_log=.true.)
+  inputdir = slasher(inputdir)
+  call get_param(PF, mdl, "BED_TOPO_FILE", nodal_bed_file, &
+                 "The file from which the nodal (B-grid corner) bed elevation is read "//&
+                 "when USE_NODAL_BED_FILE=True.", &
+                 default="ice_shelf_vel.nc")
+  call get_param(PF, mdl, "BED_TOPO_VARNAME", bed_node_varname, &
+                 "The name of the nodal bed elevation variable in NODAL_BED_FILE.", &
+                 default="depth_n")
+
+  filename = trim(inputdir)//trim(nodal_bed_file)
+  if (.not.file_exists(filename, G%Domain)) call MOM_error(FATAL, &
+       " initialize_bed_node_from_file: Unable to open "//trim(filename))
+
+  call MOM_read_data(filename, trim(bed_node_varname), bed_node, G%Domain, &
+                     position=CORNER, scale=US%m_to_Z)
+  call pass_var(bed_node, G%domain, position=CORNER)
+
+  ! Derive cell-centered bed_elev as the bilinear average of the four
+  ! surrounding nodes.
+  do j=G%jsc,G%jec ; do i=G%isc,G%iec
+    bed_elev(i,j) = ((bed_node(I-1,J-1) + bed_node(I,  J  )) + &
+                     (bed_node(I,  J-1) + bed_node(I-1,J  ))) * 0.25
+  enddo ; enddo
+  call pass_var(bed_elev, G%domain)
+
+end subroutine initialize_bed_node_from_file
 
 !> Initialize ice shelf b.c.s from file
 subroutine initialize_ice_shelf_boundary_from_file(u_face_mask_bdry, v_face_mask_bdry, &
