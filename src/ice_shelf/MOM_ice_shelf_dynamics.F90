@@ -6412,12 +6412,21 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
   real :: face_flux_total ! Total volume flux through a face [Z L2 T-1 ~> m3 s-1]
   real :: u_c, u_xi, u_eta ! Bilinear u modes on a cell from B-grid corners [L T-1 ~> m s-1]
   real :: v_c, v_xi, v_eta ! Bilinear v modes on a cell from B-grid corners [L T-1 ~> m s-1]
+  ! Per-cell accumulators split by face orientation, so that the final reduction
+  ! Rhs = Rhs_u + Rhs_v is a single binary add (order-independent under 90 deg
+  ! rotation, which swaps the u-face and v-face contributions).
+  real, dimension(SZDI_(G),SZDJ_(G)) :: Rhs_h_u, Rhs_h_v   ! Cell-mean RHS from u/v faces
+  real, dimension(SZDI_(G),SZDJ_(G)) :: Rhs_hx_u, Rhs_hx_v ! x-moment RHS from u/v faces
+  real, dimension(SZDI_(G),SZDJ_(G)) :: Rhs_hy_u, Rhs_hy_v ! y-moment RHS from u/v faces
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed, gp
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
 
   Rhs_h(:,:) = 0.0 ; Rhs_hx(:,:) = 0.0 ; Rhs_hy(:,:) = 0.0
+  Rhs_h_u(:,:)  = 0.0 ; Rhs_h_v(:,:)  = 0.0
+  Rhs_hx_u(:,:) = 0.0 ; Rhs_hx_v(:,:) = 0.0
+  Rhs_hy_u(:,:) = 0.0 ; Rhs_hy_v(:,:) = 0.0
 
   ! --- Zonal (east) face fluxes at I-faces ---
   ! Face I between cells (i,j) [left] and (i+1,j) [right]
@@ -6430,9 +6439,9 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
       uh_ice(I,j) = uh_ice(I,j) + face_flux_total
       ! For specified flux, add to cell average RHS only (no moment info in BC)
       if (hmask(i,j) == 1) &
-        Rhs_h(i,j) = Rhs_h(i,j) - face_flux_total * G%IareaT(i,j)
+        Rhs_h_u(i,j) = Rhs_h_u(i,j) - face_flux_total * G%IareaT(i,j)
       if (hmask(i+1,j) == 1) &
-        Rhs_h(i+1,j) = Rhs_h(i+1,j) + face_flux_total * G%IareaT(i+1,j)
+        Rhs_h_u(i+1,j) = Rhs_h_u(i+1,j) + face_flux_total * G%IareaT(i+1,j)
     elseif ((hmask(i,j) == 1 .or. hmask(i,j) == 3) .or. &
             (hmask(i+1,j) == 1 .or. hmask(i+1,j) == 3)) then
       ! Normal velocity at this u-face (average of B-grid velocities)
@@ -6482,17 +6491,17 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
       ! Subtract outgoing flux from left cell (i,j), add incoming flux to right cell (i+1,j)
       ! For cell average: Rhs_h -= flux / area  (flux leaving through east face)
       if (hmask(i,j) == 1) then
-        Rhs_h(i,j)  = Rhs_h(i,j)  - flux_h * G%IareaT(i,j)
+        Rhs_h_u(i,j)  = Rhs_h_u(i,j)  - flux_h * G%IareaT(i,j)
         ! For x-moment: the face value of the x test function is +0.5
-        Rhs_hx(i,j) = Rhs_hx(i,j) - flux_hx * G%IareaT(i,j)
+        Rhs_hx_u(i,j) = Rhs_hx_u(i,j) - flux_hx * G%IareaT(i,j)
         ! For y-moment: weighted by eta_gp (already in flux_hy)
-        Rhs_hy(i,j) = Rhs_hy(i,j) - flux_hy * G%IareaT(i,j)
+        Rhs_hy_u(i,j) = Rhs_hy_u(i,j) - flux_hy * G%IareaT(i,j)
       endif
       if (hmask(i+1,j) == 1) then
-        Rhs_h(i+1,j)  = Rhs_h(i+1,j)  + flux_h * G%IareaT(i+1,j)
+        Rhs_h_u(i+1,j)  = Rhs_h_u(i+1,j)  + flux_h * G%IareaT(i+1,j)
         ! For the right cell, xi at its left face = -0.5
-        Rhs_hx(i+1,j) = Rhs_hx(i+1,j) + flux_hx * (-1.0) * G%IareaT(i+1,j)
-        Rhs_hy(i+1,j) = Rhs_hy(i+1,j) + flux_hy * G%IareaT(i+1,j)
+        Rhs_hx_u(i+1,j) = Rhs_hx_u(i+1,j) + flux_hx * (-1.0) * G%IareaT(i+1,j)
+        Rhs_hy_u(i+1,j) = Rhs_hy_u(i+1,j) + flux_hy * G%IareaT(i+1,j)
       endif
     endif
   enddo ; enddo
@@ -6507,9 +6516,9 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
       face_flux_total = G%dxCv(i,J) * CS%v_flux_bdry_val(i,J)
       vh_ice(i,J) = vh_ice(i,J) + face_flux_total
       if (hmask(i,j) == 1) &
-        Rhs_h(i,j) = Rhs_h(i,j) - face_flux_total * G%IareaT(i,j)
+        Rhs_h_v(i,j) = Rhs_h_v(i,j) - face_flux_total * G%IareaT(i,j)
       if (hmask(i,j+1) == 1) &
-        Rhs_h(i,j+1) = Rhs_h(i,j+1) + face_flux_total * G%IareaT(i,j+1)
+        Rhs_h_v(i,j+1) = Rhs_h_v(i,j+1) + face_flux_total * G%IareaT(i,j+1)
     elseif ((hmask(i,j) == 1 .or. hmask(i,j) == 3) .or. &
             (hmask(i,j+1) == 1 .or. hmask(i,j+1) == 3)) then
       ! Normal velocity at this v-face
@@ -6551,16 +6560,16 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
       vh_ice(i,J) = vh_ice(i,J) + flux_h
 
       if (hmask(i,j) == 1) then
-        Rhs_h(i,j)  = Rhs_h(i,j)  - flux_h * G%IareaT(i,j)
-        Rhs_hx(i,j) = Rhs_hx(i,j) - flux_hx * G%IareaT(i,j)
+        Rhs_h_v(i,j)  = Rhs_h_v(i,j)  - flux_h * G%IareaT(i,j)
+        Rhs_hx_v(i,j) = Rhs_hx_v(i,j) - flux_hx * G%IareaT(i,j)
         ! For south cell, eta at its north face = +0.5
-        Rhs_hy(i,j) = Rhs_hy(i,j) - flux_hy * G%IareaT(i,j)
+        Rhs_hy_v(i,j) = Rhs_hy_v(i,j) - flux_hy * G%IareaT(i,j)
       endif
       if (hmask(i,j+1) == 1) then
-        Rhs_h(i,j+1)  = Rhs_h(i,j+1)  + flux_h * G%IareaT(i,j+1)
-        Rhs_hx(i,j+1) = Rhs_hx(i,j+1) + flux_hx * G%IareaT(i,j+1)
+        Rhs_h_v(i,j+1)  = Rhs_h_v(i,j+1)  + flux_h * G%IareaT(i,j+1)
+        Rhs_hx_v(i,j+1) = Rhs_hx_v(i,j+1) + flux_hx * G%IareaT(i,j+1)
         ! For north cell, eta at its south face = -0.5
-        Rhs_hy(i,j+1) = Rhs_hy(i,j+1) + flux_hy * (-1.0) * G%IareaT(i,j+1)
+        Rhs_hy_v(i,j+1) = Rhs_hy_v(i,j+1) + flux_hy * (-1.0) * G%IareaT(i,j+1)
       endif
     endif
   enddo ; enddo
@@ -6575,6 +6584,17 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
   !   integration by parts: integral(div(u*h)*test, dA) = boundary(u*h*test, ds) - integral(u*h*grad(test), dA)
   ! The above face flux terms are the boundary integral. We need to add the volume integral.
 
+  ! Reduce the per-face accumulators into the destination Rhs arrays. The single
+  ! binary add Rhs = Rhs_u + Rhs_v is FP-commutative, so the result is bit-identical
+  ! under a 90 deg rotation (which swaps the u-face and v-face contributions).
+  do j=jsc,jec ; do i=isc,iec
+    if (hmask(i,j) == 1) then
+      Rhs_h(i,j)  = Rhs_h_u(i,j)  + Rhs_h_v(i,j)
+      Rhs_hx(i,j) = Rhs_hx_u(i,j) + Rhs_hx_v(i,j)
+      Rhs_hy(i,j) = Rhs_hy_u(i,j) + Rhs_hy_v(i,j)
+    endif
+  enddo ; enddo
+
   ! Volume integral contribution: + integral(u*h * d(phi)/dx, dA) for each test function.
   ! For test xi: d(xi)/dx = 1/dx, d(xi)/dy = 0; for test eta: vice versa.
   ! With bilinear u(xi,eta) = u_c + u_xi*xi + u_eta*eta + u_xieta*xi*eta from B-grid
@@ -6585,14 +6605,16 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
   ! pairs only with odd-power h modes). Same form for v in the y-moment.
   do j=jsc,jec ; do i=isc,iec
     if (hmask(i,j) == 1) then
-      u_c   = 0.25 * ((CS%u_shelf(I-1,J-1) + CS%u_shelf(I,J-1)) + &
-                      (CS%u_shelf(I-1,J)   + CS%u_shelf(I,J)))
+      ! Diagonal + off-diagonal grouping so the 4-corner mean is invariant under
+      ! 90 deg rotation (which permutes corners within these two pairs).
+      u_c   = 0.25 * ((CS%u_shelf(I-1,J-1) + CS%u_shelf(I,J)) + &
+                      (CS%u_shelf(I,J-1)   + CS%u_shelf(I-1,J)))
       u_xi  = 0.5  * ((CS%u_shelf(I,J-1)   + CS%u_shelf(I,J)) - &
                       (CS%u_shelf(I-1,J-1) + CS%u_shelf(I-1,J)))
       u_eta = 0.5  * ((CS%u_shelf(I-1,J)   + CS%u_shelf(I,J)) - &
                       (CS%u_shelf(I-1,J-1) + CS%u_shelf(I,J-1)))
-      v_c   = 0.25 * ((CS%v_shelf(I-1,J-1) + CS%v_shelf(I,J-1)) + &
-                      (CS%v_shelf(I-1,J)   + CS%v_shelf(I,J)))
+      v_c   = 0.25 * ((CS%v_shelf(I-1,J-1) + CS%v_shelf(I,J)) + &
+                      (CS%v_shelf(I,J-1)   + CS%v_shelf(I-1,J)))
       v_xi  = 0.5  * ((CS%v_shelf(I,J-1)   + CS%v_shelf(I,J)) - &
                       (CS%v_shelf(I-1,J-1) + CS%v_shelf(I-1,J)))
       v_eta = 0.5  * ((CS%v_shelf(I-1,J)   + CS%v_shelf(I,J)) - &
@@ -7291,7 +7313,9 @@ subroutine reconstruct_bed_to_nodes(CS, G, hmask)
   real    :: bilinear_avg ! Average of 4 corner values [Z ~> m]
   real    :: max_err      ! Maximum residual across all cells [Z ~> m]
   real    :: tol          ! Convergence tolerance [Z ~> m]
-  integer :: i, j, k, l, iter, num_cells
+  real    :: c00, c10, c01, c11 ! Per-cell-of-node contributions, used to assemble
+                                ! a rotation-invariant 4-element reduction [Z ~> m]
+  integer :: i, j, iter, num_cells
   integer :: isc, iec, jsc, jec, IsdB, IedB, JsdB, JedB
   integer, parameter :: max_iter = 100
 
@@ -7300,17 +7324,26 @@ subroutine reconstruct_bed_to_nodes(CS, G, hmask)
   tol = 1.0e-12
 
   ! Step 1: Initialize bed_node as average of surrounding cell-averaged bed_elev values
-  ! (same approach as interpolate_H_to_B)
+  ! (same approach as interpolate_H_to_B). The 4 cell contributions are summed with
+  ! a diagonal + off-diagonal reduction so the result is invariant under 90 deg
+  ! grid rotation, which cyclically permutes the four neighbour cells.
   CS%bed_node(:,:) = 0.0
   do J=jsc-1,jec ; do I=isc-1,iec
     num_cells = 0
-    bilinear_avg = 0.0
-    do l=0,1 ; do k=0,1
-      if (hmask(i+k,j+l) == 1.0 .or. hmask(i+k,j+l) == 3.0) then
-        bilinear_avg = bilinear_avg + CS%bed_elev(i+k,j+l)
-        num_cells = num_cells + 1
-      endif
-    enddo ; enddo
+    c00 = 0.0 ; c10 = 0.0 ; c01 = 0.0 ; c11 = 0.0
+    if (hmask(I,  J  ) == 1.0 .or. hmask(I,  J  ) == 3.0) then
+      c00 = CS%bed_elev(I,  J  ) ; num_cells = num_cells + 1
+    endif
+    if (hmask(I+1,J  ) == 1.0 .or. hmask(I+1,J  ) == 3.0) then
+      c10 = CS%bed_elev(I+1,J  ) ; num_cells = num_cells + 1
+    endif
+    if (hmask(I,  J+1) == 1.0 .or. hmask(I,  J+1) == 3.0) then
+      c01 = CS%bed_elev(I,  J+1) ; num_cells = num_cells + 1
+    endif
+    if (hmask(I+1,J+1) == 1.0 .or. hmask(I+1,J+1) == 3.0) then
+      c11 = CS%bed_elev(I+1,J+1) ; num_cells = num_cells + 1
+    endif
+    bilinear_avg = (c00 + c11) + (c10 + c01)
     if (num_cells > 0) then
       CS%bed_node(I,J) = bilinear_avg / real(num_cells)
     endif
@@ -7323,19 +7356,32 @@ subroutine reconstruct_bed_to_nodes(CS, G, hmask)
     bed_node_new(:,:) = CS%bed_node(:,:)
 
     do J=jsc-1,jec ; do I=isc-1,iec
-      ! Node (I,J) participates in cells (I+k,J+l) for k=0,1 and l=0,1
-      ! For cell (ic,jc), the constraint is:
-      !   bed_node(ic-1,jc-1) + bed_node(ic,jc-1) + bed_node(ic-1,jc) + bed_node(ic,jc) = 4*bed_elev(ic,jc)
+      ! Node (I,J) participates in 4 cells around it. Gather each cell's residual
+      ! into its own slot and reduce as (c00+c11) + (c10+c01) so the result is
+      ! invariant under 90 deg rotation, which cyclically permutes the 4 cells.
       num_cells = 0
-      residual = 0.0
-      do l=0,1 ; do k=0,1
-        if (hmask(I+k,J+l) == 1.0 .or. hmask(I+k,J+l) == 3.0) then
-          bilinear_avg = ((CS%bed_node(I+k-1,J+l-1) + CS%bed_node(I+k,J+l)) + &
-                          (CS%bed_node(I+k,J+l-1)   + CS%bed_node(I+k-1,J+l))) * 0.25
-          residual = residual + (CS%bed_elev(I+k,J+l) - bilinear_avg)
-          num_cells = num_cells + 1
-        endif
-      enddo ; enddo
+      c00 = 0.0 ; c10 = 0.0 ; c01 = 0.0 ; c11 = 0.0
+      if (hmask(I,  J  ) == 1.0 .or. hmask(I,  J  ) == 3.0) then
+        bilinear_avg = ((CS%bed_node(I-1,J-1) + CS%bed_node(I,  J  )) + &
+                        (CS%bed_node(I,  J-1) + CS%bed_node(I-1,J  ))) * 0.25
+        c00 = CS%bed_elev(I,  J  ) - bilinear_avg ; num_cells = num_cells + 1
+      endif
+      if (hmask(I+1,J  ) == 1.0 .or. hmask(I+1,J  ) == 3.0) then
+        bilinear_avg = ((CS%bed_node(I,  J-1) + CS%bed_node(I+1,J  )) + &
+                        (CS%bed_node(I+1,J-1) + CS%bed_node(I,  J  ))) * 0.25
+        c10 = CS%bed_elev(I+1,J  ) - bilinear_avg ; num_cells = num_cells + 1
+      endif
+      if (hmask(I,  J+1) == 1.0 .or. hmask(I,  J+1) == 3.0) then
+        bilinear_avg = ((CS%bed_node(I-1,J  ) + CS%bed_node(I,  J+1)) + &
+                        (CS%bed_node(I,  J  ) + CS%bed_node(I-1,J+1))) * 0.25
+        c01 = CS%bed_elev(I,  J+1) - bilinear_avg ; num_cells = num_cells + 1
+      endif
+      if (hmask(I+1,J+1) == 1.0 .or. hmask(I+1,J+1) == 3.0) then
+        bilinear_avg = ((CS%bed_node(I,  J  ) + CS%bed_node(I+1,J+1)) + &
+                        (CS%bed_node(I+1,J  ) + CS%bed_node(I,  J+1))) * 0.25
+        c11 = CS%bed_elev(I+1,J+1) - bilinear_avg ; num_cells = num_cells + 1
+      endif
+      residual = (c00 + c11) + (c10 + c01)
 
       if (num_cells > 0) then
         bed_node_new(I,J) = CS%bed_node(I,J) + residual / real(num_cells)
