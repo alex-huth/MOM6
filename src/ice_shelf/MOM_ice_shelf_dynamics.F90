@@ -151,8 +151,8 @@ type, public :: ice_shelf_dyn_CS ; private
   real, pointer, dimension(:,:) :: ground_frac => NULL()   !< Fraction of the time a cell is "exposed", i.e. the column
                                !! thickness is below a threshold and interacting with the rock [nondim].  When this
                                !! is 1, the ice-shelf is grounded
-  ! float_cond used to be a persistent CS field; it is now a local working array in
-  ! ice_shelf_solve_outer derived from CS%ground_frac at runtime. See compute_ground_frac.
+  ! float_cond used to be a persistent CS field; it is now derived inline at use sites
+  ! from CS%ground_frac (a GL cell is "0 < ground_frac < 1" under GL_regularize=True).
   real, pointer, dimension(:,:,:,:) :: Phi => NULL() !< The gradients of bilinear basis elements at Gaussian
                                                 !! 4 quadrature points surrounding the cell vertices [L-1 ~> m-1].
   real, pointer, dimension(:,:,:) :: PhiC => NULL()  !< The gradients of bilinear basis elements at 1 cell-centered
@@ -1745,8 +1745,6 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   real, dimension(SZDIB_(G),SZDJB_(G)) :: Au, Av ! The retarding lateral stress contributions [R L3 Z T-2 ~> kg m s-2]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: u_last, v_last ! Previous velocities [L T-1 ~> m s-1]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: H_node ! Ice shelf thickness at corners [Z ~> m].
-  real, dimension(SZDI_(G),SZDJ_(G)) :: float_cond ! If GL_regularize=true, indicates cells containing
-                                                ! the grounding line (float_cond=1) or not (float_cond=0)
   real, dimension(SZDIB_(G),SZDJB_(G)) :: Normvec  ! Velocities used for convergence [L2 T-2 ~> m2 s-2]
   logical :: converged ! Indicates nonlinear convergence
   logical :: calc_Au_for_convergence ! Used for convergence criteria than need a CG_action
@@ -1794,7 +1792,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   Au(:,:) = 0.0 ; Av(:,:) = 0.0
 
   ! need to make these conditional on GL interpolation
-  float_cond(:,:) = 0.0 ; H_node(:,:) = 0.0
+  H_node(:,:) = 0.0
   !CS%ground_frac(:,:) = 0.0
 
   if (.not. CS%GL_couple) then
@@ -1809,6 +1807,18 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   ! Warning: This turns off Picard entirely and may not converge.
   if (CS%newton_after_tolerance<=0.0) CS%doing_newton=.true.
 
+  ! Set CS%ground_frac in GL-regularize cells to the fraction of sub-grid integration
+  ! points that are grounded (case 2: GL_regularize=True). Other cases leave ground_frac
+  ! at the binary or running-mean value already set upstream. H_node is needed by the
+  ! non-DG branch of compute_ground_frac and by CG_action_subgrid_basal further down.
+  ! Computed before the driving-stress call so that the DG nsub switch and the non-DG
+  ! Neumann test see the freshly-computed fractional ground_frac in the current outer
+  ! iteration rather than lagged by one.
+  if (CS%GL_regularize .and. .not. CS%use_DG_thickness) then
+    call interpolate_H_to_B(G, ISS%h_shelf, ISS%hmask, H_node, CS%min_h_shelf)
+  endif
+  call compute_ground_frac(CS, ISS, G, H_node)
+
   ! Calculate RHS
   if (CS%use_DG_thickness) then
     call calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, CS%OD_av)
@@ -1816,24 +1826,6 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     call calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, CS%OD_av)
   endif
   call pass_vector(taudx, taudy, G%domain, TO_ALL, BGRID_NE)
-
-  ! Set CS%ground_frac in GL-regularize cells to the fraction of sub-grid integration
-  ! points that are grounded (case 2: GL_regularize=True). Other cases leave ground_frac
-  ! at the binary or running-mean value already set upstream. H_node is needed by the
-  ! non-DG branch of compute_ground_frac and by CG_action_subgrid_basal further down.
-  if (CS%GL_regularize .and. .not. CS%use_DG_thickness) then
-    call interpolate_H_to_B(G, ISS%h_shelf, ISS%hmask, H_node, CS%min_h_shelf)
-  endif
-  call compute_ground_frac(CS, ISS, G, H_node)
-
-  ! Derive local float_cond from ground_frac for the inner-routine signatures.
-  ! float_cond=1 marks cells with a grounding line (0 < ground_frac < 1), which only
-  ! occurs under GL_regularize=True. Outside that case the array stays zero.
-  if (CS%GL_regularize) then
-    do j=jsd,jed ; do i=isd,ied
-      if (CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0) float_cond(i,j) = 1.0
-    enddo ; enddo
-  endif
 
   ! Calculate basal drag constants and initial velocity
   call calc_shelf_basal_prefactors(CS, ISS, G, US)
@@ -1851,7 +1843,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   if (CS%nonlin_solve_err_mode == 1 .or. CS%nonlin_solve_err_mode == 4) then
     Au(:,:) = 0.0 ; Av(:,:) = 0.0
     call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, H_node, &
-      CS%ice_visc, float_cond, CS%bed_elev, u_shlf, v_shlf, &
+      CS%ice_visc, CS%bed_elev, u_shlf, v_shlf, &
       G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow, use_newton_in=.false., &
       h_shelf=ISS%h_shelf)
     call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE) ! TODO: is this needed?
@@ -1920,7 +1912,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   do iter=1,50
 
     ! The linear solve
-    call ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H_node, float_cond, &
+    call ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H_node, &
                                ISS%hmask, conv_flag, iters, time, CS%Phi, CS%Phisub)
 
     if (CS%debug) then
@@ -1947,7 +1939,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     if (calc_Au_for_convergence) then
       Au(:,:) = 0 ; Av(:,:) = 0
       call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, &
-        H_node, CS%ice_visc, float_cond, CS%bed_elev, u_shlf, v_shlf, &
+        H_node, CS%ice_visc, CS%bed_elev, u_shlf, v_shlf, &
         G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow, use_newton_in=.false., &
         h_shelf=ISS%h_shelf)
 
@@ -2067,7 +2059,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
           if (.not. calc_Au_for_convergence) then
             Au(:,:) = 0 ; Av(:,:) = 0
             call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, &
-              H_node, CS%ice_visc, float_cond, CS%bed_elev, u_shlf, v_shlf, &
+              H_node, CS%ice_visc, CS%bed_elev, u_shlf, v_shlf, &
               G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow, use_newton_in=.false., &
               h_shelf=ISS%h_shelf)
           endif
@@ -2139,7 +2131,7 @@ end subroutine ice_shelf_solve_outer
 !> Unified inner linear solver for ice shelf velocity.
 !! Performs shared setup (RHS, preconditioner, initial matrix-vector product),
 !! dispatches to the selected Krylov method, and applies boundary conditions.
-subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H_node, float_cond, &
+subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H_node, &
                                   hmask, conv_flag, iters, time, Phi, Phisub)
   type(ice_shelf_dyn_CS), intent(in)    :: CS !< A pointer to the ice shelf control structure
   type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe the ice-shelf state
@@ -2155,9 +2147,6 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
                           intent(in)    :: taudy  !< The y-direction driving stress [R L3 Z T-2 ~> kg m s-2]
   real, dimension(SZDIB_(G),SZDJB_(G)), &
                           intent(in)    :: H_node !< The ice shelf thickness at nodal (corner) points [Z ~> m].
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(in)    :: float_cond !< If GL_regularize=true, indicates cells containing
-                                                      !! the grounding line (float_cond=1) or not (float_cond=0)
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(in)    :: hmask !< A mask indicating which tracer points are
                                                  !! partly or fully covered by an ice-shelf
@@ -2212,12 +2201,12 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
   RHSu(:,:) = taudx(:,:) ; RHSv(:,:) = taudy(:,:)
   call pass_vector(RHSu, RHSv, G%domain, TO_ALL, BGRID_NE, complete=.false.)
 
-  call matrix_diagonal(CS, G, US, float_cond, H_node, CS%ice_visc, u_shlf, v_shlf, &
+  call matrix_diagonal(CS, G, US, H_node, CS%ice_visc, u_shlf, v_shlf, &
                        hmask, rhoi_rhow, Phi, Phisub, DIAGu, DIAGv, h_shelf=ISS%h_shelf)
   call pass_vector(DIAGu, DIAGv, G%domain, TO_ALL, BGRID_NE, complete=.false.)
 
   call CG_action(CS, Au, Av, u_shlf, v_shlf, Phi, Phisub, CS%umask, CS%vmask, hmask, &
-                 H_node, CS%ice_visc, float_cond, CS%bed_elev, u_shlf, v_shlf, &
+                 H_node, CS%ice_visc, CS%bed_elev, u_shlf, v_shlf, &
                  G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, use_newton_in=.false., &
                  h_shelf=ISS%h_shelf)
   call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE, complete=.true.)
@@ -2235,19 +2224,19 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
   select case (CS%inner_solver)
     case (INNER_CG)
       call ice_shelf_solve_inner_CG(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, Av, &
-                                    IDIAGu, IDIAGv, H_node, float_cond, hmask, &
+                                    IDIAGu, IDIAGv, H_node, hmask, &
                                     rhoi_rhow, resid_scale, Phi, Phisub, conv_flag, iters, &
                                     Is_sum, Js_sum, Ie_sum, Je_sum, Iscq_sv, Jscq_sv, &
                                     h_shelf=ISS%h_shelf)
     case (INNER_MINRES)
       call ice_shelf_solve_inner_MINRES(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, Av, &
-                                        IDIAGu, IDIAGv, H_node, float_cond, hmask, &
+                                        IDIAGu, IDIAGv, H_node, hmask, &
                                         rhoi_rhow, resid_scale, Phi, Phisub, conv_flag, iters, &
                                         Is_sum, Js_sum, Ie_sum, Je_sum, Iscq_sv, Jscq_sv, &
                                         h_shelf=ISS%h_shelf)
     case (INNER_CR)
       call ice_shelf_solve_inner_CR(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, Av, &
-                                    IDIAGu, IDIAGv, H_node, float_cond, hmask, &
+                                    IDIAGu, IDIAGv, H_node, hmask, &
                                     rhoi_rhow, resid_scale, Phi, Phisub, conv_flag, iters, &
                                     Is_sum, Js_sum, Ie_sum, Je_sum, Iscq_sv, Jscq_sv, &
                                     h_shelf=ISS%h_shelf)
@@ -2278,7 +2267,7 @@ end subroutine ice_shelf_solve_inner
 
 !> CG (Conjugate Gradient) inner Krylov solve for ice shelf velocity.
 subroutine ice_shelf_solve_inner_CG(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, Av, &
-                                     IDIAGu, IDIAGv, H_node, float_cond, hmask, &
+                                     IDIAGu, IDIAGv, H_node, hmask, &
                                      rhoi_rhow, resid_scale, Phi, Phisub, conv_flag, iters, &
                                      Is_sum, Js_sum, Ie_sum, Je_sum, Iscq_sv, Jscq_sv, &
                                      h_shelf)
@@ -2303,8 +2292,6 @@ subroutine ice_shelf_solve_inner_CG(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, A
                           intent(in)    :: IDIAGv !< Reciprocal Jacobi diagonal, y [R-1 L-2 Z-1 T ~> kg-1 s]
   real, dimension(SZDIB_(G),SZDJB_(G)), &
                           intent(in)    :: H_node !< The ice shelf thickness at nodal points [Z ~> m]
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(in)    :: float_cond !< Grounding line indicator [nondim]
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(in)    :: hmask !< Ice shelf coverage mask
   real,                   intent(in)    :: rhoi_rhow !< Ice-to-ocean density ratio [nondim]
@@ -2425,7 +2412,7 @@ subroutine ice_shelf_solve_inner_CG(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, A
     Au(:,:) = 0 ; Av(:,:) = 0
 
     call CG_action(CS, Au, Av, Du, Dv, Phi, Phisub, CS%umask, CS%vmask, hmask, &
-                   H_node, CS%ice_visc, float_cond, CS%bed_elev, u_curr, v_curr, &
+                   H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
                    G, US, is, ie, js, je, rhoi_rhow, h_shelf=h_shelf)
 
     sum_vec(:,:) = 0.0
@@ -2512,7 +2499,7 @@ end subroutine ice_shelf_solve_inner_CG
 
 !> MINRES inner Krylov solve for ice shelf velocity.
 subroutine ice_shelf_solve_inner_MINRES(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, Av, &
-                                         IDIAGu, IDIAGv, H_node, float_cond, hmask, &
+                                         IDIAGu, IDIAGv, H_node, hmask, &
                                          rhoi_rhow, resid_scale, Phi, Phisub, conv_flag, iters, &
                                          Is_sum, Js_sum, Ie_sum, Je_sum, Iscq_sv, Jscq_sv, &
                                          h_shelf)
@@ -2537,8 +2524,6 @@ subroutine ice_shelf_solve_inner_MINRES(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, A
                           intent(in)    :: IDIAGv !< Reciprocal Jacobi diagonal, y [R-1 L-2 Z-1 T ~> kg-1 s]
   real, dimension(SZDIB_(G),SZDJB_(G)), &
                           intent(in)    :: H_node !< The ice shelf thickness at nodal points [Z ~> m]
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(in)    :: float_cond !< Grounding line indicator [nondim]
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(in)    :: hmask !< Ice shelf coverage mask
   real,                   intent(in)    :: rhoi_rhow !< Ice-to-ocean density ratio [nondim]
@@ -2659,7 +2644,7 @@ subroutine ice_shelf_solve_inner_MINRES(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, A
     ! --- STEP 1: Matrix Vector Product ---
     Qu(:,:) = 0 ; Qv(:,:) = 0
     call CG_action(CS, Qu, Qv, Z_curr_u, Z_curr_v, Phi, Phisub, CS%umask, CS%vmask, hmask, &
-                   H_node, CS%ice_visc, float_cond, CS%bed_elev, u_curr, v_curr, &
+                   H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
                    G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf)
     ! --- STEP 2: alpha = q dot z_curr ---
     sum_vec_3d(:,:) = 0.0
@@ -2758,7 +2743,7 @@ end subroutine ice_shelf_solve_inner_MINRES
 
 !> CR (Conjugate Residual) inner Krylov solve for ice shelf velocity.
 subroutine ice_shelf_solve_inner_CR(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, Av, &
-                                     IDIAGu, IDIAGv, H_node, float_cond, hmask, &
+                                     IDIAGu, IDIAGv, H_node, hmask, &
                                      rhoi_rhow, resid_scale, Phi, Phisub, conv_flag, iters, &
                                      Is_sum, Js_sum, Ie_sum, Je_sum, Iscq_sv, Jscq_sv, &
                                      h_shelf)
@@ -2783,8 +2768,6 @@ subroutine ice_shelf_solve_inner_CR(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, A
                           intent(in)    :: IDIAGv !< Reciprocal Jacobi diagonal, y [R-1 L-2 Z-1 T ~> kg-1 s]
   real, dimension(SZDIB_(G),SZDJB_(G)), &
                           intent(in)    :: H_node !< The ice shelf thickness at nodal points [Z ~> m]
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(in)    :: float_cond !< Grounding line indicator [nondim]
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(in)    :: hmask !< Ice shelf coverage mask
   real,                   intent(in)    :: rhoi_rhow !< Ice-to-ocean density ratio [nondim]
@@ -2861,7 +2844,7 @@ subroutine ice_shelf_solve_inner_CR(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, A
   ! Compute A * z_0
   Au(:,:) = 0 ; Av(:,:) = 0
   call CG_action(CS, Au, Av, Zu, Zv, Phi, Phisub, CS%umask, CS%vmask, hmask, &
-                 H_node, CS%ice_visc, float_cond, CS%bed_elev, u_curr, v_curr, &
+                 H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
                  G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf)
   call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
 
@@ -2939,7 +2922,7 @@ subroutine ice_shelf_solve_inner_CR(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, A
     ! --- STEP 3: w_{k+1} = A z_{k+1} ---
     Au(:,:) = 0 ; Av(:,:) = 0
     call CG_action(CS, Au, Av, Zu, Zv, Phi, Phisub, CS%umask, CS%vmask, hmask, &
-                   H_node, CS%ice_visc, float_cond, CS%bed_elev, u_curr, v_curr, &
+                   H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
                    G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf)
     call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
 
@@ -3738,7 +3721,7 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
 end subroutine calc_shelf_driving_stress
 
 subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, hmask, H_node, &
-                     ice_visc, float_cond, bathyT, u_curr, v_curr, G, US, is, ie, js, je, dens_ratio, &
+                     ice_visc, bathyT, u_curr, v_curr, G, US, is, ie, js, je, dens_ratio, &
                      use_newton_in, h_shelf)
 
   type(ice_shelf_dyn_CS), intent(in)    :: CS !< A pointer to the ice shelf control structure
@@ -3772,9 +3755,6 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   real, dimension(SZDI_(G),SZDJ_(G),CS%visc_qps), &
                          intent(in)    :: ice_visc !< A field related to the ice viscosity from Glen's
                                                !! flow law [R L4 Z T-1 ~> kg m2 s-1].
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                         intent(in)    :: float_cond !< If GL_regularize=true, indicates cells containing
-                                                !! the grounding line (float_cond=1) or not (float_cond=0)
   real, dimension(SZDI_(G),SZDJ_(G)), &
                          intent(in)    :: bathyT !< The depth of ocean bathymetry at tracer points
                                                  !! relative to sea-level [Z ~> m].
@@ -3926,7 +3906,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
         ! Basal friction and Newton Jacobian evaluated at this quadrature point (fully grounded cells only).
         ! Evaluating at quadrature points rather than cell-averaged ensures the Newton correction is the
         ! exact Jacobian of the Picard residual, enabling quadratic convergence for all friction exponents.
-        grounded_qp = (float_cond(i,j) == 0 .and. CS%ground_frac(i,j) > 0)
+        grounded_qp = merge(CS%ground_frac(i,j) >= 1.0, CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
         if (grounded_qp) then
           ! DG mode: per-Gauss-point grounding check and fB computation
           if (do_DG) then
@@ -3963,10 +3943,10 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
               CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, use_newton, &
               basal_coef_qp, drag_newt_qp)
           ! Apply ground fraction scaling (replaces external scaling of basal_traction).
-          ! Under GL_regularize, GL cells get sub-grid-aware basal handling via the
-          ! float_cond==1 branch below, so the cell-level scaling must collapse to 1.0 there
-          ! to avoid double-counting (matches pre-refactor behavior when ground_frac was
-          ! forced to 1.0 in GL cells).
+          ! Under GL_regularize, GL cells (0 < ground_frac < 1) get sub-grid-aware basal
+          ! handling via the GL branch below, so the cell-level scaling must collapse to 1.0
+          ! there to avoid double-counting (matches pre-refactor behavior when ground_frac
+          ! was forced to 1.0 in GL cells).
           basal_coef_qp = basal_coef_qp * merge(1.0, CS%ground_frac(i,j), CS%GL_regularize)
           if (use_newton) then
             drag_newt_qp = drag_newt_qp * merge(1.0, CS%ground_frac(i,j), CS%GL_regularize)
@@ -4035,7 +4015,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
       uret_b(I  ,J  ,1) = 0.25*((uret_qp(2,2,1)+uret_qp(2,2,4))+(uret_qp(2,2,2)+uret_qp(2,2,3)))
       vret_b(I  ,J  ,1) = 0.25*((vret_qp(2,2,1)+vret_qp(2,2,4))+(vret_qp(2,2,2)+vret_qp(2,2,3)))
 
-      if (float_cond(i,j) == 1) then
+      if (CS%GL_regularize .and. CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0) then
         ! Subgrid grounding-line: evaluate basal friction at each grounded sub-quadrature point.
         ! Picard and Newton Jacobian are both computed inside CG_action_subgrid_basal.
         Hcell(:,:) = H_node(I-1:I,J-1:J)
@@ -4370,15 +4350,12 @@ subroutine sum_square_matrix(sum_out, mat_in, n)
 end subroutine sum_square_matrix
 
 !> returns the diagonal entries of the matrix for a Jacobi preconditioning
-subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, u_curr, v_curr, &
+subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
                            hmask, dens_ratio, Phi, Phisub, u_diagonal, v_diagonal, h_shelf)
 
   type(ice_shelf_dyn_CS), intent(in)    :: CS !< A pointer to the ice shelf control structure
   type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
   type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(in)    :: float_cond !< If GL_regularize=true, indicates cells containing
-                                                !! the grounding line (float_cond=1) or not (float_cond=0)
   real, dimension(SZDIB_(G),SZDJB_(G)), &
                           intent(in)    :: H_node !< The ice shelf thickness at nodal
                                                  !! (corner) points [Z ~> m].
@@ -4493,7 +4470,7 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, u_curr, v_cu
       endif
 
       ! Basal friction coefficients at this quadrature point (fully grounded cells only)
-      grounded_qp = (float_cond(i,j) == 0 .and. CS%ground_frac(i,j) > 0)
+      grounded_qp = merge(CS%ground_frac(i,j) >= 1.0, CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
       if (grounded_qp) then
         if (do_DG) then
           h_gp = max(h_shelf(i,j) + ((CS%h_x(i,j)*(xquad(iq)-0.5)) + (CS%h_y(i,j)*(xquad(jq)-0.5))), &
@@ -4609,7 +4586,7 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, u_curr, v_cu
     u_diag_b(I  ,J  ,1) = 0.25*((u_diag_qp(2,2,1)+u_diag_qp(2,2,4))+(u_diag_qp(2,2,2)+u_diag_qp(2,2,3)))
     v_diag_b(I  ,J  ,1) = 0.25*((v_diag_qp(2,2,1)+v_diag_qp(2,2,4))+(v_diag_qp(2,2,2)+v_diag_qp(2,2,3)))
 
-    if (float_cond(i,j) == 1) then
+    if (CS%GL_regularize .and. CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0) then
       ! Subgrid grounding-line: evaluate basal friction diagonal at each grounded sub-quadrature point.
       ! Returns separate u_diag_sub and v_diag_sub (differ in Newton term: u^2 vs v^2).
       ! The sub-qp flotation test handles grounding fraction; no external ground_frac scaling needed.
