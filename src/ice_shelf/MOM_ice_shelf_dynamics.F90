@@ -230,6 +230,10 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: moving_shelf_front  !< Specify whether to advance shelf front (and calve).
   logical :: use_DG_thickness     !< If true, use DG(1) representation for ice thickness with
                                   !! unsplit advection scheme and sub-element driving stress quadrature.
+  logical :: use_nodal_bed_file   !< If true, read bed elevation at B-grid nodes from NODAL_BED_FILE
+                                  !! into CS%bed_node and derive CS%bed_elev by bilinear averaging.
+                                  !! Skips reconstruct_bed_to_nodes and the BED_TOPO_FILE read in
+                                  !! initialize_ice_flow_from_file. Requires USE_DG_THICKNESS.
   integer :: dg1_limiter_choice   !< Slope-limiter choice for DG(1) thickness:
                                   !! 0 = none, 1 = minmod (legacy), 2 = Venkatakrishnan.
   real :: dg1_limiter_M           !< TVB-style curvature bound for the Venkatakrishnan
@@ -749,6 +753,16 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "with unsplit RK2 advection and sub-element Gauss quadrature for "//&
                  "driving stress. Requires h_x and h_y slope moments.", &
                  default=.false.)
+    call get_param(param_file, mdl, "USE_NODAL_BED_FILE", CS%use_nodal_bed_file, &
+                 "If true, read bed elevation directly at B-grid nodes from "//&
+                 "NODAL_BED_FILE into CS%bed_node and derive the cell-centered "//&
+                 "CS%bed_elev by bilinear averaging of the four surrounding "//&
+                 "nodes. Skips reconstruct_bed_to_nodes and skips the "//&
+                 "BED_TOPO_FILE read in initialize_ice_flow_from_file. "//&
+                 "Requires USE_DG_THICKNESS=True.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
+    if (CS%use_nodal_bed_file .and. .not. CS%use_DG_thickness) &
+      call MOM_error(FATAL, "MOM_ice_shelf_dynamics: USE_NODAL_BED_FILE=True requires USE_DG_THICKNESS=True")
     call read_dg1_limiter_params(param_file, mdl, CS, US)
     call get_param(param_file, mdl, "REENTRANT_X", CS%reentrant_x, &
                  " If true, the domain is zonally reentrant.", &
@@ -876,7 +890,13 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     call pass_var(CS%C_basal_friction, G%domain, complete=.false.)
     call pass_var(CS%h_bdry_val, G%domain, complete=.true.)
     call pass_var(CS%ice_visc, G%domain)
-    if (CS%use_DG_thickness) call reconstruct_bed_to_nodes(CS, G, ISS%hmask)
+    if (CS%use_DG_thickness) then
+      if (CS%use_nodal_bed_file) then
+        call initialize_bed_node_from_file(CS, G, US, param_file)
+      else
+        call reconstruct_bed_to_nodes(CS, G, ISS%hmask)
+      endif
+    endif
 
     call pass_vector(CS%u_bdry_val, CS%v_bdry_val, G%domain, TO_ALL, BGRID_NE, complete=.false.)
     call pass_vector(CS%u_face_mask_bdry, CS%v_face_mask_bdry, G%domain, TO_ALL, BGRID_NE, complete=.true.)
@@ -974,12 +994,17 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
 
       !initialize ice flow characteristic (velocities, bed elevation under the grounded part, etc) from file
       call initialize_ice_flow_from_file(CS%bed_elev,CS%u_shelf, CS%v_shelf, CS%ground_frac, &
-                  G, US, param_file)
+                  G, US, param_file, skip_bed=CS%use_nodal_bed_file)
       call pass_vector(CS%u_shelf, CS%v_shelf, G%domain, TO_ALL, BGRID_NE, complete=.true.)
       call pass_var(CS%ground_frac, G%domain, complete=.false.)
-      call pass_var(CS%bed_elev, G%domain, complete=.true.)
+      if (CS%use_nodal_bed_file) then
+        ! Reads bed_node from file and derives bed_elev (both halo-updated inside).
+        call initialize_bed_node_from_file(CS, G, US, param_file)
+      else
+        call pass_var(CS%bed_elev, G%domain, complete=.true.)
+        if (CS%use_DG_thickness) call reconstruct_bed_to_nodes(CS, G, ISS%hmask)
+      endif
       if (CS%use_DG_thickness) then
-        call reconstruct_bed_to_nodes(CS, G, ISS%hmask)
         ! DG(1) cold-start slope init: seed from neighbour cell-mean central
         ! differences, then apply the slope limiter. Seeding (rather than
         ! zeroing) is required because DG1_slope_limit uses minmod3 of the
@@ -7384,6 +7409,53 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   enddo ; enddo
 
 end subroutine calc_shelf_driving_stress_DG
+
+
+!> Read node-based bed elevation from NODAL_BED_FILE into CS%bed_node, then
+!! derive the cell-centered CS%bed_elev by bilinear averaging the four
+!! surrounding nodes. Replaces the reconstruct_bed_to_nodes Jacobi inversion
+!! when an authoritative nodal bed product is available.
+subroutine initialize_bed_node_from_file(CS, G, US, PF)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(inout) :: G  !< The grid structure used by the ice shelf.
+  type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
+  type(param_file_type),  intent(in)    :: PF !< A structure to parse for run-time parameters
+
+  character(len=200) :: filename, inputdir, nodal_bed_file
+  character(len=200) :: bed_node_varname
+  character(len=40)  :: mdl = "initialize_bed_node_from_file"
+  integer :: i, j
+
+  call get_param(PF, mdl, "INPUTDIR", inputdir, default=".", do_not_log=.true.)
+  inputdir = slasher(inputdir)
+  call get_param(PF, mdl, "NODAL_BED_FILE", nodal_bed_file, &
+                 "The file from which the nodal (B-grid corner) bed elevation is read "//&
+                 "when USE_NODAL_BED_FILE=True.", &
+                 default="ice_shelf_bed_node.nc")
+  call get_param(PF, mdl, "NODAL_BED_VARNAME", bed_node_varname, &
+                 "The name of the nodal bed elevation variable in NODAL_BED_FILE.", &
+                 default="bed_node")
+
+  filename = trim(inputdir)//trim(nodal_bed_file)
+  if (.not.file_exists(filename, G%Domain)) call MOM_error(FATAL, &
+       " initialize_bed_node_from_file: Unable to open "//trim(filename))
+
+  call MOM_read_data(filename, trim(bed_node_varname), CS%bed_node, G%Domain, &
+                     position=CORNER, scale=US%m_to_Z)
+  call pass_var(CS%bed_node, G%domain, position=CORNER)
+
+  ! Derive cell-centered bed_elev as the bilinear average of the four
+  ! surrounding nodes. Diagonal+off-diagonal grouping is 90°-rotation safe:
+  ! a rotation cyclically permutes the four corners around the cell, swapping
+  ! the diagonal pair {SW,NE} with the off-diagonal pair {SE,NW}, and the
+  ! top-level + commutes on the two pre-rounded pair sums.
+  do j=G%jsc,G%jec ; do i=G%isc,G%iec
+    CS%bed_elev(i,j) = ((CS%bed_node(I-1,J-1) + CS%bed_node(I,  J  )) + &
+                        (CS%bed_node(I,  J-1) + CS%bed_node(I-1,J  ))) * 0.25
+  enddo ; enddo
+  call pass_var(CS%bed_elev, G%domain)
+
+end subroutine initialize_bed_node_from_file
 
 
 !> Reconstruct node-based bed elevation from cell-averaged bed_elev using a

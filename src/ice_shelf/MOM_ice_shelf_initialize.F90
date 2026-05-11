@@ -415,7 +415,7 @@ end subroutine initialize_ice_shelf_boundary_channel
 
 !> Initialize ice shelf flow from file
 subroutine initialize_ice_flow_from_file(bed_elev,u_shelf, v_shelf,float_cond,&
-                                         G, US, PF)
+                                         G, US, PF, skip_bed)
   type(ocean_grid_type), intent(in)    :: G    !< The ocean's grid structure
   real, dimension(SZDI_(G),SZDJ_(G)), &
                          intent(inout) :: bed_elev !< The bed elevation   [Z ~> m].
@@ -428,6 +428,11 @@ subroutine initialize_ice_flow_from_file(bed_elev,u_shelf, v_shelf,float_cond,&
                                                 !! shelf is floating: 0 if floating, 1 if not. [nondim]
   type(unit_scale_type), intent(in)    :: US !< A structure containing unit conversion factors
   type(param_file_type), intent(in)    :: PF !< A structure to parse for run-time parameters
+  logical, optional,     intent(in)    :: skip_bed !< If true, skip the BED_TOPO_FILE read.
+                                                !! Used when bed_elev will be derived from a
+                                                !! separately-read nodal bed field.
+
+  logical :: skip_bed_local
 
   !  This subroutine reads ice thickness and area from a file and puts it into
   !  h_shelf [Z ~> m] and area_shelf_h [L2 ~> m2] (and dimensionless) and updates hmask
@@ -437,6 +442,9 @@ subroutine initialize_ice_flow_from_file(bed_elev,u_shelf, v_shelf,float_cond,&
   character(len=40)  :: mdl = "initialize_ice_velocity_from_file" ! This subroutine's name.
 
   call MOM_mesg("  MOM_ice_shelf_init_profile.F90, initialize_velocity_from_file: reading velocity")
+
+  skip_bed_local = .false.
+  if (present(skip_bed)) skip_bed_local = skip_bed
 
   call get_param(PF, mdl, "INPUTDIR", inputdir, default=".")
   inputdir = slasher(inputdir)
@@ -455,12 +463,14 @@ subroutine initialize_ice_flow_from_file(bed_elev,u_shelf, v_shelf,float_cond,&
   call get_param(PF, mdl, "ICE_FLOAT_FRAC_VARNAME", floatfr_varname, &
                  "The name of the ice float fraction (grounding fraction) variable in ICE_VELOCITY_FILE.", &
                  default="float_frac")
-  call get_param(PF, mdl, "BED_TOPO_FILE", bed_topo_file, &
-                 "The file from which the bed elevation is read.", &
-                 default="ice_shelf_vel.nc")
-  call get_param(PF, mdl, "BED_TOPO_VARNAME", bed_varname, &
-                 "The name of the bed elevation variable in ICE_INPUT_FILE.", &
-                 default="depth")
+  if (.not. skip_bed_local) then
+    call get_param(PF, mdl, "BED_TOPO_FILE", bed_topo_file, &
+                   "The file from which the bed elevation is read.", &
+                   default="ice_shelf_vel.nc")
+    call get_param(PF, mdl, "BED_TOPO_VARNAME", bed_varname, &
+                   "The name of the bed elevation variable in ICE_INPUT_FILE.", &
+                   default="depth")
+  endif
   if (.not.file_exists(filename, G%Domain)) call MOM_error(FATAL, &
        " initialize_ice_shelf_velocity_from_file: Unable to open "//trim(filename))
 
@@ -468,8 +478,10 @@ subroutine initialize_ice_flow_from_file(bed_elev,u_shelf, v_shelf,float_cond,&
   call MOM_read_data(filename, trim(vshelf_varname), v_shelf, G%Domain, position=CORNER, scale=US%m_s_to_L_T)
   call MOM_read_data(filename, trim(floatfr_varname), float_cond, G%Domain, scale=1.)
 
-  filename = trim(inputdir)//trim(bed_topo_file)
-  call MOM_read_data(filename, trim(bed_varname), bed_elev, G%Domain, scale=US%m_to_Z)
+  if (.not. skip_bed_local) then
+    filename = trim(inputdir)//trim(bed_topo_file)
+    call MOM_read_data(filename, trim(bed_varname), bed_elev, G%Domain, scale=US%m_to_Z)
+  endif
 
 
 end subroutine initialize_ice_flow_from_file
