@@ -3937,10 +3937,10 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
           if (do_DG) then
             h_gp = max(h_shelf(i,j) + ((CS%h_x(i,j)*(xquad(iq)-0.5)) + (CS%h_y(i,j)*(xquad(jq)-0.5))), &
                        CS%min_h_shelf)
-            bed_gp = (((1.0-xquad(iq))*(1.0-xquad(jq))*CS%bed_node(I-1,J-1))  &
-                    + ( xquad(iq)     * xquad(jq)     *CS%bed_node(I,J)))   &
-                   + (( xquad(iq)     *(1.0-xquad(jq))*CS%bed_node(I,J-1)) &
-                    + ((1.0-xquad(iq))* xquad(jq)     *CS%bed_node(I-1,J)))
+            bed_gp = ((CS%bed_node(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
+                      (CS%bed_node(I,J)     * (xquad(iq)   * xquad(jq))))  + &
+                     ((CS%bed_node(I,J-1)   * (xquad(iq)   * xquad(3-jq))) + &
+                      (CS%bed_node(I-1,J)   * (xquad(3-iq) * xquad(jq))))
             grounded_qp = (dens_ratio * h_gp - bed_gp > 0)
             if (grounded_qp .and. CS%CoulombFriction) then
               fB_local = compute_fB_local(h_gp, bed_gp, rho_oi_ratio, rho_ice_g_LtoZ, &
@@ -4135,12 +4135,9 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
   real :: a, d      ! Interpolated cell-edge spacings at the sub-cell QP [L ~> m]
   real :: subarea        ! Fractional sub-cell area [nondim]
   real :: fB_local       ! Coulomb fB at sub-qp (DG mode) [(T L-1)^CF_PostPeak]
-  real :: fracx          ! Sub-cell fraction [nondim]
-  real :: xp, yp         ! Sub-qp position in [0,1] element coords [nondim]
-  real :: xi_sub, eta_sub ! Sub-qp position in [-0.5,0.5] ref coords [nondim]
   real :: rho_oi_ratio   ! density_ocean / density_ice [nondim]
   real :: rho_ice_g_LtoZ ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
-  real, dimension(2) :: xquad_sub ! Gauss points on [0,1] [nondim]
+  real :: xi_sub, eta_sub ! DG reference coords at sub-qp ([-0.5,0.5]) [nondim]
   logical :: do_DG       ! Local flag for DG mode
   integer :: nsub, i, j, qx, qy, m, n
 
@@ -4154,9 +4151,6 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
   do_DG = .false.
   if (present(use_DG)) do_DG = use_DG
   if (do_DG) then
-    xquad_sub(1) = 0.5 * (1.0 - sqrt(1.0/3.0))
-    xquad_sub(2) = 0.5 * (1.0 + sqrt(1.0/3.0))
-    fracx = 1.0 / real(nsub)
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
     rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
   endif
@@ -4167,16 +4161,12 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
     U_qp_nd(:,:,:,:) = 0.0 ; V_qp_nd(:,:,:,:) = 0.0
     do qy=1,2 ; do qx=1,2
       if (do_DG) then
-        ! DG mode: evaluate thickness from DG polynomial, bed from bilinear bed_node
-        xp = (real(i-1) + xquad_sub(qx)) * fracx  ! position in [0,1]
-        yp = (real(j-1) + xquad_sub(qy)) * fracx
-        xi_sub  = xp - 0.5   ! map to [-0.5, 0.5]
-        eta_sub = yp - 0.5
+        ! xi_sub = a_right(qx,i) - 0.5; marginal sum of Phisub over the l index gives a_right(qx,i).
+        xi_sub  = (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)) - 0.5
+        eta_sub = (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2)) - 0.5
         hloc = max(h_shelf_cell + ((h_x_cell*xi_sub) + (h_y_cell*eta_sub)), CS%min_h_shelf)
-        bed_sub = (((1.0-xp)*(1.0-yp)*bed_corners(1,1))  &
-                 + ( xp     * yp     *bed_corners(2,2))) &
-                + (( xp     *(1.0-yp)*bed_corners(2,1)) &
-                 + ((1.0-xp)* yp     *bed_corners(1,2)))
+        bed_sub = ((Phisub(qx,qy,i,j,1,1)*bed_corners(1,1)) + (Phisub(qx,qy,i,j,2,2)*bed_corners(2,2))) + &
+                  ((Phisub(qx,qy,i,j,1,2)*bed_corners(1,2)) + (Phisub(qx,qy,i,j,2,1)*bed_corners(2,1)))
       else
         ! Standard mode: bilinear H interpolation, cell-averaged bed
         hloc = ((Phisub(qx,qy,i,j,1,1)*H(1,1)) + (Phisub(qx,qy,i,j,2,2)*H(2,2))) + &
@@ -4500,10 +4490,12 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
         if (do_DG) then
           h_gp = max(h_shelf(i,j) + ((CS%h_x(i,j)*(xquad(iq)-0.5)) + (CS%h_y(i,j)*(xquad(jq)-0.5))), &
                      CS%min_h_shelf)
-          bed_gp = (((1.0-xquad(iq))*(1.0-xquad(jq))*CS%bed_node(I-1,J-1))  &
-                  + ( xquad(iq)     * xquad(jq)     *CS%bed_node(I,J)))   &
-                 + (( xquad(iq)     *(1.0-xquad(jq))*CS%bed_node(I,J-1)) &
-                  + ((1.0-xquad(iq))* xquad(jq)     *CS%bed_node(I-1,J)))
+          ! Bed at the QP with the same rotation-paired bilinear pattern as
+          ! u_curr_qp below, for symmetric rotation-cancel structure.
+          bed_gp = ((CS%bed_node(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
+                    (CS%bed_node(I,J)     * (xquad(iq)   * xquad(jq))))  + &
+                   ((CS%bed_node(I,J-1)   * (xquad(iq)   * xquad(3-jq))) + &
+                    (CS%bed_node(I-1,J)   * (xquad(3-iq) * xquad(jq))))
           grounded_qp = (dens_ratio * h_gp - bed_gp > 0)
           if (grounded_qp .and. CS%CoulombFriction) then
             fB_local = compute_fB_local(h_gp, bed_gp, rho_oi_ratio, rho_ice_g_LtoZ, &
@@ -4700,12 +4692,9 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
   real :: a, d      ! Interpolated cell-edge spacings at the sub-cell QP [L ~> m]
   real :: subarea        ! Fractional sub-cell area [nondim]
   real :: fB_local       ! Coulomb fB at sub-qp (DG mode) [(T L-1)^CF_PostPeak]
-  real :: fracx          ! Sub-cell fraction [nondim]
-  real :: xp, yp         ! Sub-qp position in [0,1] element coords [nondim]
-  real :: xi_sub, eta_sub ! Sub-qp position in [-0.5,0.5] ref coords [nondim]
   real :: rho_oi_ratio   ! density_ocean / density_ice [nondim]
   real :: rho_ice_g_LtoZ ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
-  real, dimension(2) :: xquad_sub ! Gauss points on [0,1] [nondim]
+  real :: xi_sub, eta_sub ! DG reference coords at sub-qp ([-0.5,0.5]) [nondim]
   logical :: do_DG       ! Local flag for DG mode
   integer :: nsub, i, j, qx, qy, m, n
 
@@ -4719,9 +4708,6 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
   do_DG = .false.
   if (present(use_DG)) do_DG = use_DG
   if (do_DG) then
-    xquad_sub(1) = 0.5 * (1.0 - sqrt(1.0/3.0))
-    xquad_sub(2) = 0.5 * (1.0 + sqrt(1.0/3.0))
-    fracx = 1.0 / real(nsub)
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
     rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
   endif
@@ -4733,15 +4719,12 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
     u_diag_qp_nd(:,:,:,:) = 0.0 ; v_diag_qp_nd(:,:,:,:) = 0.0
     do qy=1,2 ; do qx=1,2
       if (do_DG) then
-        xp = (real(i-1) + xquad_sub(qx)) * fracx
-        yp = (real(j-1) + xquad_sub(qy)) * fracx
-        xi_sub  = xp - 0.5
-        eta_sub = yp - 0.5
+        ! xi_sub = a_right(qx,i) - 0.5; marginal sum of Phisub over the l index gives a_right(qx,i).
+        xi_sub  = (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)) - 0.5
+        eta_sub = (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2)) - 0.5
         hloc = max(h_shelf_cell + ((h_x_cell*xi_sub) + (h_y_cell*eta_sub)), CS%min_h_shelf)
-        bed_sub = (((1.0-xp)*(1.0-yp)*bed_corners(1,1))  &
-                 + ( xp     * yp     *bed_corners(2,2))) &
-                + (( xp     *(1.0-yp)*bed_corners(2,1)) &
-                 + ((1.0-xp)* yp     *bed_corners(1,2)))
+        bed_sub = ((Phisub(qx,qy,i,j,1,1)*bed_corners(1,1)) + (Phisub(qx,qy,i,j,2,2)*bed_corners(2,2))) + &
+                  ((Phisub(qx,qy,i,j,1,2)*bed_corners(1,2)) + (Phisub(qx,qy,i,j,2,1)*bed_corners(2,1)))
       else
         hloc = ((Phisub(qx,qy,i,j,1,1)*H_node(1,1)) + (Phisub(qx,qy,i,j,2,2)*H_node(2,2))) + &
                ((Phisub(qx,qy,i,j,1,2)*H_node(1,2)) + (Phisub(qx,qy,i,j,2,1)*H_node(2,1)))
@@ -5284,24 +5267,17 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
                                                   !! (set by interpolate_H_to_B; used only
                                                   !! in the non-DG branch) [Z ~> m].
 
-  real :: xquad(2)       ! 2-point Gauss-Legendre nodes on [0,1] [nondim]
   real :: rhoi_rhow      ! Ice/ocean density ratio [nondim]
-  real :: fracx          ! Reciprocal of n_sub_regularize [nondim]
-  real :: xp, yp         ! [0,1] reference coords of a sub-grid IP within the full cell
-  real :: xi_gp, eta_gp  ! DG-element reference coords ([-0.5,0.5]) [nondim]
+  real :: xi_sub, eta_sub ! DG reference coords at sub-qp ([-0.5,0.5]) [nondim]
   real :: h_ip, bed_ip   ! Ice thickness and bed elevation at a sub-IP [Z ~> m]
   real :: bed_corners(2,2) ! Bed elevation at the 4 B-grid corners of a cell [Z ~> m]
   real :: H_corners(2,2)   ! Ice thickness at the 4 B-grid corners (non-DG path) [Z ~> m]
   integer :: i, j, isub, jsub, iq, jq, n_total, n_grounded
   integer :: isc, iec, jsc, jec
-  integer :: I0, J0      ! B-grid index offset for the cell's southwest corner
 
   if (.not. CS%GL_regularize) return
 
   rhoi_rhow = CS%density_ice / CS%density_ocean_avg
-  xquad(1) = 0.5 * (1.0 - sqrt(1.0/3.0))
-  xquad(2) = 0.5 * (1.0 + sqrt(1.0/3.0))
-  fracx = 1.0 / real(CS%n_sub_regularize)
   n_total = CS%n_sub_regularize * CS%n_sub_regularize * 4
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
 
@@ -5309,7 +5285,6 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
     if (ISS%hmask(i,j) /= 1 .and. ISS%hmask(i,j) /= 3) cycle
 
     ! Gather corner values for bed (and H if non-DG) at this cell.
-    I0 = i - G%isd  ! unused; using G-relative corner indexing below instead
     if (CS%use_DG_thickness) then
       bed_corners(1,1) = CS%bed_node(i-1,j-1) ; bed_corners(2,1) = CS%bed_node(i,j-1)
       bed_corners(1,2) = CS%bed_node(i-1,j  ) ; bed_corners(2,2) = CS%bed_node(i,j  )
@@ -5324,26 +5299,19 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
     n_grounded = 0
     do jsub=1,CS%n_sub_regularize ; do isub=1,CS%n_sub_regularize
       do jq=1,2 ; do iq=1,2
-        xp = (real(isub-1) + xquad(iq)) * fracx
-        yp = (real(jsub-1) + xquad(jq)) * fracx
-
         if (CS%use_DG_thickness) then
-          xi_gp  = xp - 0.5
-          eta_gp = yp - 0.5
-          h_ip = max(ISS%h_shelf(i,j) + ((CS%h_x(i,j)*xi_gp) + (CS%h_y(i,j)*eta_gp)), &
+          xi_sub  = (CS%Phisub(iq,jq,isub,jsub,2,1) + CS%Phisub(iq,jq,isub,jsub,2,2)) - 0.5
+          eta_sub = (CS%Phisub(iq,jq,isub,jsub,1,2) + CS%Phisub(iq,jq,isub,jsub,2,2)) - 0.5
+          h_ip = max(ISS%h_shelf(i,j) + ((CS%h_x(i,j)*xi_sub) + (CS%h_y(i,j)*eta_sub)), &
                      CS%min_h_shelf)
         else
-          h_ip = ((H_corners(1,1) * ((1.0-xp)*(1.0-yp)))  &
-                + (H_corners(2,2) * ( xp     * yp     ))) &
-               + ((H_corners(2,1) * ( xp     *(1.0-yp))) &
-                + (H_corners(1,2) * ((1.0-xp)* yp     )))
+          h_ip = ((CS%Phisub(iq,jq,isub,jsub,1,1)*H_corners(1,1)) + (CS%Phisub(iq,jq,isub,jsub,2,2)*H_corners(2,2))) + &
+                 ((CS%Phisub(iq,jq,isub,jsub,2,1)*H_corners(2,1)) + (CS%Phisub(iq,jq,isub,jsub,1,2)*H_corners(1,2)))
           h_ip = max(h_ip, CS%min_h_shelf)
         endif
 
-        bed_ip = ((bed_corners(1,1) * ((1.0-xp)*(1.0-yp)))  &
-                + (bed_corners(2,2) * ( xp     * yp     ))) &
-               + ((bed_corners(2,1) * ( xp     *(1.0-yp))) &
-                + (bed_corners(1,2) * ((1.0-xp)* yp     )))
+        bed_ip = ((CS%Phisub(iq,jq,isub,jsub,1,1)*bed_corners(1,1)) + (CS%Phisub(iq,jq,isub,jsub,2,2)*bed_corners(2,2))) + &
+                 ((CS%Phisub(iq,jq,isub,jsub,2,1)*bed_corners(2,1)) + (CS%Phisub(iq,jq,isub,jsub,1,2)*bed_corners(1,2)))
 
         if (rhoi_rhow * h_ip - bed_ip > 0.0) n_grounded = n_grounded + 1
       enddo ; enddo
@@ -7088,13 +7056,6 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   real :: dxCv_S, dxCv_N      ! Cell-edge spacings on south and north faces [L ~> m]
   real :: dyCu_W, dyCu_E      ! Cell-edge spacings on west and east faces [L ~> m]
 
-  ! Per-cell driving-stress contribution buffers, mirroring the structure of
-  ! CG_action_subgrid_basal: within a cell, accumulate per-(qx,qy,m,n) into a
-  ! 2x2x2x2 sub-cell buffer; pair-sum the 4 QPs to per-sub-cell (m,n); use
-  ! sum_square_matrix across the nsub x nsub sub-cell grid to get per-cell
-  ! (m,n). All reductions are rotation-invariant by construction. Indices (m,n)
-  ! follow the (xi-corner, eta-corner) convention: (1,1)=SW, (2,1)=SE, (1,2)=NW,
-  ! (2,2)=NE.
   real, dimension(2,2,2,2) :: qp_dx, qp_dy ! Per-QP x and y stress contributions to the
                                            ! 4 cell-corners, indexed (qx,qy,m,n)
                                            ! [R L3 Z T-2 ~> kg m s-2]
@@ -7110,11 +7071,6 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
                                            ! Neumann face) for this cell, indexed (m,n)
                                            ! [R L3 Z T-2 ~> kg m s-2]
 
-  ! Per-node, per-surrounding-element accumulator (slot k indexes which of the
-  ! 4 cells around node (I,J) is contributing). Reduction at the end:
-  !   taudx(I,J) = (b(1)+b(4)) + (b(2)+b(3))
-  ! is invariant under the 90 deg cyclic permutation of the 4 cells around a
-  ! node, giving both per-cell and cross-cell rotation invariance.
   real, dimension(SZDIB_(G),SZDJB_(G),4) :: taudx_b, taudy_b
                                            !< Per-node 4-slot driving-stress
                                            !! accumulator, slot k indexed by which
@@ -7123,16 +7079,14 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
                                            !! [R L3 Z T-2 ~> kg m s-2]
 
   ! Per-face Neumann-BC contributions to the face's two corner nodes (A,B).
-  ! Each face is perpendicular to exactly one velocity component, so the W/E
-  ! faces only contribute to the x-driving-stress and the S/N faces only to
-  ! the y-driving-stress. Each accumulator is the rounded (gp1 + gp2) face-
-  ! quadrature sum scaled by the face-orthogonal cell width
-  ! [R L3 Z T-2 ~> kg m s-2].
-  real :: face_dx_W_A, face_dx_W_B  ! West face x-stress contrib to nodes A,B
-  real :: face_dx_E_A, face_dx_E_B  ! East face x-stress contrib to nodes A,B
-  real :: face_dy_S_A, face_dy_S_B  ! South face y-stress contrib to nodes A,B
-  real :: face_dy_N_A, face_dy_N_B  ! North face y-stress contrib to nodes A,B
+  real :: face_dx_W_A, face_dx_W_B  ! West face x-stress contrib to nodes A,B [R L3 Z T-2 ~> kg m s-2]
+  real :: face_dx_E_A, face_dx_E_B  ! East face x-stress contrib to nodes A,B [R L3 Z T-2 ~> kg m s-2]
+  real :: face_dy_S_A, face_dy_S_B  ! South face y-stress contrib to nodes A,B [R L3 Z T-2 ~> kg m s-2]
+  real :: face_dy_N_A, face_dy_N_B  ! North face y-stress contrib to nodes A,B [R L3 Z T-2 ~> kg m s-2]
   integer :: m, n  ! Cell-corner (m,n) loop indices in [1..2] [nondim]
+
+  ! 1D shape-function factors similar to those used in bilinear_shape_functions_subgrid
+  real, dimension(2,max(1,CS%n_sub_regularize)) :: a_left, a_right ! [nondim]
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -7181,6 +7135,12 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       ! corner-node (m,n), giving a rotation-invariant per-cell volume-integral
       ! total vol_d*(m,n).
       fracx = 1.0 / real(nsub)
+
+      ! Rotation-paired 1D shape-function factors (as in bilinear_shape_functions_subgrid)
+      do isub=1,nsub ; do iq=1,2
+        a_left (iq,isub) = (real(nsub-isub) + xquad(3-iq)) * fracx
+        a_right(iq,isub) = (real(isub-1)    + xquad(iq))   * fracx
+      enddo ; enddo
       do jsub=1,nsub ; do isub=1,nsub
         qp_dx(:,:,:,:) = 0.0 ; qp_dy(:,:,:,:) = 0.0
         do jq=1,2 ; do iq=1,2
@@ -7199,14 +7159,28 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
           dhdx_gp = CS%h_x(i,j) * G%IdxT(i,j)
           dhdy_gp = CS%h_y(i,j) * G%IdyT(i,j)
 
-          bed_gp = ((bed_corners(1,1) * ((1.0-xp) * (1.0-yp)))  &
-                  + (bed_corners(2,2) * ( xp      *  yp     ))) &
-                 + ((bed_corners(2,1) * ( xp      * (1.0-yp))) &
-                  + (bed_corners(1,2) * ((1.0-xp) *  yp     )))
-          dbdx_gp = (((bed_corners(2,1) - bed_corners(1,1)) * (1.0-yp))  &
-                   + ((bed_corners(2,2) - bed_corners(1,2)) *  yp     )) * G%IdxT(i,j)
-          dbdy_gp = (((bed_corners(1,2) - bed_corners(1,1)) * (1.0-xp))  &
-                   + ((bed_corners(2,2) - bed_corners(2,1)) *  xp     )) * G%IdyT(i,j)
+          ! Bed at the sub-QP
+          bed_gp = ((bed_corners(1,1) * (a_left (iq,isub) * a_left (jq,jsub))) + &
+                    (bed_corners(2,2) * (a_right(iq,isub) * a_right(jq,jsub))))  + &
+                   ((bed_corners(2,1) * (a_right(iq,isub) * a_left (jq,jsub))) + &
+                    (bed_corners(1,2) * (a_left (iq,isub) * a_right(jq,jsub))))
+
+          ! Bed gradients in physical coordinates at the sub-QP.
+          ! The reference-coord derivatives of the 4 corner bilinear basis
+          ! functions are constants in the perpendicular factor:
+          !   d phi_SW/dx_ref = -a_left (qy,j)   d phi_SW/dy_ref = -a_left (qx,i)
+          !   d phi_SE/dx_ref = +a_left (qy,j)   d phi_SE/dy_ref = -a_right(qx,i)
+          !   d phi_NW/dx_ref = -a_right(qy,j)   d phi_NW/dy_ref = +a_left (qx,i)
+          !   d phi_NE/dx_ref = +a_right(qy,j)   d phi_NE/dy_ref = +a_right(qx,i)
+          ! Multiply by IdxT/IdyT for physical gradients.
+          dbdx_gp = (((bed_corners(1,1) * (-a_left (jq,jsub))) + &
+                      (bed_corners(2,2) * ( a_right(jq,jsub))))  + &
+                     ((bed_corners(2,1) * ( a_left (jq,jsub))) + &
+                      (bed_corners(1,2) * (-a_right(jq,jsub))))) * G%IdxT(i,j)
+          dbdy_gp = (((bed_corners(1,1) * (-a_left (iq,isub))) + &
+                      (bed_corners(2,2) * ( a_right(iq,isub))))  + &
+                     ((bed_corners(2,1) * (-a_right(iq,isub))) + &
+                      (bed_corners(1,2) * ( a_left (iq,isub))))) * G%IdyT(i,j)
 
           if (CS%GL_couple) then
             s_gp = -bed_gp + (OD(i,j) + h_gp)
@@ -7231,11 +7205,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             dsdy_gp = scale * dsdy_gp
           endif
 
-          ! Per-node bilinear basis: phi(1,1)=(1-xp)(1-yp), phi(2,1)=xp(1-yp),
-          ! phi(1,2)=(1-xp)yp, phi(2,2)=xp*yp. (m,n) follows CG_action_subgrid_basal
-          ! convention: m indexes the xi-corner, n indexes the eta-corner.
+          ! Per-node bilinear basis at the sub-QP
           do n=1,2 ; do m=1,2
-            phi_val = (merge(xp, 1.0-xp, m == 2)) * (merge(yp, 1.0-yp, n == 2))
+            phi_val = (merge(a_right(iq,isub), a_left(iq,isub), m == 2)) * &
+                      (merge(a_right(jq,jsub), a_left(jq,jsub), n == 2))
             qp_dx(iq,jq,m,n) = -weight_sub * phi_val * (rho * grav * h_gp * dsdx_gp)
             qp_dy(iq,jq,m,n) = -weight_sub * phi_val * (rho * grav * h_gp * dsdy_gp)
           enddo ; enddo
@@ -7400,9 +7373,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   enddo ; enddo
 
   ! Final per-node reduction: combine the 4 surrounding-cell contributions with
-  ! a diagonal + off-diagonal pair-sum. Under a 90 deg rotation the four cells
-  ! around a node cyclically permute, so the pair {SW,NE} swaps with {SE,NW}
-  ! and the top-level + commutes on the two pre-rounded pair sums.
+  ! a diagonal + off-diagonal pair-sum.
   do J=G%JsdB,G%JedB ; do I=G%IsdB,G%IedB
     taudx(I,J) = (taudx_b(I,J,1) + taudx_b(I,J,4)) + (taudx_b(I,J,2) + taudx_b(I,J,3))
     taudy(I,J) = (taudy_b(I,J,1) + taudy_b(I,J,4)) + (taudy_b(I,J,2) + taudy_b(I,J,3))
