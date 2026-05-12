@@ -3707,29 +3707,29 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
           !     is not above the base of the ice in the current cell
 
           ! Note the negative sign due to the direction of the normal vector
-          taudx(I-1,J-1) = taudx(I-1,J-1) - .5 * G%dyT(i,j) * neumann_val
-          taudx(I-1,J) = taudx(I-1,J) - .5 * G%dyT(i,j) * neumann_val
+          taudx(I-1,J-1) = taudx(I-1,J-1) - .5 * G%dyCu(I-1,j) * neumann_val
+          taudx(I-1,J) = taudx(I-1,J) - .5 * G%dyCu(I-1,j) * neumann_val
         endif
 
         if ((CS%u_face_mask_bdry(I,j) == 2) .OR. &
           ((ISS%hmask(i+1,j) == 0 .OR. ISS%hmask(i+1,j) == 2) .and. (CS%reentrant_x .OR. (i+i_off /= giec)))) then
           ! east face of the cell is at a stress boundary
-          taudx(I,J-1) = taudx(I,J-1) + .5 * G%dyT(i,j) * neumann_val
-          taudx(I,J) = taudx(I,J) + .5 * G%dyT(i,j) * neumann_val
+          taudx(I,J-1) = taudx(I,J-1) + .5 * G%dyCu(I,j) * neumann_val
+          taudx(I,J) = taudx(I,J) + .5 * G%dyCu(I,j) * neumann_val
         endif
 
         if ((CS%v_face_mask_bdry(i,J-1) == 2) .OR. &
           ((ISS%hmask(i,j-1) == 0 .OR. ISS%hmask(i,j-1) == 2) .and. (CS%reentrant_y .OR. (j+j_off /= gjsc)))) then
           ! south face of the cell is at a stress boundary
-          taudy(I-1,J-1) = taudy(I-1,J-1) - .5 * G%dxT(i,j) * neumann_val
-          taudy(I,J-1) = taudy(I,J-1) - .5 * G%dxT(i,j) * neumann_val
+          taudy(I-1,J-1) = taudy(I-1,J-1) - .5 * G%dxCv(i,J-1) * neumann_val
+          taudy(I,J-1) = taudy(I,J-1) - .5 * G%dxCv(i,J-1) * neumann_val
         endif
 
         if ((CS%v_face_mask_bdry(i,J) == 2) .OR. &
           ((ISS%hmask(i,j+1) == 0 .OR. ISS%hmask(i,j+1) == 2) .and. (CS%reentrant_y .OR. (j+j_off /= gjec)))) then
           ! north face of the cell is at a stress boundary
-          taudy(I-1,J) = taudy(I-1,J) + .5 * G%dxT(i,j) * neumann_val
-          taudy(I,J) = taudy(I,J) + .5 * G%dxT(i,j) * neumann_val
+          taudy(I-1,J) = taudy(I-1,J) + .5 * G%dxCv(i,J) * neumann_val
+          taudy(I,J) = taudy(I,J) + .5 * G%dxCv(i,J) * neumann_val
         endif
       else ! This is not an ice-filled cell, so zero out the slopes here
         CS%sx_shelf(i,j) = 0.0 ; CS%sy_shelf(i,j) = 0.0
@@ -7028,42 +7028,31 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   real :: phi_A, phi_B ! Linear nodal basis values at the face quadrature point [nondim]
   integer :: gp_face   ! Face Gauss-point loop index [nondim]
 
-  ! Sub-element quadrature variables
-  real :: xi_gp, eta_gp     ! DG reference coordinates in [-0.5,0.5] at a sub-QP [nondim]
-  real :: h_gp              ! Ice thickness at a sub-QP [Z ~> m]
-  real :: dhdx_gp, dhdy_gp  ! Thickness gradients at a sub-QP, in physical coordinates [Z L-1 ~> nondim]
-  real :: bed_gp            ! Bed elevation at a sub-QP [Z ~> m]
-  real :: dbdx_gp, dbdy_gp  ! Bed gradients at a sub-QP, in physical coordinates [Z L-1 ~> nondim]
-  real :: s_gp              ! Surface elevation at a sub-QP [Z ~> m]
-  real :: dsdx_gp, dsdy_gp  ! Surface slope at a sub-QP, in physical coordinates [Z L-1 ~> nondim]
-  real :: phi_val           ! Bilinear nodal basis value at a sub-QP [nondim]
+  ! Main-grid 2x2 Gauss quadrature variables
+  real :: xi_gp, eta_gp     ! DG reference coordinates in [-0.5,0.5] at a main qp [nondim]
+  real :: h_gp              ! Ice thickness at a qp [Z ~> m]
+  real :: dhdx_gp, dhdy_gp  ! Thickness gradients at a qp, in physical coordinates [Z L-1 ~> nondim]
+  real :: bed_gp            ! Bed elevation at a qp [Z ~> m]
+  real :: dbdx_gp, dbdy_gp  ! Bed gradients at a qp, in physical coordinates [Z L-1 ~> nondim]
+  real :: dbdx_ref, dbdy_ref ! Bed gradients in reference coords (pre-Jacobian) [Z ~> m]
+  real :: dsdx_gp, dsdy_gp  ! Surface slope at a qp, in physical coordinates [Z L-1 ~> nondim]
+  real :: phi_val           ! Bilinear nodal basis value at a qp [nondim]
   real :: scale             ! Multiplier applied to dsdx,dsdy to enforce max_surface_slope [nondim]
-  real :: slope_mag         ! |grad(s)| magnitude at a sub-QP [Z L-1 ~> nondim]
+  real :: slope_mag         ! |grad(s)| magnitude at a qp [Z L-1 ~> nondim]
+  real :: a_qp, d_qp        ! Per-qp interpolated cell-edge spacings [L ~> m]
+  real :: weight            ! Per-qp quadrature weight including Jacobian [L2 ~> m2]
   real :: bed_corners(2,2)  ! Bed elevation at the 4 B-grid corners of an element [Z ~> m]
+  real :: dxCv_S, dxCv_N    ! Cell-edge spacings on south and north faces [L ~> m]
+  real :: dyCu_W, dyCu_E    ! Cell-edge spacings on west and east faces [L ~> m]
 
   ! Gauss quadrature: 2 nodes of a 2-point Gauss-Legendre rule on [0,1]
   real, dimension(2) :: xquad  ! Quadrature point locations on [0,1] [nondim]
   integer :: i, j, iq, jq, isc, iec, jsc, jec, isd, ied, jsd, jed
   integer :: i_off, j_off, gisc, giec, gjsc, gjec
-  logical :: valid_E, valid_W, valid_N, valid_S
-
-  ! Subelement quadrature variables for grounding line cells
-  integer :: isub, jsub, nsub ! Sub-cell loop indices and sub-cell count [nondim]
-  real :: fracx               ! Reciprocal of nsub, i.e. sub-cell fractional width [nondim]
-  real :: xp, yp              ! [0,1] reference coordinates of a sub-QP within the full cell [nondim]
-  real :: weight_sub          ! Sub-QP quadrature weight including Jacobian [L2 ~> m2]
-  real :: a_metric, d_metric  ! Interpolated cell-edge spacings at a sub-QP [L ~> m]
-  real :: dxCv_S, dxCv_N      ! Cell-edge spacings on south and north faces [L ~> m]
-  real :: dyCu_W, dyCu_E      ! Cell-edge spacings on west and east faces [L ~> m]
 
   real, dimension(2,2,2,2) :: qp_dx, qp_dy ! Per-QP x and y stress contributions to the
                                            ! 4 cell-corners, indexed (qx,qy,m,n)
                                            ! [R L3 Z T-2 ~> kg m s-2]
-  real, dimension(max(1,CS%n_sub_regularize), &
-                  max(1,CS%n_sub_regularize), 2, 2) :: contr_sub_dx, contr_sub_dy
-                                           !< Per-sub-cell stress contributions to the
-                                           !! 4 cell-corners, indexed (isub,jsub,m,n)
-                                           !! [R L3 Z T-2 ~> kg m s-2]
   real, dimension(2,2) :: vol_dx, vol_dy   ! Per-corner volume-integral driving-stress
                                            ! total for this cell, indexed (m,n)
                                            ! [R L3 Z T-2 ~> kg m s-2]
@@ -7084,9 +7073,6 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   real :: face_dy_S_A, face_dy_S_B  ! South face y-stress contrib to nodes A,B [R L3 Z T-2 ~> kg m s-2]
   real :: face_dy_N_A, face_dy_N_B  ! North face y-stress contrib to nodes A,B [R L3 Z T-2 ~> kg m s-2]
   integer :: m, n  ! Cell-corner (m,n) loop indices in [1..2] [nondim]
-
-  ! 1D shape-function factors similar to those used in bilinear_shape_functions_subgrid
-  real, dimension(2,max(1,CS%n_sub_regularize)) :: a_left, a_right ! [nondim]
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -7123,76 +7109,56 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       dxCv_S = G%dxCv(i,J-1) ; dxCv_N = G%dxCv(i,J)
       dyCu_W = G%dyCu(I-1,j) ; dyCu_E = G%dyCu(I,j)
 
-      ! Determine quadrature strategy: nsub x nsub subelement for GL cells, standard 2x2 otherwise
-      nsub = 1
-      if (CS%GL_regularize .and. CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0) &
-        nsub = CS%n_sub_regularize
-
-      ! Loop over sub-cells (nsub x nsub), each with 2x2 Gauss points. Per sub-cell,
-      ! accumulate per-QP per-node contributions into qp_dx/qp_dy, then pair-sum the
-      ! 4 QPs to produce a sub-cell contribution contr_sub_d*(isub,jsub,m,n). After
-      ! the sub-cell loop, sum_square_matrix reduces the nsub x nsub array per
-      ! corner-node (m,n), giving a rotation-invariant per-cell volume-integral
-      ! total vol_d*(m,n).
-      fracx = 1.0 / real(nsub)
-
-      ! Rotation-paired 1D shape-function factors (as in bilinear_shape_functions_subgrid)
-      do isub=1,nsub ; do iq=1,2
-        a_left (iq,isub) = (real(nsub-isub) + xquad(3-iq)) * fracx
-        a_right(iq,isub) = (real(isub-1)    + xquad(iq))   * fracx
-      enddo ; enddo
-      do jsub=1,nsub ; do isub=1,nsub
+      ! GL band: defer to sub-grid routine (mirrors CG_action_subgrid_basal).
+      ! Non-GL cells: inline 2x2 main-grid Gauss quadrature, mirroring how
+      ! CG_action handles the main-grid 4-qp loop. Both paths produce vol_d*(m,n).
+      if (CS%GL_regularize .and. CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0) then
+        call calc_shelf_driving_stress_DG_subgrid(CS, CS%Phisub, &
+            ISS%h_shelf(i,j), CS%h_x(i,j), CS%h_y(i,j), bed_corners, &
+            dxCv_S, dxCv_N, dyCu_W, dyCu_E, &
+            rho, rhoi_rhow, grav, vol_dx, vol_dy)
+      else
         qp_dx(:,:,:,:) = 0.0 ; qp_dy(:,:,:,:) = 0.0
         do jq=1,2 ; do iq=1,2
+          xi_gp  = xquad(iq) - 0.5
+          eta_gp = xquad(jq) - 0.5
 
-          xp = (real(isub-1) + xquad(iq)) * fracx
-          yp = (real(jsub-1) + xquad(jq)) * fracx
-          xi_gp  = xp - 0.5
-          eta_gp = yp - 0.5
+          ! Per-qp interpolated metric
+          a_qp = (dxCv_S * xquad(3-jq)) + (dxCv_N * xquad(jq))
+          d_qp = (dyCu_W * xquad(3-iq)) + (dyCu_E * xquad(iq))
+          weight = 0.25 * (a_qp * d_qp)
 
-          a_metric = (dxCv_S * (1.0 - yp)) + (dxCv_N * yp)
-          d_metric = (dyCu_W * (1.0 - xp)) + (dyCu_E * xp)
-          weight_sub = 0.25 * fracx * fracx * (a_metric * d_metric)
-
-          h_gp = max(ISS%h_shelf(i,j) + ((CS%h_x(i,j) * xi_gp) + (CS%h_y(i,j) * eta_gp)), &
+          h_gp = max(ISS%h_shelf(i,j) + ((CS%h_x(i,j)*xi_gp) + (CS%h_y(i,j)*eta_gp)), &
                      CS%min_h_shelf)
-          dhdx_gp = CS%h_x(i,j) * G%IdxT(i,j)
-          dhdy_gp = CS%h_y(i,j) * G%IdyT(i,j)
+          dhdx_gp = CS%h_x(i,j) / a_qp
+          dhdy_gp = CS%h_y(i,j) / d_qp
 
-          ! Bed at the sub-QP
-          bed_gp = ((bed_corners(1,1) * (a_left (iq,isub) * a_left (jq,jsub))) + &
-                    (bed_corners(2,2) * (a_right(iq,isub) * a_right(jq,jsub))))  + &
-                   ((bed_corners(2,1) * (a_right(iq,isub) * a_left (jq,jsub))) + &
-                    (bed_corners(1,2) * (a_left (iq,isub) * a_right(jq,jsub))))
+          ! Bed at the qp
+          bed_gp = ((bed_corners(1,1) * (xquad(3-iq) * xquad(3-jq))) + &
+                    (bed_corners(2,2) * (xquad(iq)   * xquad(jq))))  + &
+                   ((bed_corners(2,1) * (xquad(iq)   * xquad(3-jq))) + &
+                    (bed_corners(1,2) * (xquad(3-iq) * xquad(jq))))
 
-          ! Bed gradients in physical coordinates at the sub-QP.
-          ! The reference-coord derivatives of the 4 corner bilinear basis
-          ! functions are constants in the perpendicular factor:
-          !   d phi_SW/dx_ref = -a_left (qy,j)   d phi_SW/dy_ref = -a_left (qx,i)
-          !   d phi_SE/dx_ref = +a_left (qy,j)   d phi_SE/dy_ref = -a_right(qx,i)
-          !   d phi_NW/dx_ref = -a_right(qy,j)   d phi_NW/dy_ref = +a_left (qx,i)
-          !   d phi_NE/dx_ref = +a_right(qy,j)   d phi_NE/dy_ref = +a_right(qx,i)
-          ! Multiply by IdxT/IdyT for physical gradients.
-          dbdx_gp = (((bed_corners(1,1) * (-a_left (jq,jsub))) + &
-                      (bed_corners(2,2) * ( a_right(jq,jsub))))  + &
-                     ((bed_corners(2,1) * ( a_left (jq,jsub))) + &
-                      (bed_corners(1,2) * (-a_right(jq,jsub))))) * G%IdxT(i,j)
-          dbdy_gp = (((bed_corners(1,1) * (-a_left (iq,isub))) + &
-                      (bed_corners(2,2) * ( a_right(iq,isub))))  + &
-                     ((bed_corners(2,1) * (-a_right(iq,isub))) + &
-                      (bed_corners(1,2) * ( a_left (iq,isub))))) * G%IdyT(i,j)
+          ! Reference-coord bed gradients
+          dbdx_ref = (((bed_corners(1,1) * (-xquad(3-jq))) + &
+                       (bed_corners(2,2) * ( xquad(jq))))  + &
+                      ((bed_corners(2,1) * ( xquad(3-jq))) + &
+                       (bed_corners(1,2) * (-xquad(jq)))))
+          dbdy_ref = (((bed_corners(1,1) * (-xquad(3-iq))) + &
+                       (bed_corners(2,2) * ( xquad(iq))))  + &
+                      ((bed_corners(2,1) * (-xquad(iq))) + &
+                       (bed_corners(1,2) * ( xquad(3-iq)))))
+          dbdx_gp = dbdx_ref / a_qp
+          dbdy_gp = dbdy_ref / d_qp
 
           if (CS%GL_couple) then
-            s_gp = -bed_gp + (OD(i,j) + h_gp)
             dsdx_gp = -dbdx_gp + dhdx_gp
             dsdy_gp = -dbdy_gp + dhdy_gp
           else
             if (rhoi_rhow * h_gp - bed_gp <= 0.0) then
-              s_gp = (1.0 - rhoi_rhow) * h_gp
               dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp
               dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
             else
-              s_gp = h_gp - bed_gp
               dsdx_gp = dhdx_gp - dbdx_gp
               dsdy_gp = dhdy_gp - dbdy_gp
             endif
@@ -7205,31 +7171,19 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             dsdy_gp = scale * dsdy_gp
           endif
 
-          ! Per-node bilinear basis at the sub-QP
           do n=1,2 ; do m=1,2
-            phi_val = (merge(a_right(iq,isub), a_left(iq,isub), m == 2)) * &
-                      (merge(a_right(jq,jsub), a_left(jq,jsub), n == 2))
-            qp_dx(iq,jq,m,n) = -weight_sub * phi_val * (rho * grav * h_gp * dsdx_gp)
-            qp_dy(iq,jq,m,n) = -weight_sub * phi_val * (rho * grav * h_gp * dsdy_gp)
+            phi_val = (merge(xquad(iq), xquad(3-iq), m == 2)) * &
+                      (merge(xquad(jq), xquad(3-jq), n == 2))
+            qp_dx(iq,jq,m,n) = -weight * phi_val * (rho * grav * h_gp * dsdx_gp)
+            qp_dy(iq,jq,m,n) = -weight * phi_val * (rho * grav * h_gp * dsdy_gp)
           enddo ; enddo
-
-        enddo ; enddo  ! end qx,qy
-
-        ! Pair-sum the 4 QPs to a sub-cell contribution per corner-node.
-        do n=1,2 ; do m=1,2
-          contr_sub_dx(isub,jsub,m,n) = (qp_dx(1,1,m,n) + qp_dx(2,2,m,n)) + &
-                                        (qp_dx(1,2,m,n) + qp_dx(2,1,m,n))
-          contr_sub_dy(isub,jsub,m,n) = (qp_dy(1,1,m,n) + qp_dy(2,2,m,n)) + &
-                                        (qp_dy(1,2,m,n) + qp_dy(2,1,m,n))
         enddo ; enddo
-      enddo ; enddo  ! end isub,jsub
 
-      ! Rotation-invariant reduction across the nsub x nsub sub-cell grid for
-      ! each corner-node (m,n).
-      do n=1,2 ; do m=1,2
-        call sum_square_matrix(vol_dx(m,n), contr_sub_dx(1:nsub,1:nsub,m,n), nsub)
-        call sum_square_matrix(vol_dy(m,n), contr_sub_dy(1:nsub,1:nsub,m,n), nsub)
-      enddo ; enddo
+        do n=1,2 ; do m=1,2
+          vol_dx(m,n) = (qp_dx(1,1,m,n) + qp_dx(2,2,m,n)) + (qp_dx(1,2,m,n) + qp_dx(2,1,m,n))
+          vol_dy(m,n) = (qp_dy(1,1,m,n) + qp_dy(2,2,m,n)) + (qp_dy(1,2,m,n) + qp_dy(2,1,m,n))
+        enddo ; enddo
+      endif
 
       ! Neumann (stress) boundary conditions — face-integrated using DG nodal
       ! thickness h(xi,eta) = h_shelf + h_x*xi + h_y*eta and bed_node corners.
@@ -7237,11 +7191,6 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       ! integrate Phi_node * 0.5*g*(rho*h^2 - rhow*b^2) (grounded) or
       ! Phi_node * 0.5*g*(1-rho/rhow)*rho*h^2 (floating) using 2-pt Gauss
       ! (weight 0.5 each on [0,1]). min_h_shelf floor applied per nodal h.
-      ! Grounded/floating selection is now per face quadrature point (computed inside each face loop).
-      ! Each face block stores its contributions in per-face scalars; they are
-      ! combined per cell-corner with a single binary add after all 4 face blocks,
-      ! so the per-corner total is rotation-invariant (90 deg rotation cyclically
-      ! permutes W,E,S,N and FP + is commutative on rounded operands).
       face_dx_W_A = 0.0 ; face_dx_W_B = 0.0
       face_dx_E_A = 0.0 ; face_dx_E_B = 0.0
       face_dy_S_A = 0.0 ; face_dy_S_B = 0.0
@@ -7266,8 +7215,8 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             nv_face = 0.5*grav*((1.0 - rhoi_rhow)*rho*h_face**2)
           endif
           phi_A = 1.0 - t_face ; phi_B = t_face
-          face_dx_W_A = face_dx_W_A - 0.5*G%dyT(i,j) * phi_A * nv_face
-          face_dx_W_B = face_dx_W_B - 0.5*G%dyT(i,j) * phi_B * nv_face
+          face_dx_W_A = face_dx_W_A - 0.5*G%dyCu(I-1,j) * phi_A * nv_face
+          face_dx_W_B = face_dx_W_B - 0.5*G%dyCu(I-1,j) * phi_B * nv_face
         enddo
       endif
 
@@ -7290,8 +7239,8 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             nv_face = 0.5*grav*((1.0 - rhoi_rhow)*rho*h_face**2)
           endif
           phi_A = 1.0 - t_face ; phi_B = t_face
-          face_dx_E_A = face_dx_E_A + 0.5*G%dyT(i,j) * phi_A * nv_face
-          face_dx_E_B = face_dx_E_B + 0.5*G%dyT(i,j) * phi_B * nv_face
+          face_dx_E_A = face_dx_E_A + 0.5*G%dyCu(I,j) * phi_A * nv_face
+          face_dx_E_B = face_dx_E_B + 0.5*G%dyCu(I,j) * phi_B * nv_face
         enddo
       endif
 
@@ -7314,8 +7263,8 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             nv_face = 0.5*grav*((1.0 - rhoi_rhow)*rho*h_face**2)
           endif
           phi_A = 1.0 - t_face ; phi_B = t_face
-          face_dy_S_A = face_dy_S_A - 0.5*G%dxT(i,j) * phi_A * nv_face
-          face_dy_S_B = face_dy_S_B - 0.5*G%dxT(i,j) * phi_B * nv_face
+          face_dy_S_A = face_dy_S_A - 0.5*G%dxCv(i,J-1) * phi_A * nv_face
+          face_dy_S_B = face_dy_S_B - 0.5*G%dxCv(i,J-1) * phi_B * nv_face
         enddo
       endif
 
@@ -7338,16 +7287,14 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             nv_face = 0.5*grav*((1.0 - rhoi_rhow)*rho*h_face**2)
           endif
           phi_A = 1.0 - t_face ; phi_B = t_face
-          face_dy_N_A = face_dy_N_A + 0.5*G%dxT(i,j) * phi_A * nv_face
-          face_dy_N_B = face_dy_N_B + 0.5*G%dxT(i,j) * phi_B * nv_face
+          face_dy_N_A = face_dy_N_A + 0.5*G%dxCv(i,J) * phi_A * nv_face
+          face_dy_N_B = face_dy_N_B + 0.5*G%dxCv(i,J) * phi_B * nv_face
         enddo
       endif
 
       ! Combine the per-cell volume-integral total vol_d*(m,n) with the per-face
       ! Neumann contributions to get this cell's contribution to each of its 4
-      ! corner-nodes. Each face is perpendicular to exactly one velocity component,
-      ! so the W/E face contributions land only in cell_dx_node and the S/N face
-      ! contributions only in cell_dy_node.
+      ! corner-nodes.
       cell_dx_node(1,1) = vol_dx(1,1) + face_dx_W_A  ! SW corner, W face
       cell_dy_node(1,1) = vol_dy(1,1) + face_dy_S_A  ! SW corner, S face
       cell_dx_node(2,1) = vol_dx(2,1) + face_dx_E_A  ! SE corner, E face
@@ -7380,6 +7327,128 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   enddo ; enddo
 
 end subroutine calc_shelf_driving_stress_DG
+
+!> Subgrid GL-band volume integral of the driving stress for the DG path.
+!! Mirrors CG_action_subgrid_basal: nsub x nsub sub-cells, 2x2 sub-qp each,
+!! per-sub-qp interpolated metric (a,d) from cell-edge spacings via Phisub
+!! marginal sums, rotation-paired Phisub contraction for nodal contributions,
+!! pair-summed per sub-cell, then sum_square_matrix reduction across the
+!! nsub x nsub sub-cell grid for bitwise rotation invariance.
+subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
+    h_shelf_cell, h_x_cell, h_y_cell, bed_corners, &
+    dxCv_S, dxCv_N, dyCu_W, dyCu_E, &
+    rho, rhoi_rhow, grav, vol_dx, vol_dy)
+  type(ice_shelf_dyn_CS), intent(in) :: CS    !< Ice shelf control structure
+  real, dimension(:,:,:,:,:,:), intent(in) :: Phisub !< Sub-grid quadrature weights [nondim]
+  real, intent(in) :: h_shelf_cell   !< Cell-averaged ice thickness [Z ~> m]
+  real, intent(in) :: h_x_cell       !< DG x-slope moment [Z ~> m]
+  real, intent(in) :: h_y_cell       !< DG y-slope moment [Z ~> m]
+  real, dimension(2,2), intent(in) :: bed_corners !< Bed elevation at the 4 cell corners [Z ~> m]
+  real, intent(in) :: dxCv_S         !< Cell x-length on south face [L ~> m]
+  real, intent(in) :: dxCv_N         !< Cell x-length on north face [L ~> m]
+  real, intent(in) :: dyCu_W         !< Cell y-length on west face [L ~> m]
+  real, intent(in) :: dyCu_E         !< Cell y-length on east face [L ~> m]
+  real, intent(in) :: rho            !< Ice density [R ~> kg m-3]
+  real, intent(in) :: rhoi_rhow      !< rho/rhow [nondim]
+  real, intent(in) :: grav           !< Gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
+  real, dimension(2,2), intent(out) :: vol_dx !< Per-corner x volume integral [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(2,2), intent(out) :: vol_dy !< Per-corner y volume integral [R L3 Z T-2 ~> kg m s-2]
+
+  real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: contr_sub_dx, contr_sub_dy
+  real, dimension(2,2,2,2) :: qp_dx, qp_dy
+  real :: xi_sub, eta_sub   ! DG reference coords at sub-qp ([-0.5,0.5]) [nondim]
+  real :: h_gp              ! Ice thickness at sub-qp [Z ~> m]
+  real :: dhdx_gp, dhdy_gp  ! Thickness gradients at sub-qp, physical coords [Z L-1 ~> nondim]
+  real :: bed_gp            ! Bed elevation at sub-qp [Z ~> m]
+  real :: dbdx_gp, dbdy_gp  ! Bed gradients at sub-qp, physical coords [Z L-1 ~> nondim]
+  real :: dbdx_ref, dbdy_ref ! Bed gradients in reference coords (pre-Jacobian) [Z ~> m]
+  real :: dsdx_gp, dsdy_gp  ! Surface slope at sub-qp [Z L-1 ~> nondim]
+  real :: a, d              ! Per-sub-qp interpolated cell-edge spacings [L ~> m]
+  real :: weight            ! Per-sub-qp quadrature weight [L2 ~> m2]
+  real :: subarea           ! 1/nsub^2 [nondim]
+  real :: scale, slope_mag  ! max_surface_slope clamp [nondim]
+  integer :: nsub, i, j, qx, qy, m, n
+
+  nsub    = size(Phisub, 3)
+  subarea = 1.0 / real(nsub)**2
+
+  do j=1,nsub ; do i=1,nsub
+    qp_dx(:,:,:,:) = 0.0 ; qp_dy(:,:,:,:) = 0.0
+    do qy=1,2 ; do qx=1,2
+      ! Reference coords at the sub-qp: xi_sub = a_right(qx,i) - 0.5; marginal
+      ! sum of Phisub over k for l=2 gives a_right(qx,i).
+      xi_sub  = (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)) - 0.5
+      eta_sub = (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2)) - 0.5
+
+      h_gp = max(h_shelf_cell + ((h_x_cell*xi_sub) + (h_y_cell*eta_sub)), CS%min_h_shelf)
+
+      ! Bed at sub-qp: rotation-paired Phisub contraction of bed_corners.
+      bed_gp = ((Phisub(qx,qy,i,j,1,1)*bed_corners(1,1)) + (Phisub(qx,qy,i,j,2,2)*bed_corners(2,2))) + &
+               ((Phisub(qx,qy,i,j,1,2)*bed_corners(1,2)) + (Phisub(qx,qy,i,j,2,1)*bed_corners(2,1)))
+
+      ! Per-sub-qp metric via Phisub marginal sums (same pattern as CG_action_subgrid_basal).
+      a = (dxCv_S * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1))) + &  ! (1-y) * dxCv_S
+          (dxCv_N * (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2)))      !  + y  * dxCv_N
+      d = (dyCu_W * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2))) + &  ! (1-x) * dyCu_W
+          (dyCu_E * (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)))      !  + x  * dyCu_E
+      weight = 0.25 * subarea * (a * d)
+
+      ! Physical-coord gradients: per-sub-qp Jacobian, consistent with bilinear_shape_fn_grid.
+      dhdx_gp = h_x_cell / a
+      dhdy_gp = h_y_cell / d
+
+      ! Reference-coord bed gradients: derivative of bilinear corner-basis at sub-qp.
+      dbdx_ref = (((bed_corners(1,1) * (-(Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1)))) + &
+                   (bed_corners(2,2) * ( (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2))))) + &
+                  ((bed_corners(2,1) * ( (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1)))) + &
+                   (bed_corners(1,2) * (-(Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2))))))
+      dbdy_ref = (((bed_corners(1,1) * (-(Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2)))) + &
+                   (bed_corners(2,2) * ( (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2))))) + &
+                  ((bed_corners(2,1) * (-(Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)))) + &
+                   (bed_corners(1,2) * ( (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2))))))
+      dbdx_gp = dbdx_ref / a
+      dbdy_gp = dbdy_ref / d
+
+      if (CS%GL_couple) then
+        dsdx_gp = -dbdx_gp + dhdx_gp
+        dsdy_gp = -dbdy_gp + dhdy_gp
+      else
+        if (rhoi_rhow * h_gp - bed_gp <= 0.0) then
+          dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp
+          dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
+        else
+          dsdx_gp = dhdx_gp - dbdx_gp
+          dsdy_gp = dhdy_gp - dbdy_gp
+        endif
+      endif
+
+      if (CS%max_surface_slope > 0.0) then
+        slope_mag = sqrt((dsdx_gp*dsdx_gp) + (dsdy_gp*dsdy_gp))
+        scale = CS%max_surface_slope / max(slope_mag, CS%max_surface_slope)
+        dsdx_gp = scale * dsdx_gp
+        dsdy_gp = scale * dsdy_gp
+      endif
+
+      do n=1,2 ; do m=1,2
+        qp_dx(qx,qy,m,n) = -weight * Phisub(qx,qy,i,j,m,n) * (rho * grav * h_gp * dsdx_gp)
+        qp_dy(qx,qy,m,n) = -weight * Phisub(qx,qy,i,j,m,n) * (rho * grav * h_gp * dsdy_gp)
+      enddo ; enddo
+    enddo ; enddo
+
+    do n=1,2 ; do m=1,2
+      contr_sub_dx(i,j,m,n) = (qp_dx(1,1,m,n) + qp_dx(2,2,m,n)) + &
+                              (qp_dx(1,2,m,n) + qp_dx(2,1,m,n))
+      contr_sub_dy(i,j,m,n) = (qp_dy(1,1,m,n) + qp_dy(2,2,m,n)) + &
+                              (qp_dy(1,2,m,n) + qp_dy(2,1,m,n))
+    enddo ; enddo
+  enddo ; enddo
+
+  do n=1,2 ; do m=1,2
+    call sum_square_matrix(vol_dx(m,n), contr_sub_dx(:,:,m,n), nsub)
+    call sum_square_matrix(vol_dy(m,n), contr_sub_dy(:,:,m,n), nsub)
+  enddo ; enddo
+
+end subroutine calc_shelf_driving_stress_DG_subgrid
 
 !> Reconstruct node-based bed elevation from cell-averaged bed_elev using a
 !! matrix-free iterative method. The resulting bed_node values are such that
