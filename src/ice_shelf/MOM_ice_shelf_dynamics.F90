@@ -1062,8 +1062,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         enddo ; enddo
         call DG1_slope_limit(G, ISS%h_shelf, CS%h_x, CS%h_y, ISS%hmask, CS%h_bdry_val, &
                              CS%dg1_limiter_choice, CS%dg1_limiter_M)
-        call pass_var(CS%h_x, G%domain, complete=.false.)
-        call pass_var(CS%h_y, G%domain, complete=.true.)
+        call pass_vector(CS%h_x, CS%h_y, G%domain, TO_ALL, AGRID)
       endif
       call update_velocity_masks(CS, G, ISS%hmask, CS%umask, CS%vmask, CS%u_face_mask, CS%v_face_mask)
 
@@ -1664,9 +1663,9 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
   if (CS%use_DG_thickness) then
     ! DG(1) unsplit advection with SSP-RK2
     call ice_shelf_advect_DG1(CS, ISS, G, time_step, ISS%hmask, ISS%h_shelf, CS%h_x, CS%h_y, uh_ice, vh_ice)
-    call pass_var(ISS%h_shelf, G%domain)
-    call pass_var(CS%h_x, G%domain)
-    call pass_var(CS%h_y, G%domain)
+    ! call pass_var(ISS%h_shelf, G%domain)
+    ! call pass_var(CS%h_x, G%domain)
+    ! call pass_var(CS%h_y, G%domain)
   else
     ! Reset FV slope-limiter face diagnostic; advect_thickness_x/y writes slope_lim
     ! at each face where the limiter branch is taken. Faces not visited (incomplete
@@ -6310,10 +6309,12 @@ subroutine ice_shelf_advect_DG1(CS, ISS, G, time_step, hmask, h_shelf, h_x, h_y,
   do j=jsd,jed ; do i=isd,ied
     h0(i,j) = h_shelf(i,j) ; hx0(i,j) = h_x(i,j) ; hy0(i,j) = h_y(i,j)
   enddo ; enddo
+  call pass_var(h0, G%domain)
 
   ! --- SSP-RK2 Stage 1: h1 = h0 + dt * L(h0) ---
   call DG1_slope_limit(G, h0, hx0, hy0, hmask, CS%h_bdry_val, &
                        CS%dg1_limiter_choice, CS%dg1_limiter_M)
+  call pass_vector(hx0, hy0, G%domain, TO_ALL, AGRID)
   call DG1_spatial_operator(CS, G, hmask, h0, hx0, hy0, Rhs_h, Rhs_hx, Rhs_hy, uh_ice, vh_ice)
 
   do j=jsc,jec ; do i=isc,iec
@@ -6326,8 +6327,7 @@ subroutine ice_shelf_advect_DG1(CS, ISS, G, time_step, hmask, h_shelf, h_x, h_y,
     endif
   enddo ; enddo
   call pass_var(h1, G%domain)
-  call pass_var(hx1, G%domain)
-  call pass_var(hy1, G%domain)
+  call pass_vector(hx1, hy1, G%domain, TO_ALL, AGRID)
 
   ! --- SSP-RK2 Stage 2: h_new = 0.5*h0 + 0.5*(h1 + dt * L(h1)) ---
   call DG1_slope_limit(G, h1, hx1, hy1, hmask, CS%h_bdry_val, &
@@ -6342,14 +6342,16 @@ subroutine ice_shelf_advect_DG1(CS, ISS, G, time_step, hmask, h_shelf, h_x, h_y,
     endif
   enddo ; enddo
   call pass_var(h_shelf, G%domain)
-  call pass_var(h_x, G%domain)
-  call pass_var(h_y, G%domain)
+  call pass_vector(h_x, h_y, G%domain, TO_ALL, AGRID)
 
   ! Final slope limit. Capture the limiter factors here so they reflect the
   ! limiter's effect on the state stored at end-of-timestep.
   call DG1_slope_limit(G, h_shelf, h_x, h_y, hmask, CS%h_bdry_val, &
                        CS%dg1_limiter_choice, CS%dg1_limiter_M, &
                        phi_x_out=CS%phi_x_DG, phi_y_out=CS%phi_y_DG)
+
+  call pass_var(h_shelf, G%domain)
+  call pass_vector(h_x, h_y, G%domain, TO_ALL, AGRID)
 
   ! Scale uh_ice, vh_ice: the spatial operator accumulated fluxes from both RK stages,
   ! so average them (SSP-RK2 gives equal weight to each stage)
@@ -6359,6 +6361,8 @@ subroutine ice_shelf_advect_DG1(CS, ISS, G, time_step, hmask, h_shelf, h_x, h_y,
   do J=jsc-1,jec ; do i=isc,iec
     vh_ice(i,J) = 0.5 * vh_ice(i,J)
   enddo ; enddo
+
+  call pass_vector(uh_ice, vh_ice, G%domain, TO_ALL, CGRID_NE)
 
 end subroutine ice_shelf_advect_DG1
 
@@ -7059,7 +7063,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   real, dimension(2,2) :: cell_dx_node, cell_dy_node ! Per-corner total (volume +
                                            ! Neumann face) for this cell, indexed (m,n)
                                            ! [R L3 Z T-2 ~> kg m s-2]
-
+  real, dimension(2,2) :: slope_x_gp, slope_y_gp ! Per-QP surface slopes [Z L-1 ~> nondim]
   real, dimension(SZDIB_(G),SZDJB_(G),4) :: taudx_b, taudy_b
                                            !< Per-node 4-slot driving-stress
                                            !! accumulator, slot k indexed by which
@@ -7116,7 +7120,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         call calc_shelf_driving_stress_DG_subgrid(CS, CS%Phisub, &
             ISS%h_shelf(i,j), CS%h_x(i,j), CS%h_y(i,j), bed_corners, &
             dxCv_S, dxCv_N, dyCu_W, dyCu_E, &
-            rho, rhoi_rhow, grav, vol_dx, vol_dy)
+            rho, rhoi_rhow, grav, vol_dx, vol_dy, CS%sx_shelf(i,j), CS%sy_shelf(i,j))
       else
         qp_dx(:,:,:,:) = 0.0 ; qp_dy(:,:,:,:) = 0.0
         do jq=1,2 ; do iq=1,2
@@ -7171,6 +7175,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             dsdy_gp = scale * dsdy_gp
           endif
 
+          ! For slope diagnostics
+          slope_x_gp(iq,jq) = dsdx_gp
+          slope_y_gp(iq,jq) = dsdy_gp
+
           do n=1,2 ; do m=1,2
             phi_val = (merge(xquad(iq), xquad(3-iq), m == 2)) * &
                       (merge(xquad(jq), xquad(3-jq), n == 2))
@@ -7183,6 +7191,11 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
           vol_dx(m,n) = (qp_dx(1,1,m,n) + qp_dx(2,2,m,n)) + (qp_dx(1,2,m,n) + qp_dx(2,1,m,n))
           vol_dy(m,n) = (qp_dy(1,1,m,n) + qp_dy(2,2,m,n)) + (qp_dy(1,2,m,n) + qp_dy(2,1,m,n))
         enddo ; enddo
+      endif
+
+      if (.not. (CS%GL_regularize .and. CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0)) then
+        CS%sx_shelf(i,j) = 0.25*((slope_x_gp(1,1)+slope_x_gp(2,2)) + (slope_x_gp(1,2)+slope_x_gp(2,1)))
+        CS%sy_shelf(i,j) = 0.25*((slope_y_gp(1,1)+slope_y_gp(2,2)) + (slope_y_gp(1,2)+slope_y_gp(2,1)))
       endif
 
       ! Neumann (stress) boundary conditions — face-integrated using DG nodal
@@ -7337,8 +7350,8 @@ end subroutine calc_shelf_driving_stress_DG
 subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
     h_shelf_cell, h_x_cell, h_y_cell, bed_corners, &
     dxCv_S, dxCv_N, dyCu_W, dyCu_E, &
-    rho, rhoi_rhow, grav, vol_dx, vol_dy)
-  type(ice_shelf_dyn_CS), intent(in) :: CS    !< Ice shelf control structure
+    rho, rhoi_rhow, grav, vol_dx, vol_dy, sx_shelf, sy_shelf)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS    !< Ice shelf control structure
   real, dimension(:,:,:,:,:,:), intent(in) :: Phisub !< Sub-grid quadrature weights [nondim]
   real, intent(in) :: h_shelf_cell   !< Cell-averaged ice thickness [Z ~> m]
   real, intent(in) :: h_x_cell       !< DG x-slope moment [Z ~> m]
@@ -7353,8 +7366,11 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
   real, intent(in) :: grav           !< Gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
   real, dimension(2,2), intent(out) :: vol_dx !< Per-corner x volume integral [R L3 Z T-2 ~> kg m s-2]
   real, dimension(2,2), intent(out) :: vol_dy !< Per-corner y volume integral [R L3 Z T-2 ~> kg m s-2]
-
+  real, intent(inout) :: sx_shelf !< The cell-average x surface slope [Z L-1 ~> nondim]
+  real, intent(inout) :: sy_shelf !< The cell-average y surface slope [Z L-1 ~> nondim]
   real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: contr_sub_dx, contr_sub_dy
+  real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: slope_x_gp, slope_y_gp ! Per-QP surf slopes [Z L-1 ~> nondim]
+  real, dimension(2,2) :: slope_x, slope_y ! slope sums for qps with same position within subcells [Z L-1 ~> nondim]
   real, dimension(2,2,2,2) :: qp_dx, qp_dy
   real :: xi_sub, eta_sub   ! DG reference coords at sub-qp ([-0.5,0.5]) [nondim]
   real :: h_gp              ! Ice thickness at sub-qp [Z ~> m]
@@ -7429,6 +7445,9 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
         dsdy_gp = scale * dsdy_gp
       endif
 
+      slope_x_gp(i,j,qx,qy) = dsdx_gp
+      slope_y_gp(i,j,qx,qy) = dsdy_gp
+
       do n=1,2 ; do m=1,2
         qp_dx(qx,qy,m,n) = -weight * Phisub(qx,qy,i,j,m,n) * (rho * grav * h_gp * dsdx_gp)
         qp_dy(qx,qy,m,n) = -weight * Phisub(qx,qy,i,j,m,n) * (rho * grav * h_gp * dsdy_gp)
@@ -7446,7 +7465,13 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
   do n=1,2 ; do m=1,2
     call sum_square_matrix(vol_dx(m,n), contr_sub_dx(:,:,m,n), nsub)
     call sum_square_matrix(vol_dy(m,n), contr_sub_dy(:,:,m,n), nsub)
+    ! below, m and n are qx and qy
+    call sum_square_matrix(slope_x(m,n), slope_x_gp(:,:,m,n), nsub)
+    call sum_square_matrix(slope_y(m,n), slope_y_gp(:,:,m,n), nsub)
   enddo ; enddo
+
+  sx_shelf = 0.25*((slope_x(1,1)+slope_x(2,2)) + (slope_x(1,2)+slope_x(2,1)))/nsub
+  sy_shelf = 0.25*((slope_y(1,1)+slope_y(2,2)) + (slope_y(1,2)+slope_y(2,1)))/nsub
 
 end subroutine calc_shelf_driving_stress_DG_subgrid
 
