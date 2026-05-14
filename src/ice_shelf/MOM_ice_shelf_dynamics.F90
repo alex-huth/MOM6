@@ -33,6 +33,7 @@ use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary_channel,initi
 use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary_from_file,initialize_ice_C_basal_friction
 use MOM_ice_shelf_initialize, only : initialize_ice_AGlen, initialize_bed_node_from_file
 use MOM_ice_shelf_initialize, only : initialize_DG_thickness_slopes_from_file
+use MOM_ice_shelf_initialize, only : initialize_DG_thickness_from_node_file
 implicit none ; private
 
 #include <MOM_memory.h>
@@ -559,6 +560,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   logical :: valid_E, valid_W, valid_N, valid_S ! DG cold-start neighbour-mask checks
   real :: h_E, h_W, h_N, h_S ! Effective neighbour cell-mean thickness for DG cold-start [Z ~> m]
   logical :: slopes_from_file ! True if DG h_x, h_y were read from ICE_THICKNESS_FILE
+  logical :: node_ic_used     ! True if nodal h was read and used to set h_shelf, h_x, h_y
   character(len=200) :: IS_energyfile  ! The name of the energy file.
   character(len=32) :: filename_appendix = '' ! FMS appendix to filename for ensemble runs
   character(len=16) :: inner_solver_str ! The type of inner solver to use for the SSA
@@ -1007,20 +1009,28 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         if (CS%use_DG_thickness) call reconstruct_bed_to_nodes(CS, G, ISS%hmask)
       endif
       if (CS%use_DG_thickness) then
-        ! DG(1) cold-start slope init. First try to read h_x, h_y from
-        ! ICE_THICKNESS_FILE (treated as authoritative IC, like restart values).
-        ! If those fields are absent, fall back to seeding from neighbour
-        ! cell-mean central differences followed by the slope limiter.
-        ! Seeding (rather than zeroing) is required for the fallback because
-        ! DG1_slope_limit uses minmod3 of the existing slope with neighbour
-        ! differences and minmod3 returns zero whenever any argument is zero,
-        ! so a zero seed would persist.
-        ! On restart h_x,h_y come from the restart file and this branch is skipped.
+        ! DG(1) cold-start IC priority:
+        !   1. Nodal (B-grid corner) thickness in ICE_THICKNESS_FILE: derives
+        !      both h_shelf cell mean and h_x, h_y slopes via a bilinear node fit
+        !   2. Cell-mean h_x, h_y fields in ICE_THICKNESS_FILE: slopes only.
+        !   3. Centred-FD seed of neighbour cell means followed by slope limiter.
+        ! Paths 1 and 2 mirror restart behaviour: file values are authoritative
+        ! and the limiter is skipped. Seeding (rather than zeroing) is required
+        ! for path 3 because DG1_slope_limit uses minmod3, which returns zero
+        ! whenever any argument is zero, so a zero seed would persist.
+        ! On restart h_x, h_y come from the restart file and this branch is skipped.
         call pass_var(ISS%h_shelf, G%domain)
         CS%h_x(:,:) = 0.0 ; CS%h_y(:,:) = 0.0
-        call initialize_DG_thickness_slopes_from_file(CS%h_x, CS%h_y, slopes_from_file, &
-                                                     G, US, param_file)
-       if (.not. slopes_from_file) then
+        call initialize_DG_thickness_from_node_file(ISS%h_shelf, CS%h_x, CS%h_y, &
+                                                    node_ic_used, G, US, param_file)
+        slopes_from_file = .false.
+        if (node_ic_used) then
+          call pass_var(ISS%h_shelf, G%domain)
+        else
+          call initialize_DG_thickness_slopes_from_file(CS%h_x, CS%h_y, slopes_from_file, &
+                                                       G, US, param_file)
+        endif
+       if (.not. (node_ic_used .or. slopes_from_file)) then
         do j=G%jsc,G%jec ; do i=G%isc,G%iec
           if (ISS%hmask(i,j) == 1) then
             valid_E = (ISS%hmask(i+1,j) == 1 .or. ISS%hmask(i+1,j) == 3)
@@ -1070,7 +1080,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         enddo ; enddo
         call DG1_slope_limit(G, ISS%h_shelf, CS%h_x, CS%h_y, ISS%hmask, CS%h_bdry_val, &
                              CS%dg1_limiter_choice, CS%dg1_limiter_M)
-       endif ! .not. slopes_from_file
+       endif ! .not. (node_ic_used .or. slopes_from_file)
         call pass_vector(CS%h_x, CS%h_y, G%domain, TO_ALL, AGRID)
       endif
       call update_velocity_masks(CS, G, ISS%hmask, CS%umask, CS%vmask, CS%u_face_mask, CS%v_face_mask)

@@ -24,6 +24,7 @@ public initialize_ice_shelf_boundary_channel
 public initialize_ice_flow_from_file
 public initialize_bed_node_from_file
 public initialize_DG_thickness_slopes_from_file
+public initialize_DG_thickness_from_node_file
 public initialize_ice_shelf_boundary_from_file
 public initialize_ice_C_basal_friction
 public initialize_ice_AGlen
@@ -581,6 +582,71 @@ subroutine initialize_DG_thickness_slopes_from_file(h_x, h_y, slopes_set, G, US,
   slopes_set = .true.
 
 end subroutine initialize_DG_thickness_slopes_from_file
+
+!> Optionally read nodal (B-grid corner) ice thickness from ICE_THICKNESS_FILE
+!! and use it to derive both the cell-mean h_shelf and the DG(1) cell-mean
+!! slopes h_x, h_y via a bilinear node fit. Returns used=.true. when the
+!! nodal field is present and consumed; otherwise leaves h_shelf, h_x, h_y
+!! untouched so the caller can fall back to the cell-mean read and centred-FD
+!! slope seed. The nodal field is consumed locally and not retained.
+subroutine initialize_DG_thickness_from_node_file(h_shelf, h_x, h_y, used, G, US, PF)
+  type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(inout) :: h_shelf !< Cell-mean ice thickness [Z ~> m].
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(inout) :: h_x !< Cell-mean DG(1) x-slope DOF [Z ~> m].
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(inout) :: h_y !< Cell-mean DG(1) y-slope DOF [Z ~> m].
+  logical,                intent(out)   :: used !< True if the nodal IC was applied.
+  type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
+  type(param_file_type),  intent(in)    :: PF !< A structure to parse for run-time parameters
+
+  real, allocatable :: h_node(:,:) ! Nodal (corner) ice thickness [Z ~> m].
+  character(len=200) :: filename, inputdir, thickness_file
+  character(len=200) :: node_varname
+  character(len=40)  :: mdl = "initialize_DG_thickness_from_node_file"
+  integer :: i, j
+
+  used = .false.
+
+  call get_param(PF, mdl, "INPUTDIR", inputdir, default=".", do_not_log=.true.)
+  inputdir = slasher(inputdir)
+  call get_param(PF, mdl, "ICE_THICKNESS_FILE", thickness_file, &
+                 default="ice_shelf_h.nc", do_not_log=.true.)
+  call get_param(PF, mdl, "ICE_THICKNESS_NODE_VARNAME", node_varname, &
+                 "The name of the nodal (B-grid corner) ice thickness variable in "//&
+                 "ICE_THICKNESS_FILE. If present and USE_DG_THICKNESS=True, the field "//&
+                 "is read and used to derive both the cell-mean h_shelf and the DG(1) "//&
+                 "thickness slopes h_x, h_y via a bilinear node fit, skipping the "//&
+                 "centred-FD slope seed and slope limiter. The nodal field is not "//&
+                 "retained after initialization.", &
+                 default="h_shelf_node")
+
+  filename = trim(inputdir)//trim(thickness_file)
+  if (.not.file_exists(filename, G%Domain)) return
+  if (.not.field_exists(filename, trim(node_varname), MOM_domain=G%Domain)) return
+
+  allocate(h_node(G%IsdB:G%IedB, G%JsdB:G%JedB)) ; h_node(:,:) = 0.0
+  call MOM_read_data(filename, trim(node_varname), h_node, G%Domain, &
+                     position=CORNER, scale=US%m_to_Z)
+  call pass_var(h_node, G%domain, position=CORNER)
+
+  ! DG(1) projection of the bilinear node interpolant onto {1, xi, eta} with
+  ! xi, eta in [-0.5, 0.5]: cell mean is the four-node average, slopes are the
+  ! face-mean differences.
+  do j=G%jsc,G%jec ; do i=G%isc,G%iec
+    h_shelf(i,j) = 0.25 * ((h_node(I-1,J-1) + h_node(I,  J  )) + &
+                           (h_node(I,  J-1) + h_node(I-1,J  )))
+    h_x(i,j)     = 0.5  * ((h_node(I,  J-1) + h_node(I,  J  )) - &
+                           (h_node(I-1,J-1) + h_node(I-1,J  )))
+    h_y(i,j)     = 0.5  * ((h_node(I-1,J  ) + h_node(I,  J  )) - &
+                           (h_node(I-1,J-1) + h_node(I,  J-1)))
+  enddo ; enddo
+
+  deallocate(h_node)
+  used = .true.
+
+end subroutine initialize_DG_thickness_from_node_file
 
 !> Initialize ice shelf b.c.s from file
 subroutine initialize_ice_shelf_boundary_from_file(u_face_mask_bdry, v_face_mask_bdry, &
