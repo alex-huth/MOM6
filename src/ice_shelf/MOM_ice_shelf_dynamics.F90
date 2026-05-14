@@ -6998,13 +6998,13 @@ pure real function minmod2(a, b)
   endif
 end function minmod2
 
-
-!> Compute driving stress at B-grid nodes using sub-element Gauss-point evaluation.
-!! Uses DG(1) thickness polynomial for h and grad(h) at Gauss points, and bilinear
-!! bed_node interpolation for bed and grad(bed). Surface elevation and its gradient
-!! are computed at each Gauss point, and the FEM weak-form integral
-!! integral(Phi_node * rho*g*h*grad(s), dA) is accumulated to the corner nodes.
-!! This follows the same sub-element quadrature pattern as CG_action_subgrid_basal.
+!> Compute driving stress at B-grid nodes using a Pure DG(1) formulation.
+!! Allows sub-element driving stress around grounding line
+!! Evaluates the FEM weak-form integral using integration by parts.
+!! To prevent B-grid null-space checkerboarding, the boundary integrals
+!! utilize a Lax-Friedrichs (Rusanov) numerical flux. This ensures a
+!! single-valued pressure at cell interfaces and applies a rigorous jump
+!! penalty to aggressively damp grid-scale slope oscillations.
 subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
   type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe the ice-shelf state
@@ -7022,25 +7022,35 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   real :: rhow       ! Reference ocean density [R ~> kg m-3]
   real :: rhoi_rhow  ! Ice/ocean density ratio [nondim]
   real :: grav       ! Gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
-  real :: h_nA, h_nB ! DG nodal thickness at face endpoints A and B [Z ~> m]
-  real :: b_nA, b_nB ! Bed elevation at face endpoints A and B [Z ~> m]
-  real :: h_face     ! Face-quadrature thickness [Z ~> m]
-  real :: b_face     ! Face-quadrature bed elevation [Z ~> m]
-  real :: nv_face    ! Face Neumann integrand 0.5*g*(rho*h^2 - rhow*b^2) (grounded)
-                     ! or 0.5*g*(1-rho/rhow)*rho*h^2 (floating) [R Z L2 T-2 ~> kg s-2]
-  real :: t_face     ! Face quadrature parameter in [0,1] [nondim]
-  real :: phi_A, phi_B ! Linear nodal basis values at the face quadrature point [nondim]
-  integer :: gp_face   ! Face Gauss-point loop index [nondim]
 
+  ! Face/Boundary variables
+  real :: h_loc_A, h_loc_B ! Local thickness at face endpoints A and B [Z ~> m]
+  real :: b_loc_A, b_loc_B ! Local bed elevation at face endpoints A and B [Z ~> m]
+  real :: h_ngh_A, h_ngh_B ! Neighbor thickness at face endpoints A and B [Z ~> m]
+  real :: b_ngh_A, b_ngh_B ! Neighbor bed elevation at face endpoints A and B [Z ~> m]
+  real :: h_loc, b_loc     ! Quadrature-point local thickness and bed [Z ~> m]
+  real :: h_ngh, b_ngh     ! Quadrature-point neighbor thickness and bed [Z ~> m]
+  real :: P_loc, P_ngh     ! Local and Neighbor pressures [R Z L2 T-2 ~> kg s-2]
+  real :: P_star           ! Lax-Friedrichs numerical flux at face [R Z L2 T-2 ~> kg s-2]
+  real :: alpha_pen        ! Rusanov jump penalty coefficient [R L2 T-2 ~> kg m-1 s-2]
+  real :: d_ocean          ! Draft of the ice for ocean pressure calculation [Z ~> m]
+  real :: t_face           ! Face quadrature parameter in [0,1] [nondim]
+  real :: phi_A, phi_B     ! Linear nodal basis values at the face quadrature point [nondim]
+  integer :: gp_face       ! Face Gauss-point loop index [nondim]
+  logical :: is_ext_bdry   ! True if the face is an external (ocean) boundary
+  real :: phi_val           ! Bilinear nodal basis value at a qp [nondim]
   ! Main-grid 2x2 Gauss quadrature variables
   real :: xi_gp, eta_gp     ! DG reference coordinates in [-0.5,0.5] at a main qp [nondim]
   real :: h_gp              ! Ice thickness at a qp [Z ~> m]
   real :: dhdx_gp, dhdy_gp  ! Thickness gradients at a qp, in physical coordinates [Z L-1 ~> nondim]
   real :: bed_gp            ! Bed elevation at a qp [Z ~> m]
-  real :: dbdx_gp, dbdy_gp  ! Bed gradients at a qp, in physical coordinates [Z L-1 ~> nondim]
+  real :: dbdx_gp, dbdy_gp  ! Bed gradients at a qp, physical coords [Z L-1 ~> nondim]
   real :: dbdx_ref, dbdy_ref ! Bed gradients in reference coords (pre-Jacobian) [Z ~> m]
-  real :: dsdx_gp, dsdy_gp  ! Surface slope at a qp, in physical coordinates [Z L-1 ~> nondim]
-  real :: phi_val           ! Bilinear nodal basis value at a qp [nondim]
+  real :: dsdx_gp, dsdy_gp  ! Surface slope at a qp [Z L-1 ~> nondim]
+  real :: bottom_force_x, bottom_force_y ! Bed/water bottom drag forces [R Z L2 T-2 ~> kg s-2]
+  real :: dphi_dx_ref, dphi_dy_ref ! Basis function derivatives in reference coordinates [nondim]
+  real :: dphi_dx, dphi_dy  ! Basis function derivatives in physical coordinates [L-1 ~> m-1]
+  real :: p_term_vol        ! Integrated-by-parts volume pressure term [R Z L2 T-2 ~> kg s-2]
   real :: scale             ! Multiplier applied to dsdx,dsdy to enforce max_surface_slope [nondim]
   real :: slope_mag         ! |grad(s)| magnitude at a qp [Z L-1 ~> nondim]
   real :: a_qp, d_qp        ! Per-qp interpolated cell-edge spacings [L ~> m]
@@ -7077,6 +7087,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   real :: face_dy_S_A, face_dy_S_B  ! South face y-stress contrib to nodes A,B [R L3 Z T-2 ~> kg m s-2]
   real :: face_dy_N_A, face_dy_N_B  ! North face y-stress contrib to nodes A,B [R L3 Z T-2 ~> kg m s-2]
   integer :: m, n  ! Cell-corner (m,n) loop indices in [1..2] [nondim]
+  logical :: calc_slope_diag ! True if slope diagnostics will be calculated
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -7096,7 +7107,12 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   taudx(:,:) = 0.0 ; taudy(:,:) = 0.0
   taudx_b(:,:,:) = 0.0 ; taudy_b(:,:,:) = 0.0
 
-  ! Loop over elements (each tracer cell is an element)
+  if (CS%id_sx_shelf > 0 .or.  CS%id_sy_shelf > 0 .or. CS%id_surf_slope_mag_shelf > 0) then
+    calc_slope_diag=.true.
+  else
+    calc_slope_diag=.false.
+  endif
+
   do j=jsc-1,jec+1 ; do i=isc-1,iec+1
     if (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3) then
 
@@ -7120,24 +7136,21 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         call calc_shelf_driving_stress_DG_subgrid(CS, CS%Phisub, &
             ISS%h_shelf(i,j), CS%h_x(i,j), CS%h_y(i,j), bed_corners, &
             dxCv_S, dxCv_N, dyCu_W, dyCu_E, &
-            rho, rhoi_rhow, grav, vol_dx, vol_dy, CS%sx_shelf(i,j), CS%sy_shelf(i,j))
+            rho, rhow, rhoi_rhow, grav, vol_dx, vol_dy, CS%sx_shelf(i,j), CS%sy_shelf(i,j), calc_slope_diag)
       else
         qp_dx(:,:,:,:) = 0.0 ; qp_dy(:,:,:,:) = 0.0
         do jq=1,2 ; do iq=1,2
           xi_gp  = xquad(iq) - 0.5
           eta_gp = xquad(jq) - 0.5
 
-          ! Per-qp interpolated metric
           a_qp = (dxCv_S * xquad(3-jq)) + (dxCv_N * xquad(jq))
           d_qp = (dyCu_W * xquad(3-iq)) + (dyCu_E * xquad(iq))
           weight = 0.25 * (a_qp * d_qp)
 
-          h_gp = max(ISS%h_shelf(i,j) + ((CS%h_x(i,j)*xi_gp) + (CS%h_y(i,j)*eta_gp)), &
-                     CS%min_h_shelf)
+          h_gp = max(ISS%h_shelf(i,j) + ((CS%h_x(i,j)*xi_gp) + (CS%h_y(i,j)*eta_gp)), CS%min_h_shelf)
           dhdx_gp = CS%h_x(i,j) / a_qp
           dhdy_gp = CS%h_y(i,j) / d_qp
 
-          ! Bed at the qp
           bed_gp = ((bed_corners(1,1) * (xquad(3-iq) * xquad(3-jq))) + &
                     (bed_corners(2,2) * (xquad(iq)   * xquad(jq))))  + &
                    ((bed_corners(2,1) * (xquad(iq)   * xquad(3-jq))) + &
@@ -7156,35 +7169,60 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
           dbdy_gp = dbdy_ref / d_qp
 
           if (CS%GL_couple) then
-            dsdx_gp = -dbdx_gp + dhdx_gp
-            dsdy_gp = -dbdy_gp + dhdy_gp
+            if (CS%ground_frac(i,j)>0) then
+              dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp
+              dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
+              bottom_force_x = (rho**2 / rhow) * grav * h_gp * dhdx_gp
+              bottom_force_y = (rho**2 / rhow) * grav * h_gp * dhdy_gp
+            else
+              dsdx_gp = dhdx_gp - dbdx_gp
+              dsdy_gp = dhdy_gp - dbdy_gp
+              bottom_force_x = rho * grav * h_gp * dbdx_gp
+              bottom_force_y = rho * grav * h_gp * dbdy_gp
+            endif
           else
             if (rhoi_rhow * h_gp - bed_gp <= 0.0) then
               dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp
               dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
+              bottom_force_x = (rho**2 / rhow) * grav * h_gp * dhdx_gp
+              bottom_force_y = (rho**2 / rhow) * grav * h_gp * dhdy_gp
             else
               dsdx_gp = dhdx_gp - dbdx_gp
               dsdy_gp = dhdy_gp - dbdy_gp
+              bottom_force_x = rho * grav * h_gp * dbdx_gp
+              bottom_force_y = rho * grav * h_gp * dbdy_gp
             endif
           endif
 
+          scale = 1.0
           if (CS%max_surface_slope > 0.0) then
             slope_mag = sqrt((dsdx_gp*dsdx_gp) + (dsdy_gp*dsdy_gp))
             scale = CS%max_surface_slope / max(slope_mag, CS%max_surface_slope)
-            dsdx_gp = scale * dsdx_gp
-            dsdy_gp = scale * dsdy_gp
           endif
 
           ! For slope diagnostics
-          slope_x_gp(iq,jq) = dsdx_gp
-          slope_y_gp(iq,jq) = dsdy_gp
+          if (calc_slope_diag) then
+            slope_x_gp(iq,jq) = dsdx_gp*scale
+            slope_y_gp(iq,jq) = dsdy_gp*scale
+          endif
+
+          ! Weak-form Volume Integration by Parts
+          p_term_vol = 0.5 * rho * grav * h_gp**2
 
           do n=1,2 ; do m=1,2
             phi_val = (merge(xquad(iq), xquad(3-iq), m == 2)) * &
                       (merge(xquad(jq), xquad(3-jq), n == 2))
-            qp_dx(iq,jq,m,n) = -weight * phi_val * (rho * grav * h_gp * dsdx_gp)
-            qp_dy(iq,jq,m,n) = -weight * phi_val * (rho * grav * h_gp * dsdy_gp)
+            dphi_dx_ref = (merge(1.0, -1.0, m == 2)) * &
+                          (merge(xquad(jq), xquad(3-jq), n == 2))
+            dphi_dy_ref = (merge(xquad(iq), xquad(3-iq), m == 2)) * &
+                          (merge(1.0, -1.0, n == 2))
+            dphi_dx = dphi_dx_ref / a_qp
+            dphi_dy = dphi_dy_ref / d_qp
+
+            qp_dx(iq,jq,m,n) = scale * (weight * dphi_dx * p_term_vol + weight * phi_val * bottom_force_x)
+            qp_dy(iq,jq,m,n) = scale * (weight * dphi_dy * p_term_vol + weight * phi_val * bottom_force_y)
           enddo ; enddo
+
         enddo ; enddo
 
         do n=1,2 ; do m=1,2
@@ -7193,121 +7231,224 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         enddo ; enddo
       endif
 
-      if (.not. (CS%GL_regularize .and. CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0)) then
-        CS%sx_shelf(i,j) = 0.25*((slope_x_gp(1,1)+slope_x_gp(2,2)) + (slope_x_gp(1,2)+slope_x_gp(2,1)))
-        CS%sy_shelf(i,j) = 0.25*((slope_y_gp(1,1)+slope_y_gp(2,2)) + (slope_y_gp(1,2)+slope_y_gp(2,1)))
+      if (calc_slope_diag) then
+        if (.not. (CS%GL_regularize .and. CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0)) then
+          CS%sx_shelf(i,j) = 0.25*((slope_x_gp(1,1)+slope_x_gp(2,2)) + (slope_x_gp(1,2)+slope_x_gp(2,1)))
+          CS%sy_shelf(i,j) = 0.25*((slope_y_gp(1,1)+slope_y_gp(2,2)) + (slope_y_gp(1,2)+slope_y_gp(2,1)))
+        endif
       endif
 
-      ! Neumann (stress) boundary conditions — face-integrated using DG nodal
-      ! thickness h(xi,eta) = h_shelf + h_x*xi + h_y*eta and bed_node corners.
-      ! On each face, h and b vary linearly along the face parameter s in [0,1];
-      ! integrate Phi_node * 0.5*g*(rho*h^2 - rhow*b^2) (grounded) or
-      ! Phi_node * 0.5*g*(1-rho/rhow)*rho*h^2 (floating) using 2-pt Gauss
-      ! (weight 0.5 each on [0,1]). min_h_shelf floor applied per nodal h.
       face_dx_W_A = 0.0 ; face_dx_W_B = 0.0
       face_dx_E_A = 0.0 ; face_dx_E_B = 0.0
       face_dy_S_A = 0.0 ; face_dy_S_B = 0.0
       face_dy_N_A = 0.0 ; face_dy_N_B = 0.0
 
-      ! West face (I-1): nodes (I-1,J-1) [s=0] -> (I-1,J) [s=1], xi=-0.5
-      if ((CS%u_face_mask_bdry(I-1,j) == 2) .or. &
-        ((ISS%hmask(i-1,j) == 0 .or. ISS%hmask(i-1,j) == 2) .and. &
-         (CS%reentrant_x .or. (i+i_off /= gisc)))) then
-        h_nA = max(ISS%h_shelf(i,j) + (((-0.5)*CS%h_x(i,j)) + ((-0.5)*CS%h_y(i,j))), &
-                   CS%min_h_shelf)
-        h_nB = max(ISS%h_shelf(i,j) + (((-0.5)*CS%h_x(i,j)) + (( 0.5)*CS%h_y(i,j))), &
-                   CS%min_h_shelf)
-        b_nA = bed_corners(1,1) ; b_nB = bed_corners(1,2)
-        do gp_face=1,2
-          t_face = xquad(gp_face)
-          h_face = (1.0 - t_face)*h_nA + t_face*h_nB
-          b_face = (1.0 - t_face)*b_nA + t_face*b_nB
-          if (rhoi_rhow * h_face - b_face > 0.0) then
-            nv_face = 0.5*grav*(rho*h_face**2 - rhow*b_face**2)
-          else
-            nv_face = 0.5*grav*((1.0 - rhoi_rhow)*rho*h_face**2)
-          endif
-          phi_A = 1.0 - t_face ; phi_B = t_face
-          face_dx_W_A = face_dx_W_A - 0.5*G%dyCu(I-1,j) * phi_A * nv_face
-          face_dx_W_B = face_dx_W_B - 0.5*G%dyCu(I-1,j) * phi_B * nv_face
-        enddo
-      endif
+      ! ======================================================================
+      ! West Face (I-1) of cell (i,j)
+      ! Local cell is right (i), Neighbor cell is left (i-1)
+      ! ======================================================================
+      h_loc_A = max(ISS%h_shelf(i,j) + (((-0.5)*CS%h_x(i,j)) + ((-0.5)*CS%h_y(i,j))), CS%min_h_shelf)
+      h_loc_B = max(ISS%h_shelf(i,j) + (((-0.5)*CS%h_x(i,j)) + (( 0.5)*CS%h_y(i,j))), CS%min_h_shelf)
+      b_loc_A = bed_corners(1,1) ; b_loc_B = bed_corners(1,2)
 
-      ! East face (I): nodes (I,J-1) [s=0] -> (I,J) [s=1], xi=+0.5
-      if ((CS%u_face_mask_bdry(I,j) == 2) .or. &
-        ((ISS%hmask(i+1,j) == 0 .or. ISS%hmask(i+1,j) == 2) .and. &
-         (CS%reentrant_x .or. (i+i_off /= giec)))) then
-        h_nA = max(ISS%h_shelf(i,j) + ((( 0.5)*CS%h_x(i,j)) + ((-0.5)*CS%h_y(i,j))), &
-                   CS%min_h_shelf)
-        h_nB = max(ISS%h_shelf(i,j) + ((( 0.5)*CS%h_x(i,j)) + (( 0.5)*CS%h_y(i,j))), &
-                   CS%min_h_shelf)
-        b_nA = bed_corners(2,1) ; b_nB = bed_corners(2,2)
-        do gp_face=1,2
-          t_face = xquad(gp_face)
-          h_face = (1.0 - t_face)*h_nA + t_face*h_nB
-          b_face = (1.0 - t_face)*b_nA + t_face*b_nB
-          if (rhoi_rhow * h_face - b_face > 0.0) then
-            nv_face = 0.5*grav*(rho*h_face**2 - rhow*b_face**2)
-          else
-            nv_face = 0.5*grav*((1.0 - rhoi_rhow)*rho*h_face**2)
-          endif
-          phi_A = 1.0 - t_face ; phi_B = t_face
-          face_dx_E_A = face_dx_E_A + 0.5*G%dyCu(I,j) * phi_A * nv_face
-          face_dx_E_B = face_dx_E_B + 0.5*G%dyCu(I,j) * phi_B * nv_face
-        enddo
-      endif
+      h_ngh_A = max(ISS%h_shelf(i-1,j) + ((( 0.5)*CS%h_x(i-1,j)) + ((-0.5)*CS%h_y(i-1,j))), CS%min_h_shelf)
+      h_ngh_B = max(ISS%h_shelf(i-1,j) + ((( 0.5)*CS%h_x(i-1,j)) + (( 0.5)*CS%h_y(i-1,j))), CS%min_h_shelf)
+      b_ngh_A = bed_corners(1,1) ; b_ngh_B = bed_corners(1,2)
 
-      ! South face (J-1): nodes (I-1,J-1) [s=0] -> (I,J-1) [s=1], eta=-0.5
-      if ((CS%v_face_mask_bdry(i,J-1) == 2) .or. &
-        ((ISS%hmask(i,j-1) == 0 .or. ISS%hmask(i,j-1) == 2) .and. &
-         (CS%reentrant_y .or. (j+j_off /= gjsc)))) then
-        h_nA = max(ISS%h_shelf(i,j) + (((-0.5)*CS%h_x(i,j)) + ((-0.5)*CS%h_y(i,j))), &
-                   CS%min_h_shelf)
-        h_nB = max(ISS%h_shelf(i,j) + ((( 0.5)*CS%h_x(i,j)) + ((-0.5)*CS%h_y(i,j))), &
-                   CS%min_h_shelf)
-        b_nA = bed_corners(1,1) ; b_nB = bed_corners(2,1)
-        do gp_face=1,2
-          t_face = xquad(gp_face)
-          h_face = (1.0 - t_face)*h_nA + t_face*h_nB
-          b_face = (1.0 - t_face)*b_nA + t_face*b_nB
-          if (rhoi_rhow * h_face - b_face > 0.0) then
-            nv_face = 0.5*grav*(rho*h_face**2 - rhow*b_face**2)
-          else
-            nv_face = 0.5*grav*((1.0 - rhoi_rhow)*rho*h_face**2)
-          endif
-          phi_A = 1.0 - t_face ; phi_B = t_face
-          face_dy_S_A = face_dy_S_A - 0.5*G%dxCv(i,J-1) * phi_A * nv_face
-          face_dy_S_B = face_dy_S_B - 0.5*G%dxCv(i,J-1) * phi_B * nv_face
-        enddo
-      endif
+      is_ext_bdry = ((CS%u_face_mask_bdry(I-1,j) == 2) .or. &
+                    ((ISS%hmask(i-1,j) == 0 .or. ISS%hmask(i-1,j) == 2) .and. &
+                     (CS%reentrant_x .or. (i+i_off /= gisc))))
 
-      ! North face (J): nodes (I-1,J) [s=0] -> (I,J) [s=1], eta=+0.5
-      if ((CS%v_face_mask_bdry(i,J) == 2) .or. &
-        ((ISS%hmask(i,j+1) == 0 .or. ISS%hmask(i,j+1) == 2) .and. &
-         (CS%reentrant_y .or. (j+j_off /= gjec)))) then
-        h_nA = max(ISS%h_shelf(i,j) + (((-0.5)*CS%h_x(i,j)) + (( 0.5)*CS%h_y(i,j))), &
-                   CS%min_h_shelf)
-        h_nB = max(ISS%h_shelf(i,j) + ((( 0.5)*CS%h_x(i,j)) + (( 0.5)*CS%h_y(i,j))), &
-                   CS%min_h_shelf)
-        b_nA = bed_corners(1,2) ; b_nB = bed_corners(2,2)
-        do gp_face=1,2
-          t_face = xquad(gp_face)
-          h_face = (1.0 - t_face)*h_nA + t_face*h_nB
-          b_face = (1.0 - t_face)*b_nA + t_face*b_nB
-          if (rhoi_rhow * h_face - b_face > 0.0) then
-            nv_face = 0.5*grav*(rho*h_face**2 - rhow*b_face**2)
+      do gp_face=1,2
+        t_face = xquad(gp_face)
+        h_loc = (1.0 - t_face)*h_loc_A + t_face*h_loc_B
+        b_loc = (1.0 - t_face)*b_loc_A + t_face*b_loc_B
+
+        if (rhoi_rhow * h_loc - b_loc > 0.0) then
+          P_loc = 0.5 * grav * rho * h_loc**2
+        else
+          P_loc = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_loc**2
+        endif
+
+        if (is_ext_bdry) then
+          d_ocean = min(b_loc, rhoi_rhow * h_loc)
+          P_star = 0.5 * grav * rhow * d_ocean**2
+        else
+          h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
+          b_ngh = (1.0 - t_face)*b_ngh_A + t_face*b_ngh_B
+          if (rhoi_rhow * h_ngh - b_ngh > 0.0) then
+            P_ngh = 0.5 * grav * rho * h_ngh**2
           else
-            nv_face = 0.5*grav*((1.0 - rhoi_rhow)*rho*h_face**2)
+            P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
           endif
-          phi_A = 1.0 - t_face ; phi_B = t_face
-          face_dy_N_A = face_dy_N_A + 0.5*G%dxCv(i,J) * phi_A * nv_face
-          face_dy_N_B = face_dy_N_B + 0.5*G%dxCv(i,J) * phi_B * nv_face
-        enddo
-      endif
+
+          ! Lax-Friedrichs Flux: {P} - 0.5*alpha*(h_right - h_left)
+          ! Left is ngh, Right is loc
+          alpha_pen = rho * grav * max(h_loc, h_ngh)
+          P_star = 0.5 * (P_ngh + P_loc) - 0.5 * alpha_pen * (h_loc - h_ngh)
+        endif
+
+        phi_A = 1.0 - t_face ; phi_B = t_face
+        ! Face normal n_x = -1 -> Boundary Integral = + P_star
+        face_dx_W_A = face_dx_W_A + 0.5 * G%dyCu(I-1,j) * phi_A * P_star
+        face_dx_W_B = face_dx_W_B + 0.5 * G%dyCu(I-1,j) * phi_B * P_star
+      enddo
+
+      ! ======================================================================
+      ! East Face (I) of cell (i,j)
+      ! Local cell is left (i), Neighbor cell is right (i+1)
+      ! ======================================================================
+      h_loc_A = max(ISS%h_shelf(i,j) + ((( 0.5)*CS%h_x(i,j)) + ((-0.5)*CS%h_y(i,j))), CS%min_h_shelf)
+      h_loc_B = max(ISS%h_shelf(i,j) + ((( 0.5)*CS%h_x(i,j)) + (( 0.5)*CS%h_y(i,j))), CS%min_h_shelf)
+      b_loc_A = bed_corners(2,1) ; b_loc_B = bed_corners(2,2)
+
+      h_ngh_A = max(ISS%h_shelf(i+1,j) + (((-0.5)*CS%h_x(i+1,j)) + ((-0.5)*CS%h_y(i+1,j))), CS%min_h_shelf)
+      h_ngh_B = max(ISS%h_shelf(i+1,j) + (((-0.5)*CS%h_x(i+1,j)) + (( 0.5)*CS%h_y(i+1,j))), CS%min_h_shelf)
+      b_ngh_A = bed_corners(2,1) ; b_ngh_B = bed_corners(2,2)
+
+      is_ext_bdry = ((CS%u_face_mask_bdry(I,j) == 2) .or. &
+                    ((ISS%hmask(i+1,j) == 0 .or. ISS%hmask(i+1,j) == 2) .and. &
+                     (CS%reentrant_x .or. (i+i_off /= giec))))
+
+      do gp_face=1,2
+        t_face = xquad(gp_face)
+        h_loc = (1.0 - t_face)*h_loc_A + t_face*h_loc_B
+        b_loc = (1.0 - t_face)*b_loc_A + t_face*b_loc_B
+
+        if (rhoi_rhow * h_loc - b_loc > 0.0) then
+          P_loc = 0.5 * grav * rho * h_loc**2
+        else
+          P_loc = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_loc**2
+        endif
+
+        if (is_ext_bdry) then
+          d_ocean = min(b_loc, rhoi_rhow * h_loc)
+          P_star = 0.5 * grav * rhow * d_ocean**2
+        else
+          h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
+          b_ngh = (1.0 - t_face)*b_ngh_A + t_face*b_ngh_B
+          if (rhoi_rhow * h_ngh - b_ngh > 0.0) then
+            P_ngh = 0.5 * grav * rho * h_ngh**2
+          else
+            P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
+          endif
+
+          ! Lax-Friedrichs Flux: {P} - 0.5*alpha*(h_right - h_left)
+          ! Left is loc, Right is ngh
+          alpha_pen = rho * grav * max(h_loc, h_ngh)
+          P_star = 0.5 * (P_loc + P_ngh) - 0.5 * alpha_pen * (h_ngh - h_loc)
+        endif
+
+        phi_A = 1.0 - t_face ; phi_B = t_face
+        ! Face normal n_x = 1 -> Boundary Integral = - P_star
+        face_dx_E_A = face_dx_E_A - 0.5 * G%dyCu(I,j) * phi_A * P_star
+        face_dx_E_B = face_dx_E_B - 0.5 * G%dyCu(I,j) * phi_B * P_star
+      enddo
+
+      ! ======================================================================
+      ! South Face (J-1) of cell (i,j)
+      ! Local cell is top (j), Neighbor cell is bottom (j-1)
+      ! ======================================================================
+      h_loc_A = max(ISS%h_shelf(i,j) + (((-0.5)*CS%h_x(i,j)) + ((-0.5)*CS%h_y(i,j))), CS%min_h_shelf)
+      h_loc_B = max(ISS%h_shelf(i,j) + ((( 0.5)*CS%h_x(i,j)) + ((-0.5)*CS%h_y(i,j))), CS%min_h_shelf)
+      b_loc_A = bed_corners(1,1) ; b_loc_B = bed_corners(2,1)
+
+      h_ngh_A = max(ISS%h_shelf(i,j-1) + (((-0.5)*CS%h_x(i,j-1)) + (( 0.5)*CS%h_y(i,j-1))), CS%min_h_shelf)
+      h_ngh_B = max(ISS%h_shelf(i,j-1) + ((( 0.5)*CS%h_x(i,j-1)) + (( 0.5)*CS%h_y(i,j-1))), CS%min_h_shelf)
+      b_ngh_A = bed_corners(1,1) ; b_ngh_B = bed_corners(2,1)
+
+      is_ext_bdry = ((CS%v_face_mask_bdry(i,J-1) == 2) .or. &
+                    ((ISS%hmask(i,j-1) == 0 .or. ISS%hmask(i,j-1) == 2) .and. &
+                     (CS%reentrant_y .or. (j+j_off /= gjsc))))
+
+      do gp_face=1,2
+        t_face = xquad(gp_face)
+        h_loc = (1.0 - t_face)*h_loc_A + t_face*h_loc_B
+        b_loc = (1.0 - t_face)*b_loc_A + t_face*b_loc_B
+
+        if (rhoi_rhow * h_loc - b_loc > 0.0) then
+          P_loc = 0.5 * grav * rho * h_loc**2
+        else
+          P_loc = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_loc**2
+        endif
+
+        if (is_ext_bdry) then
+          d_ocean = min(b_loc, rhoi_rhow * h_loc)
+          P_star = 0.5 * grav * rhow * d_ocean**2
+        else
+          h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
+          b_ngh = (1.0 - t_face)*b_ngh_A + t_face*b_ngh_B
+          if (rhoi_rhow * h_ngh - b_ngh > 0.0) then
+            P_ngh = 0.5 * grav * rho * h_ngh**2
+          else
+            P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
+          endif
+
+          ! Lax-Friedrichs Flux
+          ! Left is ngh, Right is loc
+          alpha_pen = rho * grav * max(h_loc, h_ngh)
+          P_star = 0.5 * (P_ngh + P_loc) - 0.5 * alpha_pen * (h_loc - h_ngh)
+        endif
+
+        phi_A = 1.0 - t_face ; phi_B = t_face
+        ! Face normal n_y = -1 -> Boundary Integral = + P_star
+        face_dy_S_A = face_dy_S_A + 0.5 * G%dxCv(i,J-1) * phi_A * P_star
+        face_dy_S_B = face_dy_S_B + 0.5 * G%dxCv(i,J-1) * phi_B * P_star
+      enddo
+
+      ! ======================================================================
+      ! North Face (J) of cell (i,j)
+      ! Local cell is bottom (j), Neighbor cell is top (j+1)
+      ! ======================================================================
+      h_loc_A = max(ISS%h_shelf(i,j) + (((-0.5)*CS%h_x(i,j)) + (( 0.5)*CS%h_y(i,j))), CS%min_h_shelf)
+      h_loc_B = max(ISS%h_shelf(i,j) + ((( 0.5)*CS%h_x(i,j)) + (( 0.5)*CS%h_y(i,j))), CS%min_h_shelf)
+      b_loc_A = bed_corners(1,2) ; b_loc_B = bed_corners(2,2)
+
+      h_ngh_A = max(ISS%h_shelf(i,j+1) + (((-0.5)*CS%h_x(i,j+1)) + ((-0.5)*CS%h_y(i,j+1))), CS%min_h_shelf)
+      h_ngh_B = max(ISS%h_shelf(i,j+1) + ((( 0.5)*CS%h_x(i,j+1)) + ((-0.5)*CS%h_y(i,j+1))), CS%min_h_shelf)
+      b_ngh_A = bed_corners(1,2) ; b_ngh_B = bed_corners(2,2)
+
+      is_ext_bdry = ((CS%v_face_mask_bdry(i,J) == 2) .or. &
+                    ((ISS%hmask(i,j+1) == 0 .or. ISS%hmask(i,j+1) == 2) .and. &
+                     (CS%reentrant_y .or. (j+j_off /= gjec))))
+
+      do gp_face=1,2
+        t_face = xquad(gp_face)
+        h_loc = (1.0 - t_face)*h_loc_A + t_face*h_loc_B
+        b_loc = (1.0 - t_face)*b_loc_A + t_face*b_loc_B
+
+        if (rhoi_rhow * h_loc - b_loc > 0.0) then
+          P_loc = 0.5 * grav * rho * h_loc**2
+        else
+          P_loc = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_loc**2
+        endif
+
+        if (is_ext_bdry) then
+          d_ocean = min(b_loc, rhoi_rhow * h_loc)
+          P_star = 0.5 * grav * rhow * d_ocean**2
+        else
+          h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
+          b_ngh = (1.0 - t_face)*b_ngh_A + t_face*b_ngh_B
+          if (rhoi_rhow * h_ngh - b_ngh > 0.0) then
+            P_ngh = 0.5 * grav * rho * h_ngh**2
+          else
+            P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
+          endif
+
+          ! Lax-Friedrichs Flux
+          ! Left is loc, Right is ngh
+          alpha_pen = rho * grav * max(h_loc, h_ngh)
+          P_star = 0.5 * (P_loc + P_ngh) - 0.5 * alpha_pen * (h_ngh - h_loc)
+        endif
+
+        phi_A = 1.0 - t_face ; phi_B = t_face
+        ! Face normal n_y = 1 -> Boundary Integral = - P_star
+        face_dy_N_A = face_dy_N_A - 0.5 * G%dxCv(i,J) * phi_A * P_star
+        face_dy_N_B = face_dy_N_B - 0.5 * G%dxCv(i,J) * phi_B * P_star
+      enddo
 
       ! Combine the per-cell volume-integral total vol_d*(m,n) with the per-face
-      ! Neumann contributions to get this cell's contribution to each of its 4
-      ! corner-nodes.
+      ! boundary contributions to get this cell's contribution to each of its 4 corner-nodes.
       cell_dx_node(1,1) = vol_dx(1,1) + face_dx_W_A  ! SW corner, W face
       cell_dy_node(1,1) = vol_dy(1,1) + face_dy_S_A  ! SW corner, S face
       cell_dx_node(2,1) = vol_dx(2,1) + face_dx_E_A  ! SE corner, E face
@@ -7317,9 +7458,6 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       cell_dx_node(2,2) = vol_dx(2,2) + face_dx_E_B  ! NE corner, E face
       cell_dy_node(2,2) = vol_dy(2,2) + face_dy_N_B  ! NE corner, N face
 
-      ! Write each per-corner cell contribution to the appropriate slot of the
-      ! per-node 4-slot buffer. Slot k indexes which of the 4 cells around a
-      ! node is contributing: 1=SW cell, 2=SE cell, 3=NW cell, 4=NE cell.
       taudx_b(I-1,J-1,4) = taudx_b(I-1,J-1,4) + cell_dx_node(1,1)
       taudy_b(I-1,J-1,4) = taudy_b(I-1,J-1,4) + cell_dy_node(1,1)
       taudx_b(I  ,J-1,3) = taudx_b(I  ,J-1,3) + cell_dx_node(2,1)
@@ -7342,16 +7480,12 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
 end subroutine calc_shelf_driving_stress_DG
 
 !> Subgrid GL-band volume integral of the driving stress for the DG path.
-!! Mirrors CG_action_subgrid_basal: nsub x nsub sub-cells, 2x2 sub-qp each,
-!! per-sub-qp interpolated metric (a,d) from cell-edge spacings via Phisub
-!! marginal sums, rotation-paired Phisub contraction for nodal contributions,
-!! pair-summed per sub-cell, then sum_square_matrix reduction across the
-!! nsub x nsub sub-cell grid for bitwise rotation invariance.
+!! Evaluates the unified integration-by-parts weak form over nsub x nsub sub-cells.
 subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
     h_shelf_cell, h_x_cell, h_y_cell, bed_corners, &
     dxCv_S, dxCv_N, dyCu_W, dyCu_E, &
-    rho, rhoi_rhow, grav, vol_dx, vol_dy, sx_shelf, sy_shelf)
-  type(ice_shelf_dyn_CS), intent(inout) :: CS    !< Ice shelf control structure
+    rho, rhow, rhoi_rhow, grav, vol_dx, vol_dy, sx_shelf, sy_shelf, calc_slope_diag)
+  type(ice_shelf_dyn_CS), intent(in) :: CS    !< Ice shelf control structure
   real, dimension(:,:,:,:,:,:), intent(in) :: Phisub !< Sub-grid quadrature weights [nondim]
   real, intent(in) :: h_shelf_cell   !< Cell-averaged ice thickness [Z ~> m]
   real, intent(in) :: h_x_cell       !< DG x-slope moment [Z ~> m]
@@ -7362,12 +7496,15 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
   real, intent(in) :: dyCu_W         !< Cell y-length on west face [L ~> m]
   real, intent(in) :: dyCu_E         !< Cell y-length on east face [L ~> m]
   real, intent(in) :: rho            !< Ice density [R ~> kg m-3]
+  real, intent(in) :: rhow           !< Ocean density [R ~> kg m-3]
   real, intent(in) :: rhoi_rhow      !< rho/rhow [nondim]
   real, intent(in) :: grav           !< Gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
   real, dimension(2,2), intent(out) :: vol_dx !< Per-corner x volume integral [R L3 Z T-2 ~> kg m s-2]
   real, dimension(2,2), intent(out) :: vol_dy !< Per-corner y volume integral [R L3 Z T-2 ~> kg m s-2]
   real, intent(inout) :: sx_shelf !< The cell-average x surface slope [Z L-1 ~> nondim]
   real, intent(inout) :: sy_shelf !< The cell-average y surface slope [Z L-1 ~> nondim]
+  logical :: calc_slope_diag ! True if slope diagnostics will be calculated
+
   real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: contr_sub_dx, contr_sub_dy
   real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: slope_x_gp, slope_y_gp ! Per-QP surf slopes [Z L-1 ~> nondim]
   real, dimension(2,2) :: slope_x, slope_y ! slope sums for qps with same position within subcells [Z L-1 ~> nondim]
@@ -7378,7 +7515,12 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
   real :: bed_gp            ! Bed elevation at sub-qp [Z ~> m]
   real :: dbdx_gp, dbdy_gp  ! Bed gradients at sub-qp, physical coords [Z L-1 ~> nondim]
   real :: dbdx_ref, dbdy_ref ! Bed gradients in reference coords (pre-Jacobian) [Z ~> m]
-  real :: dsdx_gp, dsdy_gp  ! Surface slope at sub-qp [Z L-1 ~> nondim]
+  real :: dsdx_gp, dsdy_gp   ! Surface slope at sub-qp [Z L-1 ~> nondim]
+  real :: bottom_force_x, bottom_force_y ! Bed/water bottom drag forces [R Z L2 T-2 ~> kg s-2]
+  real :: dphi_dx_ref, dphi_dy_ref ! Basis function derivatives in reference coordinates [nondim]
+  real :: dphi_dx, dphi_dy  ! Basis function derivatives in physical coordinates [L-1 ~> m-1]
+  real :: y_marginal_1, y_marginal_2, x_marginal_1, x_marginal_2 ! Marginal sums [nondim]
+  real :: p_term_vol        ! Integrated-by-parts volume pressure term [R Z L2 T-2 ~> kg s-2]
   real :: a, d              ! Per-sub-qp interpolated cell-edge spacings [L ~> m]
   real :: weight            ! Per-sub-qp quadrature weight [L2 ~> m2]
   real :: subarea           ! 1/nsub^2 [nondim]
@@ -7403,13 +7545,17 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
                ((Phisub(qx,qy,i,j,1,2)*bed_corners(1,2)) + (Phisub(qx,qy,i,j,2,1)*bed_corners(2,1)))
 
       ! Per-sub-qp metric via Phisub marginal sums (same pattern as CG_action_subgrid_basal).
-      a = (dxCv_S * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1))) + &  ! (1-y) * dxCv_S
-          (dxCv_N * (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2)))      !  + y  * dxCv_N
-      d = (dyCu_W * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2))) + &  ! (1-x) * dyCu_W
-          (dyCu_E * (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)))      !  + x  * dyCu_E
+      a = (dxCv_S * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1))) + &
+          (dxCv_N * (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2)))
+      d = (dyCu_W * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2))) + &
+          (dyCu_E * (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)))
       weight = 0.25 * subarea * (a * d)
 
-      ! Physical-coord gradients: per-sub-qp Jacobian, consistent with bilinear_shape_fn_grid.
+      y_marginal_1 = Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1)
+      y_marginal_2 = Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2)
+      x_marginal_1 = Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2)
+      x_marginal_2 = Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)
+
       dhdx_gp = h_x_cell / a
       dhdy_gp = h_y_cell / d
 
@@ -7425,33 +7571,44 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
       dbdx_gp = dbdx_ref / a
       dbdy_gp = dbdy_ref / d
 
-      if (CS%GL_couple) then
-        dsdx_gp = -dbdx_gp + dhdx_gp
-        dsdy_gp = -dbdy_gp + dhdy_gp
+      if (rhoi_rhow * h_gp - bed_gp <= 0.0) then
+        ! Floating: bottom force is water pressure on the sloped draft
+        dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp
+        dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
+        bottom_force_x = (rho**2 / rhow) * grav * h_gp * dhdx_gp
+        bottom_force_y = (rho**2 / rhow) * grav * h_gp * dhdy_gp
       else
-        if (rhoi_rhow * h_gp - bed_gp <= 0.0) then
-          dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp
-          dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
-        else
-          dsdx_gp = dhdx_gp - dbdx_gp
-          dsdy_gp = dhdy_gp - dbdy_gp
-        endif
+        ! Grounded: bottom force is bed pressure on the sloped bed
+        bottom_force_x = rho * grav * h_gp * dbdx_gp
+        bottom_force_y = rho * grav * h_gp * dbdy_gp
+        dsdx_gp = dhdx_gp - dbdx_gp
+        dsdy_gp = dhdy_gp - dbdy_gp
       endif
 
       if (CS%max_surface_slope > 0.0) then
         slope_mag = sqrt((dsdx_gp*dsdx_gp) + (dsdy_gp*dsdy_gp))
         scale = CS%max_surface_slope / max(slope_mag, CS%max_surface_slope)
-        dsdx_gp = scale * dsdx_gp
-        dsdy_gp = scale * dsdy_gp
       endif
 
-      slope_x_gp(i,j,qx,qy) = dsdx_gp
-      slope_y_gp(i,j,qx,qy) = dsdy_gp
+      ! For slope diagnostics
+      if (calc_slope_diag) then
+        slope_x_gp(i,j,qx,qy) = dsdx_gp*scale
+        slope_y_gp(i,j,qx,qy) = dsdy_gp*scale
+      endif
+
+      ! Unified Weak-form Volume Integration applied to subgrid
+      p_term_vol = 0.5 * rho * grav * h_gp**2
 
       do n=1,2 ; do m=1,2
-        qp_dx(qx,qy,m,n) = -weight * Phisub(qx,qy,i,j,m,n) * (rho * grav * h_gp * dsdx_gp)
-        qp_dy(qx,qy,m,n) = -weight * Phisub(qx,qy,i,j,m,n) * (rho * grav * h_gp * dsdy_gp)
+        dphi_dx_ref = merge(1.0, -1.0, m==2) * merge(y_marginal_2, y_marginal_1, n==2)
+        dphi_dy_ref = merge(x_marginal_2, x_marginal_1, m==2) * merge(1.0, -1.0, n==2)
+        dphi_dx = dphi_dx_ref / a
+        dphi_dy = dphi_dy_ref / d
+
+        qp_dx(qx,qy,m,n) = scale * (weight * dphi_dx * p_term_vol + weight * Phisub(qx,qy,i,j,m,n) * bottom_force_x)
+        qp_dy(qx,qy,m,n) = scale * (weight * dphi_dy * p_term_vol + weight * Phisub(qx,qy,i,j,m,n) * bottom_force_y)
       enddo ; enddo
+
     enddo ; enddo
 
     do n=1,2 ; do m=1,2
@@ -7465,13 +7622,17 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
   do n=1,2 ; do m=1,2
     call sum_square_matrix(vol_dx(m,n), contr_sub_dx(:,:,m,n), nsub)
     call sum_square_matrix(vol_dy(m,n), contr_sub_dy(:,:,m,n), nsub)
-    ! below, m and n are qx and qy
-    call sum_square_matrix(slope_x(m,n), slope_x_gp(:,:,m,n), nsub)
-    call sum_square_matrix(slope_y(m,n), slope_y_gp(:,:,m,n), nsub)
   enddo ; enddo
 
-  sx_shelf = 0.25*((slope_x(1,1)+slope_x(2,2)) + (slope_x(1,2)+slope_x(2,1)))/nsub
-  sy_shelf = 0.25*((slope_y(1,1)+slope_y(2,2)) + (slope_y(1,2)+slope_y(2,1)))/nsub
+  if (calc_slope_diag) then
+    do qy=1,2 ; do qx=1,2
+      call sum_square_matrix(slope_x(qx,qy), slope_x_gp(:,:,qx,qy), nsub)
+      call sum_square_matrix(slope_y(qx,qy), slope_y_gp(:,:,qx,qy), nsub)
+    enddo; enddo
+
+    sx_shelf = 0.25*((slope_x(1,1)+slope_x(2,2)) + (slope_x(1,2)+slope_x(2,1)))/nsub
+    sy_shelf = 0.25*((slope_y(1,1)+slope_y(2,2)) + (slope_y(1,2)+slope_y(2,1)))/nsub
+  endif
 
 end subroutine calc_shelf_driving_stress_DG_subgrid
 
