@@ -5323,13 +5323,17 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
           h_ip = max(ISS%h_shelf(i,j) + ((CS%h_x(i,j)*xi_sub) + (CS%h_y(i,j)*eta_sub)), &
                      CS%min_h_shelf)
         else
-          h_ip = ((CS%Phisub(iq,jq,isub,jsub,1,1)*H_corners(1,1)) + (CS%Phisub(iq,jq,isub,jsub,2,2)*H_corners(2,2))) + &
-                 ((CS%Phisub(iq,jq,isub,jsub,2,1)*H_corners(2,1)) + (CS%Phisub(iq,jq,isub,jsub,1,2)*H_corners(1,2)))
+          h_ip = ((CS%Phisub(iq,jq,isub,jsub,1,1)*H_corners(1,1)) + &
+                  (CS%Phisub(iq,jq,isub,jsub,2,2)*H_corners(2,2))) + &
+                 ((CS%Phisub(iq,jq,isub,jsub,2,1)*H_corners(2,1)) + &
+                  (CS%Phisub(iq,jq,isub,jsub,1,2)*H_corners(1,2)))
           h_ip = max(h_ip, CS%min_h_shelf)
         endif
 
-        bed_ip = ((CS%Phisub(iq,jq,isub,jsub,1,1)*bed_corners(1,1)) + (CS%Phisub(iq,jq,isub,jsub,2,2)*bed_corners(2,2))) + &
-                 ((CS%Phisub(iq,jq,isub,jsub,2,1)*bed_corners(2,1)) + (CS%Phisub(iq,jq,isub,jsub,1,2)*bed_corners(1,2)))
+        bed_ip = ((CS%Phisub(iq,jq,isub,jsub,1,1)*bed_corners(1,1)) + &
+                  (CS%Phisub(iq,jq,isub,jsub,2,2)*bed_corners(2,2))) + &
+                 ((CS%Phisub(iq,jq,isub,jsub,2,1)*bed_corners(2,1)) + &
+                  (CS%Phisub(iq,jq,isub,jsub,1,2)*bed_corners(1,2)))
 
         if (rhoi_rhow * h_ip - bed_ip > 0.0) n_grounded = n_grounded + 1
       enddo ; enddo
@@ -7065,13 +7069,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   real :: bed_gp            ! Bed elevation at a qp [Z ~> m]
   real :: dbdx_gp, dbdy_gp  ! Bed gradients at a qp, physical coords [Z L-1 ~> nondim]
   real :: dbdx_ref, dbdy_ref ! Bed gradients in reference coords (pre-Jacobian) [Z ~> m]
-  real :: dsdx_gp, dsdy_gp  ! Surface slope at a qp [Z L-1 ~> nondim]
   real :: bottom_force_x, bottom_force_y ! Bed/water bottom drag forces [R Z L2 T-2 ~> kg s-2]
   real :: dphi_dx_ref, dphi_dy_ref ! Basis function derivatives in reference coordinates [nondim]
   real :: dphi_dx, dphi_dy  ! Basis function derivatives in physical coordinates [L-1 ~> m-1]
   real :: p_term_vol        ! Integrated-by-parts volume pressure term [R Z L2 T-2 ~> kg s-2]
-  real :: scale             ! Multiplier applied to dsdx,dsdy to enforce max_surface_slope [nondim]
-  real :: slope_mag         ! |grad(s)| magnitude at a qp [Z L-1 ~> nondim]
   real :: a_qp, d_qp        ! Per-qp interpolated cell-edge spacings [L ~> m]
   real :: weight            ! Per-qp quadrature weight including Jacobian [L2 ~> m2]
   real :: bed_corners(2,2)  ! Bed elevation at the 4 B-grid corners of an element [Z ~> m]
@@ -7191,40 +7192,41 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
 
           if (CS%GL_couple) then
             if (CS%ground_frac(i,j)>0) then
-              dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp
-              dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
               bottom_force_x = (rho**2 / rhow) * grav * h_gp * dhdx_gp
               bottom_force_y = (rho**2 / rhow) * grav * h_gp * dhdy_gp
             else
-              dsdx_gp = dhdx_gp - dbdx_gp
-              dsdy_gp = dhdy_gp - dbdy_gp
               bottom_force_x = rho * grav * h_gp * dbdx_gp
               bottom_force_y = rho * grav * h_gp * dbdy_gp
             endif
           else
             if (rhoi_rhow * h_gp - bed_gp <= 0.0) then
-              dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp
-              dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
               bottom_force_x = (rho**2 / rhow) * grav * h_gp * dhdx_gp
               bottom_force_y = (rho**2 / rhow) * grav * h_gp * dhdy_gp
             else
-              dsdx_gp = dhdx_gp - dbdx_gp
-              dsdy_gp = dhdy_gp - dbdy_gp
               bottom_force_x = rho * grav * h_gp * dbdx_gp
               bottom_force_y = rho * grav * h_gp * dbdy_gp
             endif
           endif
 
-          scale = 1.0
-          if (CS%max_surface_slope > 0.0) then
-            slope_mag = sqrt((dsdx_gp*dsdx_gp) + (dsdy_gp*dsdy_gp))
-            scale = CS%max_surface_slope / max(slope_mag, CS%max_surface_slope)
-          endif
-
           ! For slope diagnostics
           if (calc_slope_diag) then
-            slope_x_gp(iq,jq) = dsdx_gp*scale
-            slope_y_gp(iq,jq) = dsdy_gp*scale
+            if (CS%GL_couple) then
+              if (CS%ground_frac(i,j)>0) then
+                slope_x_gp(iq,jq) = (1.0 - rhoi_rhow) * dhdx_gp
+                slope_y_gp(iq,jq) = (1.0 - rhoi_rhow) * dhdy_gp
+              else
+                slope_x_gp(iq,jq) = dhdx_gp - dbdx_gp
+                slope_y_gp(iq,jq) = dhdy_gp - dbdy_gp
+              endif
+            else
+              if (rhoi_rhow * h_gp - bed_gp <= 0.0) then
+                slope_x_gp(iq,jq) = (1.0 - rhoi_rhow) * dhdx_gp
+                slope_y_gp(iq,jq)= (1.0 - rhoi_rhow) * dhdy_gp
+              else
+                slope_x_gp(iq,jq) = dhdx_gp - dbdx_gp
+                slope_y_gp(iq,jq) = dhdy_gp - dbdy_gp
+              endif
+            endif
           endif
 
           ! Weak-form Volume Integration by Parts
@@ -7240,8 +7242,8 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             dphi_dx = dphi_dx_ref / a_qp
             dphi_dy = dphi_dy_ref / d_qp
 
-            qp_dx(iq,jq,m,n) = scale * (weight * dphi_dx * p_term_vol + weight * phi_val * bottom_force_x)
-            qp_dy(iq,jq,m,n) = scale * (weight * dphi_dy * p_term_vol + weight * phi_val * bottom_force_y)
+            qp_dx(iq,jq,m,n) = (weight * dphi_dx * p_term_vol) + (weight * phi_val * bottom_force_x)
+            qp_dy(iq,jq,m,n) = (weight * dphi_dy * p_term_vol) + (weight * phi_val * bottom_force_y)
           enddo ; enddo
 
         enddo ; enddo
@@ -7602,7 +7604,6 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
   real :: bed_gp            ! Bed elevation at sub-qp [Z ~> m]
   real :: dbdx_gp, dbdy_gp  ! Bed gradients at sub-qp, physical coords [Z L-1 ~> nondim]
   real :: dbdx_ref, dbdy_ref ! Bed gradients in reference coords (pre-Jacobian) [Z ~> m]
-  real :: dsdx_gp, dsdy_gp   ! Surface slope at sub-qp [Z L-1 ~> nondim]
   real :: bottom_force_x, bottom_force_y ! Bed/water bottom drag forces [R Z L2 T-2 ~> kg s-2]
   real :: dphi_dx_ref, dphi_dy_ref ! Basis function derivatives in reference coordinates [nondim]
   real :: dphi_dx, dphi_dy  ! Basis function derivatives in physical coordinates [L-1 ~> m-1]
@@ -7611,7 +7612,6 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
   real :: a, d              ! Per-sub-qp interpolated cell-edge spacings [L ~> m]
   real :: weight            ! Per-sub-qp quadrature weight [L2 ~> m2]
   real :: subarea           ! 1/nsub^2 [nondim]
-  real :: scale, slope_mag  ! max_surface_slope clamp [nondim]
   integer :: nsub, i, j, qx, qy, m, n
 
   nsub    = size(Phisub, 3)
@@ -7660,27 +7660,24 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
 
       if (rhoi_rhow * h_gp - bed_gp <= 0.0) then
         ! Floating: bottom force is water pressure on the sloped draft
-        dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp
-        dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
         bottom_force_x = (rho**2 / rhow) * grav * h_gp * dhdx_gp
         bottom_force_y = (rho**2 / rhow) * grav * h_gp * dhdy_gp
       else
         ! Grounded: bottom force is bed pressure on the sloped bed
         bottom_force_x = rho * grav * h_gp * dbdx_gp
         bottom_force_y = rho * grav * h_gp * dbdy_gp
-        dsdx_gp = dhdx_gp - dbdx_gp
-        dsdy_gp = dhdy_gp - dbdy_gp
-      endif
-
-      if (CS%max_surface_slope > 0.0) then
-        slope_mag = sqrt((dsdx_gp*dsdx_gp) + (dsdy_gp*dsdy_gp))
-        scale = CS%max_surface_slope / max(slope_mag, CS%max_surface_slope)
       endif
 
       ! For slope diagnostics
       if (calc_slope_diag) then
-        slope_x_gp(i,j,qx,qy) = dsdx_gp*scale
-        slope_y_gp(i,j,qx,qy) = dsdy_gp*scale
+        if (rhoi_rhow * h_gp - bed_gp <= 0.0) then
+          ! Floating: bottom force is water pressure on the sloped draft
+          slope_x_gp(i,j,qx,qy) = (1.0 - rhoi_rhow) * dhdx_gp
+          slope_y_gp(i,j,qx,qy) = (1.0 - rhoi_rhow) * dhdy_gp
+        else
+          slope_x_gp(i,j,qx,qy) = dhdx_gp - dbdx_gp
+          slope_y_gp(i,j,qx,qy) = dhdy_gp - dbdy_gp
+        endif
       endif
 
       ! Unified Weak-form Volume Integration applied to subgrid
@@ -7692,8 +7689,8 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
         dphi_dx = dphi_dx_ref / a
         dphi_dy = dphi_dy_ref / d
 
-        qp_dx(qx,qy,m,n) = scale * (weight * dphi_dx * p_term_vol + weight * Phisub(qx,qy,i,j,m,n) * bottom_force_x)
-        qp_dy(qx,qy,m,n) = scale * (weight * dphi_dy * p_term_vol + weight * Phisub(qx,qy,i,j,m,n) * bottom_force_y)
+        qp_dx(qx,qy,m,n) = (weight * dphi_dx * p_term_vol) + (weight * Phisub(qx,qy,i,j,m,n) * bottom_force_x)
+        qp_dy(qx,qy,m,n) = (weight * dphi_dy * p_term_vol) + (weight * Phisub(qx,qy,i,j,m,n) * bottom_force_y)
       enddo ; enddo
 
     enddo ; enddo
@@ -7715,7 +7712,7 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
     do qy=1,2 ; do qx=1,2
       call sum_square_matrix(slope_x(qx,qy), slope_x_gp(:,:,qx,qy), nsub)
       call sum_square_matrix(slope_y(qx,qy), slope_y_gp(:,:,qx,qy), nsub)
-    enddo; enddo
+    enddo ; enddo
 
     sx_shelf = 0.25*((slope_x(1,1)+slope_x(2,2)) + (slope_x(1,2)+slope_x(2,1)))/nsub
     sy_shelf = 0.25*((slope_y(1,1)+slope_y(2,2)) + (slope_y(1,2)+slope_y(2,1)))/nsub
