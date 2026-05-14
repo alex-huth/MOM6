@@ -32,6 +32,7 @@ use MOM_checksums, only : hchksum, qchksum
 use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary_channel,initialize_ice_flow_from_file
 use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary_from_file,initialize_ice_C_basal_friction
 use MOM_ice_shelf_initialize, only : initialize_ice_AGlen, initialize_bed_node_from_file
+use MOM_ice_shelf_initialize, only : initialize_DG_thickness_slopes_from_file
 implicit none ; private
 
 #include <MOM_memory.h>
@@ -557,6 +558,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   integer :: i, j, isd, ied, jsd, jed, Isdq, Iedq, Jsdq, Jedq, iters
   logical :: valid_E, valid_W, valid_N, valid_S ! DG cold-start neighbour-mask checks
   real :: h_E, h_W, h_N, h_S ! Effective neighbour cell-mean thickness for DG cold-start [Z ~> m]
+  logical :: slopes_from_file ! True if DG h_x, h_y were read from ICE_THICKNESS_FILE
   character(len=200) :: IS_energyfile  ! The name of the energy file.
   character(len=32) :: filename_appendix = '' ! FMS appendix to filename for ensemble runs
   character(len=16) :: inner_solver_str ! The type of inner solver to use for the SSA
@@ -1005,14 +1007,20 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         if (CS%use_DG_thickness) call reconstruct_bed_to_nodes(CS, G, ISS%hmask)
       endif
       if (CS%use_DG_thickness) then
-        ! DG(1) cold-start slope init: seed from neighbour cell-mean central
-        ! differences, then apply the slope limiter. Seeding (rather than
-        ! zeroing) is required because DG1_slope_limit uses minmod3 of the
-        ! existing slope with neighbour differences and minmod3 returns zero
-        ! whenever any argument is zero, so a zero seed would persist.
+        ! DG(1) cold-start slope init. First try to read h_x, h_y from
+        ! ICE_THICKNESS_FILE (treated as authoritative IC, like restart values).
+        ! If those fields are absent, fall back to seeding from neighbour
+        ! cell-mean central differences followed by the slope limiter.
+        ! Seeding (rather than zeroing) is required for the fallback because
+        ! DG1_slope_limit uses minmod3 of the existing slope with neighbour
+        ! differences and minmod3 returns zero whenever any argument is zero,
+        ! so a zero seed would persist.
         ! On restart h_x,h_y come from the restart file and this branch is skipped.
         call pass_var(ISS%h_shelf, G%domain)
         CS%h_x(:,:) = 0.0 ; CS%h_y(:,:) = 0.0
+        call initialize_DG_thickness_slopes_from_file(CS%h_x, CS%h_y, slopes_from_file, &
+                                                     G, US, param_file)
+       if (.not. slopes_from_file) then
         do j=G%jsc,G%jec ; do i=G%isc,G%iec
           if (ISS%hmask(i,j) == 1) then
             valid_E = (ISS%hmask(i+1,j) == 1 .or. ISS%hmask(i+1,j) == 3)
@@ -1062,6 +1070,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         enddo ; enddo
         call DG1_slope_limit(G, ISS%h_shelf, CS%h_x, CS%h_y, ISS%hmask, CS%h_bdry_val, &
                              CS%dg1_limiter_choice, CS%dg1_limiter_M)
+       endif ! .not. slopes_from_file
         call pass_vector(CS%h_x, CS%h_y, G%domain, TO_ALL, AGRID)
       endif
       call update_velocity_masks(CS, G, ISS%hmask, CS%umask, CS%vmask, CS%u_face_mask, CS%v_face_mask)
@@ -7088,6 +7097,8 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   real :: face_dy_N_A, face_dy_N_B  ! North face y-stress contrib to nodes A,B [R L3 Z T-2 ~> kg m s-2]
   integer :: m, n  ! Cell-corner (m,n) loop indices in [1..2] [nondim]
   logical :: calc_slope_diag ! True if slope diagnostics will be calculated
+  logical :: loc_is_bc       ! True if local cell has hmask==3 (Dirichlet thickness BC)
+  logical :: ngh_is_bc       ! True if neighbor cell has hmask==3 (Dirichlet thickness BC)
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -7255,6 +7266,16 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       h_ngh_B = max(ISS%h_shelf(i-1,j) + ((( 0.5)*CS%h_x(i-1,j)) + (( 0.5)*CS%h_y(i-1,j))), CS%min_h_shelf)
       b_ngh_A = bed_corners(1,1) ; b_ngh_B = bed_corners(1,2)
 
+      ! Dirichlet thickness BC: override face thicknesses with h_bdry_val on any hmask==3 side.
+      loc_is_bc = (ISS%hmask(i,j) == 3)
+      ngh_is_bc = (ISS%hmask(i-1,j) == 3)
+      if (loc_is_bc) then
+        h_loc_A = max(CS%h_bdry_val(i,j), CS%min_h_shelf) ; h_loc_B = h_loc_A
+      endif
+      if (ngh_is_bc) then
+        h_ngh_A = max(CS%h_bdry_val(i-1,j), CS%min_h_shelf) ; h_ngh_B = h_ngh_A
+      endif
+
       is_ext_bdry = ((CS%u_face_mask_bdry(I-1,j) == 2) .or. &
                     ((ISS%hmask(i-1,j) == 0 .or. ISS%hmask(i-1,j) == 2) .and. &
                      (CS%reentrant_x .or. (i+i_off /= gisc))))
@@ -7282,10 +7303,18 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
           endif
 
-          ! Lax-Friedrichs Flux: {P} - 0.5*alpha*(h_right - h_left)
-          ! Left is ngh, Right is loc
-          alpha_pen = rho * grav * max(h_loc, h_ngh)
-          P_star = 0.5 * (P_ngh + P_loc) - 0.5 * alpha_pen * (h_loc - h_ngh)
+          if (loc_is_bc .and. .not. ngh_is_bc) then
+            ! Prescribed BC face value is authoritative on the local side.
+            P_star = P_loc
+          elseif (ngh_is_bc .and. .not. loc_is_bc) then
+            ! Prescribed BC face value is authoritative on the neighbor side.
+            P_star = P_ngh
+          else
+            ! Lax-Friedrichs Flux: {P} - 0.5*alpha*(h_right - h_left)
+            ! Left is ngh, Right is loc
+            alpha_pen = rho * grav * max(h_loc, h_ngh)
+            P_star = 0.5 * (P_ngh + P_loc) - 0.5 * alpha_pen * (h_loc - h_ngh)
+          endif
         endif
 
         phi_A = 1.0 - t_face ; phi_B = t_face
@@ -7305,6 +7334,16 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       h_ngh_A = max(ISS%h_shelf(i+1,j) + (((-0.5)*CS%h_x(i+1,j)) + ((-0.5)*CS%h_y(i+1,j))), CS%min_h_shelf)
       h_ngh_B = max(ISS%h_shelf(i+1,j) + (((-0.5)*CS%h_x(i+1,j)) + (( 0.5)*CS%h_y(i+1,j))), CS%min_h_shelf)
       b_ngh_A = bed_corners(2,1) ; b_ngh_B = bed_corners(2,2)
+
+      ! Dirichlet thickness BC: override face thicknesses with h_bdry_val on any hmask==3 side.
+      loc_is_bc = (ISS%hmask(i,j) == 3)
+      ngh_is_bc = (ISS%hmask(i+1,j) == 3)
+      if (loc_is_bc) then
+        h_loc_A = max(CS%h_bdry_val(i,j), CS%min_h_shelf) ; h_loc_B = h_loc_A
+      endif
+      if (ngh_is_bc) then
+        h_ngh_A = max(CS%h_bdry_val(i+1,j), CS%min_h_shelf) ; h_ngh_B = h_ngh_A
+      endif
 
       is_ext_bdry = ((CS%u_face_mask_bdry(I,j) == 2) .or. &
                     ((ISS%hmask(i+1,j) == 0 .or. ISS%hmask(i+1,j) == 2) .and. &
@@ -7333,10 +7372,16 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
           endif
 
-          ! Lax-Friedrichs Flux: {P} - 0.5*alpha*(h_right - h_left)
-          ! Left is loc, Right is ngh
-          alpha_pen = rho * grav * max(h_loc, h_ngh)
-          P_star = 0.5 * (P_loc + P_ngh) - 0.5 * alpha_pen * (h_ngh - h_loc)
+          if (loc_is_bc .and. .not. ngh_is_bc) then
+            P_star = P_loc
+          elseif (ngh_is_bc .and. .not. loc_is_bc) then
+            P_star = P_ngh
+          else
+            ! Lax-Friedrichs Flux: {P} - 0.5*alpha*(h_right - h_left)
+            ! Left is loc, Right is ngh
+            alpha_pen = rho * grav * max(h_loc, h_ngh)
+            P_star = 0.5 * (P_loc + P_ngh) - 0.5 * alpha_pen * (h_ngh - h_loc)
+          endif
         endif
 
         phi_A = 1.0 - t_face ; phi_B = t_face
@@ -7356,6 +7401,16 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       h_ngh_A = max(ISS%h_shelf(i,j-1) + (((-0.5)*CS%h_x(i,j-1)) + (( 0.5)*CS%h_y(i,j-1))), CS%min_h_shelf)
       h_ngh_B = max(ISS%h_shelf(i,j-1) + ((( 0.5)*CS%h_x(i,j-1)) + (( 0.5)*CS%h_y(i,j-1))), CS%min_h_shelf)
       b_ngh_A = bed_corners(1,1) ; b_ngh_B = bed_corners(2,1)
+
+      ! Dirichlet thickness BC: override face thicknesses with h_bdry_val on any hmask==3 side.
+      loc_is_bc = (ISS%hmask(i,j) == 3)
+      ngh_is_bc = (ISS%hmask(i,j-1) == 3)
+      if (loc_is_bc) then
+        h_loc_A = max(CS%h_bdry_val(i,j), CS%min_h_shelf) ; h_loc_B = h_loc_A
+      endif
+      if (ngh_is_bc) then
+        h_ngh_A = max(CS%h_bdry_val(i,j-1), CS%min_h_shelf) ; h_ngh_B = h_ngh_A
+      endif
 
       is_ext_bdry = ((CS%v_face_mask_bdry(i,J-1) == 2) .or. &
                     ((ISS%hmask(i,j-1) == 0 .or. ISS%hmask(i,j-1) == 2) .and. &
@@ -7384,10 +7439,16 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
           endif
 
-          ! Lax-Friedrichs Flux
-          ! Left is ngh, Right is loc
-          alpha_pen = rho * grav * max(h_loc, h_ngh)
-          P_star = 0.5 * (P_ngh + P_loc) - 0.5 * alpha_pen * (h_loc - h_ngh)
+          if (loc_is_bc .and. .not. ngh_is_bc) then
+            P_star = P_loc
+          elseif (ngh_is_bc .and. .not. loc_is_bc) then
+            P_star = P_ngh
+          else
+            ! Lax-Friedrichs Flux
+            ! Left is ngh, Right is loc
+            alpha_pen = rho * grav * max(h_loc, h_ngh)
+            P_star = 0.5 * (P_ngh + P_loc) - 0.5 * alpha_pen * (h_loc - h_ngh)
+          endif
         endif
 
         phi_A = 1.0 - t_face ; phi_B = t_face
@@ -7407,6 +7468,16 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       h_ngh_A = max(ISS%h_shelf(i,j+1) + (((-0.5)*CS%h_x(i,j+1)) + ((-0.5)*CS%h_y(i,j+1))), CS%min_h_shelf)
       h_ngh_B = max(ISS%h_shelf(i,j+1) + ((( 0.5)*CS%h_x(i,j+1)) + ((-0.5)*CS%h_y(i,j+1))), CS%min_h_shelf)
       b_ngh_A = bed_corners(1,2) ; b_ngh_B = bed_corners(2,2)
+
+      ! Dirichlet thickness BC: override face thicknesses with h_bdry_val on any hmask==3 side.
+      loc_is_bc = (ISS%hmask(i,j) == 3)
+      ngh_is_bc = (ISS%hmask(i,j+1) == 3)
+      if (loc_is_bc) then
+        h_loc_A = max(CS%h_bdry_val(i,j), CS%min_h_shelf) ; h_loc_B = h_loc_A
+      endif
+      if (ngh_is_bc) then
+        h_ngh_A = max(CS%h_bdry_val(i,j+1), CS%min_h_shelf) ; h_ngh_B = h_ngh_A
+      endif
 
       is_ext_bdry = ((CS%v_face_mask_bdry(i,J) == 2) .or. &
                     ((ISS%hmask(i,j+1) == 0 .or. ISS%hmask(i,j+1) == 2) .and. &
@@ -7435,10 +7506,16 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
           endif
 
-          ! Lax-Friedrichs Flux
-          ! Left is loc, Right is ngh
-          alpha_pen = rho * grav * max(h_loc, h_ngh)
-          P_star = 0.5 * (P_loc + P_ngh) - 0.5 * alpha_pen * (h_ngh - h_loc)
+          if (loc_is_bc .and. .not. ngh_is_bc) then
+            P_star = P_loc
+          elseif (ngh_is_bc .and. .not. loc_is_bc) then
+            P_star = P_ngh
+          else
+            ! Lax-Friedrichs Flux
+            ! Left is loc, Right is ngh
+            alpha_pen = rho * grav * max(h_loc, h_ngh)
+            P_star = 0.5 * (P_loc + P_ngh) - 0.5 * alpha_pen * (h_ngh - h_loc)
+          endif
         endif
 
         phi_A = 1.0 - t_face ; phi_B = t_face

@@ -23,6 +23,7 @@ public initialize_ice_thickness
 public initialize_ice_shelf_boundary_channel
 public initialize_ice_flow_from_file
 public initialize_bed_node_from_file
+public initialize_DG_thickness_slopes_from_file
 public initialize_ice_shelf_boundary_from_file
 public initialize_ice_C_basal_friction
 public initialize_ice_AGlen
@@ -533,6 +534,53 @@ subroutine initialize_bed_node_from_file(bed_node, bed_elev, G, US, PF)
   call pass_var(bed_elev, G%domain)
 
 end subroutine initialize_bed_node_from_file
+
+!> Optionally read DG(1) cell-mean thickness slopes h_x, h_y from
+!! ICE_THICKNESS_FILE. Returns slopes_set=.true. when both DG_HX_VARNAME and
+!! DG_HY_VARNAME are present in the file; otherwise leaves h_x, h_y untouched
+!! and returns slopes_set=.false. so the caller can fall back to its own
+!! seeding (e.g. centred-FD of neighbour means).
+subroutine initialize_DG_thickness_slopes_from_file(h_x, h_y, slopes_set, G, US, PF)
+  type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(inout) :: h_x !< Cell-mean DG(1) x-slope DOF [Z ~> m].
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(inout) :: h_y !< Cell-mean DG(1) y-slope DOF [Z ~> m].
+  logical,                intent(out)   :: slopes_set !< True if h_x and h_y were read from file.
+  type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
+  type(param_file_type),  intent(in)    :: PF !< A structure to parse for run-time parameters
+
+  character(len=200) :: filename, inputdir, thickness_file
+  character(len=200) :: hx_varname, hy_varname
+  character(len=40)  :: mdl = "initialize_DG_thickness_slopes_from_file"
+
+  slopes_set = .false.
+
+  call get_param(PF, mdl, "INPUTDIR", inputdir, default=".", do_not_log=.true.)
+  inputdir = slasher(inputdir)
+  call get_param(PF, mdl, "ICE_THICKNESS_FILE", thickness_file, &
+                 default="ice_shelf_h.nc", do_not_log=.true.)
+  call get_param(PF, mdl, "DG_HX_VARNAME", hx_varname, &
+                 "The name of the DG(1) cell-mean x-slope variable in "//&
+                 "ICE_THICKNESS_FILE. If both DG_HX_VARNAME and DG_HY_VARNAME "//&
+                 "fields are present in the file, they are used as initial DG "//&
+                 "thickness slopes (skipping the centred-FD seed and slope limiter, "//&
+                 "mirroring restart behaviour).", &
+                 default="h_x")
+  call get_param(PF, mdl, "DG_HY_VARNAME", hy_varname, &
+                 "The name of the DG(1) cell-mean y-slope variable in ICE_THICKNESS_FILE.", &
+                 default="h_y")
+
+  filename = trim(inputdir)//trim(thickness_file)
+  if (.not.file_exists(filename, G%Domain)) return
+  if (.not.field_exists(filename, trim(hx_varname), MOM_domain=G%Domain)) return
+  if (.not.field_exists(filename, trim(hy_varname), MOM_domain=G%Domain)) return
+
+  call MOM_read_data(filename, trim(hx_varname), h_x, G%Domain, scale=US%m_to_Z)
+  call MOM_read_data(filename, trim(hy_varname), h_y, G%Domain, scale=US%m_to_Z)
+  slopes_set = .true.
+
+end subroutine initialize_DG_thickness_slopes_from_file
 
 !> Initialize ice shelf b.c.s from file
 subroutine initialize_ice_shelf_boundary_from_file(u_face_mask_bdry, v_face_mask_bdry, &
