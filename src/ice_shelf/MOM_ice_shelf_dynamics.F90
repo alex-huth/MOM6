@@ -252,6 +252,10 @@ type, public :: ice_shelf_dyn_CS ; private
   real :: dg1_limiter_M           !< TVB-style curvature bound for the Venkatakrishnan
                                   !! smooth-extremum protection band: eps = M * dx_local^2
                                   !! [Z L-2 ~> m-1].
+  logical :: dg1_positivity       !< If true, apply Zhang-Shu maximum-principle limiter
+                                  !! after the slope limiter to guarantee that the DG(1)
+                                  !! linear reconstruction stays non-negative at every
+                                  !! point of the cell.
   logical :: calve_to_mask       !< If true, calve off the ice shelf when it passes the edge of a mask.
   real :: min_thickness_simple_calve !< min. ice shelf thickness criteria for calving [Z ~> m].
   real :: T_shelf_missing   !< An ice shelf temperature to use where there is no ice shelf [C ~> degC]
@@ -1119,6 +1123,8 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         enddo ; enddo
         call DG1_slope_limit(G, ISS%h_shelf, CS%h_x, CS%h_y, ISS%hmask, CS%h_bdry_val, &
                              CS%dg1_limiter_choice, CS%dg1_limiter_M)
+        if (CS%dg1_positivity) &
+          call DG1_positivity_limit(G, ISS%h_shelf, CS%h_x, CS%h_y, ISS%hmask)
        endif ! .not. (node_ic_used .or. slopes_from_file)
         call pass_vector(CS%h_x, CS%h_y, G%domain, TO_ALL, AGRID)
       endif
@@ -6379,6 +6385,7 @@ subroutine ice_shelf_advect_DG1(CS, ISS, G, time_step, hmask, h_shelf, h_x, h_y,
   ! --- SSP-RK2 Stage 1: h1 = h0 + dt * L(h0) ---
   call DG1_slope_limit(G, h0, hx0, hy0, hmask, CS%h_bdry_val, &
                        CS%dg1_limiter_choice, CS%dg1_limiter_M)
+  if (CS%dg1_positivity) call DG1_positivity_limit(G, h0, hx0, hy0, hmask)
   call pass_vector(hx0, hy0, G%domain, TO_ALL, AGRID)
   call DG1_spatial_operator(CS, G, hmask, h0, hx0, hy0, Rhs_h, Rhs_hx, Rhs_hy, uh_ice, vh_ice)
 
@@ -6402,6 +6409,7 @@ subroutine ice_shelf_advect_DG1(CS, ISS, G, time_step, hmask, h_shelf, h_x, h_y,
   ! --- SSP-RK2 Stage 2: h_new = 0.5*h0 + 0.5*(h1 + dt * L(h1)) ---
   call DG1_slope_limit(G, h1, hx1, hy1, hmask, CS%h_bdry_val, &
                        CS%dg1_limiter_choice, CS%dg1_limiter_M)
+  if (CS%dg1_positivity) call DG1_positivity_limit(G, h1, hx1, hy1, hmask)
   call DG1_spatial_operator(CS, G, hmask, h1, hx1, hy1, Rhs_h, Rhs_hx, Rhs_hy, uh_ice, vh_ice)
 
   do j=jsc,jec ; do i=isc,iec
@@ -6423,6 +6431,7 @@ subroutine ice_shelf_advect_DG1(CS, ISS, G, time_step, hmask, h_shelf, h_x, h_y,
   call DG1_slope_limit(G, h_shelf, h_x, h_y, hmask, CS%h_bdry_val, &
                        CS%dg1_limiter_choice, CS%dg1_limiter_M, &
                        phi_x_out=CS%phi_x_DG, phi_y_out=CS%phi_y_DG)
+  if (CS%dg1_positivity) call DG1_positivity_limit(G, h_shelf, h_x, h_y, hmask)
 
   call pass_var(h_shelf, G%domain)
   call pass_vector(h_x, h_y, G%domain, TO_ALL, AGRID)
@@ -6974,6 +6983,61 @@ subroutine DG1_slope_limit(G, h_bar, h_x, h_y, hmask, h_bdry_val, &
 end subroutine DG1_slope_limit
 
 
+!> Zhang-Shu maximum-principle limiter for DG(1) thickness positivity.
+!! Scales the slope moments (h_x, h_y) by a single factor theta in [0,1]
+!! so that the linear reconstruction h_bar + h_x*xi + h_y*eta is non-negative
+!! over the reference cell xi, eta in [-1/2, 1/2]. For a linear function the
+!! minimum is attained at a corner, so h_min = h_bar - 0.5*(|h_x| + |h_y|).
+!! Cell mean is preserved exactly; formal DG(1) accuracy is retained in
+!! regions where the reconstruction is already non-negative (theta = 1).
+!! See Zhang & Shu, JCP 2010.
+subroutine DG1_positivity_limit(G, h_bar, h_x, h_y, hmask)
+  type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(in)    :: h_bar !< Cell-averaged thickness [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(inout) :: h_x  !< DG x-slope moment [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(inout) :: h_y  !< DG y-slope moment [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(in)    :: hmask !< Ice shelf mask
+
+  real :: abs_hx, abs_hy ! Magnitudes of the slope moments [Z ~> m]
+  real :: half_excursion ! Half of |h_x| + |h_y|: peak corner deviation from mean [Z ~> m]
+  real :: theta          ! Slope-scaling factor in [0, 1] [nondim]
+  integer :: i, j, isc, iec, jsc, jec
+
+  isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
+
+  do j=jsc,jec ; do i=isc,iec
+    if (hmask(i,j) /= 1) cycle
+
+    ! Defensive: if the cell mean has drifted non-positive (should not happen
+    ! under CFL with monotone fluxes), drop the linear part entirely. The
+    ! caller is responsible for floor-and-account for h_bar itself.
+    if (h_bar(i,j) <= 0.0) then
+      h_x(i,j) = 0.0 ; h_y(i,j) = 0.0
+      cycle
+    endif
+
+    abs_hx = abs(h_x(i,j)) ; abs_hy = abs(h_y(i,j))
+    half_excursion = 0.5 * (abs_hx + abs_hy)
+
+    ! No slopes -> nothing to clip. min corner = h_bar > 0 already.
+    if (half_excursion <= 0.0) cycle
+
+    if (half_excursion > h_bar(i,j)) then
+      ! Linear reconstruction dips below zero at a corner. Squash slopes so
+      ! the minimum corner value lands exactly at zero. Cell mean unchanged.
+      theta = h_bar(i,j) / half_excursion
+      h_x(i,j) = theta * h_x(i,j)
+      h_y(i,j) = theta * h_y(i,j)
+    endif
+  enddo ; enddo
+
+end subroutine DG1_positivity_limit
+
+
 !> Smooth Venkatakrishnan limiter factor for one face of a DG cell.
 !! Returns phi in [0, 1]: 1 means no clipping (predicted face value lies
 !! safely inside the cell-neighbourhood envelope, or both delta1 and delta2
@@ -7047,6 +7111,15 @@ subroutine read_dg1_limiter_params(param_file, mdl, CS, US)
                  scale=US%m_to_Z/(US%m_to_L*US%m_to_L), &
                  do_not_log=(.not.CS%use_DG_thickness) .or. &
                             (CS%dg1_limiter_choice /= 2))
+
+  call get_param(param_file, mdl, "DG1_POSITIVITY", CS%dg1_positivity, &
+                 "If true, apply the Zhang-Shu maximum-principle limiter to "//&
+                 "the DG(1) thickness slope moments after the slope limiter, "//&
+                 "guaranteeing that the linear reconstruction is non-negative "//&
+                 "at every point of the cell. The limiter scales (h_x, h_y) "//&
+                 "by a single factor theta in [0, 1] chosen so the minimum "//&
+                 "corner value lands at zero; the cell mean is preserved.", &
+                 default=.true., do_not_log=.not.CS%use_DG_thickness)
 
 end subroutine read_dg1_limiter_params
 
@@ -7656,7 +7729,7 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
   real, dimension(2,2), intent(out) :: vol_dy !< Per-corner y volume integral [R L3 Z T-2 ~> kg m s-2]
   real, intent(inout) :: sx_shelf !< The cell-average x surface slope [Z L-1 ~> nondim]
   real, intent(inout) :: sy_shelf !< The cell-average y surface slope [Z L-1 ~> nondim]
-  logical :: calc_slope_diag ! True if slope diagnostics will be calculated
+  logical :: calc_slope_diag !< True if slope diagnostics will be calculated
 
   real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: contr_sub_dx, contr_sub_dy
   real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: slope_x_gp, slope_y_gp ! Per-QP surf slopes [Z L-1 ~> nondim]
