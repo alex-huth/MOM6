@@ -34,6 +34,7 @@ use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary_from_file,ini
 use MOM_ice_shelf_initialize, only : initialize_ice_AGlen, initialize_bed_node_from_file
 use MOM_ice_shelf_initialize, only : initialize_DG_thickness_slopes_from_file
 use MOM_ice_shelf_initialize, only : initialize_DG_thickness_from_node_file
+use MOM_ice_shelf_initialize, only : apply_DG1_inverse_mass
 implicit none ; private
 
 #include <MOM_memory.h>
@@ -138,6 +139,16 @@ type, public :: ice_shelf_dyn_CS ; private
                                                        !! h(xi,eta) = h_shelf + h_x*xi + h_y*eta, where
                                                        !! (xi,eta) in [-0.5, 0.5] are local cell coordinates.
   real, pointer, dimension(:,:) :: h_y => NULL()       !< DG(1) y-slope moment of ice thickness [Z ~> m].
+
+  ! Per-cell DG(1) metric scalars on a separable-Jacobian element:
+  !   a(eta) = a0_cell + a1_cell*eta, d(xi) = d0_cell + d1_cell*xi for eta,xi in [-0.5,0.5].
+  ! Used to reconstruct per-QP physical metrics, the analytic mass matrix M,
+  ! and M_inv via apply_DG1_inverse_mass. Computed from G%dxCv, G%dyCu in the
+  ! setup pass and held constant for the rest of the run.
+  real, pointer, dimension(:,:) :: a0_cell => NULL()   !< Cell-mean x metric (dxCv_S+dxCv_N)/2 [L ~> m].
+  real, pointer, dimension(:,:) :: a1_cell => NULL()   !< Cell x-metric anisotropy dxCv_N-dxCv_S [L ~> m].
+  real, pointer, dimension(:,:) :: d0_cell => NULL()   !< Cell-mean y metric (dyCu_W+dyCu_E)/2 [L ~> m].
+  real, pointer, dimension(:,:) :: d1_cell => NULL()   !< Cell y-metric anisotropy dyCu_E-dyCu_W [L ~> m].
 
   real, pointer, dimension(:,:) :: C_basal_friction => NULL()!< Coefficient in sliding law tau_b = C u^(n_basal_fric),
                                !! units of [R L Z T-2 (s m-1)^(n_basal_fric) ~> Pa (s m-1)^(n_basal_fric)]
@@ -866,6 +877,31 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       call bilinear_shape_fn_grid(G, i, j, CS%Phi(:,:,i,j), CS%Jac(:,i,j))
     enddo ; enddo
 
+    ! Per-cell DG(1) metric scalars (separable Jacobian). Boundary-cell guards
+    ! mirror bilinear_shape_fn_grid: at the global southern/western edge there
+    ! is no south/west face to interpolate against, so a0/d0 collapses to the
+    ! single available face length and a1/d1 = 0.
+    allocate(CS%a0_cell(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%a1_cell(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%d0_cell(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%d1_cell(isd:ied,jsd:jed), source=0.0)
+    do j=G%jsd,G%jed ; do i=G%isd,G%ied
+      if (J>1) then
+        CS%a0_cell(i,j) = 0.5*(G%dxCv(i,J-1) + G%dxCv(i,J))
+        CS%a1_cell(i,j) = G%dxCv(i,J) - G%dxCv(i,J-1)
+      else
+        CS%a0_cell(i,j) = G%dxCv(i,J)
+        CS%a1_cell(i,j) = 0.0
+      endif
+      if (I>1) then
+        CS%d0_cell(i,j) = 0.5*(G%dyCu(I-1,j) + G%dyCu(I,j))
+        CS%d1_cell(i,j) = G%dyCu(I,j) - G%dyCu(I-1,j)
+      else
+        CS%d0_cell(i,j) = G%dyCu(I,j)
+        CS%d1_cell(i,j) = 0.0
+      endif
+    enddo ; enddo
+
     if (CS%GL_regularize) then
       allocate(CS%Phisub(2,2,CS%n_sub_regularize,CS%n_sub_regularize,2,2), source=0.0)
       call bilinear_shape_functions_subgrid(CS%Phisub, CS%n_sub_regularize)
@@ -1060,21 +1096,24 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
             else
               h_S = ISS%h_shelf(i,j-1)
             endif
-            ! Centred difference where both neighbours are valid; one-sided
-            ! difference at the ice front so the slope is preserved.
+            ! Width-weighted centred FD slope, mapped back to modal coefficient
+            ! via the cell-mean metric a0_cell / d0_cell. Uniform-grid collapses
+            ! to the (h_E - h_W)/2 form bit-exactly. One-sided at the front.
             if (valid_E .and. valid_W) then
-              CS%h_x(i,j) = 0.5 * (h_E - h_W)
+              CS%h_x(i,j) = 0.5 * ( ((h_E - ISS%h_shelf(i,j)) / (0.5*(G%dxT(i,j) + G%dxT(i+1,j)))) + &
+                                    ((ISS%h_shelf(i,j) - h_W) / (0.5*(G%dxT(i,j) + G%dxT(i-1,j)))) ) * CS%a0_cell(i,j)
             elseif (valid_W) then
-              CS%h_x(i,j) = ISS%h_shelf(i,j) - h_W
+              CS%h_x(i,j) = ((ISS%h_shelf(i,j) - h_W) / (0.5*(G%dxT(i,j) + G%dxT(i-1,j)))) * CS%a0_cell(i,j)
             elseif (valid_E) then
-              CS%h_x(i,j) = h_E - ISS%h_shelf(i,j)
+              CS%h_x(i,j) = ((h_E - ISS%h_shelf(i,j)) / (0.5*(G%dxT(i,j) + G%dxT(i+1,j)))) * CS%a0_cell(i,j)
             endif
             if (valid_N .and. valid_S) then
-              CS%h_y(i,j) = 0.5 * (h_N - h_S)
+              CS%h_y(i,j) = 0.5 * ( ((h_N - ISS%h_shelf(i,j)) / (0.5*(G%dyT(i,j) + G%dyT(i,j+1)))) + &
+                                    ((ISS%h_shelf(i,j) - h_S) / (0.5*(G%dyT(i,j) + G%dyT(i,j-1)))) ) * CS%d0_cell(i,j)
             elseif (valid_S) then
-              CS%h_y(i,j) = ISS%h_shelf(i,j) - h_S
+              CS%h_y(i,j) = ((ISS%h_shelf(i,j) - h_S) / (0.5*(G%dyT(i,j) + G%dyT(i,j-1)))) * CS%d0_cell(i,j)
             elseif (valid_N) then
-              CS%h_y(i,j) = h_N - ISS%h_shelf(i,j)
+              CS%h_y(i,j) = ((h_N - ISS%h_shelf(i,j)) / (0.5*(G%dyT(i,j) + G%dyT(i,j+1)))) * CS%d0_cell(i,j)
             endif
           endif
         enddo ; enddo
@@ -6311,7 +6350,10 @@ subroutine ice_shelf_advect_DG1(CS, ISS, G, time_step, hmask, h_shelf, h_x, h_y,
   ! Local variables for SSP-RK2 stages
   real, dimension(SZDI_(G),SZDJ_(G)) :: h0, hx0, hy0       ! Initial state [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: h1, hx1, hy1       ! After RK stage 1 [Z ~> m]
-  real, dimension(SZDI_(G),SZDJ_(G)) :: Rhs_h, Rhs_hx, Rhs_hy ! Spatial operator [Z T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: Rhs_h, Rhs_hx, Rhs_hy ! Unscaled volume-integral RHS
+                                                              ! in monomial basis {1, xi, eta}
+                                                              ! [Z L2 T-1 ~> m3 s-1]
+  real :: dc0, dc1, dc2 ! M^-1 . Rhs per cell [Z T-1 ~> m s-1]
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
@@ -6340,11 +6382,16 @@ subroutine ice_shelf_advect_DG1(CS, ISS, G, time_step, hmask, h_shelf, h_x, h_y,
   call pass_vector(hx0, hy0, G%domain, TO_ALL, AGRID)
   call DG1_spatial_operator(CS, G, hmask, h0, hx0, hy0, Rhs_h, Rhs_hx, Rhs_hy, uh_ice, vh_ice)
 
+  ! Stage 1: apply M^-1 to the unscaled RHS, then forward Euler step.
   do j=jsc,jec ; do i=isc,iec
     if (hmask(i,j) == 1) then
-      h1(i,j)  = h0(i,j)  + time_step * Rhs_h(i,j)
-      hx1(i,j) = hx0(i,j) + time_step * Rhs_hx(i,j)
-      hy1(i,j) = hy0(i,j) + time_step * Rhs_hy(i,j)
+      call apply_DG1_inverse_mass(CS%a0_cell(i,j), CS%a1_cell(i,j), &
+                                  CS%d0_cell(i,j), CS%d1_cell(i,j), &
+                                  Rhs_h(i,j), Rhs_hx(i,j), Rhs_hy(i,j), &
+                                  dc0, dc1, dc2)
+      h1(i,j)  = h0(i,j)  + time_step * dc0
+      hx1(i,j) = hx0(i,j) + time_step * dc1
+      hy1(i,j) = hy0(i,j) + time_step * dc2
     else
       h1(i,j) = h0(i,j) ; hx1(i,j) = hx0(i,j) ; hy1(i,j) = hy0(i,j)
     endif
@@ -6359,9 +6406,13 @@ subroutine ice_shelf_advect_DG1(CS, ISS, G, time_step, hmask, h_shelf, h_x, h_y,
 
   do j=jsc,jec ; do i=isc,iec
     if (hmask(i,j) == 1) then
-      h_shelf(i,j) = 0.5 * h0(i,j) + 0.5 * (h1(i,j)  + time_step * Rhs_h(i,j))
-      h_x(i,j)     = 0.5 * hx0(i,j)+ 0.5 * (hx1(i,j) + time_step * Rhs_hx(i,j))
-      h_y(i,j)     = 0.5 * hy0(i,j)+ 0.5 * (hy1(i,j) + time_step * Rhs_hy(i,j))
+      call apply_DG1_inverse_mass(CS%a0_cell(i,j), CS%a1_cell(i,j), &
+                                  CS%d0_cell(i,j), CS%d1_cell(i,j), &
+                                  Rhs_h(i,j), Rhs_hx(i,j), Rhs_hy(i,j), &
+                                  dc0, dc1, dc2)
+      h_shelf(i,j) = 0.5 * h0(i,j) + 0.5 * (h1(i,j)  + time_step * dc0)
+      h_x(i,j)     = 0.5 * hx0(i,j)+ 0.5 * (hx1(i,j) + time_step * dc1)
+      h_y(i,j)     = 0.5 * hy0(i,j)+ 0.5 * (hy1(i,j) + time_step * dc2)
     endif
   enddo ; enddo
   call pass_var(h_shelf, G%domain)
@@ -6406,11 +6457,14 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(in)    :: h_y  !< DG y-slope moment [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(out)   :: Rhs_h  !< RHS for cell average [Z T-1 ~> m s-1]
+                          intent(out)   :: Rhs_h  !< Unscaled volume-integral RHS for the
+                                                  !! {1} basis [Z L2 T-1 ~> m3 s-1]
   real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(out)   :: Rhs_hx !< RHS for x-slope moment [Z T-1 ~> m s-1]
+                          intent(out)   :: Rhs_hx !< Unscaled volume-integral RHS for the
+                                                  !! {xi} basis [Z L2 T-1 ~> m3 s-1]
   real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(out)   :: Rhs_hy !< RHS for y-slope moment [Z T-1 ~> m s-1]
+                          intent(out)   :: Rhs_hy !< Unscaled volume-integral RHS for the
+                                                  !! {eta} basis [Z L2 T-1 ~> m3 s-1]
   real, dimension(SZDIB_(G),SZDJ_(G)), &
                           intent(inout) :: uh_ice !< Accumulated zonal ice volume flux [Z L2 ~> m3]
   real, dimension(SZDI_(G),SZDJB_(G)), &
@@ -6425,13 +6479,14 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
   real :: u_face        ! Normal velocity at a u-face [L T-1 ~> m s-1]
   real :: v_face        ! Normal velocity at a v-face [L T-1 ~> m s-1]
   real :: h_upwind      ! Upwind thickness at a Gauss point [Z ~> m]
-  real :: flux_h        ! Flux contribution to cell average [Z L2 T-1 ~> m3 s-1]
-  real :: flux_hx       ! Flux contribution to x-moment [Z L2 T-1 ~> m3 s-1]
-  real :: flux_hy       ! Flux contribution to y-moment [Z L2 T-1 ~> m3 s-1]
+  real :: flux_h        ! Boundary flux contribution to cell average, unscaled [Z L2 T-1 ~> m3 s-1]
+  real :: flux_hx       ! Boundary flux contribution to x-moment, unscaled [Z L2 T-1 ~> m3 s-1]
+  real :: flux_hy       ! Boundary flux contribution to y-moment, unscaled [Z L2 T-1 ~> m3 s-1]
   real :: eta_gp        ! Gauss point coordinate along face [nondim]
   real :: face_flux_total ! Total volume flux through a face [Z L2 T-1 ~> m3 s-1]
-  real :: u_c, u_xi, u_eta ! Bilinear u modes on a cell from B-grid corners [L T-1 ~> m s-1]
-  real :: v_c, v_xi, v_eta ! Bilinear v modes on a cell from B-grid corners [L T-1 ~> m s-1]
+  real :: u_c, u_xi, u_eta, u_xieta ! Bilinear u modes on a cell from B-grid corners [L T-1 ~> m s-1]
+  real :: v_c, v_xi, v_eta, v_xieta ! Bilinear v modes on a cell from B-grid corners [L T-1 ~> m s-1]
+  real :: a0, a1, d0, d1 ! Cell metric scalars [L ~> m]
   ! Per-cell accumulators split by face orientation, so that the final reduction
   ! Rhs = Rhs_u + Rhs_v is a single binary add (order-independent under 90 deg
   ! rotation, which swaps the u-face and v-face contributions).
@@ -6457,11 +6512,12 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
       ! Specified flux boundary condition
       face_flux_total = G%dyCu(I,j) * CS%u_flux_bdry_val(I,j)
       uh_ice(I,j) = uh_ice(I,j) + face_flux_total
-      ! For specified flux, add to cell average RHS only (no moment info in BC)
+      ! For specified flux, add to cell average RHS only (no moment info in BC).
+      ! Unscaled volume integral — M^-1 applied by caller.
       if (hmask(i,j) == 1) &
-        Rhs_h_u(i,j) = Rhs_h_u(i,j) - face_flux_total * G%IareaT(i,j)
+        Rhs_h_u(i,j) = Rhs_h_u(i,j) - face_flux_total
       if (hmask(i+1,j) == 1) &
-        Rhs_h_u(i+1,j) = Rhs_h_u(i+1,j) + face_flux_total * G%IareaT(i+1,j)
+        Rhs_h_u(i+1,j) = Rhs_h_u(i+1,j) + face_flux_total
     elseif ((hmask(i,j) == 1 .or. hmask(i,j) == 3) .or. &
             (hmask(i+1,j) == 1 .or. hmask(i+1,j) == 3)) then
       ! Normal velocity at this u-face (average of B-grid velocities)
@@ -6508,20 +6564,21 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
 
       uh_ice(I,j) = uh_ice(I,j) + flux_h
 
-      ! Subtract outgoing flux from left cell (i,j), add incoming flux to right cell (i+1,j)
-      ! For cell average: Rhs_h -= flux / area  (flux leaving through east face)
+      ! Subtract outgoing flux from left cell (i,j), add incoming flux to right cell (i+1,j).
+      ! These are the UNSCALED boundary contributions to the volume-integral RHS;
+      ! M^-1 is applied by the caller (apply_DG1_inverse_mass).
       if (hmask(i,j) == 1) then
-        Rhs_h_u(i,j)  = Rhs_h_u(i,j)  - flux_h * G%IareaT(i,j)
+        Rhs_h_u(i,j)  = Rhs_h_u(i,j)  - flux_h
         ! For x-moment: the face value of the x test function is +0.5
-        Rhs_hx_u(i,j) = Rhs_hx_u(i,j) - flux_hx * G%IareaT(i,j)
+        Rhs_hx_u(i,j) = Rhs_hx_u(i,j) - flux_hx
         ! For y-moment: weighted by eta_gp (already in flux_hy)
-        Rhs_hy_u(i,j) = Rhs_hy_u(i,j) - flux_hy * G%IareaT(i,j)
+        Rhs_hy_u(i,j) = Rhs_hy_u(i,j) - flux_hy
       endif
       if (hmask(i+1,j) == 1) then
-        Rhs_h_u(i+1,j)  = Rhs_h_u(i+1,j)  + flux_h * G%IareaT(i+1,j)
+        Rhs_h_u(i+1,j)  = Rhs_h_u(i+1,j)  + flux_h
         ! For the right cell, xi at its left face = -0.5
-        Rhs_hx_u(i+1,j) = Rhs_hx_u(i+1,j) + flux_hx * (-1.0) * G%IareaT(i+1,j)
-        Rhs_hy_u(i+1,j) = Rhs_hy_u(i+1,j) + flux_hy * G%IareaT(i+1,j)
+        Rhs_hx_u(i+1,j) = Rhs_hx_u(i+1,j) + flux_hx * (-1.0)
+        Rhs_hy_u(i+1,j) = Rhs_hy_u(i+1,j) + flux_hy
       endif
     endif
   enddo ; enddo
@@ -6535,10 +6592,11 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
       ! Specified flux boundary condition
       face_flux_total = G%dxCv(i,J) * CS%v_flux_bdry_val(i,J)
       vh_ice(i,J) = vh_ice(i,J) + face_flux_total
+      ! Unscaled volume integral — M^-1 applied by caller.
       if (hmask(i,j) == 1) &
-        Rhs_h_v(i,j) = Rhs_h_v(i,j) - face_flux_total * G%IareaT(i,j)
+        Rhs_h_v(i,j) = Rhs_h_v(i,j) - face_flux_total
       if (hmask(i,j+1) == 1) &
-        Rhs_h_v(i,j+1) = Rhs_h_v(i,j+1) + face_flux_total * G%IareaT(i,j+1)
+        Rhs_h_v(i,j+1) = Rhs_h_v(i,j+1) + face_flux_total
     elseif ((hmask(i,j) == 1 .or. hmask(i,j) == 3) .or. &
             (hmask(i,j+1) == 1 .or. hmask(i,j+1) == 3)) then
       ! Normal velocity at this v-face
@@ -6580,16 +6638,16 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
       vh_ice(i,J) = vh_ice(i,J) + flux_h
 
       if (hmask(i,j) == 1) then
-        Rhs_h_v(i,j)  = Rhs_h_v(i,j)  - flux_h * G%IareaT(i,j)
-        Rhs_hx_v(i,j) = Rhs_hx_v(i,j) - flux_hx * G%IareaT(i,j)
+        Rhs_h_v(i,j)  = Rhs_h_v(i,j)  - flux_h
+        Rhs_hx_v(i,j) = Rhs_hx_v(i,j) - flux_hx
         ! For south cell, eta at its north face = +0.5
-        Rhs_hy_v(i,j) = Rhs_hy_v(i,j) - flux_hy * G%IareaT(i,j)
+        Rhs_hy_v(i,j) = Rhs_hy_v(i,j) - flux_hy
       endif
       if (hmask(i,j+1) == 1) then
-        Rhs_h_v(i,j+1)  = Rhs_h_v(i,j+1)  + flux_h * G%IareaT(i,j+1)
-        Rhs_hx_v(i,j+1) = Rhs_hx_v(i,j+1) + flux_hx * G%IareaT(i,j+1)
+        Rhs_h_v(i,j+1)  = Rhs_h_v(i,j+1)  + flux_h
+        Rhs_hx_v(i,j+1) = Rhs_hx_v(i,j+1) + flux_hx
         ! For north cell, eta at its south face = -0.5
-        Rhs_hy_v(i,j+1) = Rhs_hy_v(i,j+1) + flux_hy * (-1.0) * G%IareaT(i,j+1)
+        Rhs_hy_v(i,j+1) = Rhs_hy_v(i,j+1) + flux_hy * (-1.0)
       endif
     endif
   enddo ; enddo
@@ -6615,14 +6673,18 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
     endif
   enddo ; enddo
 
-  ! Volume integral contribution: + integral(u*h * d(phi)/dx, dA) for each test function.
-  ! For test xi: d(xi)/dx = 1/dx, d(xi)/dy = 0; for test eta: vice versa.
-  ! With bilinear u(xi,eta) = u_c + u_xi*xi + u_eta*eta + u_xieta*xi*eta from B-grid
-  ! corners, and linear h(xi,eta) = h_bar + h_x*xi + h_y*eta, the integral over
-  ! [-0.5,0.5]^2 evaluates to:
-  !   integral(u*h, dxi deta) = u_c*h_bar + (u_xi*h_x + u_eta*h_y)/12
-  ! (odd-power terms vanish; the xi*eta cross term contributes nothing because it
-  ! pairs only with odd-power h modes). Same form for v in the y-moment.
+  ! Volume integral contribution for the weak form: + integral(grad(test) . u*h, dA)
+  ! for each test function. For test_xi: grad(test_xi) = (1/a(eta), 0); for test_eta:
+  ! grad(test_eta) = (0, 1/d(xi)). The Jacobian a(eta)*d(xi) cancels one factor:
+  !   vol_x = int int u*h*d(xi) dxi deta
+  !   vol_y = int int v*h*a(eta) dxi deta
+  ! Bilinear u(xi,eta) = u_c + u_xi*xi + u_eta*eta + u_xieta*xi*eta from B-grid
+  ! corners; linear h(xi,eta) = h_bar + h_x*xi + h_y*eta; d(xi) = d0 + d1*xi.
+  ! Analytic 2D integrals (odd-power terms vanish):
+  !   int int u*h dxi deta            = u_c*h_bar + (u_xi*h_x + u_eta*h_y)/12
+  !   int int u*h*xi dxi deta         = (u_c*h_x + u_xi*h_bar)/12 + u_xieta*h_y/144
+  !   int int v*h*eta dxi deta        = (v_c*h_y + v_eta*h_bar)/12 + v_xieta*h_x/144
+  ! Uniform cells have a1=d1=0 so only the d0/a0 leading terms survive.
   do j=jsc,jec ; do i=isc,iec
     if (hmask(i,j) == 1) then
       ! Diagonal + off-diagonal grouping so the 4-corner mean is invariant under
@@ -6633,29 +6695,31 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
                       (CS%u_shelf(I-1,J-1) + CS%u_shelf(I-1,J)))
       u_eta = 0.5  * ((CS%u_shelf(I-1,J)   + CS%u_shelf(I,J)) - &
                       (CS%u_shelf(I-1,J-1) + CS%u_shelf(I,J-1)))
+      u_xieta = (CS%u_shelf(I-1,J-1) + CS%u_shelf(I,J)) - &
+                (CS%u_shelf(I,J-1)   + CS%u_shelf(I-1,J))
       v_c   = 0.25 * ((CS%v_shelf(I-1,J-1) + CS%v_shelf(I,J)) + &
                       (CS%v_shelf(I,J-1)   + CS%v_shelf(I-1,J)))
       v_xi  = 0.5  * ((CS%v_shelf(I,J-1)   + CS%v_shelf(I,J)) - &
                       (CS%v_shelf(I-1,J-1) + CS%v_shelf(I-1,J)))
       v_eta = 0.5  * ((CS%v_shelf(I-1,J)   + CS%v_shelf(I,J)) - &
                       (CS%v_shelf(I-1,J-1) + CS%v_shelf(I,J-1)))
+      v_xieta = (CS%v_shelf(I-1,J-1) + CS%v_shelf(I,J)) - &
+                (CS%v_shelf(I,J-1)   + CS%v_shelf(I-1,J))
+
+      a0 = CS%a0_cell(i,j) ; a1 = CS%a1_cell(i,j)
+      d0 = CS%d0_cell(i,j) ; d1 = CS%d1_cell(i,j)
 
       Rhs_hx(i,j) = Rhs_hx(i,j) + &
-        ((u_c * h_bar(i,j)) + (((u_xi * h_x(i,j)) + (u_eta * h_y(i,j))) / 12.0)) * G%IdxT(i,j)
+        ( d0 * ((u_c*h_bar(i,j)) + (((u_xi*h_x(i,j)) + (u_eta*h_y(i,j))) / 12.0)) + &
+          d1 * ((((u_c*h_x(i,j)) + (u_xi*h_bar(i,j))) / 12.0) + ((u_xieta*h_y(i,j)) / 144.0)) )
       Rhs_hy(i,j) = Rhs_hy(i,j) + &
-        ((v_c * h_bar(i,j)) + (((v_xi * h_x(i,j)) + (v_eta * h_y(i,j))) / 12.0)) * G%IdyT(i,j)
+        ( a0 * ((v_c*h_bar(i,j)) + (((v_xi*h_x(i,j)) + (v_eta*h_y(i,j))) / 12.0)) + &
+          a1 * ((((v_c*h_y(i,j)) + (v_eta*h_bar(i,j))) / 12.0) + ((v_xieta*h_x(i,j)) / 144.0)) )
     endif
   enddo ; enddo
 
-  ! Scale moment RHS by 12 for the inverse mass matrix of linear DG basis on [-0.5,0.5]:
-  ! The mass matrix for basis {1, xi, eta} on [-0.5,0.5]^2 is diag(1, 1/12, 1/12)
-  ! So the inverse mass matrix scales the slope moment RHS by 12.
-  do j=jsc,jec ; do i=isc,iec
-    if (hmask(i,j) == 1) then
-      Rhs_hx(i,j) = 12.0 * Rhs_hx(i,j)
-      Rhs_hy(i,j) = 12.0 * Rhs_hy(i,j)
-    endif
-  enddo ; enddo
+  ! Rhs_h, Rhs_hx, Rhs_hy now hold the truly unscaled volume-integral RHS in
+  ! monomial basis {1, xi, eta}. The caller applies M^-1 via apply_DG1_inverse_mass.
 
 end subroutine DG1_spatial_operator
 

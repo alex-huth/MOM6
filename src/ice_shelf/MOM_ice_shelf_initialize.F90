@@ -25,6 +25,8 @@ public initialize_ice_flow_from_file
 public initialize_bed_node_from_file
 public initialize_DG_thickness_slopes_from_file
 public initialize_DG_thickness_from_node_file
+public apply_DG1_inverse_mass
+public project_corners_to_DG1_modal
 public initialize_ice_shelf_boundary_from_file
 public initialize_ice_C_basal_friction
 public initialize_ice_AGlen
@@ -506,6 +508,8 @@ subroutine initialize_bed_node_from_file(bed_node, bed_elev, G, US, PF)
   character(len=200) :: filename, inputdir, nodal_bed_file
   character(len=200) :: bed_node_varname
   character(len=40)  :: mdl = "initialize_bed_node_from_file"
+  real :: a0, a1, d0, d1   ! Per-cell metric scalars [L ~> m].
+  real :: c1_unused, c2_unused ! Discarded modal slopes.
   integer :: i, j
 
   call get_param(PF, mdl, "INPUTDIR", inputdir, default=".", do_not_log=.true.)
@@ -526,11 +530,26 @@ subroutine initialize_bed_node_from_file(bed_node, bed_elev, G, US, PF)
                      position=CORNER, scale=US%m_to_Z)
   call pass_var(bed_node, G%domain, position=CORNER)
 
-  ! Derive cell-centered bed_elev as the bilinear average of the four
-  ! surrounding nodes.
+  ! Derive cell-centered bed_elev as the area-weighted cell mean of the
+  ! bilinear corner-node interpolant on the separable-Jacobian element.
+  ! Uniform cells collapse to bed_elev = 0.25*sum(corners) bit-exactly.
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
-    bed_elev(i,j) = ((bed_node(I-1,J-1) + bed_node(I,  J  )) + &
-                     (bed_node(I,  J-1) + bed_node(I-1,J  ))) * 0.25
+    if (J>1) then
+      a0 = 0.5*(G%dxCv(i,J-1) + G%dxCv(i,J))
+      a1 = G%dxCv(i,J) - G%dxCv(i,J-1)
+    else
+      a0 = G%dxCv(i,J) ; a1 = 0.0
+    endif
+    if (I>1) then
+      d0 = 0.5*(G%dyCu(I-1,j) + G%dyCu(I,j))
+      d1 = G%dyCu(I,j) - G%dyCu(I-1,j)
+    else
+      d0 = G%dyCu(I,j) ; d1 = 0.0
+    endif
+    call project_corners_to_DG1_modal(a0, a1, d0, d1, &
+                                      bed_node(I-1,J-1), bed_node(I,J-1), &
+                                      bed_node(I-1,J  ), bed_node(I,J  ), &
+                                      bed_elev(i,j), c1_unused, c2_unused)
   enddo ; enddo
   call pass_var(bed_elev, G%domain)
 
@@ -605,6 +624,7 @@ subroutine initialize_DG_thickness_from_node_file(h_shelf, h_x, h_y, used, G, US
   character(len=200) :: filename, inputdir, thickness_file
   character(len=200) :: node_varname
   character(len=40)  :: mdl = "initialize_DG_thickness_from_node_file"
+  real :: a0, a1, d0, d1   ! Per-cell metric scalars [L ~> m].
   integer :: i, j
 
   used = .false.
@@ -631,22 +651,125 @@ subroutine initialize_DG_thickness_from_node_file(h_shelf, h_x, h_y, used, G, US
                      position=CORNER, scale=US%m_to_Z)
   call pass_var(h_node, G%domain, position=CORNER)
 
-  ! DG(1) projection of the bilinear node interpolant onto {1, xi, eta} with
-  ! xi, eta in [-0.5, 0.5]: cell mean is the four-node average, slopes are the
-  ! face-mean differences.
+  ! Exact projection of the bilinear node interpolant onto the DG(1) monomial
+  ! basis {1, xi, eta} with weight a(eta)*d(xi). Uniform cells reduce to the
+  ! 0.25/0.5/0.5 formulas bit-exactly.
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
-    h_shelf(i,j) = 0.25 * ((h_node(I-1,J-1) + h_node(I,  J  )) + &
-                           (h_node(I,  J-1) + h_node(I-1,J  )))
-    h_x(i,j)     = 0.5  * ((h_node(I,  J-1) + h_node(I,  J  )) - &
-                           (h_node(I-1,J-1) + h_node(I-1,J  )))
-    h_y(i,j)     = 0.5  * ((h_node(I-1,J  ) + h_node(I,  J  )) - &
-                           (h_node(I-1,J-1) + h_node(I,  J-1)))
+    if (J>1) then
+      a0 = 0.5*(G%dxCv(i,J-1) + G%dxCv(i,J))
+      a1 = G%dxCv(i,J) - G%dxCv(i,J-1)
+    else
+      a0 = G%dxCv(i,J) ; a1 = 0.0
+    endif
+    if (I>1) then
+      d0 = 0.5*(G%dyCu(I-1,j) + G%dyCu(I,j))
+      d1 = G%dyCu(I,j) - G%dyCu(I-1,j)
+    else
+      d0 = G%dyCu(I,j) ; d1 = 0.0
+    endif
+    call project_corners_to_DG1_modal(a0, a1, d0, d1, &
+                                      h_node(I-1,J-1), h_node(I,J-1), &
+                                      h_node(I-1,J  ), h_node(I,J  ), &
+                                      h_shelf(i,j), h_x(i,j), h_y(i,j))
   enddo ; enddo
 
   deallocate(h_node)
   used = .true.
 
 end subroutine initialize_DG_thickness_from_node_file
+
+!> Apply M_monomial^{-1} to a 3-vector of DG(1) right-hand-sides via the
+!! tensor-product Gram-Schmidt shifted-orthogonal basis. M is the DG(1) mass
+!! matrix on a separable-Jacobian element with weight a(eta)*d(xi), where
+!! a(eta) = a0 + a1*eta and d(xi) = d0 + d1*xi on xi,eta in [-1/2, 1/2].
+!! Input rhs0,rhs1,rhs2 are the unscaled volume-integral RHS components in
+!! the monomial basis {1, xi, eta}. Output c0,c1,c2 are the corresponding
+!! monomial coefficients of the DG polynomial. On uniform cells (a1=d1=0)
+!! this collapses bit-exactly to c0 = rhs0/(a0*d0), c1 = 12*rhs1/(a0*d0),
+!! c2 = 12*rhs2/(a0*d0).
+pure subroutine apply_DG1_inverse_mass(a0, a1, d0, d1, rhs0, rhs1, rhs2, c0, c1, c2)
+  real, intent(in)  :: a0   !< Cell-mean x metric (dxCv_S + dxCv_N)/2 [L ~> m].
+  real, intent(in)  :: a1   !< Cell x-metric anisotropy dxCv_N - dxCv_S [L ~> m].
+  real, intent(in)  :: d0   !< Cell-mean y metric (dyCu_W + dyCu_E)/2 [L ~> m].
+  real, intent(in)  :: d1   !< Cell y-metric anisotropy dyCu_E - dyCu_W [L ~> m].
+  real, intent(in)  :: rhs0 !< Volume-integral RHS for the {1} basis [<rhs0 units>].
+  real, intent(in)  :: rhs1 !< Volume-integral RHS for the {xi} basis [<rhs1 units>].
+  real, intent(in)  :: rhs2 !< Volume-integral RHS for the {eta} basis [<rhs2 units>].
+  real, intent(out) :: c0   !< Monomial coefficient of 1 [<c0 units>].
+  real, intent(out) :: c1   !< Monomial coefficient of xi [<c1 units>].
+  real, intent(out) :: c2   !< Monomial coefficient of eta [<c2 units>].
+
+  real :: alpha_1, alpha_2 ! Shift parameters of the orthogonal basis [nondim].
+  real :: Mtilde_00, Mtilde_11, Mtilde_22 ! Diagonal entries of the shifted mass matrix.
+  real :: rhs0p, rhs1p, rhs2p ! Shifted-basis RHS components.
+  real :: c0p, c1p, c2p ! Shifted-basis coefficients.
+
+  alpha_1 = d1 / (12.0 * d0)
+  alpha_2 = a1 / (12.0 * a0)
+
+  Mtilde_00 = a0 * d0
+  Mtilde_11 = a0 * ((12.0*d0*d0) - (d1*d1)) / (144.0 * d0)
+  Mtilde_22 = d0 * ((12.0*a0*a0) - (a1*a1)) / (144.0 * a0)
+
+  ! Forward affine transform to shifted basis.
+  rhs0p = rhs0
+  rhs1p = rhs1 - (alpha_1 * rhs0)
+  rhs2p = rhs2 - (alpha_2 * rhs0)
+
+  ! Diagonal scale.
+  c0p = rhs0p / Mtilde_00
+  c1p = rhs1p / Mtilde_11
+  c2p = rhs2p / Mtilde_22
+
+  ! Back transform to monomial coefficients.
+  c0 = c0p - ((alpha_1 * c1p) + (alpha_2 * c2p))
+  c1 = c1p
+  c2 = c2p
+
+end subroutine apply_DG1_inverse_mass
+
+!> Exact projection of bilinear corner-node values onto DG(1) monomial
+!! coefficients on a separable-Jacobian element. Corner values are at the four
+!! reference corners (xi, eta) = (-1/2, -1/2), (+1/2, -1/2), (-1/2, +1/2),
+!! (+1/2, +1/2) for (SW, SE, NW, NE). On uniform cells (a1=d1=0) this collapses
+!! bit-exactly to c0 = 0.25*sum(corners), c1 = 0.5*((SE+NE)-(SW+NW)),
+!! c2 = 0.5*((NW+NE)-(SW+SE)).
+pure subroutine project_corners_to_DG1_modal(a0, a1, d0, d1, SW, SE, NW, NE, c0, c1, c2)
+  real, intent(in)  :: a0  !< Cell-mean x metric [L ~> m].
+  real, intent(in)  :: a1  !< Cell x-metric anisotropy [L ~> m].
+  real, intent(in)  :: d0  !< Cell-mean y metric [L ~> m].
+  real, intent(in)  :: d1  !< Cell y-metric anisotropy [L ~> m].
+  real, intent(in)  :: SW  !< Corner value at (xi,eta)=(-1/2,-1/2) [<value units>].
+  real, intent(in)  :: SE  !< Corner value at (xi,eta)=(+1/2,-1/2) [<value units>].
+  real, intent(in)  :: NW  !< Corner value at (xi,eta)=(-1/2,+1/2) [<value units>].
+  real, intent(in)  :: NE  !< Corner value at (xi,eta)=(+1/2,+1/2) [<value units>].
+  real, intent(out) :: c0  !< Monomial coefficient of 1.
+  real, intent(out) :: c1  !< Monomial coefficient of xi.
+  real, intent(out) :: c2  !< Monomial coefficient of eta.
+
+  real :: Pxm, Pxp, Qxm, Qxp ! 1D xi-integrals of d(xi) and xi*d(xi).
+  real :: Pym, Pyp, Qym, Qyp ! 1D eta-integrals of a(eta) and eta*a(eta).
+  real :: rhs0, rhs1, rhs2
+
+  Pxm = (0.5*d0) - (d1/12.0)
+  Pxp = (0.5*d0) + (d1/12.0)
+  Qxm = (-d0/12.0) + (d1/24.0)
+  Qxp = (d0/12.0) + (d1/24.0)
+
+  Pym = (0.5*a0) - (a1/12.0)
+  Pyp = (0.5*a0) + (a1/12.0)
+  Qym = (-a0/12.0) + (a1/24.0)
+  Qyp = (a0/12.0) + (a1/24.0)
+
+  ! Diagonal + off-diagonal pairing in each rhs so the projection is bit-exact
+  ! under a 90 deg grid rotation (which permutes corners SW<->SE<->NE<->NW).
+  rhs0 = ((SW*(Pxm*Pym)) + (NE*(Pxp*Pyp))) + ((SE*(Pxp*Pym)) + (NW*(Pxm*Pyp)))
+  rhs1 = ((SW*(Qxm*Pym)) + (NE*(Qxp*Pyp))) + ((SE*(Qxp*Pym)) + (NW*(Qxm*Pyp)))
+  rhs2 = ((SW*(Pxm*Qym)) + (NE*(Pxp*Qyp))) + ((SE*(Pxp*Qym)) + (NW*(Pxm*Qyp)))
+
+  call apply_DG1_inverse_mass(a0, a1, d0, d1, rhs0, rhs1, rhs2, c0, c1, c2)
+
+end subroutine project_corners_to_DG1_modal
 
 !> Initialize ice shelf b.c.s from file
 subroutine initialize_ice_shelf_boundary_from_file(u_face_mask_bdry, v_face_mask_bdry, &
