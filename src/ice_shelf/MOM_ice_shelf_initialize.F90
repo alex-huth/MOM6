@@ -688,16 +688,16 @@ end subroutine initialize_DG_thickness_from_node_file
 !! this collapses bit-exactly to c0 = rhs0/(a0*d0), c1 = 12*rhs1/(a0*d0),
 !! c2 = 12*rhs2/(a0*d0).
 pure subroutine apply_DG1_inverse_mass(a0, a1, d0, d1, rhs0, rhs1, rhs2, c0, c1, c2)
-  real, intent(in)  :: a0   !< Cell-mean x metric (dxCv_S + dxCv_N)/2 [L ~> m].
-  real, intent(in)  :: a1   !< Cell x-metric anisotropy dxCv_N - dxCv_S [L ~> m].
-  real, intent(in)  :: d0   !< Cell-mean y metric (dyCu_W + dyCu_E)/2 [L ~> m].
-  real, intent(in)  :: d1   !< Cell y-metric anisotropy dyCu_E - dyCu_W [L ~> m].
-  real, intent(in)  :: rhs0 !< Volume-integral RHS for the {1} basis [<rhs0 units>].
-  real, intent(in)  :: rhs1 !< Volume-integral RHS for the {xi} basis [<rhs1 units>].
-  real, intent(in)  :: rhs2 !< Volume-integral RHS for the {eta} basis [<rhs2 units>].
-  real, intent(out) :: c0   !< Monomial coefficient of 1 [<c0 units>].
-  real, intent(out) :: c1   !< Monomial coefficient of xi [<c1 units>].
-  real, intent(out) :: c2   !< Monomial coefficient of eta [<c2 units>].
+  real, intent(in)  :: a0   !< Cell-mean x metric (dxCv_S + dxCv_N)/2 [L ~> m]
+  real, intent(in)  :: a1   !< Cell x-metric anisotropy dxCv_N - dxCv_S [L ~> m]
+  real, intent(in)  :: d0   !< Cell-mean y metric (dyCu_W + dyCu_E)/2 [L ~> m]
+  real, intent(in)  :: d1   !< Cell y-metric anisotropy dyCu_E - dyCu_W [L ~> m]
+  real, intent(in)  :: rhs0 !< Volume-integral RHS for the {1} basis [Z L2 T-1 ~> m3 s-1]
+  real, intent(in)  :: rhs1 !< Volume-integral RHS for the {xi} basis [Z L2 T-1 ~> m3 s-1]
+  real, intent(in)  :: rhs2 !< Volume-integral RHS for the {eta} basis [Z L2 T-1 ~> m3 s-1]
+  real, intent(out) :: c0   !< Monomial coefficient of 1 [Z T-1 ~> m s-1]
+  real, intent(out) :: c1   !< Monomial coefficient of xi [Z T-1 ~> m s-1]
+  real, intent(out) :: c2   !< Monomial coefficient of eta [Z T-1 ~> m s-1]
 
   real :: alpha_1, alpha_2 ! Shift parameters of the orthogonal basis [nondim].
   real :: Mtilde_00, Mtilde_11, Mtilde_22 ! Diagonal entries of the shifted mass matrix.

@@ -256,6 +256,13 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! after the slope limiter to guarantee that the DG(1)
                                   !! linear reconstruction stays non-negative at every
                                   !! point of the cell.
+  integer :: DG_penalty_formulation !< Selects the DG driving-stress face penalty:
+                                  !! 0 = legacy Rusanov, alpha = rho*g*max(h_loc,h_ngh);
+                                  !! 1 = IIPG with the Shahbazi local sigma_f formula,
+                                  !! anisotropy- and refinement-aware.
+  real :: DG_penalty_C_safety     !< Safety multiplier above the analytical IIPG lower
+                                  !! bound for the DG(1) driving-stress face penalty
+                                  !! (Shahbazi formula) [nondim].
   logical :: calve_to_mask       !< If true, calve off the ice shelf when it passes the edge of a mask.
   real :: min_thickness_simple_calve !< min. ice shelf thickness criteria for calving [Z ~> m].
   real :: T_shelf_missing   !< An ice shelf temperature to use where there is no ice shelf [C ~> degC]
@@ -7121,6 +7128,27 @@ subroutine read_dg1_limiter_params(param_file, mdl, CS, US)
                  "corner value lands at zero; the cell mean is preserved.", &
                  default=.true., do_not_log=.not.CS%use_DG_thickness)
 
+  call get_param(param_file, mdl, "DG_PENALTY_FORMULATION", CS%DG_penalty_formulation, &
+                 "Selects the numerical-flux jump penalty used at interior faces "//&
+                 "in the DG(1) driving-stress weak form. "//&
+                 "0 = legacy Rusanov with alpha = rho*g*max(h_loc, h_ngh). "//&
+                 "1 = IIPG with the Shahbazi (2005) local sigma_f formula, "//&
+                 "which scales as 1/h_f and is anisotropy-aware via "//&
+                 "max(h_f/A_L, h_f/A_R), making the penalty refinement- and "//&
+                 "aspect-ratio-consistent.", &
+                 default=0, do_not_log=.not.CS%use_DG_thickness)
+
+  call get_param(param_file, mdl, "DG_PENALTY_SAFETY_FACTOR", CS%DG_penalty_C_safety, &
+                 "Safety multiplier above the analytical IIPG coercivity lower "//&
+                 "bound for the DG(1) driving-stress face penalty (Shahbazi "//&
+                 "formula). Values 2-8 are typical; larger increases damping of "//&
+                 "null-space (checkerboard) modes at modest cost in transition "//&
+                 "sharpness near grounding lines. Only used when "//&
+                 "DG_PENALTY_FORMULATION=1.", &
+                 units="nondim", default=2.0, &
+                 do_not_log=(.not.CS%use_DG_thickness) .or. &
+                            (CS%DG_penalty_formulation /= 1))
+
 end subroutine read_dg1_limiter_params
 
 
@@ -7158,13 +7186,70 @@ pure real function minmod2(a, b)
   endif
 end function minmod2
 
+!> Compute the interior-face numerical flux P_star for the DG(1) driving-stress
+!! weak form. Handles Dirichlet thickness BC overrides and selects between the
+!! legacy Rusanov (alpha = rho*g*max(h_loc, h_ngh)) and the IIPG penalty with
+!! the Shahbazi (2005) local sigma_f formula. Caller is responsible for the
+!! external-boundary branch (e.g. ocean back-pressure at the calving front)
+!! and for choosing the sign convention of delta_h to match the face normal.
+subroutine calc_DG_face_pstar(CS, h_loc, h_ngh, P_loc, P_ngh, &
+                              loc_is_bc, ngh_is_bc, &
+                              h_f, area_loc, area_ngh, &
+                              rho, grav, delta_h, P_star)
+  type(ice_shelf_dyn_CS), intent(in) :: CS !< Ice-shelf dynamics control structure
+  real, intent(in)  :: h_loc      !< Thickness on the local (this-cell) side [Z ~> m]
+  real, intent(in)  :: h_ngh      !< Thickness on the neighbour side [Z ~> m]
+  real, intent(in)  :: P_loc      !< Pressure on the local side [R Z L2 T-2 ~> kg s-2]
+  real, intent(in)  :: P_ngh      !< Pressure on the neighbour side [R Z L2 T-2 ~> kg s-2]
+  logical, intent(in) :: loc_is_bc !< True if the local cell carries a Dirichlet thickness BC
+  logical, intent(in) :: ngh_is_bc !< True if the neighbour cell carries a Dirichlet thickness BC
+  real, intent(in)  :: h_f        !< Face length [L ~> m]
+  real, intent(in)  :: area_loc   !< Cell area on the local side [L2 ~> m2]
+  real, intent(in)  :: area_ngh   !< Cell area on the neighbour side [L2 ~> m2]
+  real, intent(in)  :: rho        !< Ice density [R ~> kg m-3]
+  real, intent(in)  :: grav       !< Gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
+  real, intent(in)  :: delta_h    !< Signed thickness jump across the face, oriented
+                                   !! so that the penalty term acts as
+                                   !! -penalty*delta_h on P_star [Z ~> m]
+  real, intent(out) :: P_star     !< Numerical flux at the face [R Z L2 T-2 ~> kg s-2]
+
+  real :: alpha_pen ! Rusanov penalty coefficient [R L2 T-2 ~> kg m-1 s-2]
+  real :: sigma_f   ! Shahbazi local IIPG penalty coefficient [L-1 ~> m-1]
+  real :: h_face    ! Face-averaged thickness [Z ~> m]
+
+  if (loc_is_bc .and. .not. ngh_is_bc) then
+    ! Prescribed BC face value is authoritative on the local side.
+    P_star = P_loc
+  elseif (ngh_is_bc .and. .not. loc_is_bc) then
+    ! Prescribed BC face value is authoritative on the neighbour side.
+    P_star = P_ngh
+  else
+    select case (CS%DG_penalty_formulation)
+    case (1)
+      ! IIPG with Shahbazi local sigma_f. Geometric factor 3 = (p+1)(p+d)/d
+      ! for p=1, d=2. sigma_f carries units 1/length and replaces the full
+      ! 0.5*alpha coefficient (not just alpha).
+      sigma_f = CS%DG_penalty_C_safety * 3.0 * &
+                max(h_f / area_loc, h_f / area_ngh)
+      h_face = 0.5 * (h_loc + h_ngh)
+      P_star = 0.5 * (P_loc + P_ngh) - sigma_f * rho * grav * h_face * delta_h
+    case default
+      ! Legacy Rusanov / Lax-Friedrichs: P* = {P} - 0.5*alpha*[[h]]
+      alpha_pen = rho * grav * max(h_loc, h_ngh)
+      P_star = 0.5 * (P_loc + P_ngh) - 0.5 * alpha_pen * delta_h
+    end select
+  endif
+
+end subroutine calc_DG_face_pstar
+
+
 !> Compute driving stress at B-grid nodes using a Pure DG(1) formulation.
 !! Allows sub-element driving stress around grounding line
 !! Evaluates the FEM weak-form integral using integration by parts.
-!! To prevent B-grid null-space checkerboarding, the boundary integrals
-!! utilize a Lax-Friedrichs (Rusanov) numerical flux. This ensures a
-!! single-valued pressure at cell interfaces and applies a rigorous jump
-!! penalty to aggressively damp grid-scale slope oscillations.
+!! To prevent B-grid null-space checkerboarding, the interior face integrals
+!! use a numerical flux with a jump penalty selectable via
+!! DG_PENALTY_FORMULATION: 0 = legacy Rusanov (Lax-Friedrichs), 1 = IIPG with
+!! the Shahbazi (2005) local sigma_f. See calc_DG_face_pstar.
 subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
   type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe the ice-shelf state
@@ -7191,8 +7276,9 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   real :: h_loc, b_loc     ! Quadrature-point local thickness and bed [Z ~> m]
   real :: h_ngh, b_ngh     ! Quadrature-point neighbor thickness and bed [Z ~> m]
   real :: P_loc, P_ngh     ! Local and Neighbor pressures [R Z L2 T-2 ~> kg s-2]
-  real :: P_star           ! Lax-Friedrichs numerical flux at face [R Z L2 T-2 ~> kg s-2]
-  real :: alpha_pen        ! Rusanov jump penalty coefficient [R L2 T-2 ~> kg m-1 s-2]
+  real :: P_star           ! Numerical flux at face [R Z L2 T-2 ~> kg s-2]
+  real :: delta_h          ! Signed thickness jump across face for penalty term [Z ~> m]
+  real :: h_f_face         ! Face length passed to the helper [L ~> m]
   real :: d_ocean          ! Draft of the ice for ocean pressure calculation [Z ~> m]
   real :: t_face           ! Face quadrature parameter in [0,1] [nondim]
   real :: phi_A, phi_B     ! Linear nodal basis values at the face quadrature point [nondim]
@@ -7452,18 +7538,13 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
           endif
 
-          if (loc_is_bc .and. .not. ngh_is_bc) then
-            ! Prescribed BC face value is authoritative on the local side.
-            P_star = P_loc
-          elseif (ngh_is_bc .and. .not. loc_is_bc) then
-            ! Prescribed BC face value is authoritative on the neighbor side.
-            P_star = P_ngh
-          else
-            ! Lax-Friedrichs Flux: {P} - 0.5*alpha*(h_right - h_left)
-            ! Left is ngh, Right is loc
-            alpha_pen = rho * grav * max(h_loc, h_ngh)
-            P_star = 0.5 * (P_ngh + P_loc) - 0.5 * alpha_pen * (h_loc - h_ngh)
-          endif
+          ! Interior face: Left = ngh (i-1), Right = loc (i). delta_h = h_R - h_L.
+          h_f_face = G%dyCu(I-1,j)
+          delta_h = h_loc - h_ngh
+          call calc_DG_face_pstar(CS, h_loc, h_ngh, P_loc, P_ngh, &
+                                  loc_is_bc, ngh_is_bc, &
+                                  h_f_face, G%areaT(i,j), G%areaT(i-1,j), &
+                                  rho, grav, delta_h, P_star)
         endif
 
         phi_A = 1.0 - t_face ; phi_B = t_face
@@ -7521,16 +7602,13 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
           endif
 
-          if (loc_is_bc .and. .not. ngh_is_bc) then
-            P_star = P_loc
-          elseif (ngh_is_bc .and. .not. loc_is_bc) then
-            P_star = P_ngh
-          else
-            ! Lax-Friedrichs Flux: {P} - 0.5*alpha*(h_right - h_left)
-            ! Left is loc, Right is ngh
-            alpha_pen = rho * grav * max(h_loc, h_ngh)
-            P_star = 0.5 * (P_loc + P_ngh) - 0.5 * alpha_pen * (h_ngh - h_loc)
-          endif
+          ! Interior face: Left = loc (i), Right = ngh (i+1). delta_h = h_R - h_L.
+          h_f_face = G%dyCu(I,j)
+          delta_h = h_ngh - h_loc
+          call calc_DG_face_pstar(CS, h_loc, h_ngh, P_loc, P_ngh, &
+                                  loc_is_bc, ngh_is_bc, &
+                                  h_f_face, G%areaT(i,j), G%areaT(i+1,j), &
+                                  rho, grav, delta_h, P_star)
         endif
 
         phi_A = 1.0 - t_face ; phi_B = t_face
@@ -7588,16 +7666,13 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
           endif
 
-          if (loc_is_bc .and. .not. ngh_is_bc) then
-            P_star = P_loc
-          elseif (ngh_is_bc .and. .not. loc_is_bc) then
-            P_star = P_ngh
-          else
-            ! Lax-Friedrichs Flux
-            ! Left is ngh, Right is loc
-            alpha_pen = rho * grav * max(h_loc, h_ngh)
-            P_star = 0.5 * (P_ngh + P_loc) - 0.5 * alpha_pen * (h_loc - h_ngh)
-          endif
+          ! Interior face: Left = ngh (j-1), Right = loc (j). delta_h = h_R - h_L.
+          h_f_face = G%dxCv(i,J-1)
+          delta_h = h_loc - h_ngh
+          call calc_DG_face_pstar(CS, h_loc, h_ngh, P_loc, P_ngh, &
+                                  loc_is_bc, ngh_is_bc, &
+                                  h_f_face, G%areaT(i,j), G%areaT(i,j-1), &
+                                  rho, grav, delta_h, P_star)
         endif
 
         phi_A = 1.0 - t_face ; phi_B = t_face
@@ -7655,16 +7730,13 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
           endif
 
-          if (loc_is_bc .and. .not. ngh_is_bc) then
-            P_star = P_loc
-          elseif (ngh_is_bc .and. .not. loc_is_bc) then
-            P_star = P_ngh
-          else
-            ! Lax-Friedrichs Flux
-            ! Left is loc, Right is ngh
-            alpha_pen = rho * grav * max(h_loc, h_ngh)
-            P_star = 0.5 * (P_loc + P_ngh) - 0.5 * alpha_pen * (h_ngh - h_loc)
-          endif
+          ! Interior face: Left = loc (j), Right = ngh (j+1). delta_h = h_R - h_L.
+          h_f_face = G%dxCv(i,J)
+          delta_h = h_ngh - h_loc
+          call calc_DG_face_pstar(CS, h_loc, h_ngh, P_loc, P_ngh, &
+                                  loc_is_bc, ngh_is_bc, &
+                                  h_f_face, G%areaT(i,j), G%areaT(i,j+1), &
+                                  rho, grav, delta_h, P_star)
         endif
 
         phi_A = 1.0 - t_face ; phi_B = t_face
