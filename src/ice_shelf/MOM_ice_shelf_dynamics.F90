@@ -6492,8 +6492,10 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
   real, parameter :: gw  =  0.5            ! Weight for each point (sums to 1) [nondim]
 
   ! Local variables
-  real :: u_face        ! Normal velocity at a u-face [L T-1 ~> m s-1]
-  real :: v_face        ! Normal velocity at a v-face [L T-1 ~> m s-1]
+  real :: u_S, u_N      ! Corner u-velocities at south/north end of a u-face [L T-1 ~> m s-1]
+  real :: v_W, v_E      ! Corner v-velocities at west/east end of a v-face [L T-1 ~> m s-1]
+  real :: u_at_gp       ! u evaluated at a face Gauss point via linear interp [L T-1 ~> m s-1]
+  real :: v_at_gp       ! v evaluated at a face Gauss point via linear interp [L T-1 ~> m s-1]
   real :: h_upwind      ! Upwind thickness at a Gauss point [Z ~> m]
   real :: flux_h        ! Boundary flux contribution to cell average, unscaled [Z L2 T-1 ~> m3 s-1]
   real :: flux_hx       ! Boundary flux contribution to x-moment, unscaled [Z L2 T-1 ~> m3 s-1]
@@ -6536,17 +6538,25 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
         Rhs_h_u(i+1,j) = Rhs_h_u(i+1,j) + face_flux_total
     elseif ((hmask(i,j) == 1 .or. hmask(i,j) == 3) .or. &
             (hmask(i+1,j) == 1 .or. hmask(i+1,j) == 3)) then
-      ! Normal velocity at this u-face (average of B-grid velocities)
-      u_face = 0.5 * (CS%u_shelf(I,J-1) + CS%u_shelf(I,J))
+      ! Corner u-velocities along this u-face. eta = -0.5 at south corner (J-1),
+      ! eta = +0.5 at north corner (J). The face trace of the bilinear cell-u is
+      ! linear in eta, so u(eta) = 0.5*(u_S+u_N) + (u_N-u_S)*eta. Evaluating u at
+      ! each Gauss point (rather than using a single face-averaged u) keeps the
+      ! face flux IBP-consistent with the bilinear-u volume integral added later.
+      u_S = CS%u_shelf(I,J-1)
+      u_N = CS%u_shelf(I,J)
 
       flux_h = 0.0 ; flux_hx = 0.0 ; flux_hy = 0.0
 
       ! 2-point Gauss quadrature along the face (in eta direction)
       do gp=1,2
         if (gp == 1) then ; eta_gp = gp1 ; else ; eta_gp = gp2 ; endif
+        u_at_gp = (0.5 * (u_S + u_N)) + ((u_N - u_S) * eta_gp)
 
-        ! Upwind thickness at this Gauss point
-        if (u_face > 0.0) then
+        ! Upwind thickness at this Gauss point. Upwinding is on u_at_gp so a
+        ! sign change of u along the face selects the correct donor cell at
+        ! each Gauss point.
+        if (u_at_gp > 0.0) then
           if (hmask(i,j) == 3) then
             h_upwind = CS%h_bdry_val(i,j)
           elseif (hmask(i,j) == 1) then
@@ -6568,14 +6578,13 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
 
         h_upwind = max(h_upwind, 0.0)
 
-        ! Numerical flux at this Gauss point: u * h_upwind * face_length
-        ! Weight gw accounts for the Gauss quadrature (each point gets weight 0.5)
-        flux_h  = flux_h  + gw * u_face * h_upwind * G%dyCu(I,j)
+        ! Numerical flux at this Gauss point: u(eta) * h_upwind * face_length
+        flux_h  = flux_h  + gw * u_at_gp * h_upwind * G%dyCu(I,j)
         ! Moment flux: weighted by the test function value at the face
         ! For the x-moment: test function xi = +0.5 at right face of left cell, -0.5 at left face of right cell
         ! For the y-moment: test function eta = eta_gp
-        flux_hx = flux_hx + gw * u_face * h_upwind * G%dyCu(I,j) * 0.5   ! xi at face = +/-0.5
-        flux_hy = flux_hy + gw * u_face * h_upwind * G%dyCu(I,j) * eta_gp
+        flux_hx = flux_hx + gw * u_at_gp * h_upwind * G%dyCu(I,j) * 0.5   ! xi at face = +/-0.5
+        flux_hy = flux_hy + gw * u_at_gp * h_upwind * G%dyCu(I,j) * eta_gp
       enddo
 
       uh_ice(I,j) = uh_ice(I,j) + flux_h
@@ -6615,16 +6624,21 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
         Rhs_h_v(i,j+1) = Rhs_h_v(i,j+1) + face_flux_total
     elseif ((hmask(i,j) == 1 .or. hmask(i,j) == 3) .or. &
             (hmask(i,j+1) == 1 .or. hmask(i,j+1) == 3)) then
-      ! Normal velocity at this v-face
-      v_face = 0.5 * (CS%v_shelf(I-1,J) + CS%v_shelf(I,J))
+      ! Corner v-velocities along this v-face. xi = -0.5 at west corner (I-1),
+      ! xi = +0.5 at east corner (I). Face trace of bilinear cell-v is linear in
+      ! xi: v(xi) = 0.5*(v_W+v_E) + (v_E-v_W)*xi. Evaluate v per Gauss point so
+      ! the boundary integral matches the bilinear-v volume integral.
+      v_W = CS%v_shelf(I-1,J)
+      v_E = CS%v_shelf(I,J)
 
       flux_h = 0.0 ; flux_hx = 0.0 ; flux_hy = 0.0
 
       do gp=1,2
         if (gp == 1) then ; eta_gp = gp1 ; else ; eta_gp = gp2 ; endif
         ! Here eta_gp is used as the xi coordinate along the face
+        v_at_gp = (0.5 * (v_W + v_E)) + ((v_E - v_W) * eta_gp)
 
-        if (v_face > 0.0) then
+        if (v_at_gp > 0.0) then
           if (hmask(i,j) == 3) then
             h_upwind = CS%h_bdry_val(i,j)
           elseif (hmask(i,j) == 1) then
@@ -6646,9 +6660,9 @@ subroutine DG1_spatial_operator(CS, G, hmask, h_bar, h_x, h_y, Rhs_h, Rhs_hx, Rh
 
         h_upwind = max(h_upwind, 0.0)
 
-        flux_h  = flux_h  + gw * v_face * h_upwind * G%dxCv(i,J)
-        flux_hx = flux_hx + gw * v_face * h_upwind * G%dxCv(i,J) * eta_gp  ! xi along face
-        flux_hy = flux_hy + gw * v_face * h_upwind * G%dxCv(i,J) * 0.5     ! eta at face = +/-0.5
+        flux_h  = flux_h  + gw * v_at_gp * h_upwind * G%dxCv(i,J)
+        flux_hx = flux_hx + gw * v_at_gp * h_upwind * G%dxCv(i,J) * eta_gp  ! xi along face
+        flux_hy = flux_hy + gw * v_at_gp * h_upwind * G%dxCv(i,J) * 0.5     ! eta at face = +/-0.5
       enddo
 
       vh_ice(i,J) = vh_ice(i,J) + flux_h
@@ -6831,8 +6845,6 @@ subroutine DG1_slope_limit(G, h_bar, h_x, h_y, hmask, h_bdry_val, &
         h_x(i,j) = minmod2(h_x(i,j), diff_W)
       elseif (valid_E) then
         h_x(i,j) = minmod2(h_x(i,j), diff_E)
-      else
-        h_x(i,j) = 0.0
       endif
 
       ! Y-direction limiter (same one-sided handling as X)
@@ -6856,8 +6868,6 @@ subroutine DG1_slope_limit(G, h_bar, h_x, h_y, hmask, h_bdry_val, &
         h_y(i,j) = minmod2(h_y(i,j), diff_S)
       elseif (valid_N) then
         h_y(i,j) = minmod2(h_y(i,j), diff_N)
-      else
-        h_y(i,j) = 0.0
       endif
 
     else
@@ -6937,7 +6947,7 @@ subroutine DG1_slope_limit(G, h_bar, h_x, h_y, hmask, h_bdry_val, &
       if (valid_E .or. valid_W) then
         phi_x = min(phi_E, phi_W)
       else
-        phi_x = 0.0
+        phi_x = 1.0
       endif
       h_x(i,j) = phi_x * h_x(i,j)
       if (present(phi_x_out)) phi_x_out(i,j) = phi_x
@@ -6980,7 +6990,7 @@ subroutine DG1_slope_limit(G, h_bar, h_x, h_y, hmask, h_bdry_val, &
       if (valid_N .or. valid_S) then
         phi_y = min(phi_N, phi_S)
       else
-        phi_y = 0.0
+        phi_y = 1.0
       endif
       h_y(i,j) = phi_y * h_y(i,j)
       if (present(phi_y_out)) phi_y_out(i,j) = phi_y
@@ -7114,7 +7124,7 @@ subroutine read_dg1_limiter_params(param_file, mdl, CS, US)
                  "Venkatakrishnan with no extremum protection; M very "//&
                  "large effectively disables the limiter. Only used when "//&
                  "DG1_LIMITER=venkatakrishnan.", &
-                 units="m-1", default=1.0e-6, &
+                 units="m-1", default=1.0e-5, &
                  scale=US%m_to_Z/(US%m_to_L*US%m_to_L), &
                  do_not_log=(.not.CS%use_DG_thickness) .or. &
                             (CS%dg1_limiter_choice /= 2))
@@ -7136,7 +7146,7 @@ subroutine read_dg1_limiter_params(param_file, mdl, CS, US)
                  "which scales as 1/h_f and is anisotropy-aware via "//&
                  "max(h_f/A_L, h_f/A_R), making the penalty refinement- and "//&
                  "aspect-ratio-consistent.", &
-                 default=0, do_not_log=.not.CS%use_DG_thickness)
+                 default=1, do_not_log=.not.CS%use_DG_thickness)
 
   call get_param(param_file, mdl, "DG_PENALTY_SAFETY_FACTOR", CS%DG_penalty_C_safety, &
                  "Safety multiplier above the analytical IIPG coercivity lower "//&
