@@ -1068,7 +1068,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         ! On restart h_x, h_y come from the restart file and this branch is skipped.
         call pass_var(ISS%h_shelf, G%domain)
         CS%h_x(:,:) = 0.0 ; CS%h_y(:,:) = 0.0
-        call initialize_DG_thickness_from_node_file(ISS%h_shelf, CS%h_x, CS%h_y, &
+        call initialize_DG_thickness_from_node_file(ISS%h_shelf, CS%h_x, CS%h_y, ISS%hmask, &
                                                     node_ic_used, G, US, param_file)
         slopes_from_file = .false.
         if (node_ic_used) then

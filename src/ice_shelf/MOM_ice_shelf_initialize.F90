@@ -608,7 +608,7 @@ end subroutine initialize_DG_thickness_slopes_from_file
 !! nodal field is present and consumed; otherwise leaves h_shelf, h_x, h_y
 !! untouched so the caller can fall back to the cell-mean read and centred-FD
 !! slope seed. The nodal field is consumed locally and not retained.
-subroutine initialize_DG_thickness_from_node_file(h_shelf, h_x, h_y, used, G, US, PF)
+subroutine initialize_DG_thickness_from_node_file(h_shelf, h_x, h_y, hmask, used, G, US, PF)
   type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(inout) :: h_shelf !< Cell-mean ice thickness [Z ~> m].
@@ -616,6 +616,9 @@ subroutine initialize_DG_thickness_from_node_file(h_shelf, h_x, h_y, used, G, US
                           intent(inout) :: h_x !< Cell-mean DG(1) x-slope DOF [Z ~> m].
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(inout) :: h_y !< Cell-mean DG(1) y-slope DOF [Z ~> m].
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                         intent(in) :: hmask !< A mask indicating which tracer points are
+                                             !! partly or fully covered by an ice-shelf [nondim]
   logical,                intent(out)   :: used !< True if the nodal IC was applied.
   type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
   type(param_file_type),  intent(in)    :: PF !< A structure to parse for run-time parameters
@@ -655,22 +658,26 @@ subroutine initialize_DG_thickness_from_node_file(h_shelf, h_x, h_y, used, G, US
   ! basis {1, xi, eta} with weight a(eta)*d(xi). Uniform cells reduce to the
   ! 0.25/0.5/0.5 formulas bit-exactly.
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
-    if (J>1) then
-      a0 = 0.5*(G%dxCv(i,J-1) + G%dxCv(i,J))
-      a1 = G%dxCv(i,J) - G%dxCv(i,J-1)
+    if (hmask(i,j)==0) then
+      h_shelf(i,j)=0.; h_x(i,j)=0.; h_y(i,j)=0.
     else
-      a0 = G%dxCv(i,J) ; a1 = 0.0
+      if (J>1) then
+        a0 = 0.5*(G%dxCv(i,J-1) + G%dxCv(i,J))
+        a1 = G%dxCv(i,J) - G%dxCv(i,J-1)
+      else
+        a0 = G%dxCv(i,J) ; a1 = 0.0
+      endif
+      if (I>1) then
+        d0 = 0.5*(G%dyCu(I-1,j) + G%dyCu(I,j))
+        d1 = G%dyCu(I,j) - G%dyCu(I-1,j)
+      else
+        d0 = G%dyCu(I,j) ; d1 = 0.0
+      endif
+      call project_corners_to_DG1_modal(a0, a1, d0, d1, &
+        h_node(I-1,J-1), h_node(I,J-1), &
+        h_node(I-1,J  ), h_node(I,J  ), &
+        h_shelf(i,j), h_x(i,j), h_y(i,j))
     endif
-    if (I>1) then
-      d0 = 0.5*(G%dyCu(I-1,j) + G%dyCu(I,j))
-      d1 = G%dyCu(I,j) - G%dyCu(I-1,j)
-    else
-      d0 = G%dyCu(I,j) ; d1 = 0.0
-    endif
-    call project_corners_to_DG1_modal(a0, a1, d0, d1, &
-                                      h_node(I-1,J-1), h_node(I,J-1), &
-                                      h_node(I-1,J  ), h_node(I,J  ), &
-                                      h_shelf(i,j), h_x(i,j), h_y(i,j))
   enddo ; enddo
 
   deallocate(h_node)
