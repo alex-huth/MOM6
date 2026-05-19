@@ -26,6 +26,7 @@ public initialize_bed_node_from_file
 public initialize_DG_thickness_slopes_from_file
 public initialize_DG_thickness_from_node_file
 public apply_DG1_inverse_mass
+public apply_DG1_inverse_mass_meanslope
 public project_corners_to_DG1_modal
 public initialize_ice_shelf_boundary_from_file
 public initialize_ice_C_basal_friction
@@ -694,6 +695,8 @@ end subroutine initialize_DG_thickness_from_node_file
 !! monomial coefficients of the DG polynomial. On uniform cells (a1=d1=0)
 !! this collapses bit-exactly to c0 = rhs0/(a0*d0), c1 = 12*rhs1/(a0*d0),
 !! c2 = 12*rhs2/(a0*d0).
+!! Retained for the bilinear-corner projection in project_corners_to_DG1_modal;
+!! the DG advect step instead calls apply_DG1_inverse_mass_meanslope.
 pure subroutine apply_DG1_inverse_mass(a0, a1, d0, d1, rhs0, rhs1, rhs2, c0, c1, c2)
   real, intent(in)  :: a0   !< Cell-mean x metric (dxCv_S + dxCv_N)/2 [L ~> m]
   real, intent(in)  :: a1   !< Cell x-metric anisotropy dxCv_N - dxCv_S [L ~> m]
@@ -735,13 +738,57 @@ pure subroutine apply_DG1_inverse_mass(a0, a1, d0, d1, rhs0, rhs1, rhs2, c0, c1,
 
 end subroutine apply_DG1_inverse_mass
 
-!> Exact projection of bilinear corner-node values onto DG(1) monomial
-!! coefficients on a separable-Jacobian element. Corner values are at the four
-!! reference corners (xi, eta) = (-1/2, -1/2), (+1/2, -1/2), (-1/2, +1/2),
-!! (+1/2, +1/2) for (SW, SE, NW, NE). On uniform cells (a1=d1=0) this collapses
-!! bit-exactly to c0 = 0.25*sum(corners), c1 = 0.5*((SE+NE)-(SW+NW)),
-!! c2 = 0.5*((NW+NE)-(SW+SE)).
-pure subroutine project_corners_to_DG1_modal(a0, a1, d0, d1, SW, SE, NW, NE, c0, c1, c2)
+!> Apply M^{-1} to the DG(1) volume-integral RHS, returning the time
+!! rates of the area-weighted cell mean Hbar and the monomial slope
+!! coefficients c1, c2. The cell-mean rate decouples exactly from the
+!! slope rates: dHbar/dt = rhs0 / (a0*d0). Slope rates come from the
+!! shifted-orthogonal sub-system without back-transform.
+!! On uniform cells (a1=d1=0) this collapses bit-exactly to
+!! dHbar/dt = rhs0/(a0*d0), dc1/dt = 12*rhs1/(a0*d0), dc2/dt = 12*rhs2/(a0*d0).
+pure subroutine apply_DG1_inverse_mass_meanslope(a0, a1, d0, d1, rhs0, rhs1, rhs2, &
+                                                 dHbar_dt, dc1_dt, dc2_dt)
+  real, intent(in)  :: a0   !< Cell-mean x metric (dxCv_S + dxCv_N)/2 [L ~> m]
+  real, intent(in)  :: a1   !< Cell x-metric anisotropy dxCv_N - dxCv_S [L ~> m]
+  real, intent(in)  :: d0   !< Cell-mean y metric (dyCu_W + dyCu_E)/2 [L ~> m]
+  real, intent(in)  :: d1   !< Cell y-metric anisotropy dyCu_E - dyCu_W [L ~> m]
+  real, intent(in)  :: rhs0 !< Volume-integral RHS for the {1} basis [Z L2 T-1 ~> m3 s-1]
+  real, intent(in)  :: rhs1 !< Volume-integral RHS for the {xi} basis [Z L2 T-1 ~> m3 s-1]
+  real, intent(in)  :: rhs2 !< Volume-integral RHS for the {eta} basis [Z L2 T-1 ~> m3 s-1]
+  real, intent(out) :: dHbar_dt !< Time rate of the cell mean [Z T-1 ~> m s-1]
+  real, intent(out) :: dc1_dt   !< Time rate of monomial xi coefficient [Z T-1 ~> m s-1]
+  real, intent(out) :: dc2_dt   !< Time rate of monomial eta coefficient [Z T-1 ~> m s-1]
+
+  real :: alpha_1, alpha_2  ! Shifted-basis parameters [nondim].
+  real :: Mtilde_11, Mtilde_22 ! Diagonal entries of shifted mass matrix.
+
+  alpha_1 = d1 / (12.0 * d0)
+  alpha_2 = a1 / (12.0 * a0)
+
+  Mtilde_11 = a0 * ((12.0*d0*d0) - (d1*d1)) / (144.0 * d0)
+  Mtilde_22 = d0 * ((12.0*a0*a0) - (a1*a1)) / (144.0 * a0)
+
+  ! Row 0 of M*c_dot = rhs gives dHbar/dt directly:
+  !   a0*d0*c0_dot + (a0*d1/12)*c1_dot + (a1*d0/12)*c2_dot = rhs0
+  !   c0_dot + alpha_1*c1_dot + alpha_2*c2_dot = rhs0/(a0*d0) = dHbar/dt
+  dHbar_dt = rhs0 / (a0*d0)
+  ! Slope rates from the shifted-orthogonal sub-system. In the shifted basis
+  ! {1, xi-alpha_1, eta-alpha_2}, c1, c2 equal their shifted-basis counterparts
+  ! (no back-transform shift needed for the slope DOFs).
+  dc1_dt = (rhs1 - (alpha_1*rhs0)) / Mtilde_11
+  dc2_dt = (rhs2 - (alpha_2*rhs0)) / Mtilde_22
+
+end subroutine apply_DG1_inverse_mass_meanslope
+
+!> Exact projection of bilinear corner-node values onto DG(1) on a
+!! separable-Jacobian element, returning the area-weighted cell mean Hbar
+!! and the monomial slope coefficients c1, c2 in
+!! h(xi,eta) = c0 + c1*xi + c2*eta with c0 = Hbar - alpha_1*c1 - alpha_2*c2,
+!! alpha_1 = d1/(12*d0), alpha_2 = a1/(12*a0). Corner values are at the
+!! four reference corners (xi, eta) = (-1/2, -1/2), (+1/2, -1/2),
+!! (-1/2, +1/2), (+1/2, +1/2) for (SW, SE, NW, NE). On uniform cells
+!! (a1=d1=0) this collapses bit-exactly to Hbar = 0.25*sum(corners),
+!! c1 = 0.5*((SE+NE)-(SW+NW)), c2 = 0.5*((NW+NE)-(SW+SE)).
+pure subroutine project_corners_to_DG1_modal(a0, a1, d0, d1, SW, SE, NW, NE, Hbar, c1, c2)
   real, intent(in)  :: a0  !< Cell-mean x metric [L ~> m].
   real, intent(in)  :: a1  !< Cell x-metric anisotropy [L ~> m].
   real, intent(in)  :: d0  !< Cell-mean y metric [L ~> m].
@@ -750,13 +797,14 @@ pure subroutine project_corners_to_DG1_modal(a0, a1, d0, d1, SW, SE, NW, NE, c0,
   real, intent(in)  :: SE  !< Corner value at (xi,eta)=(+1/2,-1/2) [<value units>].
   real, intent(in)  :: NW  !< Corner value at (xi,eta)=(-1/2,+1/2) [<value units>].
   real, intent(in)  :: NE  !< Corner value at (xi,eta)=(+1/2,+1/2) [<value units>].
-  real, intent(out) :: c0  !< Monomial coefficient of 1.
+  real, intent(out) :: Hbar !< Area-weighted cell mean [<value units>].
   real, intent(out) :: c1  !< Monomial coefficient of xi.
   real, intent(out) :: c2  !< Monomial coefficient of eta.
 
   real :: Pxm, Pxp, Qxm, Qxp ! 1D xi-integrals of d(xi) and xi*d(xi).
   real :: Pym, Pyp, Qym, Qyp ! 1D eta-integrals of a(eta) and eta*a(eta).
   real :: rhs0, rhs1, rhs2
+  real :: c0_unused          ! Monomial constant; consumer uses Hbar instead.
 
   Pxm = (0.5*d0) - (d1/12.0)
   Pxp = (0.5*d0) + (d1/12.0)
@@ -774,7 +822,9 @@ pure subroutine project_corners_to_DG1_modal(a0, a1, d0, d1, SW, SE, NW, NE, c0,
   rhs1 = ((SW*(Qxm*Pym)) + (NE*(Qxp*Pyp))) + ((SE*(Qxp*Pym)) + (NW*(Qxm*Pyp)))
   rhs2 = ((SW*(Pxm*Qym)) + (NE*(Pxp*Qyp))) + ((SE*(Pxp*Qym)) + (NW*(Pxm*Qyp)))
 
-  call apply_DG1_inverse_mass(a0, a1, d0, d1, rhs0, rhs1, rhs2, c0, c1, c2)
+  call apply_DG1_inverse_mass(a0, a1, d0, d1, rhs0, rhs1, rhs2, c0_unused, c1, c2)
+  ! Convert monomial c0 to area-weighted cell mean Hbar.
+  Hbar = c0_unused + ((d1/(12.0*d0))*c1) + ((a1/(12.0*a0))*c2)
 
 end subroutine project_corners_to_DG1_modal
 
