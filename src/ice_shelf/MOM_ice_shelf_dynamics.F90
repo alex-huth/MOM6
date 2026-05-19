@@ -7412,14 +7412,14 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
                     (bed_corners(1,2) * (xquad(3-iq) * xquad(jq))))
 
           ! Reference-coord bed gradients
-          dbdx_ref = (((bed_corners(1,1) * (-xquad(3-jq))) + &
-                       (bed_corners(2,2) * ( xquad(jq))))  + &
-                      ((bed_corners(2,1) * ( xquad(3-jq))) + &
-                       (bed_corners(1,2) * (-xquad(jq)))))
-          dbdy_ref = (((bed_corners(1,1) * (-xquad(3-iq))) + &
-                       (bed_corners(2,2) * ( xquad(iq))))  + &
-                      ((bed_corners(2,1) * (-xquad(iq))) + &
-                       (bed_corners(1,2) * ( xquad(3-iq)))))
+          dbdx_ref = ((bed_corners(1,1) * (-xquad(3-jq))) + &
+                      (bed_corners(2,2) * ( xquad(jq))))  + &
+                     ((bed_corners(2,1) * ( xquad(3-jq))) + &
+                      (bed_corners(1,2) * (-xquad(jq))))
+          dbdy_ref = ((bed_corners(1,1) * (-xquad(3-iq))) + &
+                      (bed_corners(2,2) * ( xquad(iq))))  + &
+                     ((bed_corners(2,1) * (-xquad(iq)))   + &
+                      (bed_corners(1,2) * ( xquad(3-iq))))
           dbdx_gp = dbdx_ref / a_qp
           dbdy_gp = dbdy_ref / d_qp
 
@@ -7839,10 +7839,16 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
   do j=1,nsub ; do i=1,nsub
     qp_dx(:,:,:,:) = 0.0 ; qp_dy(:,:,:,:) = 0.0
     do qy=1,2 ; do qx=1,2
+
+      y_marginal_1 = Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1)
+      y_marginal_2 = Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2)
+      x_marginal_1 = Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2)
+      x_marginal_2 = Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)
+
       ! Reference coords at the sub-qp: xi_sub = a_right(qx,i) - 0.5; marginal
       ! sum of Phisub over k for l=2 gives a_right(qx,i).
-      xi_sub  = (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)) - 0.5
-      eta_sub = (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2)) - 0.5
+      xi_sub  = x_marginal_2 - 0.5
+      eta_sub = y_marginal_2 - 0.5
 
       h_gp = max(h_shelf_cell + ((h_x_cell*xi_sub) + (h_y_cell*eta_sub)), CS%min_h_shelf)
 
@@ -7851,29 +7857,22 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
                ((Phisub(qx,qy,i,j,1,2)*bed_corners(1,2)) + (Phisub(qx,qy,i,j,2,1)*bed_corners(2,1)))
 
       ! Per-sub-qp metric via Phisub marginal sums (same pattern as CG_action_subgrid_basal).
-      a = (dxCv_S * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1))) + &
-          (dxCv_N * (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2)))
-      d = (dyCu_W * (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2))) + &
-          (dyCu_E * (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)))
+      a = (dxCv_S * y_marginal_1) + (dxCv_N * y_marginal_2)
+      d = (dyCu_W * x_marginal_1) + (dyCu_E * x_marginal_2)
       weight = 0.25 * subarea * (a * d)
-
-      y_marginal_1 = Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1)
-      y_marginal_2 = Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2)
-      x_marginal_1 = Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2)
-      x_marginal_2 = Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)
 
       dhdx_gp = h_x_cell / a
       dhdy_gp = h_y_cell / d
 
       ! Reference-coord bed gradients: derivative of bilinear corner-basis at sub-qp.
-      dbdx_ref = (((bed_corners(1,1) * (-(Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1)))) + &
-                   (bed_corners(2,2) * ( (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2))))) + &
-                  ((bed_corners(2,1) * ( (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1)))) + &
-                   (bed_corners(1,2) * (-(Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2))))))
-      dbdy_ref = (((bed_corners(1,1) * (-(Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2)))) + &
-                   (bed_corners(2,2) * ( (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2))))) + &
-                  ((bed_corners(2,1) * (-(Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)))) + &
-                   (bed_corners(1,2) * ( (Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2))))))
+      dbdx_ref = ((bed_corners(1,1) * -y_marginal_1)  + &
+                  (bed_corners(2,2) *  y_marginal_2)) + &
+                 ((bed_corners(2,1) *  y_marginal_1)  + &
+                  (bed_corners(1,2) * -y_marginal_2))
+      dbdy_ref = ((bed_corners(1,1) * -x_marginal_1)  + &
+                  (bed_corners(2,2) *  x_marginal_2)) + &
+                 ((bed_corners(2,1) * -x_marginal_2)  + &
+                  (bed_corners(1,2) *  x_marginal_1))
       dbdx_gp = dbdx_ref / a
       dbdy_gp = dbdy_ref / d
 
