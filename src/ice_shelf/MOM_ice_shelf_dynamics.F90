@@ -888,23 +888,25 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       call bilinear_shape_fn_grid(G, i, j, CS%Phi(:,:,i,j), CS%Jac(:,i,j))
     enddo ; enddo
 
-    ! Per-cell DG(1) metric scalars (separable Jacobian). Boundary-cell guards
-    ! mirror bilinear_shape_fn_grid: at the global southern/western edge there
-    ! is no south/west face to interpolate against, so a0/d0 collapses to the
-    ! single available face length and a1/d1 = 0.
+    ! Per-cell DG(1) metric scalars (separable Jacobian). Fallback uses the
+    ! single available face length when (a) the cell sits at the global
+    ! southern/western edge so there is no neighbor face to average against,
+    ! or (b) accessing J-1 / I-1 would fall outside the q-axis array bounds
+    ! (JsdB / IsdB), which can happen in the deepest south/west halo cell on
+    ! a nonsymmetric grid where JsdB=jsd, IsdB=isd.
     allocate(CS%a0_cell(isd:ied,jsd:jed), source=0.0)
     allocate(CS%a1_cell(isd:ied,jsd:jed), source=0.0)
     allocate(CS%d0_cell(isd:ied,jsd:jed), source=0.0)
     allocate(CS%d1_cell(isd:ied,jsd:jed), source=0.0)
     do j=G%jsd,G%jed ; do i=G%isd,G%ied
-      if (J>1) then
+      if ((J-1 >= G%JsdB) .and. (j + G%jdg_offset > G%jsg)) then
         CS%a0_cell(i,j) = 0.5*(G%dxCv(i,J-1) + G%dxCv(i,J))
         CS%a1_cell(i,j) = G%dxCv(i,J) - G%dxCv(i,J-1)
       else
         CS%a0_cell(i,j) = G%dxCv(i,J)
         CS%a1_cell(i,j) = 0.0
       endif
-      if (I>1) then
+      if ((I-1 >= G%IsdB) .and. (i + G%idg_offset > G%isg)) then
         CS%d0_cell(i,j) = 0.5*(G%dyCu(I-1,j) + G%dyCu(I,j))
         CS%d1_cell(i,j) = G%dyCu(I,j) - G%dyCu(I-1,j)
       else
@@ -5554,12 +5556,15 @@ subroutine bilinear_shape_fn_grid(G, i, j, Phi, Jac)
   yquad_m(1) = yquad(3) ; yquad_m(2) = yquad(4) ; yquad_m(3) = yquad(1) ; yquad_m(4) = yquad(2)
 
   do qpoint=1,4
-    if (J>1) then
+    ! Fallback uses the single available face length when at the global
+    ! south/west edge (no neighbor to interpolate against) or when J-1 / I-1
+    ! falls outside q-axis array bounds (nonsymmetric mode in deepest halo).
+    if ((J-1 >= G%JsdB) .and. (j + G%jdg_offset > G%jsg)) then
       a = (G%dxCv(i,J-1) * yquad_m(qpoint)) + (G%dxCv(i,J) * yquad(qpoint)) ! d(x)/d(x*)
     else
       a = G%dxCv(i,J) !* yquad(qpoint) ! d(x)/d(x*)
     endif
-    if (I>1) then
+    if ((I-1 >= G%IsdB) .and. (i + G%idg_offset > G%isg)) then
       d = (G%dyCu(I-1,j) * xquad_m(qpoint)) + (G%dyCu(I,j) * xquad(qpoint)) ! d(y)/d(y*)
     else
       d = G%dyCu(I,j) !* xquad(qpoint)
@@ -5612,15 +5617,17 @@ subroutine bilinear_shape_fn_grid_1qp(G, i, j, Phi)
   real :: xexp=0.5, yexp=0.5 ! [nondim]
   integer :: node, qpoint, xnode, ynode
 
-    ! d(x)/d(x*)
-    if (J>1) then
+    ! d(x)/d(x*). Fallback to the single available face length at the global
+    ! southern edge or when J-1 falls outside the q-axis array bounds (JsdB),
+    ! which can happen in the deepest south halo on a nonsymmetric grid.
+    if ((J-1 >= G%JsdB) .and. (j + G%jdg_offset > G%jsg)) then
       a = 0.5 * (G%dxCv(i,J-1) + G%dxCv(i,J))
     else
       a = G%dxCv(i,J)
     endif
 
-    ! d(y)/d(y*)
-    if (I>1) then
+    ! d(y)/d(y*). Same logic as above on the western edge / IsdB bound.
+    if ((I-1 >= G%IsdB) .and. (i + G%idg_offset > G%isg)) then
       d = 0.5 * (G%dyCu(I-1,j) + G%dyCu(I,j))
     else
       d = G%dyCu(I,j)
