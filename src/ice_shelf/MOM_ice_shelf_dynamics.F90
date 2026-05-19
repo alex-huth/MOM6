@@ -7933,8 +7933,8 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
       call sum_square_matrix(slope_y(qx,qy), slope_y_gp(:,:,qx,qy), nsub)
     enddo ; enddo
 
-    sx_shelf = 0.25*((slope_x(1,1)+slope_x(2,2)) + (slope_x(1,2)+slope_x(2,1)))/nsub
-    sy_shelf = 0.25*((slope_y(1,1)+slope_y(2,2)) + (slope_y(1,2)+slope_y(2,1)))/nsub
+    sx_shelf = 0.25 * ((slope_x(1,1)+slope_x(2,2)) + (slope_x(1,2)+slope_x(2,1))) * subarea
+    sy_shelf = 0.25 * ((slope_y(1,1)+slope_y(2,2)) + (slope_y(1,2)+slope_y(2,1))) * subarea
   endif
 
 end subroutine calc_shelf_driving_stress_DG_subgrid
