@@ -7333,7 +7333,11 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   real, dimension(2,2) :: cell_dx_node, cell_dy_node ! Per-corner total (volume +
                                            ! Neumann face) for this cell, indexed (m,n)
                                            ! [R L3 Z T-2 ~> kg m s-2]
-  real, dimension(2,2) :: slope_x_gp, slope_y_gp ! Per-QP surface slopes [Z L-1 ~> nondim]
+  real, dimension(2,2) :: slope_x_gp, slope_y_gp ! Per-QP surface slopes pre-multiplied by
+                                                 ! Jacobian a*d for physical-area weighting
+                                                 ! [Z L ~> m]
+  real, dimension(2,2) :: weight_gp ! Per-QP Jacobian a*d used for area-weighting slopes [L2 ~> m2]
+  real :: slope_w_sum ! Sum of per-QP Jacobian weights for slope average [L2 ~> m2]
   real, dimension(SZDIB_(G),SZDJB_(G),4) :: taudx_b, taudy_b
                                            !< Per-node 4-slot driving-stress
                                            !! accumulator, slot k indexed by which
@@ -7448,23 +7452,26 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             endif
           endif
 
-          ! For slope diagnostics
+          ! For slope diagnostics. Slope values are pre-multiplied by the per-QP
+          ! Jacobian a_qp*d_qp so the QP sum below is the physical-area integral;
+          ! we divide by the sum of those Jacobians to get the area-weighted mean.
           if (calc_slope_diag) then
+            weight_gp(iq,jq) = a_qp * d_qp
             if (CS%GL_couple) then
               if (CS%ground_frac(i,j)>0) then
-                slope_x_gp(iq,jq) = (1.0 - rhoi_rhow) * dhdx_gp
-                slope_y_gp(iq,jq) = (1.0 - rhoi_rhow) * dhdy_gp
+                slope_x_gp(iq,jq) = (1.0 - rhoi_rhow) * dhdx_gp * weight_gp(iq,jq)
+                slope_y_gp(iq,jq) = (1.0 - rhoi_rhow) * dhdy_gp * weight_gp(iq,jq)
               else
-                slope_x_gp(iq,jq) = dhdx_gp - dbdx_gp
-                slope_y_gp(iq,jq) = dhdy_gp - dbdy_gp
+                slope_x_gp(iq,jq) = (dhdx_gp - dbdx_gp) * weight_gp(iq,jq)
+                slope_y_gp(iq,jq) = (dhdy_gp - dbdy_gp) * weight_gp(iq,jq)
               endif
             else
               if (rhoi_rhow * h_gp - bed_gp <= 0.0) then
-                slope_x_gp(iq,jq) = (1.0 - rhoi_rhow) * dhdx_gp
-                slope_y_gp(iq,jq)= (1.0 - rhoi_rhow) * dhdy_gp
+                slope_x_gp(iq,jq) = (1.0 - rhoi_rhow) * dhdx_gp * weight_gp(iq,jq)
+                slope_y_gp(iq,jq) = (1.0 - rhoi_rhow) * dhdy_gp * weight_gp(iq,jq)
               else
-                slope_x_gp(iq,jq) = dhdx_gp - dbdx_gp
-                slope_y_gp(iq,jq) = dhdy_gp - dbdy_gp
+                slope_x_gp(iq,jq) = (dhdx_gp - dbdx_gp) * weight_gp(iq,jq)
+                slope_y_gp(iq,jq) = (dhdy_gp - dbdy_gp) * weight_gp(iq,jq)
               endif
             endif
           endif
@@ -7496,8 +7503,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
 
       if (calc_slope_diag) then
         if (.not. (CS%GL_regularize .and. CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0)) then
-          CS%sx_shelf(i,j) = 0.25*((slope_x_gp(1,1)+slope_x_gp(2,2)) + (slope_x_gp(1,2)+slope_x_gp(2,1)))
-          CS%sy_shelf(i,j) = 0.25*((slope_y_gp(1,1)+slope_y_gp(2,2)) + (slope_y_gp(1,2)+slope_y_gp(2,1)))
+          ! Physical-area-weighted mean: slope_*_gp already premultiplied by a*d
+          slope_w_sum = (weight_gp(1,1)+weight_gp(2,2)) + (weight_gp(1,2)+weight_gp(2,1))
+          CS%sx_shelf(i,j) = ((slope_x_gp(1,1)+slope_x_gp(2,2)) + (slope_x_gp(1,2)+slope_x_gp(2,1))) / slope_w_sum
+          CS%sy_shelf(i,j) = ((slope_y_gp(1,1)+slope_y_gp(2,2)) + (slope_y_gp(1,2)+slope_y_gp(2,1))) / slope_w_sum
         endif
       endif
 
@@ -7821,8 +7830,14 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
   logical :: calc_slope_diag !< True if slope diagnostics will be calculated
 
   real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: contr_sub_dx, contr_sub_dy
-  real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: slope_x_gp, slope_y_gp ! Per-QP surf slopes [Z L-1 ~> nondim]
-  real, dimension(2,2) :: slope_x, slope_y ! slope sums for qps with same position within subcells [Z L-1 ~> nondim]
+  real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: slope_x_gp, slope_y_gp ! Per-QP surf slopes
+                                                  ! pre-multiplied by Jacobian a*d for physical-area
+                                                  ! weighting [Z L ~> m]
+  real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: weight_gp ! Per-QP Jacobian a*d used for
+                                                  ! area-weighting slopes [L2 ~> m2]
+  real, dimension(2,2) :: slope_x, slope_y ! slope sums for qps with same position within subcells [Z L ~> m]
+  real, dimension(2,2) :: weight_sum_qp ! Jacobian weight sums per (qx,qy) [L2 ~> m2]
+  real :: slope_w_total ! Total Jacobian weight summed over all sub-QPs [L2 ~> m2]
   real, dimension(2,2,2,2) :: qp_dx, qp_dy
   real :: xi_sub, eta_sub   ! DG reference coords at sub-qp ([-0.5,0.5]) [nondim]
   real :: h_gp              ! Ice thickness at sub-qp [Z ~> m]
@@ -7872,14 +7887,14 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
       dhdy_gp = h_y_cell / d
 
       ! Reference-coord bed gradients: derivative of bilinear corner-basis at sub-qp.
-      dbdx_ref = ((bed_corners(1,1) * -y_marginal_1)  + &
-                  (bed_corners(2,2) *  y_marginal_2)) + &
-                 ((bed_corners(2,1) *  y_marginal_1)  + &
-                  (bed_corners(1,2) * -y_marginal_2))
-      dbdy_ref = ((bed_corners(1,1) * -x_marginal_1)  + &
-                  (bed_corners(2,2) *  x_marginal_2)) + &
-                 ((bed_corners(2,1) * -x_marginal_2)  + &
-                  (bed_corners(1,2) *  x_marginal_1))
+      dbdx_ref = ((bed_corners(1,1) * (-y_marginal_1))  + &
+                  (bed_corners(2,2) * ( y_marginal_2))) + &
+                 ((bed_corners(2,1) * ( y_marginal_1))  + &
+                  (bed_corners(1,2) * (-y_marginal_2)))
+      dbdy_ref = ((bed_corners(1,1) * (-x_marginal_1))  + &
+                  (bed_corners(2,2) * ( x_marginal_2))) + &
+                 ((bed_corners(2,1) * (-x_marginal_2))  + &
+                  (bed_corners(1,2) * ( x_marginal_1)))
       dbdx_gp = dbdx_ref / a
       dbdy_gp = dbdy_ref / d
 
@@ -7893,15 +7908,18 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
         bottom_force_y = rho * grav * h_gp * dbdy_gp
       endif
 
-      ! For slope diagnostics
+      ! For slope diagnostics. Pre-multiply by the per-sub-QP Jacobian a*d so the
+      ! sub-cell sum is a physical-area integral; divide by sum of Jacobians at
+      ! the end to get the area-weighted mean.
       if (calc_slope_diag) then
+        weight_gp(i,j,qx,qy) = a * d
         if (rhoi_rhow * h_gp - bed_gp <= 0.0) then
           ! Floating: bottom force is water pressure on the sloped draft
-          slope_x_gp(i,j,qx,qy) = (1.0 - rhoi_rhow) * dhdx_gp
-          slope_y_gp(i,j,qx,qy) = (1.0 - rhoi_rhow) * dhdy_gp
+          slope_x_gp(i,j,qx,qy) = (1.0 - rhoi_rhow) * dhdx_gp * weight_gp(i,j,qx,qy)
+          slope_y_gp(i,j,qx,qy) = (1.0 - rhoi_rhow) * dhdy_gp * weight_gp(i,j,qx,qy)
         else
-          slope_x_gp(i,j,qx,qy) = dhdx_gp - dbdx_gp
-          slope_y_gp(i,j,qx,qy) = dhdy_gp - dbdy_gp
+          slope_x_gp(i,j,qx,qy) = (dhdx_gp - dbdx_gp) * weight_gp(i,j,qx,qy)
+          slope_y_gp(i,j,qx,qy) = (dhdy_gp - dbdy_gp) * weight_gp(i,j,qx,qy)
         endif
       endif
 
@@ -7937,10 +7955,14 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
     do qy=1,2 ; do qx=1,2
       call sum_square_matrix(slope_x(qx,qy), slope_x_gp(:,:,qx,qy), nsub)
       call sum_square_matrix(slope_y(qx,qy), slope_y_gp(:,:,qx,qy), nsub)
+      call sum_square_matrix(weight_sum_qp(qx,qy), weight_gp(:,:,qx,qy), nsub)
     enddo ; enddo
 
-    sx_shelf = 0.25 * ((slope_x(1,1)+slope_x(2,2)) + (slope_x(1,2)+slope_x(2,1))) * subarea
-    sy_shelf = 0.25 * ((slope_y(1,1)+slope_y(2,2)) + (slope_y(1,2)+slope_y(2,1))) * subarea
+    ! Physical-area-weighted mean: slope_*_gp already premultiplied by a*d.
+    ! The 0.25 * subarea factor cancels between numerator and denominator.
+    slope_w_total = (weight_sum_qp(1,1)+weight_sum_qp(2,2)) + (weight_sum_qp(1,2)+weight_sum_qp(2,1))
+    sx_shelf = ((slope_x(1,1)+slope_x(2,2)) + (slope_x(1,2)+slope_x(2,1))) / slope_w_total
+    sy_shelf = ((slope_y(1,1)+slope_y(2,2)) + (slope_y(1,2)+slope_y(2,1))) / slope_w_total
   endif
 
 end subroutine calc_shelf_driving_stress_DG_subgrid
