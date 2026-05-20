@@ -801,30 +801,37 @@ pure subroutine project_corners_to_DG1_modal(a0, a1, d0, d1, SW, SE, NW, NE, Hba
   real, intent(out) :: c1  !< Monomial coefficient of xi.
   real, intent(out) :: c2  !< Monomial coefficient of eta.
 
-  real :: Pxm, Pxp, Qxm, Qxp ! 1D xi-integrals of d(xi) and xi*d(xi).
-  real :: Pym, Pyp, Qym, Qyp ! 1D eta-integrals of a(eta) and eta*a(eta).
-  real :: rhs0, rhs1, rhs2
-  real :: c0_unused          ! Monomial constant; consumer uses Hbar instead.
+  real :: Pxm, Pxp ! 1D xi-integrals of d(xi) over the lower/upper xi half.
+  real :: Pym, Pyp ! 1D eta-integrals of a(eta) over the lower/upper eta half.
+  real :: Qpx, Qpy ! Shifted-basis 1D slope-mode integrals (positive half only).
+  real :: rhs0, rhs1p, rhs2p
 
   Pxm = (0.5*d0) - (d1/12.0)
   Pxp = (0.5*d0) + (d1/12.0)
-  Qxm = (-d0/12.0) + (d1/24.0)
-  Qxp = (d0/12.0) + (d1/24.0)
-
   Pym = (0.5*a0) - (a1/12.0)
   Pyp = (0.5*a0) + (a1/12.0)
-  Qym = (-a0/12.0) + (a1/24.0)
-  Qyp = (a0/12.0) + (a1/24.0)
 
-  ! Diagonal + off-diagonal pairing in each rhs so the projection is bit-exact
-  ! under a 90 deg grid rotation (which permutes corners SW<->SE<->NE<->NW).
+  ! Shifted-basis 1D slope integrals: int over the upper xi/eta half of
+  ! (xi - alpha_1)*d(xi) and (eta - alpha_2)*a(eta), with the lower-half
+  ! integrals equal to -Qpx, -Qpy. Using the closed form avoids the
+  ! rhs - alpha*rhs0 cancellation that otherwise leaks ~1e-13 into c1/c2
+  ! from uniform corner inputs on non-rectangular cells.
+  Qpx = ((12.0*d0*d0) - (d1*d1)) / (144.0*d0)
+  Qpy = ((12.0*a0*a0) - (a1*a1)) / (144.0*a0)
+
+  ! Constant-mode RHS gives the cell-mean directly (rhs0 = Hbar*a0*d0).
   rhs0 = ((SW*(Pxm*Pym)) + (NE*(Pxp*Pyp))) + ((SE*(Pxp*Pym)) + (NW*(Pxm*Pyp)))
-  rhs1 = ((SW*(Qxm*Pym)) + (NE*(Qxp*Pyp))) + ((SE*(Qxp*Pym)) + (NW*(Qxm*Pyp)))
-  rhs2 = ((SW*(Pxm*Qym)) + (NE*(Pxp*Qyp))) + ((SE*(Pxp*Qym)) + (NW*(Pxm*Qyp)))
+  ! Antisymmetric pairing: corner differences across each face are multiplied
+  ! by the shared positive-half Q. Uniform corners project to zero exactly.
+  rhs1p = Qpx * (((NE - NW)*Pyp) + ((SE - SW)*Pym))
+  rhs2p = Qpy * (((NW - SW)*Pxm) + ((NE - SE)*Pxp))
 
-  call apply_DG1_inverse_mass(a0, a1, d0, d1, rhs0, rhs1, rhs2, c0_unused, c1, c2)
-  ! Convert monomial c0 to area-weighted cell mean Hbar.
-  Hbar = c0_unused + ((d1/(12.0*d0))*c1) + ((a1/(12.0*a0))*c2)
+  Hbar = rhs0 / (a0*d0)
+  ! Diagonal shifted-basis sub-system: Mtilde_11 = a0*Qpx, Mtilde_22 = d0*Qpy.
+  ! Slope coefficients c1, c2 equal their shifted-basis counterparts (no back-
+  ! transform shift needed for the slope DOFs).
+  c1 = rhs1p / (a0*Qpx)
+  c2 = rhs2p / (d0*Qpy)
 
 end subroutine project_corners_to_DG1_modal
 
