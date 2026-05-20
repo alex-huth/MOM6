@@ -3806,7 +3806,8 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
 
         !Stress (Neumann) boundary conditions
         if (CS%ground_frac(i,j) == 1) then
-          neumann_val = ((.5 * grav) * (rho * max(ISS%h_shelf(i,j),CS%min_h_shelf)**2 - rhow * CS%bed_elev(i,j)**2))
+          neumann_val = ((.5 * grav) * (rho * max(ISS%h_shelf(i,j),CS%min_h_shelf)**2 - &
+                                        rhow * max(0.0, CS%bed_elev(i,j))**2))
         else
           neumann_val = (.5 * grav) * ((1-rho/rhow) * (rho * max(ISS%h_shelf(i,j),CS%min_h_shelf)**2))
         endif
@@ -7576,8 +7577,9 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   logical :: calc_slope_diag ! True if slope diagnostics will be calculated
   logical :: loc_is_bc       ! True if local cell has hmask==3 (Dirichlet thickness BC)
   logical :: ngh_is_bc       ! True if neighbor cell has hmask==3 (Dirichlet thickness BC)
-  logical :: is_global_wall  ! True if the face is at a non-reentrant global boundary that is
-                             ! not flagged as an ocean Neumann BC (i.e. a velocity-Dirichlet wall)
+  logical :: is_wall         ! True if the face is a velocity-Dirichlet wall (non-reentrant
+                             ! global boundary, or explicit face_mask_bdry zero-normal-velocity
+                             ! code), not flagged as a Neumann BC
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -7659,7 +7661,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
           dbdy_gp = dbdy_ref / d_qp
 
           if (CS%GL_couple) then
-            if (CS%ground_frac(i,j)>0) then
+            if (CS%ground_frac(i,j)<1) then
               bottom_force_x = (rho**2 / rhow) * grav * h_gp * dhdx_gp
               bottom_force_y = (rho**2 / rhow) * grav * h_gp * dhdy_gp
             else
@@ -7682,7 +7684,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
           if (calc_slope_diag) then
             weight_gp(iq,jq) = a_qp * d_qp
             if (CS%GL_couple) then
-              if (CS%ground_frac(i,j)>0) then
+              if (CS%ground_frac(i,j)<1) then
                 slope_x_gp(iq,jq) = (1.0 - rhoi_rhow) * dhdx_gp * weight_gp(iq,jq)
                 slope_y_gp(iq,jq) = (1.0 - rhoi_rhow) * dhdy_gp * weight_gp(iq,jq)
               else
@@ -7772,7 +7774,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       is_ext_bdry = ((CS%u_face_mask_bdry(I-1,j) == 2) .or. &
                     ((ISS%hmask(i-1,j) == 0 .or. ISS%hmask(i-1,j) == 2) .and. &
                      (CS%reentrant_x .or. (i+i_off /= gisc))))
-      is_global_wall = (.not. CS%reentrant_x) .and. (i+i_off == gisc) .and. (.not. is_ext_bdry)
+      is_wall = (.not. is_ext_bdry) .and. ( &
+                  ((.not. CS%reentrant_x) .and. (i+i_off == gisc)) .or. &
+                  (int(CS%u_face_mask_bdry(I-1,j)) == 3) .or. &
+                  (int(CS%u_face_mask_bdry(I-1,j)) == 5) )
 
       do gp_face=1,2
         t_face = xquad(gp_face)
@@ -7786,9 +7791,9 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         endif
 
         if (is_ext_bdry) then
-          d_ocean = min(b_loc, rhoi_rhow * h_loc)
+          d_ocean = max(0.0, min(b_loc, rhoi_rhow * h_loc))
           P_star = 0.5 * grav * rhow * d_ocean**2
-        else if (is_global_wall) then
+        else if (is_wall) then
           ! Velocity-Dirichlet global wall: mirror the volume-integral pressure
           ! (full rho*g*h^2/2, matching p_term_vol) so the IBP face term cancels
           ! the local volume term. P_loc carries the (1-rhoi_rhow) floating
@@ -7844,7 +7849,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       is_ext_bdry = ((CS%u_face_mask_bdry(I,j) == 2) .or. &
                     ((ISS%hmask(i+1,j) == 0 .or. ISS%hmask(i+1,j) == 2) .and. &
                      (CS%reentrant_x .or. (i+i_off /= giec))))
-      is_global_wall = (.not. CS%reentrant_x) .and. (i+i_off == giec) .and. (.not. is_ext_bdry)
+      is_wall = (.not. is_ext_bdry) .and. ( &
+                  ((.not. CS%reentrant_x) .and. (i+i_off == giec)) .or. &
+                  (int(CS%u_face_mask_bdry(I,j)) == 3) .or. &
+                  (int(CS%u_face_mask_bdry(I,j)) == 5) )
 
       do gp_face=1,2
         t_face = xquad(gp_face)
@@ -7858,9 +7866,9 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         endif
 
         if (is_ext_bdry) then
-          d_ocean = min(b_loc, rhoi_rhow * h_loc)
+          d_ocean = max(0.0, min(b_loc, rhoi_rhow * h_loc))
           P_star = 0.5 * grav * rhow * d_ocean**2
-        else if (is_global_wall) then
+        else if (is_wall) then
           ! Velocity-Dirichlet global wall: mirror the volume-integral pressure
           ! (full rho*g*h^2/2, matching p_term_vol) so the IBP face term cancels
           ! the local volume term. P_loc carries the (1-rhoi_rhow) floating
@@ -7916,7 +7924,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       is_ext_bdry = ((CS%v_face_mask_bdry(i,J-1) == 2) .or. &
                     ((ISS%hmask(i,j-1) == 0 .or. ISS%hmask(i,j-1) == 2) .and. &
                      (CS%reentrant_y .or. (j+j_off /= gjsc))))
-      is_global_wall = (.not. CS%reentrant_y) .and. (j+j_off == gjsc) .and. (.not. is_ext_bdry)
+      is_wall = (.not. is_ext_bdry) .and. ( &
+                  ((.not. CS%reentrant_y) .and. (j+j_off == gjsc)) .or. &
+                  (int(CS%v_face_mask_bdry(i,J-1)) == 3) .or. &
+                  (int(CS%v_face_mask_bdry(i,J-1)) == 5) )
 
       do gp_face=1,2
         t_face = xquad(gp_face)
@@ -7930,9 +7941,9 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         endif
 
         if (is_ext_bdry) then
-          d_ocean = min(b_loc, rhoi_rhow * h_loc)
+          d_ocean = max(0.0, min(b_loc, rhoi_rhow * h_loc))
           P_star = 0.5 * grav * rhow * d_ocean**2
-        else if (is_global_wall) then
+        else if (is_wall) then
           ! Velocity-Dirichlet global wall: mirror the volume-integral pressure
           ! (full rho*g*h^2/2, matching p_term_vol) so the IBP face term cancels
           ! the local volume term. P_loc carries the (1-rhoi_rhow) floating
@@ -7988,7 +7999,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       is_ext_bdry = ((CS%v_face_mask_bdry(i,J) == 2) .or. &
                     ((ISS%hmask(i,j+1) == 0 .or. ISS%hmask(i,j+1) == 2) .and. &
                      (CS%reentrant_y .or. (j+j_off /= gjec))))
-      is_global_wall = (.not. CS%reentrant_y) .and. (j+j_off == gjec) .and. (.not. is_ext_bdry)
+      is_wall = (.not. is_ext_bdry) .and. ( &
+                  ((.not. CS%reentrant_y) .and. (j+j_off == gjec)) .or. &
+                  (int(CS%v_face_mask_bdry(i,J)) == 3) .or. &
+                  (int(CS%v_face_mask_bdry(i,J)) == 5) )
 
       do gp_face=1,2
         t_face = xquad(gp_face)
@@ -8002,9 +8016,9 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         endif
 
         if (is_ext_bdry) then
-          d_ocean = min(b_loc, rhoi_rhow * h_loc)
+          d_ocean = max(0.0, min(b_loc, rhoi_rhow * h_loc))
           P_star = 0.5 * grav * rhow * d_ocean**2
-        else if (is_global_wall) then
+        else if (is_wall) then
           ! Velocity-Dirichlet global wall: mirror the volume-integral pressure
           ! (full rho*g*h^2/2, matching p_term_vol) so the IBP face term cancels
           ! the local volume term. P_loc carries the (1-rhoi_rhow) floating
@@ -8196,8 +8210,18 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
         dphi_dx = dphi_dx_ref / a
         dphi_dy = dphi_dy_ref / d
 
-        qp_dx(qx,qy,m,n) = (weight * dphi_dx * p_term_vol) + (weight * Phisub(qx,qy,i,j,m,n) * bottom_force_x)
-        qp_dy(qx,qy,m,n) = (weight * dphi_dy * p_term_vol) + (weight * Phisub(qx,qy,i,j,m,n) * bottom_force_y)
+        ! Geometric correction for the IBP pressure term on non-rectangular (e.g. lat/lon)
+        ! elements. On a bilinear element, a(eta) = dxCv_S*(1-eta) + dxCv_N*eta varies with
+        ! eta, so the reference-space IBP of P*d(phi)/deta requires an extra term
+        ! P*phi*da/deta to satisfy the discrete divergence theorem. Without it, constant P
+        ! gives a spurious metric-dependent driving stress on lat/lon grids. The 0.25*subarea
+        ! factor equals weight/(a*d), converting the reference-space integral to the nodal sum.
+        qp_dx(qx,qy,m,n) = (weight * dphi_dx * p_term_vol) &
+                          + (weight * Phisub(qx,qy,i,j,m,n) * bottom_force_x) &
+                          + (0.25 * subarea * Phisub(qx,qy,i,j,m,n) * p_term_vol * (dyCu_E - dyCu_W))
+        qp_dy(qx,qy,m,n) = (weight * dphi_dy * p_term_vol) &
+                          + (weight * Phisub(qx,qy,i,j,m,n) * bottom_force_y) &
+                          + (0.25 * subarea * Phisub(qx,qy,i,j,m,n) * p_term_vol * (dxCv_N - dxCv_S))
       enddo ; enddo
 
     enddo ; enddo
