@@ -7789,9 +7789,12 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
           d_ocean = min(b_loc, rhoi_rhow * h_loc)
           P_star = 0.5 * grav * rhow * d_ocean**2
         else if (is_global_wall) then
-          ! Velocity-Dirichlet global wall: mirror P across face so the IBP
-          ! face term cancels the local volume term (well-balance).
-          P_star = P_loc
+          ! Velocity-Dirichlet global wall: mirror the volume-integral pressure
+          ! (full rho*g*h^2/2, matching p_term_vol) so the IBP face term cancels
+          ! the local volume term. P_loc carries the (1-rhoi_rhow) floating
+          ! factor, so mirroring P_loc here would leave a rhoi_rhow*full_P
+          ! residual at the boundary nodes.
+          P_star = 0.5 * grav * rho * h_loc**2
         else
           h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
           b_ngh = (1.0 - t_face)*b_ngh_A + t_face*b_ngh_B
@@ -7858,9 +7861,12 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
           d_ocean = min(b_loc, rhoi_rhow * h_loc)
           P_star = 0.5 * grav * rhow * d_ocean**2
         else if (is_global_wall) then
-          ! Velocity-Dirichlet global wall: mirror P across face so the IBP
-          ! face term cancels the local volume term (well-balance).
-          P_star = P_loc
+          ! Velocity-Dirichlet global wall: mirror the volume-integral pressure
+          ! (full rho*g*h^2/2, matching p_term_vol) so the IBP face term cancels
+          ! the local volume term. P_loc carries the (1-rhoi_rhow) floating
+          ! factor, so mirroring P_loc here would leave a rhoi_rhow*full_P
+          ! residual at the boundary nodes.
+          P_star = 0.5 * grav * rho * h_loc**2
         else
           h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
           b_ngh = (1.0 - t_face)*b_ngh_A + t_face*b_ngh_B
@@ -7927,9 +7933,12 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
           d_ocean = min(b_loc, rhoi_rhow * h_loc)
           P_star = 0.5 * grav * rhow * d_ocean**2
         else if (is_global_wall) then
-          ! Velocity-Dirichlet global wall: mirror P across face so the IBP
-          ! face term cancels the local volume term (well-balance).
-          P_star = P_loc
+          ! Velocity-Dirichlet global wall: mirror the volume-integral pressure
+          ! (full rho*g*h^2/2, matching p_term_vol) so the IBP face term cancels
+          ! the local volume term. P_loc carries the (1-rhoi_rhow) floating
+          ! factor, so mirroring P_loc here would leave a rhoi_rhow*full_P
+          ! residual at the boundary nodes.
+          P_star = 0.5 * grav * rho * h_loc**2
         else
           h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
           b_ngh = (1.0 - t_face)*b_ngh_A + t_face*b_ngh_B
@@ -7996,9 +8005,12 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
           d_ocean = min(b_loc, rhoi_rhow * h_loc)
           P_star = 0.5 * grav * rhow * d_ocean**2
         else if (is_global_wall) then
-          ! Velocity-Dirichlet global wall: mirror P across face so the IBP
-          ! face term cancels the local volume term (well-balance).
-          P_star = P_loc
+          ! Velocity-Dirichlet global wall: mirror the volume-integral pressure
+          ! (full rho*g*h^2/2, matching p_term_vol) so the IBP face term cancels
+          ! the local volume term. P_loc carries the (1-rhoi_rhow) floating
+          ! factor, so mirroring P_loc here would leave a rhoi_rhow*full_P
+          ! residual at the boundary nodes.
+          P_star = 0.5 * grav * rho * h_loc**2
         else
           h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
           b_ngh = (1.0 - t_face)*b_ngh_A + t_face*b_ngh_B
