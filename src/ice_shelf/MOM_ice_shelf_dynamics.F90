@@ -7711,8 +7711,16 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             dphi_dx = dphi_dx_ref / a_qp
             dphi_dy = dphi_dy_ref / d_qp
 
-            qp_dx(iq,jq,m,n) = (weight * dphi_dx * p_term_vol) + (weight * phi_val * bottom_force_x)
-            qp_dy(iq,jq,m,n) = (weight * dphi_dy * p_term_vol) + (weight * phi_val * bottom_force_y)
+            ! Geometric correction for the IBP pressure term on non-rectangular (e.g. lat/lon)
+            ! elements. On a bilinear element, a(eta) = dxCv_S*(1-eta) + dxCv_N*eta varies with
+            ! eta, so the reference-space IBP of P*d(phi)/deta requires an extra term
+            ! P*phi*da/deta to satisfy the discrete divergence theorem. Without it, constant P
+            ! gives a spurious metric-dependent driving stress on lat/lon grids. The 0.25 factor
+            ! equals weight/(a_qp*d_qp), converting the reference-space integral to the nodal sum.
+            qp_dx(iq,jq,m,n) = (weight * ((dphi_dx * p_term_vol) + (phi_val * bottom_force_x))) &
+                              + (0.25 * phi_val * p_term_vol * (dyCu_E - dyCu_W))
+            qp_dy(iq,jq,m,n) = (weight * ((dphi_dy * p_term_vol) + (phi_val * bottom_force_y))) &
+                              + (0.25 * phi_val * p_term_vol * (dxCv_N - dxCv_S))
           enddo ; enddo
 
         enddo ; enddo
