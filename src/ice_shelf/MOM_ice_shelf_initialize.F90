@@ -535,13 +535,13 @@ subroutine initialize_bed_node_from_file(bed_node, bed_elev, G, US, PF)
   ! bilinear corner-node interpolant on the separable-Jacobian element.
   ! Uniform cells collapse to bed_elev = 0.25*sum(corners) bit-exactly.
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
-    if (J>1) then
+    if ((J-1 >= G%JsdB) .and. (j + G%jdg_offset > G%jsg)) then
       a0 = 0.5*(G%dxCv(i,J-1) + G%dxCv(i,J))
       a1 = G%dxCv(i,J) - G%dxCv(i,J-1)
     else
       a0 = G%dxCv(i,J) ; a1 = 0.0
     endif
-    if (I>1) then
+    if ((I-1 >= G%IsdB) .and. (i + G%idg_offset > G%isg)) then
       d0 = 0.5*(G%dyCu(I-1,j) + G%dyCu(I,j))
       d1 = G%dyCu(I,j) - G%dyCu(I-1,j)
     else
@@ -662,13 +662,13 @@ subroutine initialize_DG_thickness_from_node_file(h_shelf, h_x, h_y, hmask, used
     if (hmask(i,j)==0) then
       h_shelf(i,j)=0.; h_x(i,j)=0.; h_y(i,j)=0.
     else
-      if (J>1) then
+      if ((J-1 >= G%JsdB) .and. (j + G%jdg_offset > G%jsg)) then
         a0 = 0.5*(G%dxCv(i,J-1) + G%dxCv(i,J))
         a1 = G%dxCv(i,J) - G%dxCv(i,J-1)
       else
         a0 = G%dxCv(i,J) ; a1 = 0.0
       endif
-      if (I>1) then
+      if ((I-1 >= G%IsdB) .and. (i + G%idg_offset > G%isg)) then
         d0 = 0.5*(G%dyCu(I-1,j) + G%dyCu(I,j))
         d1 = G%dyCu(I,j) - G%dyCu(I-1,j)
       else
