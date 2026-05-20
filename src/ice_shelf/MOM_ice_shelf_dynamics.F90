@@ -7576,6 +7576,8 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   logical :: calc_slope_diag ! True if slope diagnostics will be calculated
   logical :: loc_is_bc       ! True if local cell has hmask==3 (Dirichlet thickness BC)
   logical :: ngh_is_bc       ! True if neighbor cell has hmask==3 (Dirichlet thickness BC)
+  logical :: is_global_wall  ! True if the face is at a non-reentrant global boundary that is
+                             ! not flagged as an ocean Neumann BC (i.e. a velocity-Dirichlet wall)
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -7770,6 +7772,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       is_ext_bdry = ((CS%u_face_mask_bdry(I-1,j) == 2) .or. &
                     ((ISS%hmask(i-1,j) == 0 .or. ISS%hmask(i-1,j) == 2) .and. &
                      (CS%reentrant_x .or. (i+i_off /= gisc))))
+      is_global_wall = (.not. CS%reentrant_x) .and. (i+i_off == gisc) .and. (.not. is_ext_bdry)
 
       do gp_face=1,2
         t_face = xquad(gp_face)
@@ -7785,6 +7788,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         if (is_ext_bdry) then
           d_ocean = min(b_loc, rhoi_rhow * h_loc)
           P_star = 0.5 * grav * rhow * d_ocean**2
+        else if (is_global_wall) then
+          ! Velocity-Dirichlet global wall: mirror P across face so the IBP
+          ! face term cancels the local volume term (well-balance).
+          P_star = P_loc
         else
           h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
           b_ngh = (1.0 - t_face)*b_ngh_A + t_face*b_ngh_B
@@ -7834,6 +7841,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       is_ext_bdry = ((CS%u_face_mask_bdry(I,j) == 2) .or. &
                     ((ISS%hmask(i+1,j) == 0 .or. ISS%hmask(i+1,j) == 2) .and. &
                      (CS%reentrant_x .or. (i+i_off /= giec))))
+      is_global_wall = (.not. CS%reentrant_x) .and. (i+i_off == giec) .and. (.not. is_ext_bdry)
 
       do gp_face=1,2
         t_face = xquad(gp_face)
@@ -7849,6 +7857,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         if (is_ext_bdry) then
           d_ocean = min(b_loc, rhoi_rhow * h_loc)
           P_star = 0.5 * grav * rhow * d_ocean**2
+        else if (is_global_wall) then
+          ! Velocity-Dirichlet global wall: mirror P across face so the IBP
+          ! face term cancels the local volume term (well-balance).
+          P_star = P_loc
         else
           h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
           b_ngh = (1.0 - t_face)*b_ngh_A + t_face*b_ngh_B
@@ -7898,6 +7910,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       is_ext_bdry = ((CS%v_face_mask_bdry(i,J-1) == 2) .or. &
                     ((ISS%hmask(i,j-1) == 0 .or. ISS%hmask(i,j-1) == 2) .and. &
                      (CS%reentrant_y .or. (j+j_off /= gjsc))))
+      is_global_wall = (.not. CS%reentrant_y) .and. (j+j_off == gjsc) .and. (.not. is_ext_bdry)
 
       do gp_face=1,2
         t_face = xquad(gp_face)
@@ -7913,6 +7926,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         if (is_ext_bdry) then
           d_ocean = min(b_loc, rhoi_rhow * h_loc)
           P_star = 0.5 * grav * rhow * d_ocean**2
+        else if (is_global_wall) then
+          ! Velocity-Dirichlet global wall: mirror P across face so the IBP
+          ! face term cancels the local volume term (well-balance).
+          P_star = P_loc
         else
           h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
           b_ngh = (1.0 - t_face)*b_ngh_A + t_face*b_ngh_B
@@ -7962,6 +7979,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       is_ext_bdry = ((CS%v_face_mask_bdry(i,J) == 2) .or. &
                     ((ISS%hmask(i,j+1) == 0 .or. ISS%hmask(i,j+1) == 2) .and. &
                      (CS%reentrant_y .or. (j+j_off /= gjec))))
+      is_global_wall = (.not. CS%reentrant_y) .and. (j+j_off == gjec) .and. (.not. is_ext_bdry)
 
       do gp_face=1,2
         t_face = xquad(gp_face)
@@ -7977,6 +7995,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         if (is_ext_bdry) then
           d_ocean = min(b_loc, rhoi_rhow * h_loc)
           P_star = 0.5 * grav * rhow * d_ocean**2
+        else if (is_global_wall) then
+          ! Velocity-Dirichlet global wall: mirror P across face so the IBP
+          ! face term cancels the local volume term (well-balance).
+          P_star = P_loc
         else
           h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
           b_ngh = (1.0 - t_face)*b_ngh_A + t_face*b_ngh_B
