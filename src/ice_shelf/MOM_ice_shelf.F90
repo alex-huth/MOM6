@@ -55,7 +55,8 @@ use MOM_get_input, only : directories, Get_MOM_input
 use MOM_EOS, only : calculate_density, calculate_density_derivs, calculate_TFreeze, EOS_domain
 use MOM_EOS, only : EOS_type, EOS_init
 use MOM_ice_shelf_dynamics, only : ice_shelf_dyn_CS, update_ice_shelf, write_ice_shelf_energy
-use MOM_ice_shelf_dynamics, only : clear_DG_slopes_at_cell, clear_DG_slopes_bulk
+use MOM_ice_shelf_dynamics, only : reset_DG_to_cellmean_at_cell, reset_DG_to_cellmean_bulk
+use MOM_ice_shelf_dynamics, only : accumulate_DG_source_rate
 use MOM_ice_shelf_dynamics, only : register_ice_shelf_dyn_restarts, initialize_ice_shelf_dyn
 use MOM_ice_shelf_dynamics, only : ice_shelf_min_thickness_calve, change_in_draft
 use MOM_ice_shelf_dynamics, only : ice_time_step_CFL, ice_shelf_dyn_end, IS_dynamics_post_data
@@ -1241,7 +1242,26 @@ subroutine change_thickness_using_melt(CS, ISS, G, US, time_step, fluxes)
       if (associated(fluxes%salt_flux)) fluxes%salt_flux(i,j) = 0.0
 
       if (ISS%water_flux(i,j) * time_step * I_rho_ice < ISS%h_shelf(i,j)) then
+        ! On the DG path, this direct h_shelf update is a transient: the same
+        ! mass change will be applied through h_nodal inside the next DG advect
+        ! step (see accumulate_DG_source_rate below), and recompute_h_shelf_from_nodal
+        ! will then overwrite h_shelf with the post-advect nodal mean for hmask=1
+        ! and hmask=3 cells. The update is kept for two reasons: (1) the dh_bdott
+        ! diagnostic snapshot captures the change here; (2) the non-DG path uses
+        ! h_shelf as the authoritative state. Intermediate consumers between this
+        ! point and the DG advect (mass_shelf recompute, mass_ba snapshot, debug
+        ! hchksum) all read the intermediate value as intended.
         ISS%h_shelf(i,j) = ISS%h_shelf(i,j) - ISS%water_flux(i,j) * time_step * I_rho_ice
+        ! DG path: accumulate the cell-mean ablation rate (negative for melt) into
+        ! the source buffer so the next DG advect picks it up as a Q1 nodal RHS
+        ! source inside the SSP-RK2 stages. Restricted to hmask=1 cells, matching
+        ! the cells the DG advect actually updates; hmask=2 cells stay on the
+        ! direct h_shelf path above and are not touched by the DG source pipeline.
+        ! No-op when DG is inactive.
+        if (ISS%hmask(i,j) == 1) then
+          call accumulate_DG_source_rate(CS%dCS, i, j, &
+                  -ISS%water_flux(i,j) * I_rho_ice)
+        endif
       else
         ! The ice is about to ablate. If allowing cells to fully melt, set thickness, area, and mask to zero
         ! and scale the fluxes. If NOT allowing cells to fully melt, set the fluxes to zero
@@ -1255,7 +1275,7 @@ subroutine change_thickness_using_melt(CS, ISS, G, US, time_step, fluxes)
           ISS%h_shelf(i,j) = 0.0
           ISS%hmask(i,j) = 0.0
           ISS%area_shelf_h(i,j) = 0.0
-          call clear_DG_slopes_at_cell(CS%dCS, i, j)
+          call reset_DG_to_cellmean_at_cell(CS%dCS, i, j, 0.0)
           count=count+1
         else
           ISS%water_flux(i,j)=0.0
@@ -2134,7 +2154,7 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
   ISS%mass_shelf(:,:)=0.0
   ISS%mass_hole=0.0
   ISS%tot_flux_inout = 0.0
-  call clear_DG_slopes_bulk(CS%dCS)
+  call reset_DG_to_cellmean_bulk(CS%dCS)
 
   if (CS%override_shelf_movement .and. CS%mass_from_file) then
 
@@ -2733,7 +2753,23 @@ subroutine change_thickness_using_precip(CS, ISS, G, US, fluxes, time_step, Time
     if ((ISS%hmask(i,j) == 1) .or. (ISS%hmask(i,j) == 2 .and. ISS%h_shelf(i,j) > 0)) then
 
       if (-fluxes%shelf_sfc_mass_flux(i,j) * time_step * I_rho_ice  < ISS%h_shelf(i,j)) then
+        ! On the DG path, this direct h_shelf update is a transient: the same
+        ! mass change will be applied through h_nodal inside the next DG advect
+        ! step (see accumulate_DG_source_rate below), and recompute_h_shelf_from_nodal
+        ! will then overwrite h_shelf with the post-advect nodal mean for hmask=1
+        ! and hmask=3 cells. The update is kept for the dh_adott diagnostic
+        ! snapshot and for the non-DG path where h_shelf is authoritative.
         ISS%h_shelf(i,j) = ISS%h_shelf(i,j) + fluxes%shelf_sfc_mass_flux(i,j) * time_step * I_rho_ice
+        ! DG path: accumulate the cell-mean surface mass-balance rate into the
+        ! source buffer (positive = accumulation, negative = ablation). The
+        ! source is later consumed by the SSP-RK2 stages of the DG advect step
+        ! via a continuous Q1 nodal projection. Restricted to hmask=1 cells to
+        ! match the cells the DG advect updates; hmask=2 cells stay on the
+        ! direct h_shelf path. No-op when DG is inactive.
+        if (ISS%hmask(i,j) == 1) then
+          call accumulate_DG_source_rate(CS%dCS, i, j, &
+                  fluxes%shelf_sfc_mass_flux(i,j) * I_rho_ice)
+        endif
       else
         ! The ice is about to ablate. If allowing cells to fully melt, set thickness, area, and mask to zero,
         ! and send excess ablation to the hole. If NOT allowing cells to fully melt,
@@ -2744,7 +2780,7 @@ subroutine change_thickness_using_precip(CS, ISS, G, US, fluxes, time_step, Time
          ISS%h_shelf(i,j) = 0.0
          ISS%hmask(i,j) = 0.0
          ISS%area_shelf_h(i,j) = 0.0
-         call clear_DG_slopes_at_cell(CS%dCS, i, j)
+         call reset_DG_to_cellmean_at_cell(CS%dCS, i, j, 0.0)
          count=count+1
         else
          ISS%mass_hole = ISS%mass_hole + fluxes%shelf_sfc_mass_flux(i,j) * time_step * ISS%area_shelf_h(i,j)

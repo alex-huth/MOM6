@@ -23,11 +23,7 @@ public initialize_ice_thickness
 public initialize_ice_shelf_boundary_channel
 public initialize_ice_flow_from_file
 public initialize_bed_node_from_file
-public initialize_DG_thickness_slopes_from_file
 public initialize_DG_thickness_from_node_file
-public apply_DG1_inverse_mass
-public apply_DG1_inverse_mass_meanslope
-public project_corners_to_DG1_modal
 public initialize_ice_shelf_boundary_from_file
 public initialize_ice_C_basal_friction
 public initialize_ice_AGlen
@@ -510,7 +506,7 @@ subroutine initialize_bed_node_from_file(bed_node, bed_elev, G, US, PF)
   character(len=200) :: bed_node_varname
   character(len=40)  :: mdl = "initialize_bed_node_from_file"
   real :: a0, a1, d0, d1   ! Per-cell metric scalars [L ~> m].
-  real :: c1_unused, c2_unused ! Discarded modal slopes.
+  real :: Pxm, Pxp, Pym, Pyp ! 1D half-cell integrals of d(xi) and a(eta) [L ~> m].
   integer :: i, j
 
   call get_param(PF, mdl, "INPUTDIR", inputdir, default=".", do_not_log=.true.)
@@ -547,76 +543,33 @@ subroutine initialize_bed_node_from_file(bed_node, bed_elev, G, US, PF)
     else
       d0 = G%dyCu(I,j) ; d1 = 0.0
     endif
-    call project_corners_to_DG1_modal(a0, a1, d0, d1, &
-                                      bed_node(I-1,J-1), bed_node(I,J-1), &
-                                      bed_node(I-1,J  ), bed_node(I,J  ), &
-                                      bed_elev(i,j), c1_unused, c2_unused)
+    ! Area-weighted cell mean of the bilinear corner-node interpolant on the
+    ! separable-Jacobian element. Pxm/Pxp/Pym/Pyp are 1D half-cell integrals
+    ! of d(xi) and a(eta). On uniform cells Pxm=Pxp=d0/2, Pym=Pyp=a0/2, so
+    ! bed_elev collapses to 0.25*sum(corners).
+    Pxm = (0.5*d0) - (d1/12.0)
+    Pxp = (0.5*d0) + (d1/12.0)
+    Pym = (0.5*a0) - (a1/12.0)
+    Pyp = (0.5*a0) + (a1/12.0)
+    bed_elev(i,j) = ( ((bed_node(I-1,J-1)*(Pxm*Pym)) + (bed_node(I,J)*(Pxp*Pyp))) + &
+                      ((bed_node(I,J-1)  *(Pxp*Pym)) + (bed_node(I-1,J)*(Pxm*Pyp))) ) / (a0*d0)
   enddo ; enddo
   call pass_var(bed_elev, G%domain)
 
 end subroutine initialize_bed_node_from_file
 
-!> Optionally read DG(1) cell-mean thickness slopes h_x, h_y from
-!! ICE_THICKNESS_FILE. Returns slopes_set=.true. when both DG_HX_VARNAME and
-!! DG_HY_VARNAME are present in the file; otherwise leaves h_x, h_y untouched
-!! and returns slopes_set=.false. so the caller can fall back to its own
-!! seeding (e.g. centred-FD of neighbour means).
-subroutine initialize_DG_thickness_slopes_from_file(h_x, h_y, slopes_set, G, US, PF)
-  type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(inout) :: h_x !< Cell-mean DG(1) x-slope DOF [Z ~> m].
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(inout) :: h_y !< Cell-mean DG(1) y-slope DOF [Z ~> m].
-  logical,                intent(out)   :: slopes_set !< True if h_x and h_y were read from file.
-  type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
-  type(param_file_type),  intent(in)    :: PF !< A structure to parse for run-time parameters
-
-  character(len=200) :: filename, inputdir, thickness_file
-  character(len=200) :: hx_varname, hy_varname
-  character(len=40)  :: mdl = "initialize_DG_thickness_slopes_from_file"
-
-  slopes_set = .false.
-
-  call get_param(PF, mdl, "INPUTDIR", inputdir, default=".", do_not_log=.true.)
-  inputdir = slasher(inputdir)
-  call get_param(PF, mdl, "ICE_THICKNESS_FILE", thickness_file, &
-                 default="ice_shelf_h.nc", do_not_log=.true.)
-  call get_param(PF, mdl, "DG_HX_VARNAME", hx_varname, &
-                 "The name of the DG(1) cell-mean x-slope variable in "//&
-                 "ICE_THICKNESS_FILE. If both DG_HX_VARNAME and DG_HY_VARNAME "//&
-                 "fields are present in the file, they are used as initial DG "//&
-                 "thickness slopes (skipping the centred-FD seed and slope limiter, "//&
-                 "mirroring restart behaviour).", &
-                 default="h_x")
-  call get_param(PF, mdl, "DG_HY_VARNAME", hy_varname, &
-                 "The name of the DG(1) cell-mean y-slope variable in ICE_THICKNESS_FILE.", &
-                 default="h_y")
-
-  filename = trim(inputdir)//trim(thickness_file)
-  if (.not.file_exists(filename, G%Domain)) return
-  if (.not.field_exists(filename, trim(hx_varname), MOM_domain=G%Domain)) return
-  if (.not.field_exists(filename, trim(hy_varname), MOM_domain=G%Domain)) return
-
-  call MOM_read_data(filename, trim(hx_varname), h_x, G%Domain, scale=US%m_to_Z)
-  call MOM_read_data(filename, trim(hy_varname), h_y, G%Domain, scale=US%m_to_Z)
-  slopes_set = .true.
-
-end subroutine initialize_DG_thickness_slopes_from_file
-
 !> Optionally read nodal (B-grid corner) ice thickness from ICE_THICKNESS_FILE
-!! and use it to derive both the cell-mean h_shelf and the DG(1) cell-mean
-!! slopes h_x, h_y via a bilinear node fit. Returns used=.true. when the
-!! nodal field is present and consumed; otherwise leaves h_shelf, h_x, h_y
-!! untouched so the caller can fall back to the cell-mean read and centred-FD
-!! slope seed. The nodal field is consumed locally and not retained.
-subroutine initialize_DG_thickness_from_node_file(h_shelf, h_x, h_y, hmask, used, G, US, PF)
+!! and use it to populate the nodal Q1 DG thickness h_nodal and the
+!! area-weighted cell mean h_shelf. Returns used=.true. when the nodal field
+!! is present and consumed; otherwise leaves h_shelf, h_nodal untouched so the
+!! caller can fall back to area-weighted seeding from neighbour cell means.
+!! The nodal file is consumed locally and not retained beyond initialization.
+subroutine initialize_DG_thickness_from_node_file(h_shelf, h_nodal, hmask, used, G, US, PF)
   type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
   real, dimension(SZDI_(G),SZDJ_(G)), &
                           intent(inout) :: h_shelf !< Cell-mean ice thickness [Z ~> m].
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(inout) :: h_x !< Cell-mean DG(1) x-slope DOF [Z ~> m].
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(inout) :: h_y !< Cell-mean DG(1) y-slope DOF [Z ~> m].
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), &
+                          intent(inout) :: h_nodal !< Q1 nodal thickness at 4 cell corners [Z ~> m].
   real, dimension(SZDI_(G),SZDJ_(G)), &
                          intent(in) :: hmask !< A mask indicating which tracer points are
                                              !! partly or fully covered by an ice-shelf [nondim]
@@ -629,6 +582,7 @@ subroutine initialize_DG_thickness_from_node_file(h_shelf, h_x, h_y, hmask, used
   character(len=200) :: node_varname
   character(len=40)  :: mdl = "initialize_DG_thickness_from_node_file"
   real :: a0, a1, d0, d1   ! Per-cell metric scalars [L ~> m].
+  real :: Pxm, Pxp, Pym, Pyp ! 1D half-cell integrals of d(xi) and a(eta) [L ~> m].
   integer :: i, j
 
   used = .false.
@@ -640,10 +594,9 @@ subroutine initialize_DG_thickness_from_node_file(h_shelf, h_x, h_y, hmask, used
   call get_param(PF, mdl, "ICE_THICKNESS_NODE_VARNAME", node_varname, &
                  "The name of the nodal (B-grid corner) ice thickness variable in "//&
                  "ICE_THICKNESS_FILE. If present and USE_DG_THICKNESS=True, the field "//&
-                 "is read and used to derive both the cell-mean h_shelf and the DG(1) "//&
-                 "thickness slopes h_x, h_y via a bilinear node fit, skipping the "//&
-                 "centred-FD slope seed and slope limiter. The nodal field is not "//&
-                 "retained after initialization.", &
+                 "is read and used directly as the nodal Q1 DG thickness h_nodal; "//&
+                 "the cell mean h_shelf is set to the area-weighted mean of the four "//&
+                 "corners. The nodal file is not retained after initialization.", &
                  default="h_shelf_node")
 
   filename = trim(inputdir)//trim(thickness_file)
@@ -655,13 +608,18 @@ subroutine initialize_DG_thickness_from_node_file(h_shelf, h_x, h_y, hmask, used
                      position=CORNER, scale=US%m_to_Z)
   call pass_var(h_node, G%domain, position=CORNER)
 
-  ! Exact projection of the bilinear node interpolant onto the DG(1) monomial
-  ! basis {1, xi, eta} with weight a(eta)*d(xi). Uniform cells reduce to the
-  ! 0.25/0.5/0.5 formulas bit-exactly.
+  ! Assign nodal H directly to the 4 DG corners per cell, then take the
+  ! area-weighted cell mean of the bilinear-from-corners interpolant.
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
     if (hmask(i,j)==0) then
-      h_shelf(i,j)=0.; h_x(i,j)=0.; h_y(i,j)=0.
+      h_shelf(i,j) = 0.0
+      h_nodal(i,j,:,:) = 0.0
     else
+      h_nodal(i,j,1,1) = h_node(I-1, J-1)
+      h_nodal(i,j,2,1) = h_node(I,   J-1)
+      h_nodal(i,j,1,2) = h_node(I-1, J  )
+      h_nodal(i,j,2,2) = h_node(I,   J  )
+
       if ((J-1 >= G%JsdB) .and. (j + G%jdg_offset > G%jsg)) then
         a0 = 0.5*(G%dxCv(i,J-1) + G%dxCv(i,J))
         a1 = G%dxCv(i,J) - G%dxCv(i,J-1)
@@ -674,10 +632,14 @@ subroutine initialize_DG_thickness_from_node_file(h_shelf, h_x, h_y, hmask, used
       else
         d0 = G%dyCu(I,j) ; d1 = 0.0
       endif
-      call project_corners_to_DG1_modal(a0, a1, d0, d1, &
-        h_node(I-1,J-1), h_node(I,J-1), &
-        h_node(I-1,J  ), h_node(I,J  ), &
-        h_shelf(i,j), h_x(i,j), h_y(i,j))
+      ! Area-weighted cell mean of the bilinear-from-corners interpolant on a
+      ! separable-Jacobian element. Uniform cells collapse to 0.25*sum(corners).
+      Pxm = (0.5*d0) - (d1/12.0)
+      Pxp = (0.5*d0) + (d1/12.0)
+      Pym = (0.5*a0) - (a1/12.0)
+      Pyp = (0.5*a0) + (a1/12.0)
+      h_shelf(i,j) = ( ((h_nodal(i,j,1,1)*(Pxm*Pym)) + (h_nodal(i,j,2,2)*(Pxp*Pyp))) + &
+                       ((h_nodal(i,j,2,1)*(Pxp*Pym)) + (h_nodal(i,j,1,2)*(Pxm*Pyp))) ) / (a0*d0)
     endif
   enddo ; enddo
 
@@ -685,155 +647,6 @@ subroutine initialize_DG_thickness_from_node_file(h_shelf, h_x, h_y, hmask, used
   used = .true.
 
 end subroutine initialize_DG_thickness_from_node_file
-
-!> Apply M_monomial^{-1} to a 3-vector of DG(1) right-hand-sides via the
-!! tensor-product Gram-Schmidt shifted-orthogonal basis. M is the DG(1) mass
-!! matrix on a separable-Jacobian element with weight a(eta)*d(xi), where
-!! a(eta) = a0 + a1*eta and d(xi) = d0 + d1*xi on xi,eta in [-1/2, 1/2].
-!! Input rhs0,rhs1,rhs2 are the unscaled volume-integral RHS components in
-!! the monomial basis {1, xi, eta}. Output c0,c1,c2 are the corresponding
-!! monomial coefficients of the DG polynomial. On uniform cells (a1=d1=0)
-!! this collapses bit-exactly to c0 = rhs0/(a0*d0), c1 = 12*rhs1/(a0*d0),
-!! c2 = 12*rhs2/(a0*d0).
-!! Retained for the bilinear-corner projection in project_corners_to_DG1_modal;
-!! the DG advect step instead calls apply_DG1_inverse_mass_meanslope.
-pure subroutine apply_DG1_inverse_mass(a0, a1, d0, d1, rhs0, rhs1, rhs2, c0, c1, c2)
-  real, intent(in)  :: a0   !< Cell-mean x metric (dxCv_S + dxCv_N)/2 [L ~> m]
-  real, intent(in)  :: a1   !< Cell x-metric anisotropy dxCv_N - dxCv_S [L ~> m]
-  real, intent(in)  :: d0   !< Cell-mean y metric (dyCu_W + dyCu_E)/2 [L ~> m]
-  real, intent(in)  :: d1   !< Cell y-metric anisotropy dyCu_E - dyCu_W [L ~> m]
-  real, intent(in)  :: rhs0 !< Volume-integral RHS for the {1} basis [Z L2 T-1 ~> m3 s-1]
-  real, intent(in)  :: rhs1 !< Volume-integral RHS for the {xi} basis [Z L2 T-1 ~> m3 s-1]
-  real, intent(in)  :: rhs2 !< Volume-integral RHS for the {eta} basis [Z L2 T-1 ~> m3 s-1]
-  real, intent(out) :: c0   !< Monomial coefficient of 1 [Z T-1 ~> m s-1]
-  real, intent(out) :: c1   !< Monomial coefficient of xi [Z T-1 ~> m s-1]
-  real, intent(out) :: c2   !< Monomial coefficient of eta [Z T-1 ~> m s-1]
-
-  real :: alpha_1, alpha_2 ! Shift parameters of the orthogonal basis [nondim].
-  real :: Mtilde_00, Mtilde_11, Mtilde_22 ! Diagonal entries of the shifted mass matrix.
-  real :: rhs0p, rhs1p, rhs2p ! Shifted-basis RHS components.
-  real :: c0p, c1p, c2p ! Shifted-basis coefficients.
-
-  alpha_1 = d1 / (12.0 * d0)
-  alpha_2 = a1 / (12.0 * a0)
-
-  Mtilde_00 = a0 * d0
-  Mtilde_11 = a0 * ((12.0*d0*d0) - (d1*d1)) / (144.0 * d0)
-  Mtilde_22 = d0 * ((12.0*a0*a0) - (a1*a1)) / (144.0 * a0)
-
-  ! Forward affine transform to shifted basis.
-  rhs0p = rhs0
-  rhs1p = rhs1 - (alpha_1 * rhs0)
-  rhs2p = rhs2 - (alpha_2 * rhs0)
-
-  ! Diagonal scale.
-  c0p = rhs0p / Mtilde_00
-  c1p = rhs1p / Mtilde_11
-  c2p = rhs2p / Mtilde_22
-
-  ! Back transform to monomial coefficients.
-  c0 = c0p - ((alpha_1 * c1p) + (alpha_2 * c2p))
-  c1 = c1p
-  c2 = c2p
-
-end subroutine apply_DG1_inverse_mass
-
-!> Apply M^{-1} to the DG(1) volume-integral RHS, returning the time
-!! rates of the area-weighted cell mean Hbar and the monomial slope
-!! coefficients c1, c2. The cell-mean rate decouples exactly from the
-!! slope rates: dHbar/dt = rhs0 / (a0*d0). Slope rates come from the
-!! shifted-orthogonal sub-system without back-transform.
-!! On uniform cells (a1=d1=0) this collapses bit-exactly to
-!! dHbar/dt = rhs0/(a0*d0), dc1/dt = 12*rhs1/(a0*d0), dc2/dt = 12*rhs2/(a0*d0).
-pure subroutine apply_DG1_inverse_mass_meanslope(a0, a1, d0, d1, rhs0, rhs1, rhs2, &
-                                                 dHbar_dt, dc1_dt, dc2_dt)
-  real, intent(in)  :: a0   !< Cell-mean x metric (dxCv_S + dxCv_N)/2 [L ~> m]
-  real, intent(in)  :: a1   !< Cell x-metric anisotropy dxCv_N - dxCv_S [L ~> m]
-  real, intent(in)  :: d0   !< Cell-mean y metric (dyCu_W + dyCu_E)/2 [L ~> m]
-  real, intent(in)  :: d1   !< Cell y-metric anisotropy dyCu_E - dyCu_W [L ~> m]
-  real, intent(in)  :: rhs0 !< Volume-integral RHS for the {1} basis [Z L2 T-1 ~> m3 s-1]
-  real, intent(in)  :: rhs1 !< Volume-integral RHS for the {xi} basis [Z L2 T-1 ~> m3 s-1]
-  real, intent(in)  :: rhs2 !< Volume-integral RHS for the {eta} basis [Z L2 T-1 ~> m3 s-1]
-  real, intent(out) :: dHbar_dt !< Time rate of the cell mean [Z T-1 ~> m s-1]
-  real, intent(out) :: dc1_dt   !< Time rate of monomial xi coefficient [Z T-1 ~> m s-1]
-  real, intent(out) :: dc2_dt   !< Time rate of monomial eta coefficient [Z T-1 ~> m s-1]
-
-  real :: alpha_1, alpha_2  ! Shifted-basis parameters [nondim].
-  real :: Mtilde_11, Mtilde_22 ! Diagonal entries of shifted mass matrix.
-
-  alpha_1 = d1 / (12.0 * d0)
-  alpha_2 = a1 / (12.0 * a0)
-
-  Mtilde_11 = a0 * ((12.0*d0*d0) - (d1*d1)) / (144.0 * d0)
-  Mtilde_22 = d0 * ((12.0*a0*a0) - (a1*a1)) / (144.0 * a0)
-
-  ! Row 0 of M*c_dot = rhs gives dHbar/dt directly:
-  !   a0*d0*c0_dot + (a0*d1/12)*c1_dot + (a1*d0/12)*c2_dot = rhs0
-  !   c0_dot + alpha_1*c1_dot + alpha_2*c2_dot = rhs0/(a0*d0) = dHbar/dt
-  dHbar_dt = rhs0 / (a0*d0)
-  ! Slope rates from the shifted-orthogonal sub-system. In the shifted basis
-  ! {1, xi-alpha_1, eta-alpha_2}, c1, c2 equal their shifted-basis counterparts
-  ! (no back-transform shift needed for the slope DOFs).
-  dc1_dt = (rhs1 - (alpha_1*rhs0)) / Mtilde_11
-  dc2_dt = (rhs2 - (alpha_2*rhs0)) / Mtilde_22
-
-end subroutine apply_DG1_inverse_mass_meanslope
-
-!> Exact projection of bilinear corner-node values onto DG(1) on a
-!! separable-Jacobian element, returning the area-weighted cell mean Hbar
-!! and the monomial slope coefficients c1, c2 in
-!! h(xi,eta) = c0 + c1*xi + c2*eta with c0 = Hbar - alpha_1*c1 - alpha_2*c2,
-!! alpha_1 = d1/(12*d0), alpha_2 = a1/(12*a0). Corner values are at the
-!! four reference corners (xi, eta) = (-1/2, -1/2), (+1/2, -1/2),
-!! (-1/2, +1/2), (+1/2, +1/2) for (SW, SE, NW, NE). On uniform cells
-!! (a1=d1=0) this collapses bit-exactly to Hbar = 0.25*sum(corners),
-!! c1 = 0.5*((SE+NE)-(SW+NW)), c2 = 0.5*((NW+NE)-(SW+SE)).
-pure subroutine project_corners_to_DG1_modal(a0, a1, d0, d1, SW, SE, NW, NE, Hbar, c1, c2)
-  real, intent(in)  :: a0  !< Cell-mean x metric [L ~> m].
-  real, intent(in)  :: a1  !< Cell x-metric anisotropy [L ~> m].
-  real, intent(in)  :: d0  !< Cell-mean y metric [L ~> m].
-  real, intent(in)  :: d1  !< Cell y-metric anisotropy [L ~> m].
-  real, intent(in)  :: SW  !< Corner value at (xi,eta)=(-1/2,-1/2) [<value units>].
-  real, intent(in)  :: SE  !< Corner value at (xi,eta)=(+1/2,-1/2) [<value units>].
-  real, intent(in)  :: NW  !< Corner value at (xi,eta)=(-1/2,+1/2) [<value units>].
-  real, intent(in)  :: NE  !< Corner value at (xi,eta)=(+1/2,+1/2) [<value units>].
-  real, intent(out) :: Hbar !< Area-weighted cell mean [<value units>].
-  real, intent(out) :: c1  !< Monomial coefficient of xi.
-  real, intent(out) :: c2  !< Monomial coefficient of eta.
-
-  real :: Pxm, Pxp ! 1D xi-integrals of d(xi) over the lower/upper xi half.
-  real :: Pym, Pyp ! 1D eta-integrals of a(eta) over the lower/upper eta half.
-  real :: Qpx, Qpy ! Shifted-basis 1D slope-mode integrals (positive half only).
-  real :: rhs0, rhs1p, rhs2p
-
-  Pxm = (0.5*d0) - (d1/12.0)
-  Pxp = (0.5*d0) + (d1/12.0)
-  Pym = (0.5*a0) - (a1/12.0)
-  Pyp = (0.5*a0) + (a1/12.0)
-
-  ! Shifted-basis 1D slope integrals: int over the upper xi/eta half of
-  ! (xi - alpha_1)*d(xi) and (eta - alpha_2)*a(eta), with the lower-half
-  ! integrals equal to -Qpx, -Qpy. Using the closed form avoids the
-  ! rhs - alpha*rhs0 cancellation that otherwise leaks ~1e-13 into c1/c2
-  ! from uniform corner inputs on non-rectangular cells.
-  Qpx = ((12.0*d0*d0) - (d1*d1)) / (144.0*d0)
-  Qpy = ((12.0*a0*a0) - (a1*a1)) / (144.0*a0)
-
-  ! Constant-mode RHS gives the cell-mean directly (rhs0 = Hbar*a0*d0).
-  rhs0 = ((SW*(Pxm*Pym)) + (NE*(Pxp*Pyp))) + ((SE*(Pxp*Pym)) + (NW*(Pxm*Pyp)))
-  ! Antisymmetric pairing: corner differences across each face are multiplied
-  ! by the shared positive-half Q. Uniform corners project to zero exactly.
-  rhs1p = Qpx * (((NE - NW)*Pyp) + ((SE - SW)*Pym))
-  rhs2p = Qpy * (((NW - SW)*Pxm) + ((NE - SE)*Pxp))
-
-  Hbar = rhs0 / (a0*d0)
-  ! Diagonal shifted-basis sub-system: Mtilde_11 = a0*Qpx, Mtilde_22 = d0*Qpy.
-  ! Slope coefficients c1, c2 equal their shifted-basis counterparts (no back-
-  ! transform shift needed for the slope DOFs).
-  c1 = rhs1p / (a0*Qpx)
-  c2 = rhs2p / (d0*Qpy)
-
-end subroutine project_corners_to_DG1_modal
 
 !> Initialize ice shelf b.c.s from file
 subroutine initialize_ice_shelf_boundary_from_file(u_face_mask_bdry, v_face_mask_bdry, &
