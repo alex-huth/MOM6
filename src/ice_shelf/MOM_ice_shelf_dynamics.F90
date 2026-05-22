@@ -152,6 +152,9 @@ type, public :: ice_shelf_dyn_CS ; private
                                                        !! Consumed inside ice_shelf_advect_DG1_nodal: projected
                                                        !! to a continuous Q1 nodal source field and added to
                                                        !! each SSP-RK2 stage RHS. Reset to zero after consumption.
+  real, pointer, dimension(:,:) :: h_source_rate_last => NULL() !< Snapshot of h_source_rate as consumed by the
+                                                       !! most recent DG advect step [Z T-1 ~> m s-1], kept for
+                                                       !! diagnostic posting after h_source_rate has been zeroed.
   real, pointer, dimension(:,:) :: C_basal_friction => NULL()!< Coefficient in sliding law tau_b = C u^(n_basal_fric),
                                !! units of [R L Z T-2 (s m-1)^(n_basal_fric) ~> Pa (s m-1)^(n_basal_fric)]
   real, pointer, dimension(:,:) :: coef_prefactor => NULL() !< Pre-computed area*C_basal_friction*L_T_to_m_s for
@@ -343,6 +346,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_visc_shelf = -1, id_taub = -1, &
              id_bed_node = -1, &
              id_h_nodal_SW = -1, id_h_nodal_SE = -1, id_h_nodal_NW = -1, id_h_nodal_NE = -1, &
+             id_h_jump_face = -1, id_h_source_rate = -1, &
              id_phi_lim_DG = -1, &
              id_phi_x_FV = -1, id_phi_y_FV = -1
   real, pointer, dimension(:,:) :: phi_lim_DG => NULL() !< Nodal DG(1) limiter factor at last advection
@@ -497,6 +501,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%Minv_eta(isd:ied,jsd:jed,1:2,1:2), source=0.0)
     allocate(CS%cell_mean_w(isd:ied,jsd:jed,1:2,1:2), source=0.0)
     allocate(CS%h_source_rate(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%h_source_rate_last(isd:ied,jsd:jed), source=0.0)
     allocate(CS%phi_lim_DG(isd:ied,jsd:jed), source=1.0)
     allocate(CS%phi_x_FV(IsdB:IedB,jsd:jed), source=1.0)
     allocate(CS%phi_y_FV(isd:ied,JsdB:JedB), source=1.0)
@@ -1115,6 +1120,12 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          'DG(1) nodal Q1 thickness at NW cell corner', 'm', conversion=US%Z_to_m)
       CS%id_h_nodal_NE = register_diag_field('ice_shelf_model','h_nodal_NE',CS%diag%axesT1, Time, &
          'DG(1) nodal Q1 thickness at NE cell corner', 'm', conversion=US%Z_to_m)
+      CS%id_h_jump_face = register_diag_field('ice_shelf_model','h_jump_face',CS%diag%axesT1, Time, &
+         'DG(1) max |h_L - h_R| inter-element trace jump across the 4 cell faces (hmask=1 only)', &
+         'm', conversion=US%Z_to_m)
+      CS%id_h_source_rate = register_diag_field('ice_shelf_model','h_source_rate',CS%diag%axesT1, Time, &
+         'Cell-mean thickness source rate (basal melt + surface SMB) consumed by the last DG advect step', &
+         'm s-1', conversion=US%Z_to_m*US%s_to_T)
       CS%id_phi_lim_DG = register_diag_field('ice_shelf_model','phi_lim_DG',CS%diag%axesT1, Time, &
          'Nodal DG(1) limiter factor at end-of-timestep (1=no clip, 0=full clip)', 'nondim')
     else
@@ -1376,6 +1387,9 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
                                                   !! [R L T-1 ~> Pa s m-1]
   real, dimension(SZDI_(G),SZDJ_(G))   :: surf_slope ! the surface slope of the ice shelf/sheet [nondim]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: ice_speed ! ice sheet flow speed [L T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G))   :: h_jump  ! max DG(1) inter-element trace jump across the 4
+                                                  !! cell faces [Z ~> m], 0 outside hmask=1 ice cells
+  real :: jmp                                     ! single-face corner jump [Z ~> m]
 
   integer :: i, j
 
@@ -1431,6 +1445,43 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
     if (CS%id_h_nodal_SE > 0) call post_data(CS%id_h_nodal_SE, CS%h_nodal(:,:,2,1), CS%diag)
     if (CS%id_h_nodal_NW > 0) call post_data(CS%id_h_nodal_NW, CS%h_nodal(:,:,1,2), CS%diag)
     if (CS%id_h_nodal_NE > 0) call post_data(CS%id_h_nodal_NE, CS%h_nodal(:,:,2,2), CS%diag)
+    if (CS%id_h_jump_face > 0 .and. associated(CS%h_nodal)) then
+      h_jump(:,:) = 0.0
+      do j=G%jsc,G%jec ; do i=G%isc,G%iec
+        if (ISS%hmask(i,j) /= 1.0) cycle
+        ! East face (cell i,j corners SE,NE) <-> (cell i+1,j corners SW,NW).
+        if (ISS%hmask(i+1,j) == 1.0) then
+          jmp = abs(CS%h_nodal(i,j,2,1) - CS%h_nodal(i+1,j,1,1))
+          if (jmp > h_jump(i,j)) h_jump(i,j) = jmp
+          jmp = abs(CS%h_nodal(i,j,2,2) - CS%h_nodal(i+1,j,1,2))
+          if (jmp > h_jump(i,j)) h_jump(i,j) = jmp
+        endif
+        ! West face: (cell i-1,j SE,NE) <-> (cell i,j SW,NW).
+        if (ISS%hmask(i-1,j) == 1.0) then
+          jmp = abs(CS%h_nodal(i-1,j,2,1) - CS%h_nodal(i,j,1,1))
+          if (jmp > h_jump(i,j)) h_jump(i,j) = jmp
+          jmp = abs(CS%h_nodal(i-1,j,2,2) - CS%h_nodal(i,j,1,2))
+          if (jmp > h_jump(i,j)) h_jump(i,j) = jmp
+        endif
+        ! North face: (cell i,j NW,NE) <-> (cell i,j+1 SW,SE).
+        if (ISS%hmask(i,j+1) == 1.0) then
+          jmp = abs(CS%h_nodal(i,j,1,2) - CS%h_nodal(i,j+1,1,1))
+          if (jmp > h_jump(i,j)) h_jump(i,j) = jmp
+          jmp = abs(CS%h_nodal(i,j,2,2) - CS%h_nodal(i,j+1,2,1))
+          if (jmp > h_jump(i,j)) h_jump(i,j) = jmp
+        endif
+        ! South face: (cell i,j-1 NW,NE) <-> (cell i,j SW,SE).
+        if (ISS%hmask(i,j-1) == 1.0) then
+          jmp = abs(CS%h_nodal(i,j-1,1,2) - CS%h_nodal(i,j,1,1))
+          if (jmp > h_jump(i,j)) h_jump(i,j) = jmp
+          jmp = abs(CS%h_nodal(i,j-1,2,2) - CS%h_nodal(i,j,2,1))
+          if (jmp > h_jump(i,j)) h_jump(i,j) = jmp
+        endif
+      enddo ; enddo
+      call post_data(CS%id_h_jump_face, h_jump, CS%diag)
+    endif
+    if (CS%id_h_source_rate > 0 .and. associated(CS%h_source_rate_last)) &
+        call post_data(CS%id_h_source_rate, CS%h_source_rate_last, CS%diag)
     if (CS%id_phi_lim_DG > 0 .and. associated(CS%phi_lim_DG)) &
         call post_data(CS%id_phi_lim_DG, CS%phi_lim_DG, CS%diag)
     if (CS%id_phi_x_FV > 0 .and. associated(CS%phi_x_FV)) &
@@ -5948,6 +5999,7 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%Minv_eta)) deallocate(CS%Minv_eta)
   if (associated(CS%cell_mean_w)) deallocate(CS%cell_mean_w)
   if (associated(CS%h_source_rate)) deallocate(CS%h_source_rate)
+  if (associated(CS%h_source_rate_last)) deallocate(CS%h_source_rate_last)
   if (associated(CS%phi_lim_DG)) deallocate(CS%phi_lim_DG)
   if (associated(CS%phi_x_FV)) deallocate(CS%phi_x_FV)
   if (associated(CS%phi_y_FV)) deallocate(CS%phi_y_FV)
@@ -8065,8 +8117,9 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   enddo ; enddo
   call pass_corner_field(CS%h_nodal, G)
 
-  ! Source consumed: reset the buffer so subsequent melt/SMB callers start
-  ! from a clean slate for the next advect step.
+  ! Snapshot the rate just consumed for the h_source_rate diagnostic, then
+  ! reset the buffer so subsequent melt/SMB callers start from a clean slate.
+  CS%h_source_rate_last(:,:) = CS%h_source_rate(:,:)
   CS%h_source_rate(:,:) = 0.0
 
   ! Final limit (captures phi_lim_DG diagnostic).
