@@ -7051,6 +7051,127 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
 
 end subroutine calc_shelf_driving_stress_DG
 
+!> Accumulate the ice-front Neumann face contribution for one face of one
+!! element into the per-corner accumulators face_A, face_B. Used by the
+!! strong-form driving stress at external (ocean) boundary faces.
+!! Integrand at each face Gauss point:
+!!   face_sign * 1/2 * face_length * phi * (P_ice - P_ocean)
+!! where P_ice = 1/2 rho g h^2 and P_ocean = 1/2 rhow g d_ocean^2.
+!! face_sign is the outward unit-normal component on the relevant axis
+!! (-1 on W/S faces, +1 on E/N faces) and absorbs the n-dot-axis sign.
+subroutine add_strong_ice_front_face(face_length, face_sign, &
+    h_corner_A, h_corner_B, b_corner_A, b_corner_B, &
+    h_bdry_val, loc_is_bc, rho, rhow, rhoi_rhow, grav, min_h_shelf, &
+    xquad, face_A, face_B)
+  real, intent(in)    :: face_length      !< Face length [L ~> m]
+  real, intent(in)    :: face_sign        !< +1 or -1, outward unit-normal component [nondim]
+  real, intent(in)    :: h_corner_A       !< h_nodal at face endpoint A [Z ~> m]
+  real, intent(in)    :: h_corner_B       !< h_nodal at face endpoint B [Z ~> m]
+  real, intent(in)    :: b_corner_A       !< bed depth at face endpoint A [Z ~> m]
+  real, intent(in)    :: b_corner_B       !< bed depth at face endpoint B [Z ~> m]
+  real, intent(in)    :: h_bdry_val       !< Dirichlet thickness BC value [Z ~> m]
+  logical, intent(in) :: loc_is_bc        !< True to override corner h with h_bdry_val
+  real, intent(in)    :: rho              !< Ice density [R ~> kg m-3]
+  real, intent(in)    :: rhow             !< Ocean density [R ~> kg m-3]
+  real, intent(in)    :: rhoi_rhow        !< rho / rhow [nondim]
+  real, intent(in)    :: grav             !< Gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
+  real, intent(in)    :: min_h_shelf      !< Lower clamp on h [Z ~> m]
+  real, dimension(2), intent(in) :: xquad !< 2-point Gauss-Legendre nodes on [0,1] [nondim]
+  real, intent(inout) :: face_A           !< Accumulator for corner A [R L3 Z T-2 ~> kg m s-2]
+  real, intent(inout) :: face_B           !< Accumulator for corner B [R L3 Z T-2 ~> kg m s-2]
+
+  real :: h_A, h_B, b_A, b_B
+  real :: t_face, h_loc, b_loc
+  real :: P_ice, d_ocean, P_ocean, P_face, phi_A, phi_B
+  integer :: gp_face
+
+  h_A = max(h_corner_A, min_h_shelf)
+  h_B = max(h_corner_B, min_h_shelf)
+  if (loc_is_bc) then
+    h_A = max(h_bdry_val, min_h_shelf) ; h_B = h_A
+  endif
+  b_A = b_corner_A ; b_B = b_corner_B
+
+  do gp_face = 1, 2
+    t_face = xquad(gp_face)
+    h_loc = (1.0 - t_face)*h_A + t_face*h_B
+    b_loc = (1.0 - t_face)*b_A + t_face*b_B
+    P_ice = 0.5 * grav * rho * h_loc**2
+    d_ocean = max(0.0, min(b_loc, rhoi_rhow * h_loc))
+    P_ocean = 0.5 * grav * rhow * d_ocean**2
+    P_face = P_ice - P_ocean
+    phi_A = 1.0 - t_face ; phi_B = t_face
+    face_A = face_A + face_sign * 0.5 * face_length * phi_A * P_face
+    face_B = face_B + face_sign * 0.5 * face_length * phi_B * P_face
+  enddo
+end subroutine add_strong_ice_front_face
+
+!> Accumulate the mixed-form scale-aware interior face flux for one face of
+!! one element into the per-corner accumulators face_A, face_B. Used by the
+!! strong-form driving stress at interior hmask=1 / hmask=1 faces when
+!! K_thresh > 0. Integrand at each face Gauss point:
+!!   face_sign * 1/4 * face_length * phi * s * (P_loc - P_ngh)
+!! where s = r^2 / (r^2 + K^2), r = |h_loc - h_ngh| / max(h_avg, eps), and
+!! P_loc/P_ngh use the per-side flotation-branched form. The 1/4 prefactor
+!! is the product of the 1/2 Gauss weight on [0,1] and the 1/2 from
+!! "P_loc - P_star" with central P_star = 1/2(P_loc + P_ngh).
+subroutine add_strong_mixed_interior_face(face_length, face_sign, &
+    h_loc_A, h_loc_B, h_ngh_A, h_ngh_B, b_corner_A, b_corner_B, &
+    K_thresh, rho, rhow, rhoi_rhow, grav, min_h_shelf, &
+    xquad, face_A, face_B)
+  real, intent(in)    :: face_length      !< Face length [L ~> m]
+  real, intent(in)    :: face_sign        !< +1 or -1, outward unit-normal component [nondim]
+  real, intent(in)    :: h_loc_A          !< Local-cell h_nodal at face endpoint A [Z ~> m]
+  real, intent(in)    :: h_loc_B          !< Local-cell h_nodal at face endpoint B [Z ~> m]
+  real, intent(in)    :: h_ngh_A          !< Neighbour-cell h_nodal at face endpoint A [Z ~> m]
+  real, intent(in)    :: h_ngh_B          !< Neighbour-cell h_nodal at face endpoint B [Z ~> m]
+  real, intent(in)    :: b_corner_A       !< bed depth at face endpoint A [Z ~> m]
+  real, intent(in)    :: b_corner_B       !< bed depth at face endpoint B [Z ~> m]
+  real, intent(in)    :: K_thresh         !< Venkatakrishnan-style threshold [nondim]
+  real, intent(in)    :: rho              !< Ice density [R ~> kg m-3]
+  real, intent(in)    :: rhow             !< Ocean density [R ~> kg m-3]
+  real, intent(in)    :: rhoi_rhow        !< rho / rhow [nondim]
+  real, intent(in)    :: grav             !< Gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
+  real, intent(in)    :: min_h_shelf      !< Lower clamp on h [Z ~> m]
+  real, dimension(2), intent(in) :: xquad !< 2-point Gauss-Legendre nodes on [0,1] [nondim]
+  real, intent(inout) :: face_A           !< Accumulator for corner A [R L3 Z T-2 ~> kg m s-2]
+  real, intent(inout) :: face_B           !< Accumulator for corner B [R L3 Z T-2 ~> kg m s-2]
+
+  real :: hL_A, hL_B, hN_A, hN_B, b_A, b_B
+  real :: t_face, h_loc, h_ngh, b_loc
+  real :: P_loc, P_ngh, h_avg, delta_h, r2, s_blend, phi_A, phi_B
+
+  integer :: gp_face
+
+  hL_A = max(h_loc_A, min_h_shelf) ; hL_B = max(h_loc_B, min_h_shelf)
+  hN_A = max(h_ngh_A, min_h_shelf) ; hN_B = max(h_ngh_B, min_h_shelf)
+  b_A = b_corner_A ; b_B = b_corner_B
+
+  do gp_face = 1, 2
+    t_face = xquad(gp_face)
+    h_loc = (1.0 - t_face)*hL_A + t_face*hL_B
+    h_ngh = (1.0 - t_face)*hN_A + t_face*hN_B
+    b_loc = (1.0 - t_face)*b_A + t_face*b_B
+    if (rhoi_rhow * h_loc - b_loc > 0.0) then
+      P_loc = 0.5 * grav * rho * h_loc**2
+    else
+      P_loc = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_loc**2
+    endif
+    if (rhoi_rhow * h_ngh - b_loc > 0.0) then
+      P_ngh = 0.5 * grav * rho * h_ngh**2
+    else
+      P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
+    endif
+    h_avg = 0.5 * (h_loc + h_ngh)
+    delta_h = h_loc - h_ngh
+    r2 = (delta_h * delta_h) / max(h_avg * h_avg, 1.0e-20)
+    s_blend = r2 / (r2 + K_thresh**2)
+    phi_A = 1.0 - t_face ; phi_B = t_face
+    face_A = face_A + face_sign * 0.25 * face_length * phi_A * s_blend * (P_loc - P_ngh)
+    face_B = face_B + face_sign * 0.25 * face_length * phi_B * s_blend * (P_loc - P_ngh)
+  enddo
+end subroutine add_strong_mixed_interior_face
+
 !> Strong-form (non-IBP) DG(1) driving stress with optional scale-aware face
 !! flux at interior hmask=1 / hmask=1 faces. The volume integral is
 !!   int phi * (-rho*g*h*grad(s)) dA,
@@ -7100,26 +7221,8 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
   real :: dyCu_W, dyCu_E        ! Cell-edge spacings on west and east faces [L ~> m]
   real :: fx_gp, fy_gp          ! Driving-force density at a qp [R Z L T-2 ~> kg m-1 s-2]
 
-  ! Face quadrature variables (ice-front Neumann BC).
-  real :: t_face                 ! Face Gauss-point parameter in [0,1] [nondim]
-  real :: phi_A, phi_B           ! Linear nodal basis values at the face QP [nondim]
-  real :: h_loc_A, h_loc_B       ! Local thickness at face endpoints A and B [Z ~> m]
-  real :: b_loc_A, b_loc_B       ! Local bed depth at face endpoints A and B [Z ~> m]
-  real :: h_loc, b_loc           ! Face-QP local thickness and bed depth [Z ~> m]
-  real :: d_ocean                ! Draft for ocean back-pressure [Z ~> m]
-  real :: P_ice, P_ocean         ! Ice column self-pressure and ocean back-pressure [R Z L2 T-2 ~> kg s-2]
-  real :: P_face                 ! Net face traction integrand P_ice - P_ocean [R Z L2 T-2 ~> kg s-2]
-  real :: h_ngh_A, h_ngh_B       ! Neighbour-cell thickness at face endpoints A,B for the
-                                  ! mixed-form interior face flux [Z ~> m]
-  real :: h_ngh                  ! Face-QP neighbour-cell thickness for mixed face flux [Z ~> m]
-  real :: P_loc, P_ngh           ! Local- and neighbour-side pressures (flotation-branched,
-                                  ! matches the IBP routine's convention) at an interior face
-                                  ! Gauss point used by the mixed-form scale-aware face flux
-                                  ! [R Z L2 T-2 ~> kg s-2]
-  real :: h_avg, delta_h         ! Face-QP average and signed jump in nodal thickness [Z ~> m]
-  real :: r2, s_blend            ! Squared relative jump and the Venkatakrishnan-style
-                                  ! smooth blending indicator s = r^2 / (r^2 + K^2) [nondim]
-  integer :: gp_face             ! Face Gauss-point loop index
+  ! Face contribution dispatch flags (per-face quadrature is delegated to
+  ! add_strong_ice_front_face / add_strong_mixed_interior_face).
   logical :: is_ext_bdry         ! True if the face is an external (ocean) boundary
   logical :: loc_is_bc           ! True if local cell has hmask==3 (Dirichlet thickness BC)
   real :: face_dx_W_A, face_dx_W_B  ! West face x-stress contrib to nodes A,B [R L3 Z T-2 ~> kg m s-2]
@@ -7284,53 +7387,17 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
                   ((ISS%hmask(i-1,j) == 0 .or. ISS%hmask(i-1,j) == 2) .and. &
                    (CS%reentrant_x .or. (i+i_off /= gisc))))
     if (is_ext_bdry) then
-      h_loc_A = max(CS%h_nodal(i,j,1,1), CS%min_h_shelf)
-      h_loc_B = max(CS%h_nodal(i,j,1,2), CS%min_h_shelf)
-      if (loc_is_bc) then
-        h_loc_A = max(CS%h_bdry_val(i,j), CS%min_h_shelf) ; h_loc_B = h_loc_A
-      endif
-      b_loc_A = bed_corners(1,1) ; b_loc_B = bed_corners(1,2)
-      do gp_face=1,2
-        t_face = xquad(gp_face)
-        h_loc = (1.0 - t_face)*h_loc_A + t_face*h_loc_B
-        b_loc = (1.0 - t_face)*b_loc_A + t_face*b_loc_B
-        P_ice = 0.5 * grav * rho * h_loc**2
-        d_ocean = max(0.0, min(b_loc, rhoi_rhow * h_loc))
-        P_ocean = 0.5 * grav * rhow * d_ocean**2
-        P_face = P_ice - P_ocean
-        phi_A = 1.0 - t_face ; phi_B = t_face
-        face_dx_W_A = face_dx_W_A - 0.5 * G%dyCu(I-1,j) * phi_A * P_face
-        face_dx_W_B = face_dx_W_B - 0.5 * G%dyCu(I-1,j) * phi_B * P_face
-      enddo
+      call add_strong_ice_front_face(G%dyCu(I-1,j), -1.0, &
+        CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,1,2), bed_corners(1,1), bed_corners(1,2), &
+        CS%h_bdry_val(i,j), loc_is_bc, rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, &
+        xquad, face_dx_W_A, face_dx_W_B)
     elseif (CS%dg_face_flux_K_thresh > 0.0 .and. ISS%hmask(i-1,j) == 1.0) then
-      h_loc_A = max(CS%h_nodal(i,j,1,1), CS%min_h_shelf)
-      h_loc_B = max(CS%h_nodal(i,j,1,2), CS%min_h_shelf)
-      h_ngh_A = max(CS%h_nodal(i-1,j,2,1), CS%min_h_shelf)
-      h_ngh_B = max(CS%h_nodal(i-1,j,2,2), CS%min_h_shelf)
-      b_loc_A = bed_corners(1,1) ; b_loc_B = bed_corners(1,2)
-      do gp_face=1,2
-        t_face = xquad(gp_face)
-        h_loc = (1.0 - t_face)*h_loc_A + t_face*h_loc_B
-        h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
-        b_loc = (1.0 - t_face)*b_loc_A + t_face*b_loc_B
-        if (rhoi_rhow * h_loc - b_loc > 0.0) then
-          P_loc = 0.5 * grav * rho * h_loc**2
-        else
-          P_loc = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_loc**2
-        endif
-        if (rhoi_rhow * h_ngh - b_loc > 0.0) then
-          P_ngh = 0.5 * grav * rho * h_ngh**2
-        else
-          P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
-        endif
-        h_avg = 0.5 * (h_loc + h_ngh)
-        delta_h = h_loc - h_ngh
-        r2 = (delta_h * delta_h) / max(h_avg * h_avg, 1.0e-20)
-        s_blend = r2 / (r2 + CS%dg_face_flux_K_thresh**2)
-        phi_A = 1.0 - t_face ; phi_B = t_face
-        face_dx_W_A = face_dx_W_A - 0.25 * G%dyCu(I-1,j) * phi_A * s_blend * (P_loc - P_ngh)
-        face_dx_W_B = face_dx_W_B - 0.25 * G%dyCu(I-1,j) * phi_B * s_blend * (P_loc - P_ngh)
-      enddo
+      call add_strong_mixed_interior_face(G%dyCu(I-1,j), -1.0, &
+        CS%h_nodal(i,j,1,1),   CS%h_nodal(i,j,1,2), &
+        CS%h_nodal(i-1,j,2,1), CS%h_nodal(i-1,j,2,2), &
+        bed_corners(1,1), bed_corners(1,2), CS%dg_face_flux_K_thresh, &
+        rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
+        face_dx_W_A, face_dx_W_B)
     endif
 
     ! East face (n_x = +1).
@@ -7338,53 +7405,17 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
                   ((ISS%hmask(i+1,j) == 0 .or. ISS%hmask(i+1,j) == 2) .and. &
                    (CS%reentrant_x .or. (i+i_off /= giec))))
     if (is_ext_bdry) then
-      h_loc_A = max(CS%h_nodal(i,j,2,1), CS%min_h_shelf)
-      h_loc_B = max(CS%h_nodal(i,j,2,2), CS%min_h_shelf)
-      if (loc_is_bc) then
-        h_loc_A = max(CS%h_bdry_val(i,j), CS%min_h_shelf) ; h_loc_B = h_loc_A
-      endif
-      b_loc_A = bed_corners(2,1) ; b_loc_B = bed_corners(2,2)
-      do gp_face=1,2
-        t_face = xquad(gp_face)
-        h_loc = (1.0 - t_face)*h_loc_A + t_face*h_loc_B
-        b_loc = (1.0 - t_face)*b_loc_A + t_face*b_loc_B
-        P_ice = 0.5 * grav * rho * h_loc**2
-        d_ocean = max(0.0, min(b_loc, rhoi_rhow * h_loc))
-        P_ocean = 0.5 * grav * rhow * d_ocean**2
-        P_face = P_ice - P_ocean
-        phi_A = 1.0 - t_face ; phi_B = t_face
-        face_dx_E_A = face_dx_E_A + 0.5 * G%dyCu(I,j) * phi_A * P_face
-        face_dx_E_B = face_dx_E_B + 0.5 * G%dyCu(I,j) * phi_B * P_face
-      enddo
+      call add_strong_ice_front_face(G%dyCu(I,j), +1.0, &
+        CS%h_nodal(i,j,2,1), CS%h_nodal(i,j,2,2), bed_corners(2,1), bed_corners(2,2), &
+        CS%h_bdry_val(i,j), loc_is_bc, rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, &
+        xquad, face_dx_E_A, face_dx_E_B)
     elseif (CS%dg_face_flux_K_thresh > 0.0 .and. ISS%hmask(i+1,j) == 1.0) then
-      h_loc_A = max(CS%h_nodal(i,j,2,1), CS%min_h_shelf)
-      h_loc_B = max(CS%h_nodal(i,j,2,2), CS%min_h_shelf)
-      h_ngh_A = max(CS%h_nodal(i+1,j,1,1), CS%min_h_shelf)
-      h_ngh_B = max(CS%h_nodal(i+1,j,1,2), CS%min_h_shelf)
-      b_loc_A = bed_corners(2,1) ; b_loc_B = bed_corners(2,2)
-      do gp_face=1,2
-        t_face = xquad(gp_face)
-        h_loc = (1.0 - t_face)*h_loc_A + t_face*h_loc_B
-        h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
-        b_loc = (1.0 - t_face)*b_loc_A + t_face*b_loc_B
-        if (rhoi_rhow * h_loc - b_loc > 0.0) then
-          P_loc = 0.5 * grav * rho * h_loc**2
-        else
-          P_loc = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_loc**2
-        endif
-        if (rhoi_rhow * h_ngh - b_loc > 0.0) then
-          P_ngh = 0.5 * grav * rho * h_ngh**2
-        else
-          P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
-        endif
-        h_avg = 0.5 * (h_loc + h_ngh)
-        delta_h = h_loc - h_ngh
-        r2 = (delta_h * delta_h) / max(h_avg * h_avg, 1.0e-20)
-        s_blend = r2 / (r2 + CS%dg_face_flux_K_thresh**2)
-        phi_A = 1.0 - t_face ; phi_B = t_face
-        face_dx_E_A = face_dx_E_A + 0.25 * G%dyCu(I,j) * phi_A * s_blend * (P_loc - P_ngh)
-        face_dx_E_B = face_dx_E_B + 0.25 * G%dyCu(I,j) * phi_B * s_blend * (P_loc - P_ngh)
-      enddo
+      call add_strong_mixed_interior_face(G%dyCu(I,j), +1.0, &
+        CS%h_nodal(i,j,2,1),   CS%h_nodal(i,j,2,2), &
+        CS%h_nodal(i+1,j,1,1), CS%h_nodal(i+1,j,1,2), &
+        bed_corners(2,1), bed_corners(2,2), CS%dg_face_flux_K_thresh, &
+        rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
+        face_dx_E_A, face_dx_E_B)
     endif
 
     ! South face (n_y = -1).
@@ -7392,53 +7423,17 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
                   ((ISS%hmask(i,j-1) == 0 .or. ISS%hmask(i,j-1) == 2) .and. &
                    (CS%reentrant_y .or. (j+j_off /= gjsc))))
     if (is_ext_bdry) then
-      h_loc_A = max(CS%h_nodal(i,j,1,1), CS%min_h_shelf)
-      h_loc_B = max(CS%h_nodal(i,j,2,1), CS%min_h_shelf)
-      if (loc_is_bc) then
-        h_loc_A = max(CS%h_bdry_val(i,j), CS%min_h_shelf) ; h_loc_B = h_loc_A
-      endif
-      b_loc_A = bed_corners(1,1) ; b_loc_B = bed_corners(2,1)
-      do gp_face=1,2
-        t_face = xquad(gp_face)
-        h_loc = (1.0 - t_face)*h_loc_A + t_face*h_loc_B
-        b_loc = (1.0 - t_face)*b_loc_A + t_face*b_loc_B
-        P_ice = 0.5 * grav * rho * h_loc**2
-        d_ocean = max(0.0, min(b_loc, rhoi_rhow * h_loc))
-        P_ocean = 0.5 * grav * rhow * d_ocean**2
-        P_face = P_ice - P_ocean
-        phi_A = 1.0 - t_face ; phi_B = t_face
-        face_dy_S_A = face_dy_S_A - 0.5 * G%dxCv(i,J-1) * phi_A * P_face
-        face_dy_S_B = face_dy_S_B - 0.5 * G%dxCv(i,J-1) * phi_B * P_face
-      enddo
+      call add_strong_ice_front_face(G%dxCv(i,J-1), -1.0, &
+        CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,2,1), bed_corners(1,1), bed_corners(2,1), &
+        CS%h_bdry_val(i,j), loc_is_bc, rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, &
+        xquad, face_dy_S_A, face_dy_S_B)
     elseif (CS%dg_face_flux_K_thresh > 0.0 .and. ISS%hmask(i,j-1) == 1.0) then
-      h_loc_A = max(CS%h_nodal(i,j,1,1), CS%min_h_shelf)
-      h_loc_B = max(CS%h_nodal(i,j,2,1), CS%min_h_shelf)
-      h_ngh_A = max(CS%h_nodal(i,j-1,1,2), CS%min_h_shelf)
-      h_ngh_B = max(CS%h_nodal(i,j-1,2,2), CS%min_h_shelf)
-      b_loc_A = bed_corners(1,1) ; b_loc_B = bed_corners(2,1)
-      do gp_face=1,2
-        t_face = xquad(gp_face)
-        h_loc = (1.0 - t_face)*h_loc_A + t_face*h_loc_B
-        h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
-        b_loc = (1.0 - t_face)*b_loc_A + t_face*b_loc_B
-        if (rhoi_rhow * h_loc - b_loc > 0.0) then
-          P_loc = 0.5 * grav * rho * h_loc**2
-        else
-          P_loc = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_loc**2
-        endif
-        if (rhoi_rhow * h_ngh - b_loc > 0.0) then
-          P_ngh = 0.5 * grav * rho * h_ngh**2
-        else
-          P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
-        endif
-        h_avg = 0.5 * (h_loc + h_ngh)
-        delta_h = h_loc - h_ngh
-        r2 = (delta_h * delta_h) / max(h_avg * h_avg, 1.0e-20)
-        s_blend = r2 / (r2 + CS%dg_face_flux_K_thresh**2)
-        phi_A = 1.0 - t_face ; phi_B = t_face
-        face_dy_S_A = face_dy_S_A - 0.25 * G%dxCv(i,J-1) * phi_A * s_blend * (P_loc - P_ngh)
-        face_dy_S_B = face_dy_S_B - 0.25 * G%dxCv(i,J-1) * phi_B * s_blend * (P_loc - P_ngh)
-      enddo
+      call add_strong_mixed_interior_face(G%dxCv(i,J-1), -1.0, &
+        CS%h_nodal(i,j,1,1),   CS%h_nodal(i,j,2,1), &
+        CS%h_nodal(i,j-1,1,2), CS%h_nodal(i,j-1,2,2), &
+        bed_corners(1,1), bed_corners(2,1), CS%dg_face_flux_K_thresh, &
+        rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
+        face_dy_S_A, face_dy_S_B)
     endif
 
     ! North face (n_y = +1).
@@ -7446,53 +7441,17 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
                   ((ISS%hmask(i,j+1) == 0 .or. ISS%hmask(i,j+1) == 2) .and. &
                    (CS%reentrant_y .or. (j+j_off /= gjec))))
     if (is_ext_bdry) then
-      h_loc_A = max(CS%h_nodal(i,j,1,2), CS%min_h_shelf)
-      h_loc_B = max(CS%h_nodal(i,j,2,2), CS%min_h_shelf)
-      if (loc_is_bc) then
-        h_loc_A = max(CS%h_bdry_val(i,j), CS%min_h_shelf) ; h_loc_B = h_loc_A
-      endif
-      b_loc_A = bed_corners(1,2) ; b_loc_B = bed_corners(2,2)
-      do gp_face=1,2
-        t_face = xquad(gp_face)
-        h_loc = (1.0 - t_face)*h_loc_A + t_face*h_loc_B
-        b_loc = (1.0 - t_face)*b_loc_A + t_face*b_loc_B
-        P_ice = 0.5 * grav * rho * h_loc**2
-        d_ocean = max(0.0, min(b_loc, rhoi_rhow * h_loc))
-        P_ocean = 0.5 * grav * rhow * d_ocean**2
-        P_face = P_ice - P_ocean
-        phi_A = 1.0 - t_face ; phi_B = t_face
-        face_dy_N_A = face_dy_N_A + 0.5 * G%dxCv(i,J) * phi_A * P_face
-        face_dy_N_B = face_dy_N_B + 0.5 * G%dxCv(i,J) * phi_B * P_face
-      enddo
+      call add_strong_ice_front_face(G%dxCv(i,J), +1.0, &
+        CS%h_nodal(i,j,1,2), CS%h_nodal(i,j,2,2), bed_corners(1,2), bed_corners(2,2), &
+        CS%h_bdry_val(i,j), loc_is_bc, rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, &
+        xquad, face_dy_N_A, face_dy_N_B)
     elseif (CS%dg_face_flux_K_thresh > 0.0 .and. ISS%hmask(i,j+1) == 1.0) then
-      h_loc_A = max(CS%h_nodal(i,j,1,2), CS%min_h_shelf)
-      h_loc_B = max(CS%h_nodal(i,j,2,2), CS%min_h_shelf)
-      h_ngh_A = max(CS%h_nodal(i,j+1,1,1), CS%min_h_shelf)
-      h_ngh_B = max(CS%h_nodal(i,j+1,2,1), CS%min_h_shelf)
-      b_loc_A = bed_corners(1,2) ; b_loc_B = bed_corners(2,2)
-      do gp_face=1,2
-        t_face = xquad(gp_face)
-        h_loc = (1.0 - t_face)*h_loc_A + t_face*h_loc_B
-        h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
-        b_loc = (1.0 - t_face)*b_loc_A + t_face*b_loc_B
-        if (rhoi_rhow * h_loc - b_loc > 0.0) then
-          P_loc = 0.5 * grav * rho * h_loc**2
-        else
-          P_loc = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_loc**2
-        endif
-        if (rhoi_rhow * h_ngh - b_loc > 0.0) then
-          P_ngh = 0.5 * grav * rho * h_ngh**2
-        else
-          P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
-        endif
-        h_avg = 0.5 * (h_loc + h_ngh)
-        delta_h = h_loc - h_ngh
-        r2 = (delta_h * delta_h) / max(h_avg * h_avg, 1.0e-20)
-        s_blend = r2 / (r2 + CS%dg_face_flux_K_thresh**2)
-        phi_A = 1.0 - t_face ; phi_B = t_face
-        face_dy_N_A = face_dy_N_A + 0.25 * G%dxCv(i,J) * phi_A * s_blend * (P_loc - P_ngh)
-        face_dy_N_B = face_dy_N_B + 0.25 * G%dxCv(i,J) * phi_B * s_blend * (P_loc - P_ngh)
-      enddo
+      call add_strong_mixed_interior_face(G%dxCv(i,J), +1.0, &
+        CS%h_nodal(i,j,1,2),   CS%h_nodal(i,j,2,2), &
+        CS%h_nodal(i,j+1,1,1), CS%h_nodal(i,j+1,2,1), &
+        bed_corners(1,2), bed_corners(2,2), CS%dg_face_flux_K_thresh, &
+        rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
+        face_dy_N_A, face_dy_N_B)
     endif
 
     ! Combine cell-volume integral with face contributions (ice-front Neumann
