@@ -266,14 +266,17 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! rho*g*h*grad(s) directly at Gauss points using the Q1
                                   !! nodal basis, with an optional scale-aware face flux
                                   !! gated by dg_face_flux_K_thresh.
-  real :: dg_face_flux_K_thresh   !< Relative-jump threshold for the strong-form driving
-                                  !! stress's optional scale-aware face flux at interior
-                                  !! faces (between two hmask=1 cells). A Venkatakrishnan-
-                                  !! style blend s = r^2 / (r^2 + K^2) with r = |[h]|/h_avg
-                                  !! ramps the face contribution from zero (pure strong) to
-                                  !! the central-IBP face flux. <=0 disables (pure strong);
-                                  !! ~0.05-0.2 engages on real h discontinuities; >>1 is
-                                  !! effectively disabled (r << 1 in typical flows) [nondim].
+  real :: dg_face_flux_K_thresh   !< Controls the strong-form driving stress's optional
+                                  !! face flux at interior faces (between two hmask=1
+                                  !! cells). <0 (default) disables it entirely (pure
+                                  !! strong form). =0 forces s=1 (full central-IBP face
+                                  !! flux: equivalent at the SSA node assembly to the
+                                  !! IBP routine). >0 enables a Venkatakrishnan-style
+                                  !! blend s = r^2 / (r^2 + K^2), r = |[h]|/h_avg, that
+                                  !! ramps from zero (smooth faces) to the central-IBP
+                                  !! flux (large jumps). ~0.05-0.2 engages on real h
+                                  !! discontinuities; >>1 is effectively disabled
+                                  !! (r << 1 in typical flows) [nondim].
   logical :: calve_to_mask       !< If true, calve off the ice shelf when it passes the edge of a mask.
   real :: min_thickness_simple_calve !< min. ice shelf thickness criteria for calving [Z ~> m].
   real :: T_shelf_missing   !< An ice shelf temperature to use where there is no ice shelf [C ~> degC]
@@ -6534,6 +6537,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   logical :: is_wall         ! True if the face is a velocity-Dirichlet wall (non-reentrant
                              ! global boundary, or explicit face_mask_bdry zero-normal-velocity
                              ! code), not flagged as a Neumann BC
+  logical :: is_grounded     ! True if the local QP / face point is grounded (vs floating)
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -6625,21 +6629,27 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
           dbdy_gp = dbdy_ref / d_qp
 
           if (CS%GL_couple) then
-            if (CS%ground_frac(i,j)<1) then
-              bottom_force_x = (rho**2 / rhow) * grav * h_gp * dhdx_gp
-              bottom_force_y = (rho**2 / rhow) * grav * h_gp * dhdy_gp
-            else
-              bottom_force_x = rho * grav * h_gp * dbdx_gp
-              bottom_force_y = rho * grav * h_gp * dbdy_gp
-            endif
+            is_grounded = (CS%ground_frac(i,j) >= 1.0)
           else
-            if (rhoi_rhow * h_gp - bed_gp <= 0.0) then
-              bottom_force_x = (rho**2 / rhow) * grav * h_gp * dhdx_gp
-              bottom_force_y = (rho**2 / rhow) * grav * h_gp * dhdy_gp
-            else
-              bottom_force_x = rho * grav * h_gp * dbdx_gp
-              bottom_force_y = rho * grav * h_gp * dbdy_gp
-            endif
+            is_grounded = (rhoi_rhow * h_gp - bed_gp > 0.0)
+          endif
+
+          ! Flotation-branched IBP decomposition of -rho*g*h*grad(s):
+          !   grounded: P = 0.5*rho*g*h^2, bottom_force = rho*g*h*grad(bed).
+          !   floating: P = 0.5*(1 - rhoi_rhow)*rho*g*h^2, bottom_force = 0.
+          ! This makes the IBP face term (volume IBP -> face) carry the
+          ! correct (1 - rhoi_rhow) scaling at floating cells so the SSA node
+          ! assembly matches the strong form's grad(s) decomposition. The
+          ! previous full-P decomposition over-coupled h-jumps at floating
+          ! interior faces by a factor of 1/(1 - rhoi_rhow).
+          if (is_grounded) then
+            p_term_vol = 0.5 * rho * grav * h_gp**2
+            bottom_force_x = rho * grav * h_gp * dbdx_gp
+            bottom_force_y = rho * grav * h_gp * dbdy_gp
+          else
+            p_term_vol = 0.5 * (1.0 - rhoi_rhow) * rho * grav * h_gp**2
+            bottom_force_x = 0.0
+            bottom_force_y = 0.0
           endif
 
           ! For slope diagnostics. Slope values are pre-multiplied by the per-QP
@@ -6666,9 +6676,8 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             endif
           endif
 
-          ! Weak-form Volume Integration by Parts
-          p_term_vol = 0.5 * rho * grav * h_gp**2
-
+          ! Weak-form Volume Integration by Parts; p_term_vol set above
+          ! by the flotation branch.
           do n=1,2 ; do m=1,2
             phi_val = (merge(xquad(iq), xquad(3-iq), m == 2)) * &
                       (merge(xquad(jq), xquad(3-jq), n == 2))
@@ -6755,15 +6764,26 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         endif
 
         if (is_ext_bdry) then
-          d_ocean = max(0.0, min(b_loc, rhoi_rhow * h_loc))
-          P_star = 0.5 * grav * rhow * d_ocean**2
+          ! Ice-front Neumann (natural BC: (h*sigma_dev)*n = P_ice - P_ocean).
+          ! With the flotation-branched volume IBP p_term_vol, the per-cell
+          ! face contribution sums to (P_loc - P_star)*n*phi*dS, so:
+          !   grounded: P_loc = 0.5*rho*g*h^2 and we set P_star = P_ocean
+          !             to recover net (P_ice - P_ocean).
+          !   floating: P_loc = (1 - rhoi_rhow)*0.5*rho*g*h^2 already
+          !             equals (P_ice - P_ocean) for d_ocean = rhoi_rhow*h,
+          !             so the IBP face P_star must vanish.
+          if (rhoi_rhow * h_loc - b_loc > 0.0) then
+            d_ocean = max(0.0, min(b_loc, rhoi_rhow * h_loc))
+            P_star = 0.5 * grav * rhow * d_ocean**2
+          else
+            P_star = 0.0
+          endif
         else if (is_wall) then
-          ! Velocity-Dirichlet global wall: mirror the volume-integral pressure
-          ! (full rho*g*h^2/2, matching p_term_vol) so the IBP face term cancels
-          ! the local volume term. P_loc carries the (1-rhoi_rhow) floating
-          ! factor, so mirroring P_loc here would leave a rhoi_rhow*full_P
-          ! residual at the boundary nodes.
-          P_star = 0.5 * grav * rho * h_loc**2
+          ! Velocity-Dirichlet global wall: mirror p_term_vol so the IBP
+          ! face term exactly cancels the local volume IBP face term. The
+          ! flotation-branched P_loc equals p_term_vol per QP, so use it
+          ! directly.
+          P_star = P_loc
         else
           h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
           b_ngh = (1.0 - t_face)*b_ngh_A + t_face*b_ngh_B
@@ -6833,15 +6853,26 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         endif
 
         if (is_ext_bdry) then
-          d_ocean = max(0.0, min(b_loc, rhoi_rhow * h_loc))
-          P_star = 0.5 * grav * rhow * d_ocean**2
+          ! Ice-front Neumann (natural BC: (h*sigma_dev)*n = P_ice - P_ocean).
+          ! With the flotation-branched volume IBP p_term_vol, the per-cell
+          ! face contribution sums to (P_loc - P_star)*n*phi*dS, so:
+          !   grounded: P_loc = 0.5*rho*g*h^2 and we set P_star = P_ocean
+          !             to recover net (P_ice - P_ocean).
+          !   floating: P_loc = (1 - rhoi_rhow)*0.5*rho*g*h^2 already
+          !             equals (P_ice - P_ocean) for d_ocean = rhoi_rhow*h,
+          !             so the IBP face P_star must vanish.
+          if (rhoi_rhow * h_loc - b_loc > 0.0) then
+            d_ocean = max(0.0, min(b_loc, rhoi_rhow * h_loc))
+            P_star = 0.5 * grav * rhow * d_ocean**2
+          else
+            P_star = 0.0
+          endif
         else if (is_wall) then
-          ! Velocity-Dirichlet global wall: mirror the volume-integral pressure
-          ! (full rho*g*h^2/2, matching p_term_vol) so the IBP face term cancels
-          ! the local volume term. P_loc carries the (1-rhoi_rhow) floating
-          ! factor, so mirroring P_loc here would leave a rhoi_rhow*full_P
-          ! residual at the boundary nodes.
-          P_star = 0.5 * grav * rho * h_loc**2
+          ! Velocity-Dirichlet global wall: mirror p_term_vol so the IBP
+          ! face term exactly cancels the local volume IBP face term. The
+          ! flotation-branched P_loc equals p_term_vol per QP, so use it
+          ! directly.
+          P_star = P_loc
         else
           h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
           b_ngh = (1.0 - t_face)*b_ngh_A + t_face*b_ngh_B
@@ -6909,15 +6940,26 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         endif
 
         if (is_ext_bdry) then
-          d_ocean = max(0.0, min(b_loc, rhoi_rhow * h_loc))
-          P_star = 0.5 * grav * rhow * d_ocean**2
+          ! Ice-front Neumann (natural BC: (h*sigma_dev)*n = P_ice - P_ocean).
+          ! With the flotation-branched volume IBP p_term_vol, the per-cell
+          ! face contribution sums to (P_loc - P_star)*n*phi*dS, so:
+          !   grounded: P_loc = 0.5*rho*g*h^2 and we set P_star = P_ocean
+          !             to recover net (P_ice - P_ocean).
+          !   floating: P_loc = (1 - rhoi_rhow)*0.5*rho*g*h^2 already
+          !             equals (P_ice - P_ocean) for d_ocean = rhoi_rhow*h,
+          !             so the IBP face P_star must vanish.
+          if (rhoi_rhow * h_loc - b_loc > 0.0) then
+            d_ocean = max(0.0, min(b_loc, rhoi_rhow * h_loc))
+            P_star = 0.5 * grav * rhow * d_ocean**2
+          else
+            P_star = 0.0
+          endif
         else if (is_wall) then
-          ! Velocity-Dirichlet global wall: mirror the volume-integral pressure
-          ! (full rho*g*h^2/2, matching p_term_vol) so the IBP face term cancels
-          ! the local volume term. P_loc carries the (1-rhoi_rhow) floating
-          ! factor, so mirroring P_loc here would leave a rhoi_rhow*full_P
-          ! residual at the boundary nodes.
-          P_star = 0.5 * grav * rho * h_loc**2
+          ! Velocity-Dirichlet global wall: mirror p_term_vol so the IBP
+          ! face term exactly cancels the local volume IBP face term. The
+          ! flotation-branched P_loc equals p_term_vol per QP, so use it
+          ! directly.
+          P_star = P_loc
         else
           h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
           b_ngh = (1.0 - t_face)*b_ngh_A + t_face*b_ngh_B
@@ -6985,15 +7027,26 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         endif
 
         if (is_ext_bdry) then
-          d_ocean = max(0.0, min(b_loc, rhoi_rhow * h_loc))
-          P_star = 0.5 * grav * rhow * d_ocean**2
+          ! Ice-front Neumann (natural BC: (h*sigma_dev)*n = P_ice - P_ocean).
+          ! With the flotation-branched volume IBP p_term_vol, the per-cell
+          ! face contribution sums to (P_loc - P_star)*n*phi*dS, so:
+          !   grounded: P_loc = 0.5*rho*g*h^2 and we set P_star = P_ocean
+          !             to recover net (P_ice - P_ocean).
+          !   floating: P_loc = (1 - rhoi_rhow)*0.5*rho*g*h^2 already
+          !             equals (P_ice - P_ocean) for d_ocean = rhoi_rhow*h,
+          !             so the IBP face P_star must vanish.
+          if (rhoi_rhow * h_loc - b_loc > 0.0) then
+            d_ocean = max(0.0, min(b_loc, rhoi_rhow * h_loc))
+            P_star = 0.5 * grav * rhow * d_ocean**2
+          else
+            P_star = 0.0
+          endif
         else if (is_wall) then
-          ! Velocity-Dirichlet global wall: mirror the volume-integral pressure
-          ! (full rho*g*h^2/2, matching p_term_vol) so the IBP face term cancels
-          ! the local volume term. P_loc carries the (1-rhoi_rhow) floating
-          ! factor, so mirroring P_loc here would leave a rhoi_rhow*full_P
-          ! residual at the boundary nodes.
-          P_star = 0.5 * grav * rho * h_loc**2
+          ! Velocity-Dirichlet global wall: mirror p_term_vol so the IBP
+          ! face term exactly cancels the local volume IBP face term. The
+          ! flotation-branched P_loc equals p_term_vol per QP, so use it
+          ! directly.
+          P_star = P_loc
         else
           h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
           b_ngh = (1.0 - t_face)*b_ngh_A + t_face*b_ngh_B
@@ -7162,10 +7215,17 @@ subroutine add_strong_mixed_interior_face(face_length, face_sign, &
     else
       P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
     endif
-    h_avg = 0.5 * (h_loc + h_ngh)
-    delta_h = h_loc - h_ngh
-    r2 = (delta_h * delta_h) / max(h_avg * h_avg, 1.0e-20)
-    s_blend = r2 / (r2 + K_thresh**2)
+    ! Blend factor: K_thresh == 0 recovers the full central-IBP face flux
+    ! (s = 1 everywhere); K_thresh > 0 ramps smoothly from strong form
+    ! (small jumps) to central-IBP (large jumps).
+    if (K_thresh == 0.0) then
+      s_blend = 1.0
+    else
+      h_avg = 0.5 * (h_loc + h_ngh)
+      delta_h = h_loc - h_ngh
+      r2 = (delta_h * delta_h) / max(h_avg * h_avg, 1.0e-20)
+      s_blend = r2 / (r2 + K_thresh**2)
+    endif
     phi_A = 1.0 - t_face ; phi_B = t_face
     face_A = face_A + face_sign * 0.25 * face_length * phi_A * s_blend * (P_loc - P_ngh)
     face_B = face_B + face_sign * 0.25 * face_length * phi_B * s_blend * (P_loc - P_ngh)
@@ -7183,12 +7243,13 @@ end subroutine add_strong_mixed_interior_face
 !! over external boundary faces. Walls contribute nothing.
 !!
 !! Interior face flux (optional, off by default): when
-!! CS%dg_face_flux_K_thresh > 0, a Venkatakrishnan-style smooth blend
-!!   s = r^2 / (r^2 + K^2),  r = |[h]|/h_avg
-!! engages a per-cell face contribution
-!!   s * int phi * 0.5 * (P_loc - P_ngh) * n dS,
-!! recovering the central-IBP face flux at large r and vanishing for smooth
-!! h. K_thresh <= 0 disables the face flux entirely (pure strong form).
+!! CS%dg_face_flux_K_thresh >= 0, a per-cell face contribution
+!!   s * int phi * 0.5 * (P_loc - P_ngh) * n dS
+!! is added at hmask=1/hmask=1 faces. K_thresh = 0 forces s = 1 (full
+!! central-IBP face flux). K_thresh > 0 ramps via the Venkatakrishnan-style
+!! smooth blend  s = r^2 / (r^2 + K^2),  r = |[h]|/h_avg, recovering central
+!! flux at large r and vanishing for smooth h. K_thresh < 0 disables the
+!! face flux entirely (pure strong form).
 subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
   type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe the ice-shelf state
@@ -7366,15 +7427,17 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
     ! (1) is_ext_bdry: ice-front Neumann
     !       +integral phi * (P_ice - P_ocean) * n dS
     !     with the natural n sign (-W, +E, -S, +N).
-    ! (2) Interior hmask=1/hmask=1 face and CS%dg_face_flux_K_thresh > 0:
+    ! (2) Interior hmask=1/hmask=1 face and CS%dg_face_flux_K_thresh >= 0:
     !     mixed-form scale-aware face flux
     !       s * integral phi * 0.5*(P_loc - P_ngh) * n dS
-    !     with s = r^2/(r^2 + K^2), r = |[h]|/h_avg. The per-cell factor
-    !     0.5 is the leftover after the IBP-reverse identity is applied to
-    !     the strong form (each adjacent cell contributes its own ½(P_K -
-    !     P_K') · n; the K and K' contributions sum to ∮ φ · [P] · n at
-    !     the shared B-node). At s=0 (default, K_thresh <= 0 or no jump)
-    !     this vanishes and the strong form is recovered.
+    !     where s = 1 when K_thresh = 0 (full central-IBP face flux), and
+    !     s = r^2/(r^2 + K^2), r = |[h]|/h_avg, when K_thresh > 0 (smooth
+    !     ramp from strong to central). The per-cell factor 0.5 is the
+    !     leftover after the IBP-reverse identity is applied to the strong
+    !     form (each adjacent cell contributes its own 0.5*(P_K - P_K')*n;
+    !     the K and K' contributions sum to int phi*[P]*n at the shared
+    !     B-node). K_thresh < 0 (default) disables the face flux entirely
+    !     and recovers the pure strong form.
     ! Walls and other (hmask=3 / hmask=0 interior) faces contribute nothing.
     face_dx_W_A = 0.0 ; face_dx_W_B = 0.0
     face_dx_E_A = 0.0 ; face_dx_E_B = 0.0
@@ -7391,7 +7454,7 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
         CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,1,2), bed_corners(1,1), bed_corners(1,2), &
         CS%h_bdry_val(i,j), loc_is_bc, rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, &
         xquad, face_dx_W_A, face_dx_W_B)
-    elseif (CS%dg_face_flux_K_thresh > 0.0 .and. ISS%hmask(i-1,j) == 1.0) then
+    elseif (CS%dg_face_flux_K_thresh >= 0.0 .and. ISS%hmask(i-1,j) == 1.0) then
       call add_strong_mixed_interior_face(G%dyCu(I-1,j), -1.0, &
         CS%h_nodal(i,j,1,1),   CS%h_nodal(i,j,1,2), &
         CS%h_nodal(i-1,j,2,1), CS%h_nodal(i-1,j,2,2), &
@@ -7409,7 +7472,7 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
         CS%h_nodal(i,j,2,1), CS%h_nodal(i,j,2,2), bed_corners(2,1), bed_corners(2,2), &
         CS%h_bdry_val(i,j), loc_is_bc, rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, &
         xquad, face_dx_E_A, face_dx_E_B)
-    elseif (CS%dg_face_flux_K_thresh > 0.0 .and. ISS%hmask(i+1,j) == 1.0) then
+    elseif (CS%dg_face_flux_K_thresh >= 0.0 .and. ISS%hmask(i+1,j) == 1.0) then
       call add_strong_mixed_interior_face(G%dyCu(I,j), +1.0, &
         CS%h_nodal(i,j,2,1),   CS%h_nodal(i,j,2,2), &
         CS%h_nodal(i+1,j,1,1), CS%h_nodal(i+1,j,1,2), &
@@ -7427,7 +7490,7 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
         CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,2,1), bed_corners(1,1), bed_corners(2,1), &
         CS%h_bdry_val(i,j), loc_is_bc, rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, &
         xquad, face_dy_S_A, face_dy_S_B)
-    elseif (CS%dg_face_flux_K_thresh > 0.0 .and. ISS%hmask(i,j-1) == 1.0) then
+    elseif (CS%dg_face_flux_K_thresh >= 0.0 .and. ISS%hmask(i,j-1) == 1.0) then
       call add_strong_mixed_interior_face(G%dxCv(i,J-1), -1.0, &
         CS%h_nodal(i,j,1,1),   CS%h_nodal(i,j,2,1), &
         CS%h_nodal(i,j-1,1,2), CS%h_nodal(i,j-1,2,2), &
@@ -7445,7 +7508,7 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
         CS%h_nodal(i,j,1,2), CS%h_nodal(i,j,2,2), bed_corners(1,2), bed_corners(2,2), &
         CS%h_bdry_val(i,j), loc_is_bc, rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, &
         xquad, face_dy_N_A, face_dy_N_B)
-    elseif (CS%dg_face_flux_K_thresh > 0.0 .and. ISS%hmask(i,j+1) == 1.0) then
+    elseif (CS%dg_face_flux_K_thresh >= 0.0 .and. ISS%hmask(i,j+1) == 1.0) then
       call add_strong_mixed_interior_face(G%dxCv(i,J), +1.0, &
         CS%h_nodal(i,j,1,2),   CS%h_nodal(i,j,2,2), &
         CS%h_nodal(i,j+1,1,1), CS%h_nodal(i,j+1,2,1), &
@@ -7720,14 +7783,17 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
       dbdx_gp = dbdx_ref / a
       dbdy_gp = dbdy_ref / d
 
-      if (rhoi_rhow * h_gp - bed_gp <= 0.0) then
-        ! Floating: bottom force is water pressure on the sloped draft
-        bottom_force_x = (rho**2 / rhow) * grav * h_gp * dhdx_gp
-        bottom_force_y = (rho**2 / rhow) * grav * h_gp * dhdy_gp
-      else
-        ! Grounded: bottom force is bed pressure on the sloped bed
+      ! Flotation-branched IBP decomposition (see main-grid path for the
+      ! derivation). grounded: P = 0.5*rho*g*h^2, bottom_force = rho*g*h*grad(b).
+      ! floating: P = (1 - rhoi_rhow)*0.5*rho*g*h^2, bottom_force = 0.
+      if (rhoi_rhow * h_gp - bed_gp > 0.0) then
+        p_term_vol = 0.5 * rho * grav * h_gp**2
         bottom_force_x = rho * grav * h_gp * dbdx_gp
         bottom_force_y = rho * grav * h_gp * dbdy_gp
+      else
+        p_term_vol = 0.5 * (1.0 - rhoi_rhow) * rho * grav * h_gp**2
+        bottom_force_x = 0.0
+        bottom_force_y = 0.0
       endif
 
       ! For slope diagnostics. Pre-multiply by the per-sub-QP Jacobian a*d so the
@@ -7745,9 +7811,8 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
         endif
       endif
 
-      ! Unified Weak-form Volume Integration applied to subgrid
-      p_term_vol = 0.5 * rho * grav * h_gp**2
-
+      ! Unified Weak-form Volume Integration applied to subgrid; p_term_vol
+      ! set above by the flotation branch.
       do n=1,2 ; do m=1,2
         dphi_dx_ref = merge(1.0, -1.0, m==2) * merge(y_marginal_2, y_marginal_1, n==2)
         dphi_dy_ref = merge(x_marginal_2, x_marginal_1, m==2) * merge(1.0, -1.0, n==2)
@@ -8108,16 +8173,17 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  default=.false., do_not_log=.not.CS%use_DG_thickness)
 
   call get_param(param_file, mdl, "DG_FACE_FLUX_K_THRESH", CS%dg_face_flux_K_thresh, &
-                 "Relative-jump threshold for the strong-form driving stress's optional "//&
-                 "scale-aware face flux at interior hmask=1 / hmask=1 faces. A "//&
+                 "Controls the optional face flux at interior hmask=1 / hmask=1 faces in "//&
+                 "the strong-form DG(1) driving stress. K_THRESH < 0 (the default) disables "//&
+                 "the face flux entirely (pure strong form). K_THRESH = 0 forces s = 1 "//&
+                 "(full central-IBP face flux: equivalent at the SSA node assembly to the "//&
+                 "IBP routine with any single-valued P_star). K_THRESH > 0 enables a "//&
                  "Venkatakrishnan-style smooth blend s = r^2 / (r^2 + K^2) with "//&
-                 "r = |[h]| / h_avg ramps the per-cell face contribution from zero "//&
-                 "(pure strong form) at s=0 to the central-IBP face flux at s=1. "//&
-                 "K_THRESH <= 0 disables the face flux entirely (pure strong form, the "//&
-                 "default). Typical engaging values are ~0.05-0.2, where r is comparable "//&
-                 "to the chosen K. Values >> 1 are effectively disabled because r << 1 in "//&
-                 "typical near-C0 nodal Q1 flows. Has no effect when USE_DG_THICKNESS is "//&
-                 "false or DG_DRIVING_STRESS_IBP is true.", &
+                 "r = |[h]| / h_avg, ramping the per-cell face contribution from zero at "//&
+                 "smooth faces to the central-IBP face flux at large jumps. Typical "//&
+                 "engaging values are ~0.05-0.2. Values >> 1 are effectively disabled "//&
+                 "because r << 1 in typical near-C0 nodal Q1 flows. Has no effect when "//&
+                 "USE_DG_THICKNESS is false or DG_DRIVING_STRESS_IBP is true.", &
                  units="nondim", default=-1.0, do_not_log=.not.CS%use_DG_thickness)
 
 end subroutine read_nodal_limiter_params
