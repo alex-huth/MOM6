@@ -253,24 +253,27 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! Skips reconstruct_bed_to_nodes and the BED_TOPO_FILE read in
                                   !! initialize_ice_flow_from_file. Requires USE_DG_THICKNESS.
   integer :: nodal_limiter_choice !< Slope-limiter choice for nodal DG(1) thickness:
-                                  !! 0 = none, 1 = Barth-Jespersen, 2 = Venkatakrishnan.
-  real :: nodal_limiter_K         !< Venkatakrishnan K parameter [nondim].
+                                  !! 0 = none, 1 = Barth-Jespersen (cardinal-neighbor cell-mean
+                                  !! stencil), 2 = Kuzmin vertex-based (B-node stencil over all
+                                  !! 4 surrounding cells including hmask=2 partial-fill cells
+                                  !! and hmask=3 Dirichlet cells; robust at ice fronts).
   logical :: nodal_positivity     !< If true, apply Liu-style positivity-preserving limiter
                                   !! to the nodal DG(1) thickness corners.
-  integer :: DG_penalty_formulation !< Selects the DG driving-stress face penalty:
-                                  !! 0 = legacy Rusanov, alpha = rho*g*max(h_loc,h_ngh);
-                                  !! 1 = IIPG with the Shahbazi local sigma_f formula,
-                                  !! anisotropy- and refinement-aware.
-  real :: DG_penalty_C_safety     !< Safety multiplier above the analytical IIPG lower
-                                  !! bound for the DG(1) driving-stress face penalty
-                                  !! (Shahbazi formula) [nondim].
-  logical :: dg_driving_stress_IBP !< If true (default), the DG(1) driving stress uses the
-                                  !! integration-by-parts weak form (with face fluxes and
-                                  !! IBP pressure-volume term). If false, use a strong-form
-                                  !! collocation that evaluates rho*g*h*grad(s) directly at
-                                  !! Gauss points using the Q1 nodal basis; no face fluxes.
-                                  !! Provided for comparison; the strong form lacks the
-                                  !! natural ocean back-pressure BC at the ice front.
+  logical :: dg_driving_stress_IBP !< If true, the DG(1) driving stress uses the
+                                  !! integration-by-parts weak form with central P*
+                                  !! (= 1/2(P_loc + P_ngh)) at interior faces. If false
+                                  !! (default), use a strong-form collocation that evaluates
+                                  !! rho*g*h*grad(s) directly at Gauss points using the Q1
+                                  !! nodal basis, with an optional scale-aware face flux
+                                  !! gated by dg_face_flux_K_thresh.
+  real :: dg_face_flux_K_thresh   !< Relative-jump threshold for the strong-form driving
+                                  !! stress's optional scale-aware face flux at interior
+                                  !! faces (between two hmask=1 cells). A Venkatakrishnan-
+                                  !! style blend s = r^2 / (r^2 + K^2) with r = |[h]|/h_avg
+                                  !! ramps the face contribution from zero (pure strong) to
+                                  !! the central-IBP face flux. <=0 disables (pure strong);
+                                  !! ~0.05-0.2 engages on real h discontinuities; >>1 is
+                                  !! effectively disabled (r << 1 in typical flows) [nondim].
   logical :: calve_to_mask       !< If true, calve off the ice shelf when it passes the edge of a mask.
   real :: min_thickness_simple_calve !< min. ice shelf thickness criteria for calving [Z ~> m].
   real :: T_shelf_missing   !< An ice shelf temperature to use where there is no ice shelf [C ~> degC]
@@ -1060,7 +1063,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         if (.not. node_ic_used) then
           call initialize_h_nodal_from_cellmean(ISS%h_shelf, CS%h_nodal, ISS%hmask, G)
         endif
-        call nodal_BarthJespersen_limit(CS, G, ISS)
+        call apply_nodal_slope_limit(CS, G, ISS)
         if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
         call pass_corner_field(CS%h_nodal, G)
         call recompute_h_shelf_from_nodal(CS, ISS, G)
@@ -6436,70 +6439,13 @@ end subroutine ice_shelf_advect_temp_y
 
 
 
-!> Compute the interior-face numerical flux P_star for the DG(1) driving-stress
-!! weak form. Handles Dirichlet thickness BC overrides and selects between the
-!! legacy Rusanov (alpha = rho*g*max(h_loc, h_ngh)) and the IIPG penalty with
-!! the Shahbazi (2005) local sigma_f formula. Caller is responsible for the
-!! external-boundary branch (e.g. ocean back-pressure at the calving front)
-!! and for choosing the sign convention of delta_h to match the face normal.
-subroutine calc_DG_face_pstar(CS, h_loc, h_ngh, P_loc, P_ngh, &
-                              loc_is_bc, ngh_is_bc, &
-                              h_f, area_loc, area_ngh, &
-                              rho, grav, delta_h, P_star)
-  type(ice_shelf_dyn_CS), intent(in) :: CS !< Ice-shelf dynamics control structure
-  real, intent(in)  :: h_loc      !< Thickness on the local (this-cell) side [Z ~> m]
-  real, intent(in)  :: h_ngh      !< Thickness on the neighbour side [Z ~> m]
-  real, intent(in)  :: P_loc      !< Pressure on the local side [R Z L2 T-2 ~> kg s-2]
-  real, intent(in)  :: P_ngh      !< Pressure on the neighbour side [R Z L2 T-2 ~> kg s-2]
-  logical, intent(in) :: loc_is_bc !< True if the local cell carries a Dirichlet thickness BC
-  logical, intent(in) :: ngh_is_bc !< True if the neighbour cell carries a Dirichlet thickness BC
-  real, intent(in)  :: h_f        !< Face length [L ~> m]
-  real, intent(in)  :: area_loc   !< Cell area on the local side [L2 ~> m2]
-  real, intent(in)  :: area_ngh   !< Cell area on the neighbour side [L2 ~> m2]
-  real, intent(in)  :: rho        !< Ice density [R ~> kg m-3]
-  real, intent(in)  :: grav       !< Gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
-  real, intent(in)  :: delta_h    !< Signed thickness jump across the face, oriented
-                                   !! so that the penalty term acts as
-                                   !! -penalty*delta_h on P_star [Z ~> m]
-  real, intent(out) :: P_star     !< Numerical flux at the face [R Z L2 T-2 ~> kg s-2]
-
-  real :: alpha_pen ! Rusanov penalty coefficient [R L2 T-2 ~> kg m-1 s-2]
-  real :: sigma_f   ! Shahbazi local IIPG penalty coefficient [L-1 ~> m-1]
-  real :: h_face    ! Face-averaged thickness [Z ~> m]
-
-  if (loc_is_bc .and. .not. ngh_is_bc) then
-    ! Prescribed BC face value is authoritative on the local side.
-    P_star = P_loc
-  elseif (ngh_is_bc .and. .not. loc_is_bc) then
-    ! Prescribed BC face value is authoritative on the neighbour side.
-    P_star = P_ngh
-  else
-    select case (CS%DG_penalty_formulation)
-    case (1)
-      ! IIPG with Shahbazi local sigma_f. Geometric factor 3 = (p+1)(p+d)/d
-      ! for p=1, d=2. sigma_f carries units 1/length and replaces the full
-      ! 0.5*alpha coefficient (not just alpha).
-      sigma_f = CS%DG_penalty_C_safety * 3.0 * &
-                max(h_f / area_loc, h_f / area_ngh)
-      h_face = 0.5 * (h_loc + h_ngh)
-      P_star = 0.5 * (P_loc + P_ngh) - sigma_f * rho * grav * h_face * delta_h
-    case default
-      ! Legacy Rusanov / Lax-Friedrichs: P* = {P} - 0.5*alpha*[[h]]
-      alpha_pen = rho * grav * max(h_loc, h_ngh)
-      P_star = 0.5 * (P_loc + P_ngh) - 0.5 * alpha_pen * delta_h
-    end select
-  endif
-
-end subroutine calc_DG_face_pstar
-
-
 !> Compute driving stress at B-grid nodes using a Pure DG(1) formulation.
-!! Allows sub-element driving stress around grounding line
-!! Evaluates the FEM weak-form integral using integration by parts.
-!! To prevent B-grid null-space checkerboarding, the interior face integrals
-!! use a numerical flux with a jump penalty selectable via
-!! DG_PENALTY_FORMULATION: 0 = legacy Rusanov (Lax-Friedrichs), 1 = IIPG with
-!! the Shahbazi (2005) local sigma_f. See calc_DG_face_pstar.
+!! Allows sub-element driving stress around grounding line. Evaluates the FEM
+!! weak-form integral using integration by parts. Interior faces use a simple
+!! central numerical flux P* = 0.5*(P_loc + P_ngh); any single-valued P* gives
+!! the same SSA node-assembly total by the IBP-reverse identity, so penalty
+!! terms (Rusanov, IIPG) were dropped. Dirichlet thickness BC sides use their
+!! own P as authoritative.
 subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
   type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe the ice-shelf state
@@ -6527,8 +6473,6 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   real :: h_ngh, b_ngh     ! Quadrature-point neighbor thickness and bed [Z ~> m]
   real :: P_loc, P_ngh     ! Local and Neighbor pressures [R Z L2 T-2 ~> kg s-2]
   real :: P_star           ! Numerical flux at face [R Z L2 T-2 ~> kg s-2]
-  real :: delta_h          ! Signed thickness jump across face for penalty term [Z ~> m]
-  real :: h_f_face         ! Face length passed to the helper [L ~> m]
   real :: d_ocean          ! Draft of the ice for ocean pressure calculation [Z ~> m]
   real :: t_face           ! Face quadrature parameter in [0,1] [nondim]
   real :: phi_A, phi_B     ! Linear nodal basis values at the face quadrature point [nondim]
@@ -6829,13 +6773,16 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
           endif
 
-          ! Interior face: Left = ngh (i-1), Right = loc (i). delta_h = h_R - h_L.
-          h_f_face = G%dyCu(I-1,j)
-          delta_h = h_loc - h_ngh
-          call calc_DG_face_pstar(CS, h_loc, h_ngh, P_loc, P_ngh, &
-                                  loc_is_bc, ngh_is_bc, &
-                                  h_f_face, G%areaT(i,j), G%areaT(i-1,j), &
-                                  rho, grav, delta_h, P_star)
+          ! Interior face: central P_star. Any single-valued P_star gives the
+          ! same SSA node-assembly total; penalty/upwind terms cancel by
+          ! the IBP-reverse identity. Dirichlet sides override with their own P.
+          if (loc_is_bc .and. .not. ngh_is_bc) then
+            P_star = P_loc
+          elseif (ngh_is_bc .and. .not. loc_is_bc) then
+            P_star = P_ngh
+          else
+            P_star = 0.5 * (P_loc + P_ngh)
+          endif
         endif
 
         phi_A = 1.0 - t_face ; phi_B = t_face
@@ -6904,13 +6851,14 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
           endif
 
-          ! Interior face: Left = loc (i), Right = ngh (i+1). delta_h = h_R - h_L.
-          h_f_face = G%dyCu(I,j)
-          delta_h = h_ngh - h_loc
-          call calc_DG_face_pstar(CS, h_loc, h_ngh, P_loc, P_ngh, &
-                                  loc_is_bc, ngh_is_bc, &
-                                  h_f_face, G%areaT(i,j), G%areaT(i+1,j), &
-                                  rho, grav, delta_h, P_star)
+          ! Interior face: central P_star. See west-face block for rationale.
+          if (loc_is_bc .and. .not. ngh_is_bc) then
+            P_star = P_loc
+          elseif (ngh_is_bc .and. .not. loc_is_bc) then
+            P_star = P_ngh
+          else
+            P_star = 0.5 * (P_loc + P_ngh)
+          endif
         endif
 
         phi_A = 1.0 - t_face ; phi_B = t_face
@@ -6979,13 +6927,14 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
           endif
 
-          ! Interior face: Left = ngh (j-1), Right = loc (j). delta_h = h_R - h_L.
-          h_f_face = G%dxCv(i,J-1)
-          delta_h = h_loc - h_ngh
-          call calc_DG_face_pstar(CS, h_loc, h_ngh, P_loc, P_ngh, &
-                                  loc_is_bc, ngh_is_bc, &
-                                  h_f_face, G%areaT(i,j), G%areaT(i,j-1), &
-                                  rho, grav, delta_h, P_star)
+          ! Interior face: central P_star. See west-face block for rationale.
+          if (loc_is_bc .and. .not. ngh_is_bc) then
+            P_star = P_loc
+          elseif (ngh_is_bc .and. .not. loc_is_bc) then
+            P_star = P_ngh
+          else
+            P_star = 0.5 * (P_loc + P_ngh)
+          endif
         endif
 
         phi_A = 1.0 - t_face ; phi_B = t_face
@@ -7054,13 +7003,14 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
             P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
           endif
 
-          ! Interior face: Left = loc (j), Right = ngh (j+1). delta_h = h_R - h_L.
-          h_f_face = G%dxCv(i,J)
-          delta_h = h_ngh - h_loc
-          call calc_DG_face_pstar(CS, h_loc, h_ngh, P_loc, P_ngh, &
-                                  loc_is_bc, ngh_is_bc, &
-                                  h_f_face, G%areaT(i,j), G%areaT(i,j+1), &
-                                  rho, grav, delta_h, P_star)
+          ! Interior face: central P_star. See west-face block for rationale.
+          if (loc_is_bc .and. .not. ngh_is_bc) then
+            P_star = P_loc
+          elseif (ngh_is_bc .and. .not. loc_is_bc) then
+            P_star = P_ngh
+          else
+            P_star = 0.5 * (P_loc + P_ngh)
+          endif
         endif
 
         phi_A = 1.0 - t_face ; phi_B = t_face
@@ -7101,22 +7051,23 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
 
 end subroutine calc_shelf_driving_stress_DG
 
-!> Strong-form (non-IBP) DG(1) driving stress, fully operational alternative
-!! to the integration-by-parts form in calc_shelf_driving_stress_DG. The
-!! volume integral is int phi * (-rho*g*h*grad(s)) dA, evaluated at 2x2 Gauss
-!! points (or nsub x nsub x 2x2 sub-Gauss in the GL band when GL_regularize
-!! is on) using the Q1 nodal basis for h, grad(h) and corner bed_node for b,
-!! grad(b). Inter-element face fluxes are not needed because the SSA test
-!! functions are the B-grid corner basis (C0 across cells), so jumps in
-!! test-function trace are zero and inter-element coupling happens at the
-!! node-level assembly. The ice-front Neumann BC (ocean back-pressure) is
-!! added as an explicit face integral
+!> Strong-form (non-IBP) DG(1) driving stress with optional scale-aware face
+!! flux at interior hmask=1 / hmask=1 faces. The volume integral is
+!!   int phi * (-rho*g*h*grad(s)) dA,
+!! evaluated at 2x2 Gauss points (or nsub x nsub x 2x2 sub-Gauss in the GL
+!! band when GL_regularize is on) using the Q1 nodal basis for h, grad(h)
+!! and corner bed_node for b, grad(b). The ice-front Neumann BC (ocean
+!! back-pressure) is added as an explicit face integral
 !!   int phi * (1/2*rho*g*h^2 - 1/2*rhow*g*d_ocean^2) * n dS
-!! over external boundary faces. Walls and interior faces contribute nothing
-!! beyond the volume integral. This form trades the IBP discrete momentum
-!! conservation at faces for a simpler discretization; it matches the IBP
-!! form globally (to quadrature accuracy) for smooth h and converges to the
-!! same continuous limit.
+!! over external boundary faces. Walls contribute nothing.
+!!
+!! Interior face flux (optional, off by default): when
+!! CS%dg_face_flux_K_thresh > 0, a Venkatakrishnan-style smooth blend
+!!   s = r^2 / (r^2 + K^2),  r = |[h]|/h_avg
+!! engages a per-cell face contribution
+!!   s * int phi * 0.5 * (P_loc - P_ngh) * n dS,
+!! recovering the central-IBP face flux at large r and vanishing for smooth
+!! h. K_thresh <= 0 disables the face flux entirely (pure strong form).
 subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
   type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe the ice-shelf state
@@ -7158,6 +7109,16 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
   real :: d_ocean                ! Draft for ocean back-pressure [Z ~> m]
   real :: P_ice, P_ocean         ! Ice column self-pressure and ocean back-pressure [R Z L2 T-2 ~> kg s-2]
   real :: P_face                 ! Net face traction integrand P_ice - P_ocean [R Z L2 T-2 ~> kg s-2]
+  real :: h_ngh_A, h_ngh_B       ! Neighbour-cell thickness at face endpoints A,B for the
+                                  ! mixed-form interior face flux [Z ~> m]
+  real :: h_ngh                  ! Face-QP neighbour-cell thickness for mixed face flux [Z ~> m]
+  real :: P_loc, P_ngh           ! Local- and neighbour-side pressures (flotation-branched,
+                                  ! matches the IBP routine's convention) at an interior face
+                                  ! Gauss point used by the mixed-form scale-aware face flux
+                                  ! [R Z L2 T-2 ~> kg s-2]
+  real :: h_avg, delta_h         ! Face-QP average and signed jump in nodal thickness [Z ~> m]
+  real :: r2, s_blend            ! Squared relative jump and the Venkatakrishnan-style
+                                  ! smooth blending indicator s = r^2 / (r^2 + K^2) [nondim]
   integer :: gp_face             ! Face Gauss-point loop index
   logical :: is_ext_bdry         ! True if the face is an external (ocean) boundary
   logical :: loc_is_bc           ! True if local cell has hmask==3 (Dirichlet thickness BC)
@@ -7298,18 +7259,20 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
       endif
     endif
 
-    ! Ice-front Neumann face contributions. Only external (ocean) boundary
-    ! faces contribute; interior and wall faces contribute nothing in the
-    ! strong form because the C0 corner-basis test function has zero trace
-    ! jump across element boundaries. Boundary integrand is
-    !   +integral phi * (P_ice - P_ocean) * n dS
-    ! with P_ice = 1/2 rho g h^2 and P_ocean = 1/2 rhow g d_ocean^2. Signs
-    ! match the non-DG strong-form calc_shelf_driving_stress (Neumann face
-    ! signs: -West, +East, -South, +North). NB: this differs from the IBP
-    ! routine, where the same Neumann content is delivered via the
-    ! combination "IBP-volume boundary leftover + face flux with P_star =
-    ! P_ocean"; the strong form has no IBP leftover, so the explicit face
-    ! integrand carries the full (P_ice - P_ocean) with the natural n sign.
+    ! Face contributions. Two cases per face:
+    ! (1) is_ext_bdry: ice-front Neumann
+    !       +integral phi * (P_ice - P_ocean) * n dS
+    !     with the natural n sign (-W, +E, -S, +N).
+    ! (2) Interior hmask=1/hmask=1 face and CS%dg_face_flux_K_thresh > 0:
+    !     mixed-form scale-aware face flux
+    !       s * integral phi * 0.5*(P_loc - P_ngh) * n dS
+    !     with s = r^2/(r^2 + K^2), r = |[h]|/h_avg. The per-cell factor
+    !     0.5 is the leftover after the IBP-reverse identity is applied to
+    !     the strong form (each adjacent cell contributes its own ½(P_K -
+    !     P_K') · n; the K and K' contributions sum to ∮ φ · [P] · n at
+    !     the shared B-node). At s=0 (default, K_thresh <= 0 or no jump)
+    !     this vanishes and the strong form is recovered.
+    ! Walls and other (hmask=3 / hmask=0 interior) faces contribute nothing.
     face_dx_W_A = 0.0 ; face_dx_W_B = 0.0
     face_dx_E_A = 0.0 ; face_dx_E_B = 0.0
     face_dy_S_A = 0.0 ; face_dy_S_B = 0.0
@@ -7339,6 +7302,35 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
         face_dx_W_A = face_dx_W_A - 0.5 * G%dyCu(I-1,j) * phi_A * P_face
         face_dx_W_B = face_dx_W_B - 0.5 * G%dyCu(I-1,j) * phi_B * P_face
       enddo
+    elseif (CS%dg_face_flux_K_thresh > 0.0 .and. ISS%hmask(i-1,j) == 1.0) then
+      h_loc_A = max(CS%h_nodal(i,j,1,1), CS%min_h_shelf)
+      h_loc_B = max(CS%h_nodal(i,j,1,2), CS%min_h_shelf)
+      h_ngh_A = max(CS%h_nodal(i-1,j,2,1), CS%min_h_shelf)
+      h_ngh_B = max(CS%h_nodal(i-1,j,2,2), CS%min_h_shelf)
+      b_loc_A = bed_corners(1,1) ; b_loc_B = bed_corners(1,2)
+      do gp_face=1,2
+        t_face = xquad(gp_face)
+        h_loc = (1.0 - t_face)*h_loc_A + t_face*h_loc_B
+        h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
+        b_loc = (1.0 - t_face)*b_loc_A + t_face*b_loc_B
+        if (rhoi_rhow * h_loc - b_loc > 0.0) then
+          P_loc = 0.5 * grav * rho * h_loc**2
+        else
+          P_loc = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_loc**2
+        endif
+        if (rhoi_rhow * h_ngh - b_loc > 0.0) then
+          P_ngh = 0.5 * grav * rho * h_ngh**2
+        else
+          P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
+        endif
+        h_avg = 0.5 * (h_loc + h_ngh)
+        delta_h = h_loc - h_ngh
+        r2 = (delta_h * delta_h) / max(h_avg * h_avg, 1.0e-20)
+        s_blend = r2 / (r2 + CS%dg_face_flux_K_thresh**2)
+        phi_A = 1.0 - t_face ; phi_B = t_face
+        face_dx_W_A = face_dx_W_A - 0.25 * G%dyCu(I-1,j) * phi_A * s_blend * (P_loc - P_ngh)
+        face_dx_W_B = face_dx_W_B - 0.25 * G%dyCu(I-1,j) * phi_B * s_blend * (P_loc - P_ngh)
+      enddo
     endif
 
     ! East face (n_x = +1).
@@ -7363,6 +7355,35 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
         phi_A = 1.0 - t_face ; phi_B = t_face
         face_dx_E_A = face_dx_E_A + 0.5 * G%dyCu(I,j) * phi_A * P_face
         face_dx_E_B = face_dx_E_B + 0.5 * G%dyCu(I,j) * phi_B * P_face
+      enddo
+    elseif (CS%dg_face_flux_K_thresh > 0.0 .and. ISS%hmask(i+1,j) == 1.0) then
+      h_loc_A = max(CS%h_nodal(i,j,2,1), CS%min_h_shelf)
+      h_loc_B = max(CS%h_nodal(i,j,2,2), CS%min_h_shelf)
+      h_ngh_A = max(CS%h_nodal(i+1,j,1,1), CS%min_h_shelf)
+      h_ngh_B = max(CS%h_nodal(i+1,j,1,2), CS%min_h_shelf)
+      b_loc_A = bed_corners(2,1) ; b_loc_B = bed_corners(2,2)
+      do gp_face=1,2
+        t_face = xquad(gp_face)
+        h_loc = (1.0 - t_face)*h_loc_A + t_face*h_loc_B
+        h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
+        b_loc = (1.0 - t_face)*b_loc_A + t_face*b_loc_B
+        if (rhoi_rhow * h_loc - b_loc > 0.0) then
+          P_loc = 0.5 * grav * rho * h_loc**2
+        else
+          P_loc = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_loc**2
+        endif
+        if (rhoi_rhow * h_ngh - b_loc > 0.0) then
+          P_ngh = 0.5 * grav * rho * h_ngh**2
+        else
+          P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
+        endif
+        h_avg = 0.5 * (h_loc + h_ngh)
+        delta_h = h_loc - h_ngh
+        r2 = (delta_h * delta_h) / max(h_avg * h_avg, 1.0e-20)
+        s_blend = r2 / (r2 + CS%dg_face_flux_K_thresh**2)
+        phi_A = 1.0 - t_face ; phi_B = t_face
+        face_dx_E_A = face_dx_E_A + 0.25 * G%dyCu(I,j) * phi_A * s_blend * (P_loc - P_ngh)
+        face_dx_E_B = face_dx_E_B + 0.25 * G%dyCu(I,j) * phi_B * s_blend * (P_loc - P_ngh)
       enddo
     endif
 
@@ -7389,6 +7410,35 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
         face_dy_S_A = face_dy_S_A - 0.5 * G%dxCv(i,J-1) * phi_A * P_face
         face_dy_S_B = face_dy_S_B - 0.5 * G%dxCv(i,J-1) * phi_B * P_face
       enddo
+    elseif (CS%dg_face_flux_K_thresh > 0.0 .and. ISS%hmask(i,j-1) == 1.0) then
+      h_loc_A = max(CS%h_nodal(i,j,1,1), CS%min_h_shelf)
+      h_loc_B = max(CS%h_nodal(i,j,2,1), CS%min_h_shelf)
+      h_ngh_A = max(CS%h_nodal(i,j-1,1,2), CS%min_h_shelf)
+      h_ngh_B = max(CS%h_nodal(i,j-1,2,2), CS%min_h_shelf)
+      b_loc_A = bed_corners(1,1) ; b_loc_B = bed_corners(2,1)
+      do gp_face=1,2
+        t_face = xquad(gp_face)
+        h_loc = (1.0 - t_face)*h_loc_A + t_face*h_loc_B
+        h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
+        b_loc = (1.0 - t_face)*b_loc_A + t_face*b_loc_B
+        if (rhoi_rhow * h_loc - b_loc > 0.0) then
+          P_loc = 0.5 * grav * rho * h_loc**2
+        else
+          P_loc = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_loc**2
+        endif
+        if (rhoi_rhow * h_ngh - b_loc > 0.0) then
+          P_ngh = 0.5 * grav * rho * h_ngh**2
+        else
+          P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
+        endif
+        h_avg = 0.5 * (h_loc + h_ngh)
+        delta_h = h_loc - h_ngh
+        r2 = (delta_h * delta_h) / max(h_avg * h_avg, 1.0e-20)
+        s_blend = r2 / (r2 + CS%dg_face_flux_K_thresh**2)
+        phi_A = 1.0 - t_face ; phi_B = t_face
+        face_dy_S_A = face_dy_S_A - 0.25 * G%dxCv(i,J-1) * phi_A * s_blend * (P_loc - P_ngh)
+        face_dy_S_B = face_dy_S_B - 0.25 * G%dxCv(i,J-1) * phi_B * s_blend * (P_loc - P_ngh)
+      enddo
     endif
 
     ! North face (n_y = +1).
@@ -7414,9 +7464,39 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
         face_dy_N_A = face_dy_N_A + 0.5 * G%dxCv(i,J) * phi_A * P_face
         face_dy_N_B = face_dy_N_B + 0.5 * G%dxCv(i,J) * phi_B * P_face
       enddo
+    elseif (CS%dg_face_flux_K_thresh > 0.0 .and. ISS%hmask(i,j+1) == 1.0) then
+      h_loc_A = max(CS%h_nodal(i,j,1,2), CS%min_h_shelf)
+      h_loc_B = max(CS%h_nodal(i,j,2,2), CS%min_h_shelf)
+      h_ngh_A = max(CS%h_nodal(i,j+1,1,1), CS%min_h_shelf)
+      h_ngh_B = max(CS%h_nodal(i,j+1,2,1), CS%min_h_shelf)
+      b_loc_A = bed_corners(1,2) ; b_loc_B = bed_corners(2,2)
+      do gp_face=1,2
+        t_face = xquad(gp_face)
+        h_loc = (1.0 - t_face)*h_loc_A + t_face*h_loc_B
+        h_ngh = (1.0 - t_face)*h_ngh_A + t_face*h_ngh_B
+        b_loc = (1.0 - t_face)*b_loc_A + t_face*b_loc_B
+        if (rhoi_rhow * h_loc - b_loc > 0.0) then
+          P_loc = 0.5 * grav * rho * h_loc**2
+        else
+          P_loc = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_loc**2
+        endif
+        if (rhoi_rhow * h_ngh - b_loc > 0.0) then
+          P_ngh = 0.5 * grav * rho * h_ngh**2
+        else
+          P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
+        endif
+        h_avg = 0.5 * (h_loc + h_ngh)
+        delta_h = h_loc - h_ngh
+        r2 = (delta_h * delta_h) / max(h_avg * h_avg, 1.0e-20)
+        s_blend = r2 / (r2 + CS%dg_face_flux_K_thresh**2)
+        phi_A = 1.0 - t_face ; phi_B = t_face
+        face_dy_N_A = face_dy_N_A + 0.25 * G%dxCv(i,J) * phi_A * s_blend * (P_loc - P_ngh)
+        face_dy_N_B = face_dy_N_B + 0.25 * G%dxCv(i,J) * phi_B * s_blend * (P_loc - P_ngh)
+      enddo
     endif
 
-    ! Combine cell-volume integral with ice-front Neumann contributions.
+    ! Combine cell-volume integral with face contributions (ice-front Neumann
+    ! and, when enabled, mixed-form scale-aware interior face flux).
     cell_dx_node(1,1) = vol_dx(1,1) + face_dx_W_A
     cell_dy_node(1,1) = vol_dy(1,1) + face_dy_S_A
     cell_dx_node(2,1) = vol_dx(2,1) + face_dx_E_A
@@ -8039,47 +8119,47 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
 
   call get_param(param_file, mdl, "DG1_NODAL_LIMITER", limiter_str, &
                  "Slope limiter for nodal DG(1) ice thickness. One of: "//&
-                 "'barth' (default), 'venkatakrishnan', 'none'.", &
+                 "'barth' (default; cardinal-neighbor cell-mean stencil), "//&
+                 "'kuzmin' (vertex-based stencil over all 4 cells sharing each B-node, "//&
+                 "including hmask=2 partial-fill and hmask=3 Dirichlet cells; robust at "//&
+                 "ice fronts where Barth-Jespersen's stencil degenerates), or 'none'.", &
                  default="barth", do_not_log=.not.CS%use_DG_thickness)
   select case (trim(limiter_str))
   case ("none");            CS%nodal_limiter_choice = 0
   case ("barth");           CS%nodal_limiter_choice = 1
-  case ("venkatakrishnan"); CS%nodal_limiter_choice = 2
+  case ("kuzmin");          CS%nodal_limiter_choice = 2
   case default
     call MOM_error(FATAL, "read_nodal_limiter_params: DG1_NODAL_LIMITER must be "//&
-                          "one of: none, barth, venkatakrishnan.")
+                          "one of: none, barth, kuzmin.")
   end select
-
-  call get_param(param_file, mdl, "DG1_NODAL_LIMITER_K", CS%nodal_limiter_K, &
-                 "Venkatakrishnan K parameter (smooth-extremum protection band scale).", &
-                 units="nondim", default=5.0, &
-                 do_not_log=(.not.CS%use_DG_thickness) .or. &
-                            (CS%nodal_limiter_choice /= 2))
 
   call get_param(param_file, mdl, "DG1_NODAL_POSITIVITY", CS%nodal_positivity, &
                  "If true, apply the Liu-style positivity-preserving limiter to the "//&
                  "nodal DG(1) thickness after the slope limiter.", &
                  default=.true., do_not_log=.not.CS%use_DG_thickness)
 
-  call get_param(param_file, mdl, "DG_PENALTY_FORMULATION", CS%DG_penalty_formulation, &
-                 "Selects the numerical-flux jump penalty used at interior faces "//&
-                 "in the DG(1) driving-stress weak form. 0 = legacy Rusanov, "//&
-                 "1 = IIPG Shahbazi.", &
-                 default=1, do_not_log=.not.CS%use_DG_thickness)
-
-  call get_param(param_file, mdl, "DG_PENALTY_SAFETY_FACTOR", CS%DG_penalty_C_safety, &
-                 "Safety multiplier above the analytical IIPG coercivity lower bound.", &
-                 units="nondim", default=2.0, &
-                 do_not_log=(.not.CS%use_DG_thickness) .or. &
-                            (CS%DG_penalty_formulation /= 1))
-
   call get_param(param_file, mdl, "DG_DRIVING_STRESS_IBP", CS%dg_driving_stress_IBP, &
                  "If true, evaluate the DG(1) driving stress with the integration-by-parts "//&
-                 "weak form (volume IBP pressure term plus face fluxes). If false, evaluate "//&
-                 "rho*g*h*grad(s) directly at 2x2 Gauss points using the Q1 nodal basis, "//&
-                 "with no face fluxes. The strong form is provided for comparison and lacks "//&
-                 "the natural ocean back-pressure BC at the ice front.", &
-                 default=.true., do_not_log=.not.CS%use_DG_thickness)
+                 "weak form. Interior faces use a central numerical flux "//&
+                 "P_star = 0.5*(P_loc + P_ngh); any single-valued P_star gives the same SSA "//&
+                 "node-assembly total, so the prior Rusanov/IIPG penalty machinery is gone. "//&
+                 "If false (default), evaluate -rho*g*h*grad(s) directly at 2x2 Gauss points "//&
+                 "using the Q1 nodal basis, with an optional scale-aware face flux gated by "//&
+                 "DG_FACE_FLUX_K_THRESH.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
+
+  call get_param(param_file, mdl, "DG_FACE_FLUX_K_THRESH", CS%dg_face_flux_K_thresh, &
+                 "Relative-jump threshold for the strong-form driving stress's optional "//&
+                 "scale-aware face flux at interior hmask=1 / hmask=1 faces. A "//&
+                 "Venkatakrishnan-style smooth blend s = r^2 / (r^2 + K^2) with "//&
+                 "r = |[h]| / h_avg ramps the per-cell face contribution from zero "//&
+                 "(pure strong form) at s=0 to the central-IBP face flux at s=1. "//&
+                 "K_THRESH <= 0 disables the face flux entirely (pure strong form, the "//&
+                 "default). Typical engaging values are ~0.05-0.2, where r is comparable "//&
+                 "to the chosen K. Values >> 1 are effectively disabled because r << 1 in "//&
+                 "typical near-C0 nodal Q1 flows. Has no effect when USE_DG_THICKNESS is "//&
+                 "false or DG_DRIVING_STRESS_IBP is true.", &
+                 units="nondim", default=-1.0, do_not_log=.not.CS%use_DG_thickness)
 
 end subroutine read_nodal_limiter_params
 
@@ -8297,6 +8377,103 @@ subroutine nodal_BarthJespersen_limit(CS, G, ISS)
     if (associated(CS%phi_lim_DG)) CS%phi_lim_DG(i,j) = phi_cell
   enddo ; enddo
 end subroutine nodal_BarthJespersen_limit
+
+!> Kuzmin vertex-based slope limiter for CS%h_nodal. For each interior B-node,
+!! the allowed thickness envelope [Hmin_B, Hmax_B] is built from the cell-mean
+!! of all 4 surrounding cells (including hmask=2 partial-fill and hmask=3
+!! Dirichlet cells). Each hmask=1 cell's 4 corners are then clamped against
+!! the envelope of their respective B-node. Unlike Barth-Jespersen's cardinal
+!! 4-neighbor cell-mean stencil, this stencil does not degenerate at ice
+!! fronts (where seaward neighbours are hmask=0/2), so phi_lim_DG no longer
+!! collapses to 0 there. phi is recorded in CS%phi_lim_DG.
+subroutine nodal_Kuzmin_limit(CS, G, ISS)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS
+  type(ocean_grid_type),  intent(inout) :: G
+  type(ice_shelf_state),  intent(in)    :: ISS
+
+  ! Per-B-node thickness envelope [Z ~> m].
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: Hmax_B, Hmin_B
+  real :: Hbar, delta, phi_loc, phi_cell, cell_mean_val
+  real :: Hmax_loc, Hmin_loc
+  real, parameter :: H_LARGE = 1.0e30  ! Sentinel for "no contributing cell yet"
+  integer :: i, j, a, b, I_node, J_node
+
+  if (CS%nodal_limiter_choice == 0) return
+
+  ! Step A: build the per-B-node envelope. Initialise with sentinels and
+  ! widen by every surrounding cell with hmask in {1, 2, 3}.
+  Hmax_B(:,:) = -H_LARGE
+  Hmin_B(:,:) =  H_LARGE
+  do j = G%jsd+1, G%jed-1 ; do i = G%isd+1, G%ied-1
+    if (ISS%hmask(i,j) == 1.0) then
+      cell_mean_val = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
+    elseif (ISS%hmask(i,j) == 3.0) then
+      cell_mean_val = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
+    elseif (ISS%hmask(i,j) == 2.0) then
+      cell_mean_val = max(ISS%h_shelf(i,j), CS%min_h_shelf)
+    else
+      cycle  ! hmask = 0 (ocean): no contribution.
+    endif
+    ! Push this cell's representative thickness into its 4 B-nodes:
+    ! corner (a,b) of cell (i,j) maps to B-node (i+a-2, j+b-2).
+    Hmax_B(i-1, j-1) = max(Hmax_B(i-1, j-1), cell_mean_val)
+    Hmin_B(i-1, j-1) = min(Hmin_B(i-1, j-1), cell_mean_val)
+    Hmax_B(i,   j-1) = max(Hmax_B(i,   j-1), cell_mean_val)
+    Hmin_B(i,   j-1) = min(Hmin_B(i,   j-1), cell_mean_val)
+    Hmax_B(i-1, j  ) = max(Hmax_B(i-1, j  ), cell_mean_val)
+    Hmin_B(i-1, j  ) = min(Hmin_B(i-1, j  ), cell_mean_val)
+    Hmax_B(i,   j  ) = max(Hmax_B(i,   j  ), cell_mean_val)
+    Hmin_B(i,   j  ) = min(Hmin_B(i,   j  ), cell_mean_val)
+  enddo ; enddo
+
+  ! Step B: per-cell corner clamping. Identical indicator to Barth-Jespersen,
+  ! but read Hmax/Hmin from each corner's B-node envelope rather than from
+  ! the cardinal cell-mean stencil.
+  do j = G%jsc, G%jec ; do i = G%isc, G%iec
+    if (ISS%hmask(i,j) /= 1.0) cycle
+    Hbar = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
+    phi_cell = 1.0
+    do b = 1, 2 ; do a = 1, 2
+      I_node = i + a - 2 ; J_node = j + b - 2
+      Hmax_loc = Hmax_B(I_node, J_node)
+      Hmin_loc = Hmin_B(I_node, J_node)
+      ! If the B-node had no contributing cell (all sentinels), don't
+      ! constrain this corner.
+      if (Hmax_loc <= -H_LARGE + 1.0 .or. Hmin_loc >= H_LARGE - 1.0) cycle
+      delta = CS%h_nodal(i,j,a,b) - Hbar
+      if (delta > 1.0e-30) then
+        phi_loc = min(1.0, (Hmax_loc - Hbar) / delta)
+      elseif (delta < -1.0e-30) then
+        phi_loc = min(1.0, (Hmin_loc - Hbar) / delta)
+      else
+        phi_loc = 1.0
+      endif
+      phi_cell = min(phi_cell, max(0.0, phi_loc))
+    enddo ; enddo
+    do b = 1, 2 ; do a = 1, 2
+      CS%h_nodal(i,j,a,b) = Hbar + phi_cell*(CS%h_nodal(i,j,a,b) - Hbar)
+    enddo ; enddo
+    if (associated(CS%phi_lim_DG)) CS%phi_lim_DG(i,j) = phi_cell
+  enddo ; enddo
+
+  call pass_corner_field(CS%h_nodal, G)
+end subroutine nodal_Kuzmin_limit
+
+!> Dispatch the configured nodal slope limiter (no-op for
+!! CS%nodal_limiter_choice == 0). Centralises the choice gating so call
+!! sites do not need to know about the available limiters.
+subroutine apply_nodal_slope_limit(CS, G, ISS)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS
+  type(ocean_grid_type),  intent(inout) :: G
+  type(ice_shelf_state),  intent(in)    :: ISS
+
+  select case (CS%nodal_limiter_choice)
+  case (1)
+    call nodal_BarthJespersen_limit(CS, G, ISS)
+  case (2)
+    call nodal_Kuzmin_limit(CS, G, ISS)
+  end select
+end subroutine apply_nodal_slope_limit
 
 !> Liu-style positivity-preserving limiter: scale each cell's corner
 !! deviations from the mean by a single factor in [0,1] so the minimum
@@ -8588,7 +8765,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   call project_h_source_rate_to_nodes(CS, ISS, G, S_node)
 
   ! Stage 1: limit -> spatial op -> M^-1 -> Euler step (+ source).
-  call nodal_BarthJespersen_limit(CS, G, ISS)
+  call apply_nodal_slope_limit(CS, G, ISS)
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
   call pass_corner_field(CS%h_nodal, G)
   call DG1_nodal_spatial_operator(CS, G, hmask, CS%h_nodal, rhs, uh_ice, vh_ice)
@@ -8603,7 +8780,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   call pass_corner_field(CS%h_nodal, G)
 
   ! Stage 2: limit -> spatial op -> M^-1 -> SSP-RK2 combine (+ source).
-  call nodal_BarthJespersen_limit(CS, G, ISS)
+  call apply_nodal_slope_limit(CS, G, ISS)
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
   h_curr(:,:,:,:) = CS%h_nodal(:,:,:,:)
   call DG1_nodal_spatial_operator(CS, G, hmask, h_curr, rhs, uh_ice, vh_ice)
@@ -8624,7 +8801,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   CS%h_source_rate(:,:) = 0.0
 
   ! Final limit (captures phi_lim_DG diagnostic).
-  call nodal_BarthJespersen_limit(CS, G, ISS)
+  call apply_nodal_slope_limit(CS, G, ISS)
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
   call pass_corner_field(CS%h_nodal, G)
 
