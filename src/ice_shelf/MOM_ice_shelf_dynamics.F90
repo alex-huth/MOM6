@@ -7166,15 +7166,25 @@ subroutine add_strong_ice_front_face(face_length, face_sign, &
   enddo
 end subroutine add_strong_ice_front_face
 
-!> Accumulate the mixed-form scale-aware interior face flux for one face of
-!! one element into the per-corner accumulators face_A, face_B. Used by the
-!! strong-form driving stress at interior hmask=1 / hmask=1 faces when
-!! K_thresh > 0. Integrand at each face Gauss point:
-!!   face_sign * 1/4 * face_length * phi * s * (P_loc - P_ngh)
-!! where s = r^2 / (r^2 + K^2), r = |h_loc - h_ngh| / max(h_avg, eps), and
-!! P_loc/P_ngh use the per-side flotation-branched form. The 1/4 prefactor
-!! is the product of the 1/2 Gauss weight on [0,1] and the 1/2 from
-!! "P_loc - P_star" with central P_star = 1/2(P_loc + P_ngh).
+!> Accumulate the interior-face Dirac correction for one face of one element
+!! into the per-corner accumulators face_A, face_B. Used by the strong-form
+!! driving stress at interior hmask=1 / hmask=1 (or hmask=3) faces when
+!! K_thresh >= 0. The broken-Q1 thickness jump at the face contributes a
+!! distributional Dirac source the per-cell strong-form quadrature misses;
+!! adding this term restores the correct weak-form RHS. Per face Gauss point:
+!!   face_sign * 1/4 * face_length * phi * blend * rho*g*{h}*[s]
+!! where {h} = 1/2*(h_loc + h_ngh), [s] = s_loc - s_ngh, and each side's
+!! surface elevation s uses its own flotation test:
+!!   grounded side: s = h - b
+!!   floating side: s = (1 - rho_i/rho_w) * h
+!! At uniformly-grounded faces this reduces to rho*g*{h}*[h] = [P]; at
+!! uniformly-floating faces to (1 - rho_i/rho_w)*[P]; at mixed-flotation
+!! faces it remains distributionally correct (the per-side-P difference
+!! formula does not, missing terms of order 1/2*rho*g*r*h^2).
+!! The 1/4 prefactor is the product of the 1/2 Gauss weight on [0,1] and
+!! the 1/2 per-cell share of the inter-cell edge integral. blend = 1 when
+!! K_thresh = 0 (full central edge flux); K_thresh > 0 ramps blend from 0
+!! at small relative jumps to 1 at large jumps.
 subroutine add_strong_mixed_interior_face(face_length, face_sign, &
     h_loc_A, h_loc_B, h_ngh_A, h_ngh_B, b_corner_A, b_corner_B, &
     K_thresh, rho, rhow, rhoi_rhow, grav, min_h_shelf, &
@@ -7187,7 +7197,7 @@ subroutine add_strong_mixed_interior_face(face_length, face_sign, &
   real, intent(in)    :: h_ngh_B          !< Neighbour-cell h_nodal at face endpoint B [Z ~> m]
   real, intent(in)    :: b_corner_A       !< bed depth at face endpoint A [Z ~> m]
   real, intent(in)    :: b_corner_B       !< bed depth at face endpoint B [Z ~> m]
-  real, intent(in)    :: K_thresh         !< Venkatakrishnan-style threshold [nondim]
+  real, intent(in)    :: K_thresh         !< Venkatakrishnan-style blend threshold [nondim]
   real, intent(in)    :: rho              !< Ice density [R ~> kg m-3]
   real, intent(in)    :: rhow             !< Ocean density [R ~> kg m-3]
   real, intent(in)    :: rhoi_rhow        !< rho / rhow [nondim]
@@ -7199,8 +7209,8 @@ subroutine add_strong_mixed_interior_face(face_length, face_sign, &
 
   real :: hL_A, hL_B, hN_A, hN_B, b_A, b_B
   real :: t_face, h_loc, h_ngh, b_loc
-  real :: P_loc, P_ngh, h_avg, delta_h, r2, s_blend, phi_A, phi_B
-
+  real :: s_loc, s_ngh, h_avg, jump_factor
+  real :: delta_h, r2, s_blend, phi_A, phi_B
   integer :: gp_face
 
   hL_A = max(h_loc_A, min_h_shelf) ; hL_B = max(h_loc_B, min_h_shelf)
@@ -7212,30 +7222,39 @@ subroutine add_strong_mixed_interior_face(face_length, face_sign, &
     h_loc = (1.0 - t_face)*hL_A + t_face*hL_B
     h_ngh = (1.0 - t_face)*hN_A + t_face*hN_B
     b_loc = (1.0 - t_face)*b_A + t_face*b_B
+
+    ! Per-side surface elevation using each side's local flotation test.
     if (rhoi_rhow * h_loc - b_loc > 0.0) then
-      P_loc = 0.5 * grav * rho * h_loc**2
+      s_loc = h_loc - b_loc                          ! grounded
     else
-      P_loc = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_loc**2
+      s_loc = (1.0 - rhoi_rhow) * h_loc              ! floating
     endif
     if (rhoi_rhow * h_ngh - b_loc > 0.0) then
-      P_ngh = 0.5 * grav * rho * h_ngh**2
+      s_ngh = h_ngh - b_loc                          ! grounded
     else
-      P_ngh = 0.5 * grav * (1.0 - rhoi_rhow) * rho * h_ngh**2
+      s_ngh = (1.0 - rhoi_rhow) * h_ngh              ! floating
     endif
-    ! Blend factor: K_thresh == 0 recovers the full central-IBP face flux
-    ! (s = 1 everywhere); K_thresh > 0 ramps smoothly from strong form
-    ! (small jumps) to central-IBP (large jumps).
+
+    h_avg = 0.5 * (h_loc + h_ngh)
+    ! Universal Dirac integrand: rho * grav * {h} * [s]. Reduces to [P_eff]
+    ! at uniformly-grounded and uniformly-floating faces; remains correct
+    ! at mixed-flotation faces where [P_per-side] would miss terms.
+    jump_factor = rho * grav * h_avg * (s_loc - s_ngh)
+
+    ! Blend factor: K_thresh == 0 recovers the full distributional edge
+    ! correction (blend = 1 everywhere); K_thresh > 0 ramps smoothly from
+    ! strong form (small jumps) to full correction (large jumps).
     if (K_thresh == 0.0) then
       s_blend = 1.0
     else
-      h_avg = 0.5 * (h_loc + h_ngh)
       delta_h = h_loc - h_ngh
       r2 = (delta_h * delta_h) / max(h_avg * h_avg, 1.0e-20)
       s_blend = r2 / (r2 + K_thresh**2)
     endif
+
     phi_A = 1.0 - t_face ; phi_B = t_face
-    face_A = face_A + face_sign * 0.25 * face_length * phi_A * s_blend * (P_loc - P_ngh)
-    face_B = face_B + face_sign * 0.25 * face_length * phi_B * s_blend * (P_loc - P_ngh)
+    face_A = face_A + face_sign * 0.25 * face_length * phi_A * s_blend * jump_factor
+    face_B = face_B + face_sign * 0.25 * face_length * phi_B * s_blend * jump_factor
   enddo
 end subroutine add_strong_mixed_interior_face
 
