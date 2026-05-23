@@ -976,6 +976,12 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
       !Set haline_driving to zero for cells that may have had water_flux changed to 0.0 in change_thickness_using_melt
       if (ISS%water_flux(i,j)==0.0) haline_driving(i,j) = 0.
     enddo ; enddo
+    ! Halo of dhdt_shelf is stale: the difference above is only evaluated on
+    ! the compute domain, while ISS%h_shelf has been halo-exchanged in
+    ! update_ice_shelf. Fill the halo so processor-edge stripes don't appear
+    ! in the diagnostic and downstream readers (e.g. last_h_shelf) see
+    ! consistent values across ranks and reentrant boundaries.
+    call pass_var(ISS%dhdt_shelf, G%domain)
 
     call IS_dynamics_post_data(time_step, Time, CS%dCS, ISS, G)
 
@@ -3055,6 +3061,7 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
   do j=js,je ; do i=is,ie
     ISS%dhdt_shelf(i,j) = (ISS%h_shelf(i,j) - ISS%dhdt_shelf(i,j)) * Ifull_time_step
   enddo ; enddo
+  call pass_var(ISS%dhdt_shelf, G%domain)
 
   call enable_averages(full_time_step, Time, CS%diag)
   if (CS%id_area_shelf_h > 0) call post_data(CS%id_area_shelf_h ,ISS%area_shelf_h,CS%diag)
