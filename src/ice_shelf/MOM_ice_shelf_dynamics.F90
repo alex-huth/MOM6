@@ -1470,6 +1470,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
     if (CS%id_h_nodal_NW > 0) call post_data(CS%id_h_nodal_NW, CS%h_nodal(:,:,1,2), CS%diag)
     if (CS%id_h_nodal_NE > 0) call post_data(CS%id_h_nodal_NE, CS%h_nodal(:,:,2,2), CS%diag)
     if (CS%id_h_jump_face > 0 .and. associated(CS%h_nodal)) then
+      call pass_corner_field(CS%h_nodal, G)
       h_jump(:,:) = 0.0
       do j=G%jsc,G%jec ; do i=G%isc,G%iec
         if (ISS%hmask(i,j) /= 1.0) cycle
@@ -8305,17 +8306,19 @@ end subroutine init_nodal_DG_metric
 !> Halo-exchange the per-cell 4-corner nodal field. Each corner slot is a
 !! cell-centered scalar (A-grid).
 subroutine pass_corner_field(h_nodal, G)
-  type(ocean_grid_type),  intent(inout) :: G
+  type(ocean_grid_type),  intent(in) :: G
   real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(inout) :: h_nodal
+  real, dimension(SZDI_(G),SZDJ_(G),4) :: tmp
 
-  integer :: a, b
-  real, dimension(SZDI_(G),SZDJ_(G)) :: tmp
-
-  do b = 1, 2 ; do a = 1, 2
-    tmp(:,:) = h_nodal(:,:,a,b)
-    call pass_var(tmp, G%domain)
-    h_nodal(:,:,a,b) = tmp(:,:)
-  enddo ; enddo
+  tmp(:,:,1) = h_nodal(:,:,1,1)
+  tmp(:,:,2) = h_nodal(:,:,2,1)
+  tmp(:,:,3) = h_nodal(:,:,1,2)
+  tmp(:,:,4) = h_nodal(:,:,2,2)
+  call pass_var(tmp, G%domain)
+  h_nodal(:,:,1,1) = tmp(:,:,1)
+  h_nodal(:,:,2,1) = tmp(:,:,2)
+  h_nodal(:,:,1,2) = tmp(:,:,3)
+  h_nodal(:,:,2,2) = tmp(:,:,4)
 end subroutine pass_corner_field
 
 !> Compute the area-weighted cell mean of the 4 corner values via cell_mean_w.
@@ -8444,10 +8447,10 @@ subroutine nodal_Kuzmin_limit(CS, G, ISS)
       cell_mean_val = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
     elseif (ISS%hmask(i,j) == 3.0) then
       cell_mean_val = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
-    elseif (ISS%hmask(i,j) == 2.0) then
-      cell_mean_val = max(ISS%h_shelf(i,j), CS%min_h_shelf)
+    !elseif (ISS%hmask(i,j) == 2.0) then
+    !  cell_mean_val = max(ISS%h_shelf(i,j), CS%min_h_shelf)
     else
-      cycle  ! hmask = 0 (ocean): no contribution.
+      cycle  ! hmask = 0 (ocean) or 2 (calving/advancing): no contribution.
     endif
     ! Corner (a,b) of cell (i,j) -> B-node (i+a-2, j+b-2). The four
     ! B-nodes touched are (i-1, j-1), (i, j-1), (i-1, j), (i, j).
@@ -8553,6 +8556,8 @@ subroutine nodal_positivity_limit(CS, G, ISS)
       CS%h_nodal(i,j,a,b) = Hbar + phi_pos*(CS%h_nodal(i,j,a,b) - Hbar)
     enddo ; enddo
   enddo ; enddo
+
+  call pass_corner_field(CS%h_nodal, G)
 end subroutine nodal_positivity_limit
 
 !> Apply the per-cell tensor-product Q1 mass-matrix inverse:
