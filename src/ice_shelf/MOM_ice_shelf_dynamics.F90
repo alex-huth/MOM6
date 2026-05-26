@@ -8100,6 +8100,7 @@ subroutine project_h_source_rate_to_nodes(CS, ISS, G, S_node)
   S_corner(:,:) = 0.0
   w_corner(:,:) = 0.0
 
+  call pass_var(CS%h_source_rate, G%domain)
   ! Accumulate contributions from every hmask=1 T-cell to its 4 B-grid
   ! corners, weighted by CS%cell_mean_w. Only hmask=1 cells contribute, for
   ! mass conservation: cells with hmask=3 (Dirichlet thickness BC) hold
@@ -8418,6 +8419,7 @@ subroutine nodal_Kuzmin_limit(CS, G, ISS)
   type(ice_shelf_state),  intent(in)    :: ISS
 
   real, dimension(SZDIB_(G),SZDJB_(G)) :: Hmax_B, Hmin_B  ! Per-B-node envelope [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: count_B          ! Contributor count per B-node [nondim]
   real :: Hbar           ! Local cell mean [Z ~> m]
   real :: delta          ! h_nodal - Hbar at a corner [Z ~> m]
   real :: d_max          ! Signed-side envelope distance (>= 0) [Z ~> m]
@@ -8442,6 +8444,7 @@ subroutine nodal_Kuzmin_limit(CS, G, ISS)
   ! halo-exchanged below.
   Hmax_B(:,:) = -H_LARGE
   Hmin_B(:,:) =  H_LARGE
+  count_B(:,:) = 0.0
   do j = G%jsd, G%jed ; do i = G%isd, G%ied
     if (ISS%hmask(i,j) == 1.0) then
       cell_mean_val = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
@@ -8457,23 +8460,28 @@ subroutine nodal_Kuzmin_limit(CS, G, ISS)
     if (i-1 >= G%IsdB .and. j-1 >= G%JsdB) then
       Hmax_B(i-1, j-1) = max(Hmax_B(i-1, j-1), cell_mean_val)
       Hmin_B(i-1, j-1) = min(Hmin_B(i-1, j-1), cell_mean_val)
+      count_B(i-1, j-1) = count_B(i-1, j-1) + 1.0
     endif
     if (i <= G%IedB .and. j-1 >= G%JsdB) then
       Hmax_B(i,   j-1) = max(Hmax_B(i,   j-1), cell_mean_val)
       Hmin_B(i,   j-1) = min(Hmin_B(i,   j-1), cell_mean_val)
+      count_B(i,   j-1) = count_B(i,   j-1) + 1.0
     endif
     if (i-1 >= G%IsdB .and. j <= G%JedB) then
       Hmax_B(i-1, j  ) = max(Hmax_B(i-1, j  ), cell_mean_val)
       Hmin_B(i-1, j  ) = min(Hmin_B(i-1, j  ), cell_mean_val)
+      count_B(i-1, j  ) = count_B(i-1, j  ) + 1.0
     endif
     if (i <= G%IedB .and. j <= G%JedB) then
       Hmax_B(i,   j  ) = max(Hmax_B(i,   j  ), cell_mean_val)
       Hmin_B(i,   j  ) = min(Hmin_B(i,   j  ), cell_mean_val)
+      count_B(i,   j  ) = count_B(i,   j  ) + 1.0
     endif
   enddo ; enddo
 
   call pass_var(Hmax_B, G%domain, position=CORNER)
   call pass_var(Hmin_B, G%domain, position=CORNER)
+  call pass_var(count_B, G%domain, position=CORNER)
 
   do j = G%jsc, G%jec ; do i = G%isc, G%iec
     if (ISS%hmask(i,j) /= 1.0) cycle
@@ -8485,6 +8493,10 @@ subroutine nodal_Kuzmin_limit(CS, G, ISS)
       Hmin_loc = Hmin_B(I_node, J_node)
       ! If the B-node had no contributing cell (sentinels), skip.
       if (Hmax_loc <= -H_LARGE + 1.0 .or. Hmin_loc >= H_LARGE - 1.0) cycle
+      ! One-sided stencil (only this cell contributed): no neighbour
+      ! information to bound the corner. Leave it unconstrained rather
+      ! than collapsing phi to zero.
+      if (count_B(I_node, J_node) <= 1.5) cycle
       delta = CS%h_nodal(i,j,a,b) - Hbar
       d_minus = abs(delta)
       ! No deviation -> nothing to limit at this corner.
@@ -8674,26 +8686,18 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         t_co = 1.0 - t_face
         u_at_qp = t_co*CS%u_shelf(i,j-1) + t_face*CS%u_shelf(i,j)
         if (u_at_qp >= 0.0) then
-          if (i >= isc) then
-            if (hmask(i,j) == 3.0) then
-              h_upwind = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
-            elseif (hmask(i,j) == 1.0) then
-              h_upwind = t_co*h_nodal_in(i,j,2,1) + t_face*h_nodal_in(i,j,2,2)
-            else
-              h_upwind = 0.0
-            endif
+          if (hmask(i,j) == 3.0) then
+            h_upwind = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
+          elseif (hmask(i,j) == 1.0) then
+            h_upwind = t_co*h_nodal_in(i,j,2,1) + t_face*h_nodal_in(i,j,2,2)
           else
             h_upwind = 0.0
           endif
         else
-          if (i+1 <= iec) then
-            if (hmask(i+1,j) == 3.0) then
-              h_upwind = max(CS%h_bdry_val(i+1,j), CS%min_h_shelf)
-            elseif (hmask(i+1,j) == 1.0) then
-              h_upwind = t_co*h_nodal_in(i+1,j,1,1) + t_face*h_nodal_in(i+1,j,1,2)
-            else
-              h_upwind = 0.0
-            endif
+          if (hmask(i+1,j) == 3.0) then
+            h_upwind = max(CS%h_bdry_val(i+1,j), CS%min_h_shelf)
+          elseif (hmask(i+1,j) == 1.0) then
+            h_upwind = t_co*h_nodal_in(i+1,j,1,1) + t_face*h_nodal_in(i+1,j,1,2)
           else
             h_upwind = 0.0
           endif
@@ -8733,26 +8737,18 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         t_co = 1.0 - t_face
         v_at_qp = t_co*CS%v_shelf(i-1,j) + t_face*CS%v_shelf(i,j)
         if (v_at_qp >= 0.0) then
-          if (j >= jsc) then
-            if (hmask(i,j) == 3.0) then
-              h_upwind = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
-            elseif (hmask(i,j) == 1.0) then
-              h_upwind = t_co*h_nodal_in(i,j,1,2) + t_face*h_nodal_in(i,j,2,2)
-            else
-              h_upwind = 0.0
-            endif
+          if (hmask(i,j) == 3.0) then
+            h_upwind = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
+          elseif (hmask(i,j) == 1.0) then
+            h_upwind = t_co*h_nodal_in(i,j,1,2) + t_face*h_nodal_in(i,j,2,2)
           else
             h_upwind = 0.0
           endif
         else
-          if (j+1 <= jec) then
-            if (hmask(i,j+1) == 3.0) then
-              h_upwind = max(CS%h_bdry_val(i,j+1), CS%min_h_shelf)
-            elseif (hmask(i,j+1) == 1.0) then
-              h_upwind = t_co*h_nodal_in(i,j+1,1,1) + t_face*h_nodal_in(i,j+1,2,1)
-            else
-              h_upwind = 0.0
-            endif
+          if (hmask(i,j+1) == 3.0) then
+            h_upwind = max(CS%h_bdry_val(i,j+1), CS%min_h_shelf)
+          elseif (hmask(i,j+1) == 1.0) then
+            h_upwind = t_co*h_nodal_in(i,j+1,1,1) + t_face*h_nodal_in(i,j+1,2,1)
           else
             h_upwind = 0.0
           endif
