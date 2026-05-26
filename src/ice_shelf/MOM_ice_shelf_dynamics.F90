@@ -8253,13 +8253,15 @@ subroutine init_nodal_DG_metric(CS, G)
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
 
   do j = jsd, jed ; do i = isd, ied
-    ! Face lengths with one-sided fallback at domain edges.
-    if ((J-1 >= G%JsdB) .and. (j + G%jdg_offset > G%jsg)) then
+    ! Face lengths with one-sided fallback at non-reentrant domain edges. For
+    ! reentrant domains the wrap halo carries valid dxCv/dyCu, so use the
+    ! two-sided metric even at the global west/south edge cell.
+    if ((J-1 >= G%JsdB) .and. (CS%reentrant_y .or. (j + G%jdg_offset > G%jsg))) then
       dxS = G%dxCv(i,J-1) ; dxN = G%dxCv(i,J)
     else
       dxS = G%dxCv(i,J)   ; dxN = G%dxCv(i,J)
     endif
-    if ((I-1 >= G%IsdB) .and. (i + G%idg_offset > G%isg)) then
+    if ((I-1 >= G%IsdB) .and. (CS%reentrant_x .or. (i + G%idg_offset > G%isg))) then
       dyW = G%dyCu(I-1,j) ; dyE = G%dyCu(I,j)
     else
       dyW = G%dyCu(I,j)   ; dyE = G%dyCu(I,j)
