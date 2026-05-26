@@ -1076,6 +1076,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         call apply_nodal_slope_limit(CS, G, ISS)
         if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
         call pass_corner_field(CS%h_nodal, G)
+        call enforce_wrap_corner_consistency(CS, ISS, G)
         call recompute_h_shelf_from_nodal(CS, ISS, G)
       endif
       call update_velocity_masks(CS, G, ISS%hmask, CS%umask, CS%vmask, CS%u_face_mask, CS%v_face_mask)
@@ -8305,6 +8306,50 @@ subroutine init_nodal_DG_metric(CS, G)
     CS%cell_mean_w(i,j,2,2) = (dyW/6.0 + dyE/3.0) * (dxS/6.0 + dxN/3.0)
   enddo ; enddo
 end subroutine init_nodal_DG_metric
+
+!> For symmetric BGRID + reentrant domains, the wrap-mate B-nodes on either
+!! side of the periodic boundary are the same physical location, but each
+!! cell adjacent to the boundary stores its own DG corner there. At IC we
+!! want the two wrap-shared corners to hold the same value (a continuous
+!! initial field). FMS pass_var with position=CORNER does not always
+!! reconcile owned wrap-edge B-nodes for symmetric grids, and the IC node
+!! file may have small asymmetries at the wrap. Force consistency by
+!! having the PE owning the global west (south) edge adopt the wrap-mate's
+!! value from its halo. Halos are then re-passed.
+subroutine enforce_wrap_corner_consistency(CS, ISS, G)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS
+  type(ice_shelf_state),  intent(in)    :: ISS
+  type(ocean_grid_type),  intent(inout) :: G
+
+  integer :: i, j
+
+  if (.not. G%symmetric) return
+  if (.not. (CS%reentrant_x .or. CS%reentrant_y)) return
+
+  if (CS%reentrant_x .and. (G%isc + G%idg_offset == G%isg)) then
+    i = G%isc
+    do j = G%jsc, G%jec
+      if (ISS%hmask(i, j) == 1.0 .or. ISS%hmask(i, j) == 3.0) then
+        CS%h_nodal(i, j, 1, 1) = CS%h_nodal(i-1, j, 2, 1)
+        CS%h_nodal(i, j, 1, 2) = CS%h_nodal(i-1, j, 2, 2)
+      endif
+    enddo
+  endif
+
+  if (CS%reentrant_y .and. (G%jsc + G%jdg_offset == G%jsg)) then
+    j = G%jsc
+    do i = G%isc, G%iec
+      if (ISS%hmask(i, j) == 1.0 .or. ISS%hmask(i, j) == 3.0) then
+        CS%h_nodal(i, j, 1, 1) = CS%h_nodal(i, j-1, 1, 2)
+        CS%h_nodal(i, j, 2, 1) = CS%h_nodal(i, j-1, 2, 2)
+      endif
+    enddo
+  endif
+
+  ! pass_corner_field is collective; every PE must call regardless of
+  ! whether it touched its data.
+  call pass_corner_field(CS%h_nodal, G)
+end subroutine enforce_wrap_corner_consistency
 
 !> Halo-exchange the per-cell 4-corner nodal field. Each corner slot is a
 !! cell-centered scalar (A-grid).
