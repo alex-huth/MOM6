@@ -269,6 +269,17 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! dx_perp * |u_face|. coef = 0 disables the viscosity;
                                   !! coef -> infinity drives the face jump toward zero
                                   !! (stabilised-CG limit). Typical values 0.01-0.1.
+  real :: dg_art_visc_gamma       !< Shock-capturing amplification of the artificial
+                                  !! viscosity coefficient [nondim]. coef_face is
+                                  !! multiplied by (1 + gamma * max(0, |[[h]]|/H_ref -
+                                  !! threshold)), where H_ref is the average cell-mean
+                                  !! thickness over the two cells touching the face.
+                                  !! gamma = 0 gives the plain linear viscosity; gamma > 0
+                                  !! leaves smooth faces near coef while strongly amplifying
+                                  !! at faces where the relative jump exceeds threshold.
+  real :: dg_art_visc_thresh      !< Relative-jump threshold at which the shock-capturing
+                                  !! amplification activates [nondim]. Faces with
+                                  !! |[[h]]|/H_ref below this value receive no amplification.
   logical :: dg_driving_stress_IBP !< If true, the DG(1) driving stress uses the
                                   !! integration-by-parts weak form with central P*
                                   !! (= 1/2(P_loc + P_ngh)) at interior faces. If false
@@ -8305,6 +8316,26 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  units="nondim", default=0.05, &
                  do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_art_visc))
 
+  call get_param(param_file, mdl, "DG1_ART_VISC_GAMMA", CS%dg_art_visc_gamma, &
+                 "Shock-capturing amplification on the DG(1) artificial viscosity. The "//&
+                 "face coefficient is multiplied by (1 + gamma * max(0, |[[h]]|/H_ref - "//&
+                 "threshold)), where H_ref is the average cell-mean thickness over the "//&
+                 "two cells touching the face. gamma = 0 (default) recovers the plain "//&
+                 "linear viscosity. gamma > 0 leaves smooth faces near coef while "//&
+                 "strongly amplifying at faces where the relative jump exceeds "//&
+                 "DG1_ART_VISC_THRESHOLD. Typical values 5-20.", &
+                 units="nondim", default=0.0, &
+                 do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_art_visc))
+
+  call get_param(param_file, mdl, "DG1_ART_VISC_THRESHOLD", CS%dg_art_visc_thresh, &
+                 "Relative-jump threshold at which the DG(1) artificial-viscosity "//&
+                 "shock-capturing amplification activates. Faces with |[[h]]|/H_ref "//&
+                 "below this value receive no extra amplification beyond the linear "//&
+                 "coef term. Has no effect when DG1_ART_VISC_GAMMA = 0. Typical 0.05-0.2.", &
+                 units="nondim", default=0.1, &
+                 do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_art_visc &
+                             .or. CS%dg_art_visc_gamma == 0.0))
+
   call get_param(param_file, mdl, "DG_DRIVING_STRESS_IBP", CS%dg_driving_stress_IBP, &
                  "If true, evaluate the DG(1) driving stress with the integration-by-parts "//&
                  "weak form. Interior faces use a central numerical flux "//&
@@ -8623,6 +8654,10 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: h_A_qp, h_B_qp     ! Face-QP corner thickness on the two sides of a DG face [Z ~> m]
   real :: u_mag_qp           ! Velocity magnitude sqrt(u^2+v^2) at a face QP [L T-1 ~> m s-1]
   real :: visc_flux_qp       ! Artificial-viscosity face flux per QP, antisymmetric [Z L2 T-1]
+  real :: Hbar_A, Hbar_B     ! Cell-mean thickness on the two sides of a DG face [Z ~> m]
+  real :: H_ref              ! Reference thickness for the relative jump [Z ~> m]
+  real :: rel_jump           ! |[[h]]| / H_ref at a face QP [nondim]
+  real :: coef_face          ! Per-face viscosity coefficient incl. shock-capturing amp [nondim]
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_vol, rhs_face
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
@@ -8738,6 +8773,11 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       ! pulling the interior cell toward h_bdry_val. The BC's inflow flux is
       ! already handled correctly in the upwind block.
       if (.not. (hmask(i,j) == 1.0 .and. hmask(i+1,j) == 1.0)) cycle
+      if (CS%dg_art_visc_gamma > 0.0) then
+        Hbar_A = nodal_cell_mean(h_nodal_in(i,  j,:,:), CS%cell_mean_w(i,  j,:,:))
+        Hbar_B = nodal_cell_mean(h_nodal_in(i+1,j,:,:), CS%cell_mean_w(i+1,j,:,:))
+        H_ref = max(CS%min_h_shelf, 0.5*(Hbar_A + Hbar_B))
+      endif
       do gp = 1, 2
         if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
         t_co = 1.0 - t_face
@@ -8746,7 +8786,13 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         u_mag_qp = sqrt(u_at_qp*u_at_qp + v_at_qp*v_at_qp)
         h_A_qp  = t_co*h_nodal_in(i,  j,2,1) + t_face*h_nodal_in(i,  j,2,2)
         h_B_qp  = t_co*h_nodal_in(i+1,j,1,1) + t_face*h_nodal_in(i+1,j,1,2)
-        visc_flux_qp = gw * CS%dg_art_visc_coef * u_mag_qp * (h_B_qp - h_A_qp) * G%dyCu(i,j)
+        coef_face = CS%dg_art_visc_coef
+        if (CS%dg_art_visc_gamma > 0.0) then
+          rel_jump = abs(h_A_qp - h_B_qp) / H_ref
+          coef_face = coef_face * (1.0 + CS%dg_art_visc_gamma * &
+                                         max(0.0, rel_jump - CS%dg_art_visc_thresh))
+        endif
+        visc_flux_qp = gw * coef_face * u_mag_qp * (h_B_qp - h_A_qp) * G%dyCu(i,j)
         if (i >= isc .and. hmask(i,j) == 1.0) then
           rhs_face(i,j,2,1) = rhs_face(i,j,2,1) + visc_flux_qp * t_co
           rhs_face(i,j,2,2) = rhs_face(i,j,2,2) + visc_flux_qp * t_face
@@ -8816,6 +8862,11 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       if (CS%v_face_mask(i,j) == 4.0) cycle
       ! Skip faces touching Dirichlet thickness BCs - see east-face block for rationale.
       if (.not. (hmask(i,j) == 1.0 .and. hmask(i,j+1) == 1.0)) cycle
+      if (CS%dg_art_visc_gamma > 0.0) then
+        Hbar_A = nodal_cell_mean(h_nodal_in(i,j,  :,:), CS%cell_mean_w(i,j,  :,:))
+        Hbar_B = nodal_cell_mean(h_nodal_in(i,j+1,:,:), CS%cell_mean_w(i,j+1,:,:))
+        H_ref = max(CS%min_h_shelf, 0.5*(Hbar_A + Hbar_B))
+      endif
       do gp = 1, 2
         if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
         t_co = 1.0 - t_face
@@ -8824,7 +8875,13 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         u_mag_qp = sqrt(u_at_qp*u_at_qp + v_at_qp*v_at_qp)
         h_A_qp  = t_co*h_nodal_in(i,j,  1,2) + t_face*h_nodal_in(i,j,  2,2)
         h_B_qp  = t_co*h_nodal_in(i,j+1,1,1) + t_face*h_nodal_in(i,j+1,2,1)
-        visc_flux_qp = gw * CS%dg_art_visc_coef * u_mag_qp * (h_B_qp - h_A_qp) * G%dxCv(i,j)
+        coef_face = CS%dg_art_visc_coef
+        if (CS%dg_art_visc_gamma > 0.0) then
+          rel_jump = abs(h_A_qp - h_B_qp) / H_ref
+          coef_face = coef_face * (1.0 + CS%dg_art_visc_gamma * &
+                                         max(0.0, rel_jump - CS%dg_art_visc_thresh))
+        endif
+        visc_flux_qp = gw * coef_face * u_mag_qp * (h_B_qp - h_A_qp) * G%dxCv(i,j)
         if (j >= jsc .and. hmask(i,j) == 1.0) then
           rhs_face(i,j,1,2) = rhs_face(i,j,1,2) + visc_flux_qp * t_co
           rhs_face(i,j,2,2) = rhs_face(i,j,2,2) + visc_flux_qp * t_face
