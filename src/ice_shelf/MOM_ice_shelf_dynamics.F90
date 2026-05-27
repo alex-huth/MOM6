@@ -366,7 +366,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_visc_shelf = -1, id_taub = -1, &
              id_bed_node = -1, &
              id_h_nodal_SW = -1, id_h_nodal_SE = -1, id_h_nodal_NW = -1, id_h_nodal_NE = -1, &
-             id_h_jump_face = -1, id_h_source_rate = -1, &
+             id_h_jump_node = -1, id_h_jump_node_rel = -1, id_h_source_rate = -1, &
              id_phi_lim_DG = -1, &
              id_phi_x_FV = -1, id_phi_y_FV = -1
   real, pointer, dimension(:,:) :: phi_lim_DG => NULL() !< Nodal DG(1) limiter factor at last advection
@@ -1141,9 +1141,12 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          'DG(1) nodal Q1 thickness at NW cell corner', 'm', conversion=US%Z_to_m)
       CS%id_h_nodal_NE = register_diag_field('ice_shelf_model','h_nodal_NE',CS%diag%axesT1, Time, &
          'DG(1) nodal Q1 thickness at NE cell corner', 'm', conversion=US%Z_to_m)
-      CS%id_h_jump_face = register_diag_field('ice_shelf_model','h_jump_face',CS%diag%axesT1, Time, &
-         'DG(1) max |h_L - h_R| inter-element trace jump across the 4 cell faces (hmask=1 only)', &
-         'm', conversion=US%Z_to_m)
+      CS%id_h_jump_node = register_diag_field('ice_shelf_model','h_jump_node',CS%diag%axesB1, Time, &
+         'DG(1) max-minus-min of co-located corner thickness across up to 4 touching cells '//&
+         '(hmask=1 only) at each B-grid node', 'm', conversion=US%Z_to_m)
+      CS%id_h_jump_node_rel = register_diag_field('ice_shelf_model','h_jump_node_rel',CS%diag%axesB1, Time, &
+         'DG(1) B-node jump as a fraction of the mean cell-mean thickness over the touching cells '//&
+         '(hmask=1 only)', 'nondim')
       CS%id_h_source_rate = register_diag_field('ice_shelf_model','h_source_rate',CS%diag%axesT1, Time, &
          'Cell-mean thickness source rate (basal melt + surface SMB) consumed by the last DG advect step', &
          'm s-1', conversion=US%Z_to_m*US%s_to_T)
@@ -1412,9 +1415,19 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
                                                   !! [R L T-1 ~> Pa s m-1]
   real, dimension(SZDI_(G),SZDJ_(G))   :: surf_slope ! the surface slope of the ice shelf/sheet [nondim]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: ice_speed ! ice sheet flow speed [L T-1 ~> m s-1]
-  real, dimension(SZDI_(G),SZDJ_(G))   :: h_jump  ! max DG(1) inter-element trace jump across the 4
-                                                  !! cell faces [Z ~> m], 0 outside hmask=1 ice cells
-  real :: jmp                                     ! single-face corner jump [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_n     ! max-min of co-located DG(1) corner thickness
+                                                       !! across the up to 4 cells (hmask=1) touching each
+                                                       !! B-grid node [Z ~> m], 0 where <2 touching cells
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_n_rel ! h_jump_n normalised by the mean cell-mean
+                                                       !! thickness over the same touching cells [nondim]
+  real :: h_cSW, h_cSE, h_cNW, h_cNE              ! corner thickness candidates at a B-node [Z ~> m]
+  real :: Hb_SW, Hb_SE, Hb_NW, Hb_NE              ! cell-mean thickness for each touching cell [Z ~> m]
+  real :: hmax_b, hmin_b                          ! max and min of valid corner candidates [Z ~> m]
+  real :: Hbar_sum                                ! sum of valid cell-mean thicknesses [Z ~> m]
+  real :: Hbar_avg                                ! arithmetic mean of valid cell-mean thicknesses [Z ~> m]
+  integer :: n_valid                              ! number of touching cells with hmask==1 [nondim]
+  logical :: vSW, vSE, vNW, vNE                   ! per-touching-cell validity flags
+  integer :: ii, jj                               ! touching-cell indices on the T-grid
 
   integer :: i, j
 
@@ -1470,41 +1483,68 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
     if (CS%id_h_nodal_SE > 0) call post_data(CS%id_h_nodal_SE, CS%h_nodal(:,:,2,1), CS%diag)
     if (CS%id_h_nodal_NW > 0) call post_data(CS%id_h_nodal_NW, CS%h_nodal(:,:,1,2), CS%diag)
     if (CS%id_h_nodal_NE > 0) call post_data(CS%id_h_nodal_NE, CS%h_nodal(:,:,2,2), CS%diag)
-    if (CS%id_h_jump_face > 0 .and. associated(CS%h_nodal)) then
+    if ((CS%id_h_jump_node > 0 .or. CS%id_h_jump_node_rel > 0) .and. associated(CS%h_nodal)) then
       call pass_corner_field(CS%h_nodal, G)
-      h_jump(:,:) = 0.0
-      do j=G%jsc,G%jec ; do i=G%isc,G%iec
-        if (ISS%hmask(i,j) /= 1.0) cycle
-        ! East face (cell i,j corners SE,NE) <-> (cell i+1,j corners SW,NW).
-        if (ISS%hmask(i+1,j) == 1.0) then
-          jmp = abs(CS%h_nodal(i,j,2,1) - CS%h_nodal(i+1,j,1,1))
-          if (jmp > h_jump(i,j)) h_jump(i,j) = jmp
-          jmp = abs(CS%h_nodal(i,j,2,2) - CS%h_nodal(i+1,j,1,2))
-          if (jmp > h_jump(i,j)) h_jump(i,j) = jmp
+      h_jump_n(:,:)     = 0.0
+      h_jump_n_rel(:,:) = 0.0
+      ! At B-node (I,J) the up to 4 touching T-cells are, in fixed order,
+      !   SW=(I,J), SE=(I+1,J), NW=(I,J+1), NE=(I+1,J+1).
+      ! Each contributes its DG(1) corner that is co-located at (I,J):
+      !   SW -> h_nodal(I,  J,  2,2)   SE -> h_nodal(I+1,J,  1,2)
+      !   NW -> h_nodal(I,  J+1,2,1)   NE -> h_nodal(I+1,J+1,1,1)
+      ! Fixed traversal order is required so the result is bitwise identical
+      ! under any horizontal decomposition (halo cells produce the same value)
+      ! and under a 90 deg rotation of the grid (the labelling rotates with i,j).
+      do J=G%JscB,G%JecB ; do I=G%IscB,G%IecB
+        ii = I   ; jj = J     ; vSW = (ISS%hmask(ii,jj) == 1.0)
+        h_cSW = 0.0 ; Hb_SW = 0.0
+        if (vSW) then ; h_cSW = CS%h_nodal(ii,jj,2,2) ; Hb_SW = ISS%h_shelf(ii,jj) ; endif
+        ii = I+1 ; jj = J     ; vSE = (ISS%hmask(ii,jj) == 1.0)
+        h_cSE = 0.0 ; Hb_SE = 0.0
+        if (vSE) then ; h_cSE = CS%h_nodal(ii,jj,1,2) ; Hb_SE = ISS%h_shelf(ii,jj) ; endif
+        ii = I   ; jj = J+1   ; vNW = (ISS%hmask(ii,jj) == 1.0)
+        h_cNW = 0.0 ; Hb_NW = 0.0
+        if (vNW) then ; h_cNW = CS%h_nodal(ii,jj,2,1) ; Hb_NW = ISS%h_shelf(ii,jj) ; endif
+        ii = I+1 ; jj = J+1   ; vNE = (ISS%hmask(ii,jj) == 1.0)
+        h_cNE = 0.0 ; Hb_NE = 0.0
+        if (vNE) then ; h_cNE = CS%h_nodal(ii,jj,1,1) ; Hb_NE = ISS%h_shelf(ii,jj) ; endif
+        n_valid = 0
+        if (vSW) n_valid = n_valid + 1
+        if (vSE) n_valid = n_valid + 1
+        if (vNW) n_valid = n_valid + 1
+        if (vNE) n_valid = n_valid + 1
+        if (n_valid < 2) cycle
+        ! Initialise min/max from the first valid candidate (SW->SE->NW->NE).
+        if (vSW) then
+          hmax_b = h_cSW ; hmin_b = h_cSW
+        elseif (vSE) then
+          hmax_b = h_cSE ; hmin_b = h_cSE
+        elseif (vNW) then
+          hmax_b = h_cNW ; hmin_b = h_cNW
+        else
+          hmax_b = h_cNE ; hmin_b = h_cNE
         endif
-        ! West face: (cell i-1,j SE,NE) <-> (cell i,j SW,NW).
-        if (ISS%hmask(i-1,j) == 1.0) then
-          jmp = abs(CS%h_nodal(i-1,j,2,1) - CS%h_nodal(i,j,1,1))
-          if (jmp > h_jump(i,j)) h_jump(i,j) = jmp
-          jmp = abs(CS%h_nodal(i-1,j,2,2) - CS%h_nodal(i,j,1,2))
-          if (jmp > h_jump(i,j)) h_jump(i,j) = jmp
+        if (vSE) then
+          if (h_cSE > hmax_b) hmax_b = h_cSE
+          if (h_cSE < hmin_b) hmin_b = h_cSE
         endif
-        ! North face: (cell i,j NW,NE) <-> (cell i,j+1 SW,SE).
-        if (ISS%hmask(i,j+1) == 1.0) then
-          jmp = abs(CS%h_nodal(i,j,1,2) - CS%h_nodal(i,j+1,1,1))
-          if (jmp > h_jump(i,j)) h_jump(i,j) = jmp
-          jmp = abs(CS%h_nodal(i,j,2,2) - CS%h_nodal(i,j+1,2,1))
-          if (jmp > h_jump(i,j)) h_jump(i,j) = jmp
+        if (vNW) then
+          if (h_cNW > hmax_b) hmax_b = h_cNW
+          if (h_cNW < hmin_b) hmin_b = h_cNW
         endif
-        ! South face: (cell i,j-1 NW,NE) <-> (cell i,j SW,SE).
-        if (ISS%hmask(i,j-1) == 1.0) then
-          jmp = abs(CS%h_nodal(i,j-1,1,2) - CS%h_nodal(i,j,1,1))
-          if (jmp > h_jump(i,j)) h_jump(i,j) = jmp
-          jmp = abs(CS%h_nodal(i,j-1,2,2) - CS%h_nodal(i,j,2,1))
-          if (jmp > h_jump(i,j)) h_jump(i,j) = jmp
+        if (vNE) then
+          if (h_cNE > hmax_b) hmax_b = h_cNE
+          if (h_cNE < hmin_b) hmin_b = h_cNE
         endif
+        h_jump_n(I,J) = hmax_b - hmin_b
+        ! Mean cell-mean thickness over the same valid cells, with a fixed
+        ! summation order to avoid FMA / reassociation differences.
+        Hbar_sum = (Hb_SW + Hb_SE) + (Hb_NW + Hb_NE)
+        Hbar_avg = Hbar_sum / real(n_valid)
+        h_jump_n_rel(I,J) = h_jump_n(I,J) / max(CS%min_h_shelf, Hbar_avg)
       enddo ; enddo
-      call post_data(CS%id_h_jump_face, h_jump, CS%diag)
+      if (CS%id_h_jump_node     > 0) call post_data(CS%id_h_jump_node,     h_jump_n,     CS%diag)
+      if (CS%id_h_jump_node_rel > 0) call post_data(CS%id_h_jump_node_rel, h_jump_n_rel, CS%diag)
     endif
     if (CS%id_h_source_rate > 0 .and. associated(CS%h_source_rate_last)) &
         call post_data(CS%id_h_source_rate, CS%h_source_rate_last, CS%diag)
