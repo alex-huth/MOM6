@@ -254,6 +254,15 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! initialize_ice_flow_from_file. Requires USE_DG_THICKNESS.
   logical :: nodal_positivity     !< If true, apply Liu-style positivity-preserving limiter
                                   !! to the nodal DG(1) thickness corners.
+  logical :: dg_jump_penalty      !< If true, add an interior-penalty face term
+                                  !! -eta * |u.n_qp| * [[h]] to the DG(1) nodal spatial
+                                  !! operator. Dissipates DG face jumps over time while
+                                  !! preserving the in-cell Q1 slope used by the subgrid
+                                  !! driving stress. Conservative across each face pair.
+  real :: dg_jump_penalty_eta     !< Dimensionless coefficient on the DG(1) face jump
+                                  !! penalty [nondim]. tau_face = eta * |u.n_qp|. eta = 0
+                                  !! disables the penalty; eta -> infinity drives the
+                                  !! face jump toward zero (stabilised-CG limit).
   logical :: dg_driving_stress_IBP !< If true, the DG(1) driving stress uses the
                                   !! integration-by-parts weak form with central P*
                                   !! (= 1/2(P_loc + P_ngh)) at interior faces. If false
@@ -8266,6 +8275,24 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "nodal DG(1) thickness corners as a safety floor against negative "//&
                  "thickness from numerical noise.", &
                  default=.true., do_not_log=.not.CS%use_DG_thickness)
+
+  call get_param(param_file, mdl, "DG1_JUMP_PENALTY", CS%dg_jump_penalty, &
+                 "If true, add an interior-penalty face term -eta*|u.n_qp|*[[h]] to "//&
+                 "the DG(1) nodal spatial operator. Dissipates inter-cell DG face "//&
+                 "jumps over time while preserving the in-cell Q1 slope used by the "//&
+                 "subgrid driving stress. Conservative across each face pair "//&
+                 "(antisymmetric flux on the two cells). eta -> infinity recovers a "//&
+                 "stabilised-CG-like behaviour; eta = 0 disables the penalty and "//&
+                 "the DG advection runs with only the natural upwind dissipation.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
+
+  call get_param(param_file, mdl, "DG1_JUMP_PENALTY_ETA", CS%dg_jump_penalty_eta, &
+                 "Dimensionless coefficient on the DG(1) face jump penalty. "//&
+                 "tau_face = eta * |u.n_qp| in the interior-penalty face integral. "//&
+                 "Typical values 0.01-0.1; larger values give stronger jump "//&
+                 "dissipation and approach stabilised-CG behaviour.", &
+                 units="nondim", default=0.02, &
+                 do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_jump_penalty))
 
   call get_param(param_file, mdl, "DG_DRIVING_STRESS_IBP", CS%dg_driving_stress_IBP, &
                  "If true, evaluate the DG(1) driving stress with the integration-by-parts "//&
