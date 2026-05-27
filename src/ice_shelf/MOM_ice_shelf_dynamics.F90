@@ -280,6 +280,11 @@ type, public :: ice_shelf_dyn_CS ; private
   real :: dg_art_visc_thresh      !< Relative-jump threshold at which the shock-capturing
                                   !! amplification activates [nondim]. Faces with
                                   !! |[[h]]|/H_ref below this value receive no amplification.
+  real :: dg_art_visc_cfl_safety  !< Safety fraction of the per-face CFL bound used as
+                                  !! an on-the-fly upper cap on the gated artificial-
+                                  !! viscosity coefficient [nondim]. Per-face cap is
+                                  !! coef_face_max = safety * dx_perp / (|u_face| * dt).
+                                  !! Active only when DG1_ART_VISC_GAMMA > 0.
   logical :: dg_driving_stress_IBP !< If true, the DG(1) driving stress uses the
                                   !! integration-by-parts weak form with central P*
                                   !! (= 1/2(P_loc + P_ngh)) at interior faces. If false
@@ -8336,6 +8341,19 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_art_visc &
                              .or. CS%dg_art_visc_gamma == 0.0))
 
+  call get_param(param_file, mdl, "DG1_ART_VISC_CFL_SAFETY", CS%dg_art_visc_cfl_safety, &
+                 "Safety fraction of the per-face CFL bound used as an on-the-fly upper "//&
+                 "cap on the gated artificial-viscosity coefficient. Per face, the cap "//&
+                 "is coef_face_max = safety * dx_perp / (|u_face| * dt), derived from "//&
+                 "the SSP-RK2 stability bound K*dt < 2 with K = 2*coef*|u|/dx_perp. "//&
+                 "safety < 1 ensures CFL stability; smaller values (e.g. 0.1-0.25) also "//&
+                 "guard against the SSA-coupling positive-feedback that destabilises the "//&
+                 "scheme well below the strict CFL bound. Has no effect when "//&
+                 "DG1_ART_VISC_GAMMA = 0 (the linear coef is user-set and uncapped).", &
+                 units="nondim", default=0.25, &
+                 do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_art_visc &
+                             .or. CS%dg_art_visc_gamma == 0.0))
+
   call get_param(param_file, mdl, "DG_DRIVING_STRESS_IBP", CS%dg_driving_stress_IBP, &
                  "If true, evaluate the DG(1) driving stress with the integration-by-parts "//&
                  "weak form. Interior faces use a central numerical flux "//&
@@ -8628,7 +8646,7 @@ end subroutine apply_nodal_DG_mass_inverse
 !! at 2x2 Gauss-Legendre QPs in the volume and 2-point Gauss on each face.
 !! Specified-flux faces (u/v_face_mask == 4) distribute the prescribed face
 !! flux to the two on-face corners with equal weight (plan R24).
-subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_ice)
+subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_ice, dt)
   type(ice_shelf_dyn_CS), intent(in) :: CS
   type(ocean_grid_type),  intent(in) :: G
   real, dimension(SZDI_(G),SZDJ_(G)), intent(in)        :: hmask
@@ -8636,6 +8654,10 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out)   :: rhs
   real, dimension(SZDIB_(G),SZDJ_(G)),    intent(inout) :: uh_ice
   real, dimension(SZDI_(G),SZDJB_(G)),    intent(inout) :: vh_ice
+  real,                                   intent(in)    :: dt !< RK-stage time step [T ~> s]
+                                                              !! used to derive the per-face
+                                                              !! CFL cap on the gated
+                                                              !! artificial-viscosity coef.
 
   ! 2-point Gauss-Legendre on [0,1]
   real, parameter :: gp1 = 0.5 - 0.5/sqrt(3.0)
@@ -8658,6 +8680,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: H_ref              ! Reference thickness for the relative jump [Z ~> m]
   real :: rel_jump           ! |[[h]]| / H_ref at a face QP [nondim]
   real :: coef_face          ! Per-face viscosity coefficient incl. shock-capturing amp [nondim]
+  real :: coef_face_max      ! Per-face CFL-based upper cap on coef_face [nondim]
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_vol, rhs_face
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
@@ -8791,6 +8814,10 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
           rel_jump = abs(h_A_qp - h_B_qp) / H_ref
           coef_face = coef_face * (1.0 + CS%dg_art_visc_gamma * &
                                          max(0.0, rel_jump - CS%dg_art_visc_thresh))
+          if (u_mag_qp * dt > 0.0) then
+            coef_face_max = CS%dg_art_visc_cfl_safety * G%dxCu(i,j) / (u_mag_qp * dt)
+            coef_face = min(coef_face, coef_face_max)
+          endif
         endif
         visc_flux_qp = gw * coef_face * u_mag_qp * (h_B_qp - h_A_qp) * G%dyCu(i,j)
         if (i >= isc .and. hmask(i,j) == 1.0) then
@@ -8880,6 +8907,10 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
           rel_jump = abs(h_A_qp - h_B_qp) / H_ref
           coef_face = coef_face * (1.0 + CS%dg_art_visc_gamma * &
                                          max(0.0, rel_jump - CS%dg_art_visc_thresh))
+          if (u_mag_qp * dt > 0.0) then
+            coef_face_max = CS%dg_art_visc_cfl_safety * G%dyCv(i,j) / (u_mag_qp * dt)
+            coef_face = min(coef_face, coef_face_max)
+          endif
         endif
         visc_flux_qp = gw * coef_face * u_mag_qp * (h_B_qp - h_A_qp) * G%dxCv(i,j)
         if (j >= jsc .and. hmask(i,j) == 1.0) then
@@ -8945,7 +8976,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   ! Stage 1: positivity floor -> spatial op -> M^-1 -> Euler step (+ source).
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
   call pass_corner_field(CS%h_nodal, G)
-  call DG1_nodal_spatial_operator(CS, G, hmask, CS%h_nodal, rhs, uh_ice, vh_ice)
+  call DG1_nodal_spatial_operator(CS, G, hmask, CS%h_nodal, rhs, uh_ice, vh_ice, time_step)
   do j = jsc, jec ; do i = isc, iec
     if (hmask(i,j) /= 1.0) cycle
     call apply_nodal_DG_mass_inverse(CS%Minv_xi(i,j,:,:), CS%Minv_eta(i,j,:,:), &
@@ -8959,7 +8990,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   ! Stage 2: positivity floor -> spatial op -> M^-1 -> SSP-RK2 combine (+ source).
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
   h_curr(:,:,:,:) = CS%h_nodal(:,:,:,:)
-  call DG1_nodal_spatial_operator(CS, G, hmask, h_curr, rhs, uh_ice, vh_ice)
+  call DG1_nodal_spatial_operator(CS, G, hmask, h_curr, rhs, uh_ice, vh_ice, time_step)
   do j = jsc, jec ; do i = isc, iec
     if (hmask(i,j) /= 1.0) cycle
     call apply_nodal_DG_mass_inverse(CS%Minv_xi(i,j,:,:), CS%Minv_eta(i,j,:,:), &
