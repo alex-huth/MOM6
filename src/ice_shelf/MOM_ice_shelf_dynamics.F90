@@ -252,20 +252,6 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! into CS%bed_node and derive CS%bed_elev by bilinear averaging.
                                   !! Skips reconstruct_bed_to_nodes and the BED_TOPO_FILE read in
                                   !! initialize_ice_flow_from_file. Requires USE_DG_THICKNESS.
-  integer :: nodal_limiter_choice !< Slope-limiter choice for nodal DG(1) thickness:
-                                  !! 0 = none, 1 = Kuzmin vertex-based limiter with
-                                  !! Venkatakrishnan smooth indicator (Kuzmin 2010,
-                                  !! Venkatakrishnan 1993), 2 = bound-preserving
-                                  !! Algebraic Flux Correction (Kuzmin & Moeller 2010
-                                  !! IJNMF / Zhang & Shu 2010 JCP).
-  real :: nodal_limiter_K_venkat  !< Venkatakrishnan smoothing constant [nondim].
-                                  !! K=0 is the pure Venkatakrishnan indicator
-                                  !! (smoother than Barth-Jespersen at intermediate
-                                  !! ratios, but still phi->0 at exact extrema).
-                                  !! K>0 relaxes phi toward 1 at smooth extrema by
-                                  !! setting eps = K * (Hmax_B - Hmin_B); the
-                                  !! envelope-width normalisation keeps K grid-
-                                  !! independent. Typical K = 0.01-0.1.
   logical :: nodal_positivity     !< If true, apply Liu-style positivity-preserving limiter
                                   !! to the nodal DG(1) thickness corners.
   logical :: dg_driving_stress_IBP !< If true, the DG(1) driving stress uses the
@@ -370,10 +356,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_h_nodal_SW = -1, id_h_nodal_SE = -1, id_h_nodal_NW = -1, id_h_nodal_NE = -1, &
              id_h_jump_node = -1, id_h_jump_node_rel = -1, &
              id_h_jump_envelope = -1, id_h_jump_envelope_rel = -1, id_h_source_rate = -1, &
-             id_phi_lim_DG = -1, &
              id_phi_x_FV = -1, id_phi_y_FV = -1
-  real, pointer, dimension(:,:) :: phi_lim_DG => NULL() !< Nodal DG(1) limiter factor at last advection
-                                                       !! call [nondim], in [0,1].
   real, pointer, dimension(:,:) :: phi_x_FV => NULL() !< Van Leer slope-limiter factor at each u-face
                                                        !! from ice_shelf_advect_thickness_x [nondim],
                                                        !! in [0,2]. Faces where the limiter branch was
@@ -525,7 +508,6 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%cell_mean_w(isd:ied,jsd:jed,1:2,1:2), source=0.0)
     allocate(CS%h_source_rate(isd:ied,jsd:jed), source=0.0)
     allocate(CS%h_source_rate_last(isd:ied,jsd:jed), source=0.0)
-    allocate(CS%phi_lim_DG(isd:ied,jsd:jed), source=1.0)
     allocate(CS%phi_x_FV(IsdB:IedB,jsd:jed), source=1.0)
     allocate(CS%phi_y_FV(isd:ied,JsdB:JedB), source=1.0)
     allocate(CS%u_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0)
@@ -1076,7 +1058,6 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         if (.not. node_ic_used) then
           call initialize_h_nodal_from_cellmean(ISS%h_shelf, CS%h_nodal, ISS%hmask, G)
         endif
-        call apply_nodal_slope_limit(CS, G, ISS)
         if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
         call pass_corner_field(CS%h_nodal, G)
         call enforce_wrap_corner_consistency(CS, ISS, G)
@@ -1152,10 +1133,9 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          '(hmask=1 only)', 'nondim')
       CS%id_h_jump_envelope = register_diag_field('ice_shelf_model','h_jump_envelope', &
          CS%diag%axesB1, Time, &
-         'Hmax_B - Hmin_B at each B-node: the per-B-node cell-mean envelope width that the nodal '//&
-         'Kuzmin / AFC limiter uses as its bound on corner thickness. Built over hmask=1 and '//&
-         'hmask=3 (Dirichlet) cells touching the node. h_jump_node cannot exceed this; if it '//&
-         'does, the limiter is failing to enforce the bound.', &
+         'Per-B-node cell-mean envelope width Hmax_B - Hmin_B, built over hmask=1 and hmask=3 '//&
+         '(Dirichlet) cells touching the node. Reports the local roughness of the cell-mean '//&
+         'thickness field around each B-node.', &
          'm', conversion=US%Z_to_m)
       CS%id_h_jump_envelope_rel = register_diag_field('ice_shelf_model','h_jump_envelope_rel', &
          CS%diag%axesB1, Time, &
@@ -1163,8 +1143,6 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       CS%id_h_source_rate = register_diag_field('ice_shelf_model','h_source_rate',CS%diag%axesT1, Time, &
          'Cell-mean thickness source rate (basal melt + surface SMB) consumed by the last DG advect step', &
          'm s-1', conversion=US%Z_to_m*US%s_to_T)
-      CS%id_phi_lim_DG = register_diag_field('ice_shelf_model','phi_lim_DG',CS%diag%axesT1, Time, &
-         'Nodal DG(1) limiter factor at end-of-timestep (1=no clip, 0=full clip)', 'nondim')
     else
       CS%id_phi_x_FV = register_diag_field('ice_shelf_model','phi_x_FV',CS%diag%axesCu1, Time, &
          'Van Leer slope-limiter factor at each u-face from ice_shelf_advect_thickness_x '//&
@@ -1569,12 +1547,10 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       if (CS%id_h_jump_node_rel > 0) call post_data(CS%id_h_jump_node_rel, h_jump_n_rel, CS%diag)
     endif
     if ((CS%id_h_jump_envelope > 0 .or. CS%id_h_jump_envelope_rel > 0) .and. associated(CS%h_nodal)) then
-      ! Reconstruct the per-B-node cell-mean envelope Hmax_B - Hmin_B that
-      ! the nodal slope / AFC limiter uses as its bound on corner thickness.
-      ! Identical construction to nodal_AFC_limit / nodal_Kuzmin_limit so
-      ! h_jump_node should never exceed h_jump_envelope when AFC is the
-      ! active limiter. Built independent of the active limiter so it is
-      ! always meaningful as a smoothness diagnostic of the cell-mean field.
+      ! Per-B-node cell-mean envelope width Hmax_B - Hmin_B. Reports the
+      ! local roughness of the cell-mean thickness field; useful as a
+      ! smoothness diagnostic regardless of whether any face-jump
+      ! stabilisation is active.
       call pass_corner_field(CS%h_nodal, G)
       Hmax_Bd(:,:) = -H_LARGE_D
       Hmin_Bd(:,:) =  H_LARGE_D
@@ -1625,8 +1601,6 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
     endif
     if (CS%id_h_source_rate > 0 .and. associated(CS%h_source_rate_last)) &
         call post_data(CS%id_h_source_rate, CS%h_source_rate_last, CS%diag)
-    if (CS%id_phi_lim_DG > 0 .and. associated(CS%phi_lim_DG)) &
-        call post_data(CS%id_phi_lim_DG, CS%phi_lim_DG, CS%diag)
     if (CS%id_phi_x_FV > 0 .and. associated(CS%phi_x_FV)) &
         call post_data(CS%id_phi_x_FV, CS%phi_x_FV, CS%diag)
     if (CS%id_phi_y_FV > 0 .and. associated(CS%phi_y_FV)) &
@@ -6150,7 +6124,6 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%cell_mean_w)) deallocate(CS%cell_mean_w)
   if (associated(CS%h_source_rate)) deallocate(CS%h_source_rate)
   if (associated(CS%h_source_rate_last)) deallocate(CS%h_source_rate_last)
-  if (associated(CS%phi_lim_DG)) deallocate(CS%phi_lim_DG)
   if (associated(CS%phi_x_FV)) deallocate(CS%phi_x_FV)
   if (associated(CS%phi_y_FV)) deallocate(CS%phi_y_FV)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
@@ -8281,55 +8254,17 @@ end subroutine project_h_source_rate_to_nodes
 ! Minv_eta, cell_mean_w caches built in init_nodal_DG_metric.
 ! ===========================================================================
 
-!> Read nodal-DG limiter runtime parameters.
+!> Read nodal-DG runtime parameters (positivity floor + driving-stress options).
 subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
   type(param_file_type),   intent(in)    :: param_file
   character(len=*),        intent(in)    :: mdl
   type(ice_shelf_dyn_CS),  intent(inout) :: CS
   type(unit_scale_type),   intent(in)    :: US
 
-  character(len=40) :: limiter_str
-
-  call get_param(param_file, mdl, "DG1_NODAL_LIMITER", limiter_str, &
-                 "Slope limiter for nodal DG(1) ice thickness. One of: "//&
-                 "'kuzmin' (default; Kuzmin 2010 vertex-based limiter with the "//&
-                 "Venkatakrishnan 1993 smooth indicator), 'afc' (bound-preserving "//&
-                 "Algebraic Flux Correction, Kuzmin & Moeller 2010 IJNMF / "//&
-                 "Zhang & Shu 2010 JCP; corner deviations from the cell mean are "//&
-                 "uniformly scaled so each corner stays inside the neighbour "//&
-                 "cell-mean envelope, preserves in-cell slope where smooth, "//&
-                 "preserves cell mean exactly), or 'none'. The legacy "//&
-                 "names 'barth' and 'venkatakrishnan' are accepted as aliases for "//&
-                 "'kuzmin'.", &
-                 default="kuzmin", do_not_log=.not.CS%use_DG_thickness)
-  select case (trim(limiter_str))
-  case ("none");                       CS%nodal_limiter_choice = 0
-  case ("kuzmin");                     CS%nodal_limiter_choice = 1
-  case ("afc");                        CS%nodal_limiter_choice = 2
-  case ("barth", "venkatakrishnan")
-    if (CS%use_DG_thickness) &
-      call MOM_error(WARNING, "read_nodal_limiter_params: DG1_NODAL_LIMITER='"//&
-                              trim(limiter_str)//"' is deprecated; mapped to 'kuzmin'.")
-    CS%nodal_limiter_choice = 1
-  case default
-    call MOM_error(FATAL, "read_nodal_limiter_params: DG1_NODAL_LIMITER must be "//&
-                          "one of: none, kuzmin, afc.")
-  end select
-
-  call get_param(param_file, mdl, "DG1_LIMITER_K_VENKAT", CS%nodal_limiter_K_venkat, &
-                 "Venkatakrishnan smoothing constant for the Kuzmin slope limiter "//&
-                 "applied to nodal DG(1) thickness. K=0 is the pure "//&
-                 "Venkatakrishnan indicator (smoother than Barth-Jespersen at "//&
-                 "intermediate ratios but phi->0 at exact extrema). K>0 relaxes "//&
-                 "phi toward 1 at smooth extrema via eps = K * (Hmax_B - Hmin_B); "//&
-                 "the envelope-width normalisation keeps K grid-independent. "//&
-                 "Typical values 0.01-0.1.", &
-                 units="nondim", default=0.0, &
-                 do_not_log=(.not.CS%use_DG_thickness .or. CS%nodal_limiter_choice /= 1))
-
   call get_param(param_file, mdl, "DG1_NODAL_POSITIVITY", CS%nodal_positivity, &
                  "If true, apply the Liu-style positivity-preserving limiter to the "//&
-                 "nodal DG(1) thickness after the slope limiter.", &
+                 "nodal DG(1) thickness corners as a safety floor against negative "//&
+                 "thickness from numerical noise.", &
                  default=.true., do_not_log=.not.CS%use_DG_thickness)
 
   call get_param(param_file, mdl, "DG_DRIVING_STRESS_IBP", CS%dg_driving_stress_IBP, &
@@ -8568,277 +8503,6 @@ subroutine initialize_h_nodal_from_cellmean(h_shelf, h_nodal, hmask, G)
   enddo ; enddo
 end subroutine initialize_h_nodal_from_cellmean
 
-!> Kuzmin vertex-based slope limiter (Kuzmin 2010) with the Venkatakrishnan
-!! 1993 smooth indicator. For each B-node, the admissible envelope
-!! [Hmin_B, Hmax_B] is the min/max of the cell means of all surrounding
-!! cells (including self): hmask=1 contributes nodal_cell_mean(h_nodal),
-!! hmask=3 contributes h_bdry_val, hmask=2 contributes h_shelf, hmask=0
-!! is skipped. The envelope is halo-exchanged so processor-edge B-nodes
-!! receive contributions from cells on the other side. For each hmask=1
-!! cell, the per-corner Venkatakrishnan indicator
-!!   phi_loc = ((d_max^2 + 2*d_minus*d_max + eps^2) /
-!!              (d_max^2 + 2*d_minus^2 + d_minus*d_max + eps^2))
-!! is taken (with d_max = Hmax_B - Hbar [or Hbar - Hmin_B], d_minus = |delta|,
-!! eps = K_venkat * (Hmax_B - Hmin_B)), and the cell's phi is the min over
-!! its 4 corners. K_venkat = 0 gives the pure Venkatakrishnan indicator
-!! (smoother than Barth-Jespersen at intermediate ratios, but phi->0 at
-!! exact extrema); K_venkat > 0 relaxes phi toward 1 at smooth extrema.
-!! References:
-!!   D. Kuzmin (2010), J. Comput. Appl. Math. 233, 3077-3085.
-!!   V. Venkatakrishnan (1993), AIAA 93-0880.
-subroutine nodal_Kuzmin_limit(CS, G, ISS)
-  type(ice_shelf_dyn_CS), intent(inout) :: CS
-  type(ocean_grid_type),  intent(inout) :: G
-  type(ice_shelf_state),  intent(in)    :: ISS
-
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: Hmax_B, Hmin_B  ! Per-B-node envelope [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: count_B          ! Contributor count per B-node [nondim]
-  real :: Hbar           ! Local cell mean [Z ~> m]
-  real :: delta          ! h_nodal - Hbar at a corner [Z ~> m]
-  real :: d_max          ! Signed-side envelope distance (>= 0) [Z ~> m]
-  real :: d_minus        ! abs(delta) [Z ~> m]
-  real :: eps2           ! Venkatakrishnan smoothing squared [Z2 ~> m2]
-  real :: phi_loc        ! Per-corner limiter factor [nondim]
-  real :: phi_cell       ! Per-cell limiter factor (min over 4 corners) [nondim]
-  real :: cell_mean_val  ! This cell's contribution to the envelope [Z ~> m]
-  real :: Hmax_loc, Hmin_loc  ! Envelope read at a corner's B-node [Z ~> m]
-  real :: num, den       ! Venkatakrishnan numerator/denominator [Z2 ~> m2]
-  real, parameter :: H_LARGE = 1.0e30  ! Sentinel for "no contributing cell"
-  integer :: i, j, a, b, I_node, J_node
-
-  if (CS%nodal_limiter_choice == 0) return
-
-  ! Ensure neighbour corner values are fresh before reading across cells.
-  call pass_corner_field(CS%h_nodal, G)
-
-  ! Build the per-B-node cell-mean envelope over the full data domain so
-  ! every B-node inside the compute domain receives contributions from all
-  ! up-to-4 surrounding cells. Processor-boundary B-nodes are then
-  ! halo-exchanged below.
-  Hmax_B(:,:) = -H_LARGE
-  Hmin_B(:,:) =  H_LARGE
-  count_B(:,:) = 0.0
-  do j = G%jsd, G%jed ; do i = G%isd, G%ied
-    if (ISS%hmask(i,j) == 1.0) then
-      cell_mean_val = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
-    elseif (ISS%hmask(i,j) == 3.0) then
-      cell_mean_val = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
-    !elseif (ISS%hmask(i,j) == 2.0) then
-    !  cell_mean_val = max(ISS%h_shelf(i,j), CS%min_h_shelf)
-    else
-      cycle  ! hmask = 0 (ocean) or 2 (calving/advancing): no contribution.
-    endif
-    ! Corner (a,b) of cell (i,j) -> B-node (i+a-2, j+b-2). The four
-    ! B-nodes touched are (i-1, j-1), (i, j-1), (i-1, j), (i, j).
-    if (i-1 >= G%IsdB .and. j-1 >= G%JsdB) then
-      Hmax_B(i-1, j-1) = max(Hmax_B(i-1, j-1), cell_mean_val)
-      Hmin_B(i-1, j-1) = min(Hmin_B(i-1, j-1), cell_mean_val)
-      count_B(i-1, j-1) = count_B(i-1, j-1) + 1.0
-    endif
-    if (i <= G%IedB .and. j-1 >= G%JsdB) then
-      Hmax_B(i,   j-1) = max(Hmax_B(i,   j-1), cell_mean_val)
-      Hmin_B(i,   j-1) = min(Hmin_B(i,   j-1), cell_mean_val)
-      count_B(i,   j-1) = count_B(i,   j-1) + 1.0
-    endif
-    if (i-1 >= G%IsdB .and. j <= G%JedB) then
-      Hmax_B(i-1, j  ) = max(Hmax_B(i-1, j  ), cell_mean_val)
-      Hmin_B(i-1, j  ) = min(Hmin_B(i-1, j  ), cell_mean_val)
-      count_B(i-1, j  ) = count_B(i-1, j  ) + 1.0
-    endif
-    if (i <= G%IedB .and. j <= G%JedB) then
-      Hmax_B(i,   j  ) = max(Hmax_B(i,   j  ), cell_mean_val)
-      Hmin_B(i,   j  ) = min(Hmin_B(i,   j  ), cell_mean_val)
-      count_B(i,   j  ) = count_B(i,   j  ) + 1.0
-    endif
-  enddo ; enddo
-
-  call pass_var(Hmax_B, G%domain, position=CORNER)
-  call pass_var(Hmin_B, G%domain, position=CORNER)
-  call pass_var(count_B, G%domain, position=CORNER)
-
-  do j = G%jsc, G%jec ; do i = G%isc, G%iec
-    if (ISS%hmask(i,j) /= 1.0) cycle
-    Hbar = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
-    phi_cell = 1.0
-    do b = 1, 2 ; do a = 1, 2
-      I_node = i + a - 2 ; J_node = j + b - 2
-      Hmax_loc = Hmax_B(I_node, J_node)
-      Hmin_loc = Hmin_B(I_node, J_node)
-      ! If the B-node had no contributing cell (sentinels), skip.
-      if (Hmax_loc <= -H_LARGE + 1.0 .or. Hmin_loc >= H_LARGE - 1.0) cycle
-      ! One-sided stencil (only this cell contributed): no neighbour
-      ! information to bound the corner. Leave it unconstrained rather
-      ! than collapsing phi to zero.
-      if (count_B(I_node, J_node) <= 1.5) cycle
-      delta = CS%h_nodal(i,j,a,b) - Hbar
-      d_minus = abs(delta)
-      ! No deviation -> nothing to limit at this corner.
-      if (d_minus <= 1.0e-30) cycle
-      if (delta > 0.0) then
-        d_max = max(0.0, Hmax_loc - Hbar)
-      else
-        d_max = max(0.0, Hbar - Hmin_loc)
-      endif
-      eps2 = (CS%nodal_limiter_K_venkat * (Hmax_loc - Hmin_loc))**2
-      ! Venkatakrishnan smooth limiter (Venkatakrishnan 1993, eq. 11):
-      ! phi = (d_max^2 + 2 d_minus d_max + eps^2) /
-      !       (d_max^2 + 2 d_minus^2 + d_minus d_max + eps^2)
-      ! eps=0 recovers min(1, d_max/d_minus) exactly.
-      num = d_max*d_max + 2.0*d_minus*d_max + eps2
-      den = d_max*d_max + 2.0*d_minus*d_minus + d_minus*d_max + eps2
-      if (den > 0.0) then
-        phi_loc = num / den
-      else
-        phi_loc = 1.0
-      endif
-      phi_cell = min(phi_cell, max(0.0, min(1.0, phi_loc)))
-    enddo ; enddo
-    do b = 1, 2 ; do a = 1, 2
-      CS%h_nodal(i,j,a,b) = Hbar + phi_cell*(CS%h_nodal(i,j,a,b) - Hbar)
-    enddo ; enddo
-    if (associated(CS%phi_lim_DG)) CS%phi_lim_DG(i,j) = phi_cell
-  enddo ; enddo
-
-  call pass_corner_field(CS%h_nodal, G)
-  if (associated(CS%phi_lim_DG)) call pass_var(CS%phi_lim_DG, G%domain)
-end subroutine nodal_Kuzmin_limit
-
-!> Algebraic Flux Correction (AFC) bound-preserving limiter for nodal DG(1)
-!! ice thickness. For each cell, scale the deviation of every corner from the
-!! cell mean by a single per-cell factor phi in [0,1] so that every corner
-!! ends up inside the per-B-node envelope [Hmin_B, Hmax_B] formed by the
-!! cell-mean thicknesses of all cells touching that node.
-!!
-!! For Q1 DG transport this bound-preserving form (Zhang & Shu 2010 JCP) is
-!! mathematically equivalent to the edge-graph + Zalesak vertex-based AFC of
-!! Kuzmin & Moeller 2010 IJNMF when the local bounds are cell-mean based, but
-!! is much cheaper to assemble. Unlike the Kuzmin/Venkatakrishnan slope
-!! limiter (choice 1), which always shrinks corner deviations toward the cell
-!! mean, AFC fires only when a corner would otherwise leave the neighbour
-!! cell-mean range. Smooth flow is therefore untouched, sharp grounding-line
-!! and shear-margin jumps are bounded by the neighbour cell-mean contrast
-!! (instead of growing unboundedly under upwind DG where u . n approx 0), and
-!! the in-cell slope used by the subgrid driving stress is preserved.
-!!
-!! Cell mean is preserved exactly because the same phi multiplies all 4
-!! corner deviations.
-subroutine nodal_AFC_limit(CS, G, ISS)
-  type(ice_shelf_dyn_CS), intent(inout) :: CS
-  type(ocean_grid_type),  intent(inout) :: G
-  type(ice_shelf_state),  intent(in)    :: ISS
-
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: Hmax_B, Hmin_B  ! Per-B-node envelope [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: count_B          ! Contributor count per B-node [nondim]
-  real :: Hbar           ! Local cell mean [Z ~> m]
-  real :: delta          ! h_nodal - Hbar at a corner [Z ~> m]
-  real :: room           ! Signed-side distance from Hbar to the B-node envelope [Z ~> m]
-  real :: cell_mean_val  ! This cell's contribution to the envelope [Z ~> m]
-  real :: Hmax_loc, Hmin_loc  ! Envelope read at a corner's B-node [Z ~> m]
-  real :: phi_loc        ! Per-corner bound-preserving factor [nondim]
-  real :: phi_cell       ! Per-cell bound-preserving factor (min over 4 corners) [nondim]
-  real, parameter :: H_LARGE = 1.0e30  ! Sentinel for "no contributing cell"
-  real, parameter :: EPS_DELTA = 1.0e-30  ! Numerical floor on |delta| [Z ~> m]
-  integer :: i, j, a, b, I_node, J_node
-
-  if (CS%nodal_limiter_choice /= 2) return
-
-  ! Ensure neighbour corner values are fresh before reading across cells.
-  call pass_corner_field(CS%h_nodal, G)
-
-  ! Build the per-B-node cell-mean envelope over the full data domain so
-  ! every B-node inside the compute domain receives contributions from all
-  ! up-to-4 surrounding cells. Processor-boundary B-nodes are then
-  ! halo-exchanged below. The envelope construction here is identical to
-  ! the one used by nodal_Kuzmin_limit (which keeps the two limiters
-  ! consistent and bitwise-reproducing under any PE layout).
-  Hmax_B(:,:) = -H_LARGE
-  Hmin_B(:,:) =  H_LARGE
-  count_B(:,:) = 0.0
-  do j = G%jsd, G%jed ; do i = G%isd, G%ied
-    if (ISS%hmask(i,j) == 1.0) then
-      cell_mean_val = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
-    elseif (ISS%hmask(i,j) == 3.0) then
-      cell_mean_val = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
-    else
-      cycle  ! hmask = 0 (ocean) or 2 (calving/advancing): no contribution.
-    endif
-    if (i-1 >= G%IsdB .and. j-1 >= G%JsdB) then
-      Hmax_B(i-1, j-1) = max(Hmax_B(i-1, j-1), cell_mean_val)
-      Hmin_B(i-1, j-1) = min(Hmin_B(i-1, j-1), cell_mean_val)
-      count_B(i-1, j-1) = count_B(i-1, j-1) + 1.0
-    endif
-    if (i <= G%IedB .and. j-1 >= G%JsdB) then
-      Hmax_B(i,   j-1) = max(Hmax_B(i,   j-1), cell_mean_val)
-      Hmin_B(i,   j-1) = min(Hmin_B(i,   j-1), cell_mean_val)
-      count_B(i,   j-1) = count_B(i,   j-1) + 1.0
-    endif
-    if (i-1 >= G%IsdB .and. j <= G%JedB) then
-      Hmax_B(i-1, j  ) = max(Hmax_B(i-1, j  ), cell_mean_val)
-      Hmin_B(i-1, j  ) = min(Hmin_B(i-1, j  ), cell_mean_val)
-      count_B(i-1, j  ) = count_B(i-1, j  ) + 1.0
-    endif
-    if (i <= G%IedB .and. j <= G%JedB) then
-      Hmax_B(i,   j  ) = max(Hmax_B(i,   j  ), cell_mean_val)
-      Hmin_B(i,   j  ) = min(Hmin_B(i,   j  ), cell_mean_val)
-      count_B(i,   j  ) = count_B(i,   j  ) + 1.0
-    endif
-  enddo ; enddo
-
-  call pass_var(Hmax_B,  G%domain, position=CORNER)
-  call pass_var(Hmin_B,  G%domain, position=CORNER)
-  call pass_var(count_B, G%domain, position=CORNER)
-
-  ! Per-cell bound-preserving scaling. Order (b outer, a inner) matches the
-  ! existing nodal Kuzmin/positivity limiters so results are independent of
-  ! decomposition and bitwise identical under 90 deg grid rotation.
-  do j = G%jsc, G%jec ; do i = G%isc, G%iec
-    if (ISS%hmask(i,j) /= 1.0) cycle
-    Hbar = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
-    phi_cell = 1.0
-    do b = 1, 2 ; do a = 1, 2
-      I_node = i + a - 2 ; J_node = j + b - 2
-      Hmax_loc = Hmax_B(I_node, J_node)
-      Hmin_loc = Hmin_B(I_node, J_node)
-      ! B-node had no contributing cell (sentinels): nothing to bound against.
-      if (Hmax_loc <= -H_LARGE + 1.0 .or. Hmin_loc >= H_LARGE - 1.0) cycle
-      ! One-sided stencil (only this cell contributed): no neighbour
-      ! information to bound against; leave the corner unconstrained.
-      if (count_B(I_node, J_node) <= 1.5) cycle
-      delta = CS%h_nodal(i,j,a,b) - Hbar
-      ! No deviation -> nothing to limit at this corner.
-      if (abs(delta) <= EPS_DELTA) cycle
-      if (delta > 0.0) then
-        ! Upward excursion: shrink toward Hmax_loc.
-        room = max(0.0, Hmax_loc - Hbar)
-        phi_loc = min(1.0, room / delta)
-      else
-        ! Downward excursion (delta < 0): shrink toward Hmin_loc.
-        room = max(0.0, Hbar - Hmin_loc)
-        phi_loc = min(1.0, room / (-delta))
-      endif
-      phi_cell = min(phi_cell, max(0.0, phi_loc))
-    enddo ; enddo
-    do b = 1, 2 ; do a = 1, 2
-      CS%h_nodal(i,j,a,b) = Hbar + phi_cell*(CS%h_nodal(i,j,a,b) - Hbar)
-    enddo ; enddo
-    if (associated(CS%phi_lim_DG)) CS%phi_lim_DG(i,j) = phi_cell
-  enddo ; enddo
-
-  call pass_corner_field(CS%h_nodal, G)
-  if (associated(CS%phi_lim_DG)) call pass_var(CS%phi_lim_DG, G%domain)
-end subroutine nodal_AFC_limit
-
-!> Dispatch the configured nodal slope limiter (no-op for
-!! CS%nodal_limiter_choice == 0). Centralises the choice gating so call
-!! sites do not need to know about the available limiters.
-subroutine apply_nodal_slope_limit(CS, G, ISS)
-  type(ice_shelf_dyn_CS), intent(inout) :: CS
-  type(ocean_grid_type),  intent(inout) :: G
-  type(ice_shelf_state),  intent(in)    :: ISS
-
-  if (CS%nodal_limiter_choice == 1) call nodal_Kuzmin_limit(CS, G, ISS)
-  if (CS%nodal_limiter_choice == 2) call nodal_AFC_limit(CS, G, ISS)
-end subroutine apply_nodal_slope_limit
 
 !> Liu-style positivity-preserving limiter: scale each cell's corner
 !! deviations from the mean by a single factor in [0,1] so the minimum
@@ -9115,8 +8779,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   ! source enters each SSP-RK2 stage as a simple additive term on dh.
   call project_h_source_rate_to_nodes(CS, ISS, G, S_node)
 
-  ! Stage 1: limit -> spatial op -> M^-1 -> Euler step (+ source).
-  call apply_nodal_slope_limit(CS, G, ISS)
+  ! Stage 1: positivity floor -> spatial op -> M^-1 -> Euler step (+ source).
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
   call pass_corner_field(CS%h_nodal, G)
   call DG1_nodal_spatial_operator(CS, G, hmask, CS%h_nodal, rhs, uh_ice, vh_ice)
@@ -9130,8 +8793,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   enddo ; enddo
   call pass_corner_field(CS%h_nodal, G)
 
-  ! Stage 2: limit -> spatial op -> M^-1 -> SSP-RK2 combine (+ source).
-  call apply_nodal_slope_limit(CS, G, ISS)
+  ! Stage 2: positivity floor -> spatial op -> M^-1 -> SSP-RK2 combine (+ source).
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
   h_curr(:,:,:,:) = CS%h_nodal(:,:,:,:)
   call DG1_nodal_spatial_operator(CS, G, hmask, h_curr, rhs, uh_ice, vh_ice)
@@ -9151,8 +8813,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   CS%h_source_rate_last(:,:) = CS%h_source_rate(:,:)
   CS%h_source_rate(:,:) = 0.0
 
-  ! Final limit (captures phi_lim_DG diagnostic).
-  call apply_nodal_slope_limit(CS, G, ISS)
+  ! Final positivity floor.
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
   call pass_corner_field(CS%h_nodal, G)
 
