@@ -8732,8 +8732,12 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   if (CS%dg_art_visc) then
     do j = jsc, jec ; do i = isc-1, iec
       if (CS%u_face_mask(i,j) == 4.0) cycle  ! specified-flux face: viscosity undefined.
-      if (.not. ((hmask(i,j)   == 1.0 .or. hmask(i,j)   == 3.0) .and. &
-                 (hmask(i+1,j) == 1.0 .or. hmask(i+1,j) == 3.0))) cycle
+      ! Skip faces touching Dirichlet thickness BCs (hmask==3). Those cells are
+      ! pinned to h_bdry_val between stages, so viscous flux into the BC cell is
+      ! discarded - making the coupling non-conservative and unphysically
+      ! pulling the interior cell toward h_bdry_val. The BC's inflow flux is
+      ! already handled correctly in the upwind block.
+      if (.not. (hmask(i,j) == 1.0 .and. hmask(i+1,j) == 1.0)) cycle
       do gp = 1, 2
         if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
         t_co = 1.0 - t_face
@@ -8810,8 +8814,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   if (CS%dg_art_visc) then
     do j = jsc-1, jec ; do i = isc, iec
       if (CS%v_face_mask(i,j) == 4.0) cycle
-      if (.not. ((hmask(i,j)   == 1.0 .or. hmask(i,j)   == 3.0) .and. &
-                 (hmask(i,j+1) == 1.0 .or. hmask(i,j+1) == 3.0))) cycle
+      ! Skip faces touching Dirichlet thickness BCs - see east-face block for rationale.
+      if (.not. (hmask(i,j) == 1.0 .and. hmask(i,j+1) == 1.0)) cycle
       do gp = 1, 2
         if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
         t_co = 1.0 - t_face
