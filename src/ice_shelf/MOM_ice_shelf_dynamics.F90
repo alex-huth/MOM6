@@ -387,7 +387,16 @@ type, public :: ice_shelf_dyn_CS ; private
              id_h_nodal_SW = -1, id_h_nodal_SE = -1, id_h_nodal_NW = -1, id_h_nodal_NE = -1, &
              id_h_jump_node = -1, id_h_jump_node_rel = -1, &
              id_h_jump_envelope = -1, id_h_jump_envelope_rel = -1, id_h_source_rate = -1, &
-             id_phi_x_FV = -1, id_phi_y_FV = -1
+             id_phi_x_FV = -1, id_phi_y_FV = -1, &
+             id_dg_art_visc_coef_u = -1, id_dg_art_visc_coef_v = -1
+  real, pointer, dimension(:,:) :: dg_art_visc_coef_u => NULL() !< Per-face DG(1) artificial-
+                                                       !! viscosity coefficient on u-faces
+                                                       !! [nondim], stored as the max over
+                                                       !! the 2 face Gauss points from the
+                                                       !! last spatial-operator call.
+                                                       !! Diagnostic only.
+  real, pointer, dimension(:,:) :: dg_art_visc_coef_v => NULL() !< As dg_art_visc_coef_u but
+                                                       !! on v-faces [nondim].
   real, pointer, dimension(:,:) :: phi_x_FV => NULL() !< Van Leer slope-limiter factor at each u-face
                                                        !! from ice_shelf_advect_thickness_x [nondim],
                                                        !! in [0,2]. Faces where the limiter branch was
@@ -541,6 +550,8 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%h_source_rate_last(isd:ied,jsd:jed), source=0.0)
     allocate(CS%phi_x_FV(IsdB:IedB,jsd:jed), source=1.0)
     allocate(CS%phi_y_FV(isd:ied,JsdB:JedB), source=1.0)
+    allocate(CS%dg_art_visc_coef_u(IsdB:IedB,jsd:jed), source=0.0)
+    allocate(CS%dg_art_visc_coef_v(isd:ied,JsdB:JedB), source=0.0)
     allocate(CS%u_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%v_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%u_face_mask_bdry(IsdB:IedB,JsdB:JedB), source=-2.0)
@@ -1174,6 +1185,15 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       CS%id_h_source_rate = register_diag_field('ice_shelf_model','h_source_rate',CS%diag%axesT1, Time, &
          'Cell-mean thickness source rate (basal melt + surface SMB) consumed by the last DG advect step', &
          'm s-1', conversion=US%Z_to_m*US%s_to_T)
+      CS%id_dg_art_visc_coef_u = register_diag_field('ice_shelf_model','dg_art_visc_coef_u', &
+         CS%diag%axesCu1, Time, &
+         'Per-face DG(1) artificial-viscosity coefficient on u-faces (max over the 2 face '//&
+         'Gauss points from the last spatial-operator call). Shows where shock-capturing '//&
+         'amplification fires and where the CFL cap is binding.', 'nondim')
+      CS%id_dg_art_visc_coef_v = register_diag_field('ice_shelf_model','dg_art_visc_coef_v', &
+         CS%diag%axesCv1, Time, &
+         'Per-face DG(1) artificial-viscosity coefficient on v-faces (max over the 2 face '//&
+         'Gauss points from the last spatial-operator call).', 'nondim')
     else
       CS%id_phi_x_FV = register_diag_field('ice_shelf_model','phi_x_FV',CS%diag%axesCu1, Time, &
          'Van Leer slope-limiter factor at each u-face from ice_shelf_advect_thickness_x '//&
@@ -1636,6 +1656,10 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_phi_x_FV, CS%phi_x_FV, CS%diag)
     if (CS%id_phi_y_FV > 0 .and. associated(CS%phi_y_FV)) &
         call post_data(CS%id_phi_y_FV, CS%phi_y_FV, CS%diag)
+    if (CS%id_dg_art_visc_coef_u > 0 .and. associated(CS%dg_art_visc_coef_u)) &
+        call post_data(CS%id_dg_art_visc_coef_u, CS%dg_art_visc_coef_u, CS%diag)
+    if (CS%id_dg_art_visc_coef_v > 0 .and. associated(CS%dg_art_visc_coef_v)) &
+        call post_data(CS%id_dg_art_visc_coef_v, CS%dg_art_visc_coef_v, CS%diag)
     if (CS%id_u_mask > 0) call post_data(CS%id_u_mask, CS%umask, CS%diag)
     if (CS%id_v_mask > 0) call post_data(CS%id_v_mask, CS%vmask, CS%diag)
     if (CS%id_ufb_mask > 0) call post_data(CS%id_ufb_mask, CS%u_face_mask_bdry, CS%diag)
@@ -6157,6 +6181,8 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%h_source_rate_last)) deallocate(CS%h_source_rate_last)
   if (associated(CS%phi_x_FV)) deallocate(CS%phi_x_FV)
   if (associated(CS%phi_y_FV)) deallocate(CS%phi_y_FV)
+  if (associated(CS%dg_art_visc_coef_u)) deallocate(CS%dg_art_visc_coef_u)
+  if (associated(CS%dg_art_visc_coef_v)) deallocate(CS%dg_art_visc_coef_v)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
   if (associated(CS%Jac)) deallocate(CS%Jac)
   if (associated(CS%Phi)) deallocate(CS%Phi)
@@ -8688,6 +8714,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   rhs(:,:,:,:) = 0.0
   rhs_vol(:,:,:,:) = 0.0
   rhs_face(:,:,:,:) = 0.0
+  if (associated(CS%dg_art_visc_coef_u)) CS%dg_art_visc_coef_u(:,:) = 0.0
+  if (associated(CS%dg_art_visc_coef_v)) CS%dg_art_visc_coef_v(:,:) = 0.0
 
   ! Volume integral over each cell.
   do j = jsc, jec ; do i = isc, iec
@@ -8820,6 +8848,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
           endif
         endif
         visc_flux_qp = gw * coef_face * u_mag_qp * (h_B_qp - h_A_qp) * G%dyCu(i,j)
+        if (associated(CS%dg_art_visc_coef_u)) &
+          CS%dg_art_visc_coef_u(i,j) = max(CS%dg_art_visc_coef_u(i,j), coef_face)
         if (i >= isc .and. hmask(i,j) == 1.0) then
           rhs_face(i,j,2,1) = rhs_face(i,j,2,1) + visc_flux_qp * t_co
           rhs_face(i,j,2,2) = rhs_face(i,j,2,2) + visc_flux_qp * t_face
@@ -8913,6 +8943,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
           endif
         endif
         visc_flux_qp = gw * coef_face * u_mag_qp * (h_B_qp - h_A_qp) * G%dxCv(i,j)
+        if (associated(CS%dg_art_visc_coef_v)) &
+          CS%dg_art_visc_coef_v(i,j) = max(CS%dg_art_visc_coef_v(i,j), coef_face)
         if (j >= jsc .and. hmask(i,j) == 1.0) then
           rhs_face(i,j,1,2) = rhs_face(i,j,1,2) + visc_flux_qp * t_co
           rhs_face(i,j,2,2) = rhs_face(i,j,2,2) + visc_flux_qp * t_face
