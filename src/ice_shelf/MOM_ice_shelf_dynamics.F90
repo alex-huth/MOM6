@@ -3432,12 +3432,15 @@ subroutine shelf_advance_front(CS, ISS, G, hmask, uh_ice, vh_ice, calving)
               h_reference = h_reference / tot_flux
               !h_reference = h_reference / real(n_flux)
               partial_vol = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) + tot_flux
-              ! Any DG nodal values attached to this cell are no longer
-              ! meaningful after the partial-fill overwrites h_shelf with the
-              ! donor cell mean. Zero them; the next advect step will spin
-              ! them up.
+              ! The partial-fill overwrites h_shelf with the donor cell mean;
+              ! set the DG nodal field to that same donor mean so
+              ! nodal_cell_mean matches ISS%h_shelf. Leaving the corners at
+              ! 0 (the prior code path) collapses Hmin_B at this cell's 4
+              ! B-nodes to 0, which lets neighbour ice cells show corner
+              ! jumps as large as their own Hbar through the nodal limiter
+              ! envelope.
               if (CS%use_DG_thickness) then
-                CS%h_nodal(i,j,:,:) = 0.0
+                CS%h_nodal(i,j,:,:) = h_reference
               endif
 
               if (ice_shelf_calving) then
