@@ -263,6 +263,15 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! penalty [nondim]. tau_face = eta * |u.n_qp|. eta = 0
                                   !! disables the penalty; eta -> infinity drives the
                                   !! face jump toward zero (stabilised-CG limit).
+  real :: dg_jump_penalty_gamma   !< Shock-capturing amplification of the face jump
+                                  !! penalty [nondim]. tau_face is multiplied by
+                                  !! (1 + gamma * max(0, |[[h]]|/H_ref - threshold)),
+                                  !! where H_ref is the cell-mean thickness averaged
+                                  !! over the two cells touching the face. gamma = 0
+                                  !! gives the plain linear penalty.
+  real :: dg_jump_penalty_thresh  !< Relative-jump threshold at which the shock-capturing
+                                  !! amplification kicks in [nondim]. Jumps with
+                                  !! |[[h]]|/H_ref below this value get no amplification.
   logical :: dg_driving_stress_IBP !< If true, the DG(1) driving stress uses the
                                   !! integration-by-parts weak form with central P*
                                   !! (= 1/2(P_loc + P_ngh)) at interior faces. If false
@@ -8294,6 +8303,27 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  units="nondim", default=0.02, &
                  do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_jump_penalty))
 
+  call get_param(param_file, mdl, "DG1_JUMP_PENALTY_GAMMA", CS%dg_jump_penalty_gamma, &
+                 "Shock-capturing amplification on the DG(1) jump penalty. "//&
+                 "tau_face is multiplied by "//&
+                 "(1 + gamma * max(0, |[[h]]| / H_ref - threshold)), where H_ref is "//&
+                 "the average cell-mean thickness over the two cells touching the "//&
+                 "face. gamma = 0 (default) recovers the plain linear penalty. "//&
+                 "gamma > 0 leaves smooth-flow faces near eta while strongly "//&
+                 "amplifying tau at faces where the relative jump exceeds "//&
+                 "DG1_JUMP_PENALTY_THRESHOLD. Typical values 5-20.", &
+                 units="nondim", default=0.0, &
+                 do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_jump_penalty))
+
+  call get_param(param_file, mdl, "DG1_JUMP_PENALTY_THRESHOLD", CS%dg_jump_penalty_thresh, &
+                 "Relative-jump threshold at which the DG(1) shock-capturing "//&
+                 "amplification activates. Faces with |[[h]]|/H_ref below this "//&
+                 "receive no extra amplification beyond the linear eta term. "//&
+                 "Has no effect when DG1_JUMP_PENALTY_GAMMA = 0. Typical 0.05-0.2.", &
+                 units="nondim", default=0.1, &
+                 do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_jump_penalty &
+                             .or. CS%dg_jump_penalty_gamma == 0.0))
+
   call get_param(param_file, mdl, "DG_DRIVING_STRESS_IBP", CS%dg_driving_stress_IBP, &
                  "If true, evaluate the DG(1) driving stress with the integration-by-parts "//&
                  "weak form. Interior faces use a central numerical flux "//&
@@ -8610,6 +8640,10 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: t_face, t_co
   real :: u_at_qp, v_at_qp, h_upwind, flux_qp, face_flux_total
   real :: h_A_qp, h_B_qp     ! Face-QP corner thickness on the two sides of a DG face [Z ~> m]
+  real :: Hbar_A, Hbar_B     ! Cell-mean thickness on the two sides of a DG face [Z ~> m]
+  real :: H_ref              ! Reference thickness for the relative jump [Z ~> m]
+  real :: rel_jump           ! |[[h]]| / H_ref at a face QP [nondim]
+  real :: amp                ! Shock-capturing amplification factor on tau [nondim]
   real :: tau_qp             ! Penalty coefficient at the face QP [L T-1 ~> m s-1]
   real :: pen_flux_qp        ! Penalty face flux per QP, antisymmetric across the face [Z L2 T-1]
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_vol, rhs_face
@@ -8714,19 +8748,35 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   ! antisymmetric face flux -tau*[[h]] that dissipates inter-cell corner
   ! jumps without touching the in-cell slope. Conservative per face pair
   ! because the same scalar pen_flux_qp is added to cell A's owned face
-  ! corners with sign -1 and to cell B's with sign +1.
+  ! corners with sign -1 and to cell B's with sign +1. With
+  ! DG1_JUMP_PENALTY_GAMMA > 0, tau is amplified at faces where the
+  ! relative jump |[[h]]|/H_ref exceeds the threshold (shock-capturing).
   if (CS%dg_jump_penalty) then
     do j = jsc, jec ; do i = isc-1, iec
       if (CS%u_face_mask(i,j) == 4.0) cycle  ! specified-flux face: penalty undefined.
       if (.not. ((hmask(i,j)   == 1.0 .or. hmask(i,j)   == 3.0) .and. &
                  (hmask(i+1,j) == 1.0 .or. hmask(i+1,j) == 3.0))) cycle
+      if (hmask(i,j) == 3.0) then
+        Hbar_A = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
+      else
+        Hbar_A = nodal_cell_mean(h_nodal_in(i,j,:,:), CS%cell_mean_w(i,j,:,:))
+      endif
+      if (hmask(i+1,j) == 3.0) then
+        Hbar_B = max(CS%h_bdry_val(i+1,j), CS%min_h_shelf)
+      else
+        Hbar_B = nodal_cell_mean(h_nodal_in(i+1,j,:,:), CS%cell_mean_w(i+1,j,:,:))
+      endif
+      H_ref = max(CS%min_h_shelf, 0.5*(Hbar_A + Hbar_B))
       do gp = 1, 2
         if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
         t_co = 1.0 - t_face
         u_at_qp = t_co*CS%u_shelf(i,j-1) + t_face*CS%u_shelf(i,j)
         h_A_qp  = t_co*h_nodal_in(i,  j,2,1) + t_face*h_nodal_in(i,  j,2,2)
         h_B_qp  = t_co*h_nodal_in(i+1,j,1,1) + t_face*h_nodal_in(i+1,j,1,2)
-        tau_qp  = CS%dg_jump_penalty_eta * abs(u_at_qp)
+        rel_jump = abs(h_A_qp - h_B_qp) / H_ref
+        amp = 1.0 + CS%dg_jump_penalty_gamma * &
+                    max(0.0, rel_jump - CS%dg_jump_penalty_thresh)
+        tau_qp  = CS%dg_jump_penalty_eta * abs(u_at_qp) * amp
         pen_flux_qp = gw * tau_qp * (h_A_qp - h_B_qp) * G%dyCu(i,j)
         if (i >= isc .and. hmask(i,j) == 1.0) then
           rhs_face(i,j,2,1) = rhs_face(i,j,2,1) - pen_flux_qp * t_co
@@ -8797,13 +8847,27 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       if (CS%v_face_mask(i,j) == 4.0) cycle
       if (.not. ((hmask(i,j)   == 1.0 .or. hmask(i,j)   == 3.0) .and. &
                  (hmask(i,j+1) == 1.0 .or. hmask(i,j+1) == 3.0))) cycle
+      if (hmask(i,j) == 3.0) then
+        Hbar_A = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
+      else
+        Hbar_A = nodal_cell_mean(h_nodal_in(i,j,:,:), CS%cell_mean_w(i,j,:,:))
+      endif
+      if (hmask(i,j+1) == 3.0) then
+        Hbar_B = max(CS%h_bdry_val(i,j+1), CS%min_h_shelf)
+      else
+        Hbar_B = nodal_cell_mean(h_nodal_in(i,j+1,:,:), CS%cell_mean_w(i,j+1,:,:))
+      endif
+      H_ref = max(CS%min_h_shelf, 0.5*(Hbar_A + Hbar_B))
       do gp = 1, 2
         if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
         t_co = 1.0 - t_face
         v_at_qp = t_co*CS%v_shelf(i-1,j) + t_face*CS%v_shelf(i,j)
         h_A_qp  = t_co*h_nodal_in(i,j,  1,2) + t_face*h_nodal_in(i,j,  2,2)
         h_B_qp  = t_co*h_nodal_in(i,j+1,1,1) + t_face*h_nodal_in(i,j+1,2,1)
-        tau_qp  = CS%dg_jump_penalty_eta * abs(v_at_qp)
+        rel_jump = abs(h_A_qp - h_B_qp) / H_ref
+        amp = 1.0 + CS%dg_jump_penalty_gamma * &
+                    max(0.0, rel_jump - CS%dg_jump_penalty_thresh)
+        tau_qp  = CS%dg_jump_penalty_eta * abs(v_at_qp) * amp
         pen_flux_qp = gw * tau_qp * (h_A_qp - h_B_qp) * G%dxCv(i,j)
         if (j >= jsc .and. hmask(i,j) == 1.0) then
           rhs_face(i,j,1,2) = rhs_face(i,j,1,2) - pen_flux_qp * t_co
