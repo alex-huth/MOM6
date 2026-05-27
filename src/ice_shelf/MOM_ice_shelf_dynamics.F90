@@ -8609,6 +8609,9 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: dxCv_S, dxCv_N, dyCu_W, dyCu_E
   real :: t_face, t_co
   real :: u_at_qp, v_at_qp, h_upwind, flux_qp, face_flux_total
+  real :: h_A_qp, h_B_qp     ! Face-QP corner thickness on the two sides of a DG face [Z ~> m]
+  real :: tau_qp             ! Penalty coefficient at the face QP [L T-1 ~> m s-1]
+  real :: pen_flux_qp        ! Penalty face flux per QP, antisymmetric across the face [Z L2 T-1]
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_vol, rhs_face
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
@@ -8707,6 +8710,36 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     endif
   enddo ; enddo
 
+  ! East-face DG jump penalty (interior penalty stabilisation). Adds an
+  ! antisymmetric face flux -tau*[[h]] that dissipates inter-cell corner
+  ! jumps without touching the in-cell slope. Conservative per face pair
+  ! because the same scalar pen_flux_qp is added to cell A's owned face
+  ! corners with sign -1 and to cell B's with sign +1.
+  if (CS%dg_jump_penalty) then
+    do j = jsc, jec ; do i = isc-1, iec
+      if (CS%u_face_mask(i,j) == 4.0) cycle  ! specified-flux face: penalty undefined.
+      if (.not. ((hmask(i,j)   == 1.0 .or. hmask(i,j)   == 3.0) .and. &
+                 (hmask(i+1,j) == 1.0 .or. hmask(i+1,j) == 3.0))) cycle
+      do gp = 1, 2
+        if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
+        t_co = 1.0 - t_face
+        u_at_qp = t_co*CS%u_shelf(i,j-1) + t_face*CS%u_shelf(i,j)
+        h_A_qp  = t_co*h_nodal_in(i,  j,2,1) + t_face*h_nodal_in(i,  j,2,2)
+        h_B_qp  = t_co*h_nodal_in(i+1,j,1,1) + t_face*h_nodal_in(i+1,j,1,2)
+        tau_qp  = CS%dg_jump_penalty_eta * abs(u_at_qp)
+        pen_flux_qp = gw * tau_qp * (h_A_qp - h_B_qp) * G%dyCu(i,j)
+        if (i >= isc .and. hmask(i,j) == 1.0) then
+          rhs_face(i,j,2,1) = rhs_face(i,j,2,1) - pen_flux_qp * t_co
+          rhs_face(i,j,2,2) = rhs_face(i,j,2,2) - pen_flux_qp * t_face
+        endif
+        if (i+1 <= iec .and. hmask(i+1,j) == 1.0) then
+          rhs_face(i+1,j,1,1) = rhs_face(i+1,j,1,1) + pen_flux_qp * t_co
+          rhs_face(i+1,j,1,2) = rhs_face(i+1,j,1,2) + pen_flux_qp * t_face
+        endif
+      enddo
+    enddo ; enddo
+  endif
+
   ! North-face fluxes between cells (i,j) and (i,j+1).
   do j = jsc-1, jec ; do i = isc, iec
     if (CS%v_face_mask(i,j) == 4.0) then
@@ -8757,6 +8790,32 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       enddo
     endif
   enddo ; enddo
+
+  ! North-face DG jump penalty (analogous to east-face block above).
+  if (CS%dg_jump_penalty) then
+    do j = jsc-1, jec ; do i = isc, iec
+      if (CS%v_face_mask(i,j) == 4.0) cycle
+      if (.not. ((hmask(i,j)   == 1.0 .or. hmask(i,j)   == 3.0) .and. &
+                 (hmask(i,j+1) == 1.0 .or. hmask(i,j+1) == 3.0))) cycle
+      do gp = 1, 2
+        if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
+        t_co = 1.0 - t_face
+        v_at_qp = t_co*CS%v_shelf(i-1,j) + t_face*CS%v_shelf(i,j)
+        h_A_qp  = t_co*h_nodal_in(i,j,  1,2) + t_face*h_nodal_in(i,j,  2,2)
+        h_B_qp  = t_co*h_nodal_in(i,j+1,1,1) + t_face*h_nodal_in(i,j+1,2,1)
+        tau_qp  = CS%dg_jump_penalty_eta * abs(v_at_qp)
+        pen_flux_qp = gw * tau_qp * (h_A_qp - h_B_qp) * G%dxCv(i,j)
+        if (j >= jsc .and. hmask(i,j) == 1.0) then
+          rhs_face(i,j,1,2) = rhs_face(i,j,1,2) - pen_flux_qp * t_co
+          rhs_face(i,j,2,2) = rhs_face(i,j,2,2) - pen_flux_qp * t_face
+        endif
+        if (j+1 <= jec .and. hmask(i,j+1) == 1.0) then
+          rhs_face(i,j+1,1,1) = rhs_face(i,j+1,1,1) + pen_flux_qp * t_co
+          rhs_face(i,j+1,2,1) = rhs_face(i,j+1,2,1) + pen_flux_qp * t_face
+        endif
+      enddo
+    enddo ; enddo
+  endif
 
   ! Reduce volume + face.
   do j = jsc, jec ; do i = isc, iec
