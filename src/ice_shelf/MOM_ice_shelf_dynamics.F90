@@ -254,24 +254,21 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! initialize_ice_flow_from_file. Requires USE_DG_THICKNESS.
   logical :: nodal_positivity     !< If true, apply Liu-style positivity-preserving limiter
                                   !! to the nodal DG(1) thickness corners.
-  logical :: dg_jump_penalty      !< If true, add an interior-penalty face term
-                                  !! -eta * |u.n_qp| * [[h]] to the DG(1) nodal spatial
-                                  !! operator. Dissipates DG face jumps over time while
-                                  !! preserving the in-cell Q1 slope used by the subgrid
-                                  !! driving stress. Conservative across each face pair.
-  real :: dg_jump_penalty_eta     !< Dimensionless coefficient on the DG(1) face jump
-                                  !! penalty [nondim]. tau_face = eta * |u.n_qp|. eta = 0
-                                  !! disables the penalty; eta -> infinity drives the
-                                  !! face jump toward zero (stabilised-CG limit).
-  real :: dg_jump_penalty_gamma   !< Shock-capturing amplification of the face jump
-                                  !! penalty [nondim]. tau_face is multiplied by
-                                  !! (1 + gamma * max(0, |[[h]]|/H_ref - threshold)),
-                                  !! where H_ref is the cell-mean thickness averaged
-                                  !! over the two cells touching the face. gamma = 0
-                                  !! gives the plain linear penalty.
-  real :: dg_jump_penalty_thresh  !< Relative-jump threshold at which the shock-capturing
-                                  !! amplification kicks in [nondim]. Jumps with
-                                  !! |[[h]]|/H_ref below this value get no amplification.
+  logical :: dg_art_visc          !< If true, add an artificial-viscosity face term
+                                  !! +nu_face * (h_B - h_A) / dx_perp * dy at each
+                                  !! interior DG face. With nu_face = coef*dx_perp*|u_face|
+                                  !! the dx_perp factor cancels, leaving an antisymmetric
+                                  !! face flux gw*coef*|u_face|*(h_B-h_A)*dy distributed
+                                  !! conservatively to the two adjacent cells.
+                                  !! Diffuses DG face jumps over time while preserving
+                                  !! the in-cell Q1 slope. Differs from a jump penalty
+                                  !! tau~|u.n|: |u_face|=sqrt(u^2+v^2) so the term still
+                                  !! damps jumps at shear-margin faces where u.n~=0.
+  real :: dg_art_visc_coef        !< Dimensionless coefficient on the DG(1) artificial
+                                  !! viscosity face flux [nondim]. nu_face = coef *
+                                  !! dx_perp * |u_face|. coef = 0 disables the viscosity;
+                                  !! coef -> infinity drives the face jump toward zero
+                                  !! (stabilised-CG limit). Typical values 0.01-0.1.
   logical :: dg_driving_stress_IBP !< If true, the DG(1) driving stress uses the
                                   !! integration-by-parts weak form with central P*
                                   !! (= 1/2(P_loc + P_ngh)) at interior faces. If false
@@ -8285,44 +8282,28 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "thickness from numerical noise.", &
                  default=.true., do_not_log=.not.CS%use_DG_thickness)
 
-  call get_param(param_file, mdl, "DG1_JUMP_PENALTY", CS%dg_jump_penalty, &
-                 "If true, add an interior-penalty face term -eta*|u.n_qp|*[[h]] to "//&
-                 "the DG(1) nodal spatial operator. Dissipates inter-cell DG face "//&
-                 "jumps over time while preserving the in-cell Q1 slope used by the "//&
-                 "subgrid driving stress. Conservative across each face pair "//&
-                 "(antisymmetric flux on the two cells). eta -> infinity recovers a "//&
-                 "stabilised-CG-like behaviour; eta = 0 disables the penalty and "//&
-                 "the DG advection runs with only the natural upwind dissipation.", &
+  call get_param(param_file, mdl, "DG1_ART_VISC", CS%dg_art_visc, &
+                 "If true, add an artificial-viscosity face term to the DG(1) nodal "//&
+                 "spatial operator. Per interior face, distributes the antisymmetric "//&
+                 "flux gw*coef*|u_face|*(h_B-h_A)*dy to the two adjacent cells, where "//&
+                 "|u_face| = sqrt(u^2+v^2) at each face Gauss point. Diffuses inter-cell "//&
+                 "DG face jumps while preserving the in-cell Q1 slope used by the "//&
+                 "subgrid driving stress. Conservative across each face pair. Unlike "//&
+                 "a normal-velocity jump penalty (tau~|u.n|), the magnitude scaling "//&
+                 "still damps jumps at shear-margin faces where u.n~=0. coef -> "//&
+                 "infinity recovers a stabilised-CG-like behaviour; coef = 0 disables "//&
+                 "the viscosity and the DG advection runs with only the natural "//&
+                 "upwind dissipation.", &
                  default=.false., do_not_log=.not.CS%use_DG_thickness)
 
-  call get_param(param_file, mdl, "DG1_JUMP_PENALTY_ETA", CS%dg_jump_penalty_eta, &
-                 "Dimensionless coefficient on the DG(1) face jump penalty. "//&
-                 "tau_face = eta * |u.n_qp| in the interior-penalty face integral. "//&
-                 "Typical values 0.01-0.1; larger values give stronger jump "//&
-                 "dissipation and approach stabilised-CG behaviour.", &
-                 units="nondim", default=0.02, &
-                 do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_jump_penalty))
-
-  call get_param(param_file, mdl, "DG1_JUMP_PENALTY_GAMMA", CS%dg_jump_penalty_gamma, &
-                 "Shock-capturing amplification on the DG(1) jump penalty. "//&
-                 "tau_face is multiplied by "//&
-                 "(1 + gamma * max(0, |[[h]]| / H_ref - threshold)), where H_ref is "//&
-                 "the average cell-mean thickness over the two cells touching the "//&
-                 "face. gamma = 0 (default) recovers the plain linear penalty. "//&
-                 "gamma > 0 leaves smooth-flow faces near eta while strongly "//&
-                 "amplifying tau at faces where the relative jump exceeds "//&
-                 "DG1_JUMP_PENALTY_THRESHOLD. Typical values 5-20.", &
-                 units="nondim", default=0.0, &
-                 do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_jump_penalty))
-
-  call get_param(param_file, mdl, "DG1_JUMP_PENALTY_THRESHOLD", CS%dg_jump_penalty_thresh, &
-                 "Relative-jump threshold at which the DG(1) shock-capturing "//&
-                 "amplification activates. Faces with |[[h]]|/H_ref below this "//&
-                 "receive no extra amplification beyond the linear eta term. "//&
-                 "Has no effect when DG1_JUMP_PENALTY_GAMMA = 0. Typical 0.05-0.2.", &
-                 units="nondim", default=0.1, &
-                 do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_jump_penalty &
-                             .or. CS%dg_jump_penalty_gamma == 0.0))
+  call get_param(param_file, mdl, "DG1_ART_VISC_COEF", CS%dg_art_visc_coef, &
+                 "Dimensionless coefficient on the DG(1) artificial-viscosity face flux. "//&
+                 "Face viscosity nu_face = coef*dx_perp*|u_face|; the dx_perp cancels "//&
+                 "with the discrete Laplacian denominator so the face flux reduces to "//&
+                 "gw*coef*|u_face|*(h_B-h_A)*dy. Typical values 0.01-0.1; larger values "//&
+                 "give stronger jump dissipation and approach stabilised-CG behaviour.", &
+                 units="nondim", default=0.05, &
+                 do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_art_visc))
 
   call get_param(param_file, mdl, "DG_DRIVING_STRESS_IBP", CS%dg_driving_stress_IBP, &
                  "If true, evaluate the DG(1) driving stress with the integration-by-parts "//&
@@ -8640,12 +8621,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: t_face, t_co
   real :: u_at_qp, v_at_qp, h_upwind, flux_qp, face_flux_total
   real :: h_A_qp, h_B_qp     ! Face-QP corner thickness on the two sides of a DG face [Z ~> m]
-  real :: Hbar_A, Hbar_B     ! Cell-mean thickness on the two sides of a DG face [Z ~> m]
-  real :: H_ref              ! Reference thickness for the relative jump [Z ~> m]
-  real :: rel_jump           ! |[[h]]| / H_ref at a face QP [nondim]
-  real :: amp                ! Shock-capturing amplification factor on tau [nondim]
-  real :: tau_qp             ! Penalty coefficient at the face QP [L T-1 ~> m s-1]
-  real :: pen_flux_qp        ! Penalty face flux per QP, antisymmetric across the face [Z L2 T-1]
+  real :: u_mag_qp           ! Velocity magnitude sqrt(u^2+v^2) at a face QP [L T-1 ~> m s-1]
+  real :: visc_flux_qp       ! Artificial-viscosity face flux per QP, antisymmetric [Z L2 T-1]
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_vol, rhs_face
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
@@ -8744,47 +8721,35 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     endif
   enddo ; enddo
 
-  ! East-face DG jump penalty (interior penalty stabilisation). Adds an
-  ! antisymmetric face flux -tau*[[h]] that dissipates inter-cell corner
-  ! jumps without touching the in-cell slope. Conservative per face pair
-  ! because the same scalar pen_flux_qp is added to cell A's owned face
-  ! corners with sign -1 and to cell B's with sign +1. With
-  ! DG1_JUMP_PENALTY_GAMMA > 0, tau is amplified at faces where the
-  ! relative jump |[[h]]|/H_ref exceeds the threshold (shock-capturing).
-  if (CS%dg_jump_penalty) then
+  ! East-face DG artificial viscosity. Adds the antisymmetric face flux
+  ! +gw*coef*|u_face|*(h_B - h_A)*dyCu at each face QP, which is the
+  ! discrete Laplacian face contribution with nu_face = coef*dx_perp*|u_face|
+  ! (the dx_perp factor cancels with the discrete gradient denominator).
+  ! Conservative per face pair: visc_flux_qp is added to cell A's owned face
+  ! corners with sign -1 and to cell B's with sign +1. |u_face| uses the
+  ! full velocity magnitude so jumps still damp at shear-margin faces where
+  ! u.n ~= 0 (the failure mode of a tau~|u.n| jump penalty).
+  if (CS%dg_art_visc) then
     do j = jsc, jec ; do i = isc-1, iec
-      if (CS%u_face_mask(i,j) == 4.0) cycle  ! specified-flux face: penalty undefined.
+      if (CS%u_face_mask(i,j) == 4.0) cycle  ! specified-flux face: viscosity undefined.
       if (.not. ((hmask(i,j)   == 1.0 .or. hmask(i,j)   == 3.0) .and. &
                  (hmask(i+1,j) == 1.0 .or. hmask(i+1,j) == 3.0))) cycle
-      if (hmask(i,j) == 3.0) then
-        Hbar_A = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
-      else
-        Hbar_A = nodal_cell_mean(h_nodal_in(i,j,:,:), CS%cell_mean_w(i,j,:,:))
-      endif
-      if (hmask(i+1,j) == 3.0) then
-        Hbar_B = max(CS%h_bdry_val(i+1,j), CS%min_h_shelf)
-      else
-        Hbar_B = nodal_cell_mean(h_nodal_in(i+1,j,:,:), CS%cell_mean_w(i+1,j,:,:))
-      endif
-      H_ref = max(CS%min_h_shelf, 0.5*(Hbar_A + Hbar_B))
       do gp = 1, 2
         if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
         t_co = 1.0 - t_face
         u_at_qp = t_co*CS%u_shelf(i,j-1) + t_face*CS%u_shelf(i,j)
+        v_at_qp = t_co*CS%v_shelf(i,j-1) + t_face*CS%v_shelf(i,j)
+        u_mag_qp = sqrt(u_at_qp*u_at_qp + v_at_qp*v_at_qp)
         h_A_qp  = t_co*h_nodal_in(i,  j,2,1) + t_face*h_nodal_in(i,  j,2,2)
         h_B_qp  = t_co*h_nodal_in(i+1,j,1,1) + t_face*h_nodal_in(i+1,j,1,2)
-        rel_jump = abs(h_A_qp - h_B_qp) / H_ref
-        amp = 1.0 + CS%dg_jump_penalty_gamma * &
-                    max(0.0, rel_jump - CS%dg_jump_penalty_thresh)
-        tau_qp  = CS%dg_jump_penalty_eta * abs(u_at_qp) * amp
-        pen_flux_qp = gw * tau_qp * (h_A_qp - h_B_qp) * G%dyCu(i,j)
+        visc_flux_qp = gw * CS%dg_art_visc_coef * u_mag_qp * (h_B_qp - h_A_qp) * G%dyCu(i,j)
         if (i >= isc .and. hmask(i,j) == 1.0) then
-          rhs_face(i,j,2,1) = rhs_face(i,j,2,1) - pen_flux_qp * t_co
-          rhs_face(i,j,2,2) = rhs_face(i,j,2,2) - pen_flux_qp * t_face
+          rhs_face(i,j,2,1) = rhs_face(i,j,2,1) + visc_flux_qp * t_co
+          rhs_face(i,j,2,2) = rhs_face(i,j,2,2) + visc_flux_qp * t_face
         endif
         if (i+1 <= iec .and. hmask(i+1,j) == 1.0) then
-          rhs_face(i+1,j,1,1) = rhs_face(i+1,j,1,1) + pen_flux_qp * t_co
-          rhs_face(i+1,j,1,2) = rhs_face(i+1,j,1,2) + pen_flux_qp * t_face
+          rhs_face(i+1,j,1,1) = rhs_face(i+1,j,1,1) - visc_flux_qp * t_co
+          rhs_face(i+1,j,1,2) = rhs_face(i+1,j,1,2) - visc_flux_qp * t_face
         endif
       enddo
     enddo ; enddo
@@ -8841,41 +8806,28 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     endif
   enddo ; enddo
 
-  ! North-face DG jump penalty (analogous to east-face block above).
-  if (CS%dg_jump_penalty) then
+  ! North-face DG artificial viscosity (analogous to east-face block above).
+  if (CS%dg_art_visc) then
     do j = jsc-1, jec ; do i = isc, iec
       if (CS%v_face_mask(i,j) == 4.0) cycle
       if (.not. ((hmask(i,j)   == 1.0 .or. hmask(i,j)   == 3.0) .and. &
                  (hmask(i,j+1) == 1.0 .or. hmask(i,j+1) == 3.0))) cycle
-      if (hmask(i,j) == 3.0) then
-        Hbar_A = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
-      else
-        Hbar_A = nodal_cell_mean(h_nodal_in(i,j,:,:), CS%cell_mean_w(i,j,:,:))
-      endif
-      if (hmask(i,j+1) == 3.0) then
-        Hbar_B = max(CS%h_bdry_val(i,j+1), CS%min_h_shelf)
-      else
-        Hbar_B = nodal_cell_mean(h_nodal_in(i,j+1,:,:), CS%cell_mean_w(i,j+1,:,:))
-      endif
-      H_ref = max(CS%min_h_shelf, 0.5*(Hbar_A + Hbar_B))
       do gp = 1, 2
         if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
         t_co = 1.0 - t_face
+        u_at_qp = t_co*CS%u_shelf(i-1,j) + t_face*CS%u_shelf(i,j)
         v_at_qp = t_co*CS%v_shelf(i-1,j) + t_face*CS%v_shelf(i,j)
+        u_mag_qp = sqrt(u_at_qp*u_at_qp + v_at_qp*v_at_qp)
         h_A_qp  = t_co*h_nodal_in(i,j,  1,2) + t_face*h_nodal_in(i,j,  2,2)
         h_B_qp  = t_co*h_nodal_in(i,j+1,1,1) + t_face*h_nodal_in(i,j+1,2,1)
-        rel_jump = abs(h_A_qp - h_B_qp) / H_ref
-        amp = 1.0 + CS%dg_jump_penalty_gamma * &
-                    max(0.0, rel_jump - CS%dg_jump_penalty_thresh)
-        tau_qp  = CS%dg_jump_penalty_eta * abs(v_at_qp) * amp
-        pen_flux_qp = gw * tau_qp * (h_A_qp - h_B_qp) * G%dxCv(i,j)
+        visc_flux_qp = gw * CS%dg_art_visc_coef * u_mag_qp * (h_B_qp - h_A_qp) * G%dxCv(i,j)
         if (j >= jsc .and. hmask(i,j) == 1.0) then
-          rhs_face(i,j,1,2) = rhs_face(i,j,1,2) - pen_flux_qp * t_co
-          rhs_face(i,j,2,2) = rhs_face(i,j,2,2) - pen_flux_qp * t_face
+          rhs_face(i,j,1,2) = rhs_face(i,j,1,2) + visc_flux_qp * t_co
+          rhs_face(i,j,2,2) = rhs_face(i,j,2,2) + visc_flux_qp * t_face
         endif
         if (j+1 <= jec .and. hmask(i,j+1) == 1.0) then
-          rhs_face(i,j+1,1,1) = rhs_face(i,j+1,1,1) + pen_flux_qp * t_co
-          rhs_face(i,j+1,2,1) = rhs_face(i,j+1,2,1) + pen_flux_qp * t_face
+          rhs_face(i,j+1,1,1) = rhs_face(i,j+1,1,1) - visc_flux_qp * t_co
+          rhs_face(i,j+1,2,1) = rhs_face(i,j+1,2,1) - visc_flux_qp * t_face
         endif
       enddo
     enddo ; enddo
