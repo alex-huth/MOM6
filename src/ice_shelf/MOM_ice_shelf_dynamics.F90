@@ -386,7 +386,8 @@ type, public :: ice_shelf_dyn_CS ; private
              id_bed_node = -1, &
              id_h_nodal_SW = -1, id_h_nodal_SE = -1, id_h_nodal_NW = -1, id_h_nodal_NE = -1, &
              id_h_jump_node = -1, id_h_jump_node_rel = -1, &
-             id_h_jump_envelope = -1, id_h_jump_envelope_rel = -1, id_h_source_rate = -1, &
+             id_h_jump_envelope = -1, id_h_jump_envelope_rel = -1, &
+             id_h_overshoot_node = -1, id_h_overshoot_node_rel = -1, id_h_source_rate = -1, &
              id_phi_x_FV = -1, id_phi_y_FV = -1, &
              id_dg_art_visc_coef_u = -1, id_dg_art_visc_coef_v = -1
   real, pointer, dimension(:,:) :: dg_art_visc_coef_u => NULL() !< Per-face DG(1) artificial-
@@ -1182,6 +1183,18 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       CS%id_h_jump_envelope_rel = register_diag_field('ice_shelf_model','h_jump_envelope_rel', &
          CS%diag%axesB1, Time, &
          'h_jump_envelope normalised by the mean of the contributing cell means.', 'nondim')
+      CS%id_h_overshoot_node = register_diag_field('ice_shelf_model','h_overshoot_node', &
+         CS%diag%axesB1, Time, &
+         'Per-B-node Barth-Jespersen overshoot: max over the touching DG(1) corner values of '//&
+         'max(0, h_corner - Hmax_B, Hmin_B - h_corner), where [Hmin_B, Hmax_B] is the envelope '//&
+         'of cell-mean thicknesses over the cells touching the node. Nonzero only where a DG '//&
+         'corner has wandered outside the local neighbor-mean envelope (true sub-cell '//&
+         'discontinuous mode, i.e. an unphysical overshoot rather than a faithful resolved '//&
+         'sharp gradient).', &
+         'm', conversion=US%Z_to_m)
+      CS%id_h_overshoot_node_rel = register_diag_field('ice_shelf_model','h_overshoot_node_rel', &
+         CS%diag%axesB1, Time, &
+         'h_overshoot_node normalised by 0.5*(Hmax_B + Hmin_B).', 'nondim')
       CS%id_h_source_rate = register_diag_field('ice_shelf_model','h_source_rate',CS%diag%axesT1, Time, &
          'Cell-mean thickness source rate (basal melt + surface SMB) consumed by the last DG advect step', &
          'm s-1', conversion=US%Z_to_m*US%s_to_T)
@@ -1469,6 +1482,9 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
   real, dimension(SZDIB_(G),SZDJB_(G)) :: count_Bd     ! number of contributing cells per B-node [nondim]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_env   ! Hmax_B - Hmin_B at each B-node [Z ~> m]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_env_rel ! Envelope width / mean Hbar [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_over_n     ! BJ-overshoot magnitude at each B-node [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_over_n_rel ! Overshoot normalised by envelope mean [nondim]
+  real :: over_b                                  ! Per-corner BJ-bound violation [Z ~> m]
   real :: h_cSW, h_cSE, h_cNW, h_cNE              ! corner thickness candidates at a B-node [Z ~> m]
   real :: Hb_SW, Hb_SE, Hb_NW, Hb_NE              ! cell-mean thickness for each touching cell [Z ~> m]
   real :: hmax_b, hmin_b                          ! max and min of valid corner candidates [Z ~> m]
@@ -1597,7 +1613,9 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       if (CS%id_h_jump_node     > 0) call post_data(CS%id_h_jump_node,     h_jump_n,     CS%diag)
       if (CS%id_h_jump_node_rel > 0) call post_data(CS%id_h_jump_node_rel, h_jump_n_rel, CS%diag)
     endif
-    if ((CS%id_h_jump_envelope > 0 .or. CS%id_h_jump_envelope_rel > 0) .and. associated(CS%h_nodal)) then
+    if ((CS%id_h_jump_envelope > 0 .or. CS%id_h_jump_envelope_rel > 0 .or. &
+         CS%id_h_overshoot_node > 0 .or. CS%id_h_overshoot_node_rel > 0) .and. &
+        associated(CS%h_nodal)) then
       ! Per-B-node cell-mean envelope width Hmax_B - Hmin_B. Reports the
       ! local roughness of the cell-mean thickness field; useful as a
       ! smoothness diagnostic regardless of whether any face-jump
@@ -1649,6 +1667,41 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       enddo ; enddo
       if (CS%id_h_jump_envelope     > 0) call post_data(CS%id_h_jump_envelope,     h_jump_env,     CS%diag)
       if (CS%id_h_jump_envelope_rel > 0) call post_data(CS%id_h_jump_envelope_rel, h_jump_env_rel, CS%diag)
+      ! BJ-overshoot per B-node: max over the up-to-4 touching DG(1) corner values of
+      ! how far the corner sits outside the local cell-mean envelope [Hmin_B, Hmax_B].
+      ! Nonzero only where the DG(1) corner has overshot the neighbor cell-mean
+      ! envelope, i.e. the discontinuous mode is doing more than just resolve a sharp
+      ! gradient between neighbouring cells. Uses Hmax_Bd / Hmin_Bd built above and
+      ! the same corner-gathering pattern as h_jump_node.
+      if (CS%id_h_overshoot_node > 0 .or. CS%id_h_overshoot_node_rel > 0) then
+        h_over_n(:,:)     = 0.0
+        h_over_n_rel(:,:) = 0.0
+        do J = G%JscB, G%JecB ; do I = G%IscB, G%IecB
+          if (count_Bd(I,J) < 1.5) cycle
+          if (Hmax_Bd(I,J) <= -H_LARGE_D + 1.0 .or. Hmin_Bd(I,J) >= H_LARGE_D - 1.0) cycle
+          ii = I   ; jj = J     ; vSW = (ISS%hmask(ii,jj) == 1.0)
+          h_cSW = 0.0
+          if (vSW) h_cSW = CS%h_nodal(ii,jj,2,2)
+          ii = I+1 ; jj = J     ; vSE = (ISS%hmask(ii,jj) == 1.0)
+          h_cSE = 0.0
+          if (vSE) h_cSE = CS%h_nodal(ii,jj,1,2)
+          ii = I   ; jj = J+1   ; vNW = (ISS%hmask(ii,jj) == 1.0)
+          h_cNW = 0.0
+          if (vNW) h_cNW = CS%h_nodal(ii,jj,2,1)
+          ii = I+1 ; jj = J+1   ; vNE = (ISS%hmask(ii,jj) == 1.0)
+          h_cNE = 0.0
+          if (vNE) h_cNE = CS%h_nodal(ii,jj,1,1)
+          over_b = 0.0
+          if (vSW) over_b = max(over_b, h_cSW - Hmax_Bd(I,J), Hmin_Bd(I,J) - h_cSW)
+          if (vSE) over_b = max(over_b, h_cSE - Hmax_Bd(I,J), Hmin_Bd(I,J) - h_cSE)
+          if (vNW) over_b = max(over_b, h_cNW - Hmax_Bd(I,J), Hmin_Bd(I,J) - h_cNW)
+          if (vNE) over_b = max(over_b, h_cNE - Hmax_Bd(I,J), Hmin_Bd(I,J) - h_cNE)
+          h_over_n(I,J)     = over_b
+          h_over_n_rel(I,J) = over_b / max(CS%min_h_shelf, 0.5*(Hmax_Bd(I,J) + Hmin_Bd(I,J)))
+        enddo ; enddo
+        if (CS%id_h_overshoot_node     > 0) call post_data(CS%id_h_overshoot_node,     h_over_n,     CS%diag)
+        if (CS%id_h_overshoot_node_rel > 0) call post_data(CS%id_h_overshoot_node_rel, h_over_n_rel, CS%diag)
+      endif
     endif
     if (CS%id_h_source_rate > 0 .and. associated(CS%h_source_rate_last)) &
         call post_data(CS%id_h_source_rate, CS%h_source_rate_last, CS%diag)
