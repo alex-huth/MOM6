@@ -368,7 +368,8 @@ type, public :: ice_shelf_dyn_CS ; private
              id_visc_shelf = -1, id_taub = -1, &
              id_bed_node = -1, &
              id_h_nodal_SW = -1, id_h_nodal_SE = -1, id_h_nodal_NW = -1, id_h_nodal_NE = -1, &
-             id_h_jump_node = -1, id_h_jump_node_rel = -1, id_h_source_rate = -1, &
+             id_h_jump_node = -1, id_h_jump_node_rel = -1, &
+             id_h_jump_envelope = -1, id_h_jump_envelope_rel = -1, id_h_source_rate = -1, &
              id_phi_lim_DG = -1, &
              id_phi_x_FV = -1, id_phi_y_FV = -1
   real, pointer, dimension(:,:) :: phi_lim_DG => NULL() !< Nodal DG(1) limiter factor at last advection
@@ -1149,6 +1150,16 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       CS%id_h_jump_node_rel = register_diag_field('ice_shelf_model','h_jump_node_rel',CS%diag%axesB1, Time, &
          'DG(1) B-node jump as a fraction of the mean cell-mean thickness over the touching cells '//&
          '(hmask=1 only)', 'nondim')
+      CS%id_h_jump_envelope = register_diag_field('ice_shelf_model','h_jump_envelope', &
+         CS%diag%axesB1, Time, &
+         'Hmax_B - Hmin_B at each B-node: the per-B-node cell-mean envelope width that the nodal '//&
+         'Kuzmin / AFC limiter uses as its bound on corner thickness. Built over hmask=1 and '//&
+         'hmask=3 (Dirichlet) cells touching the node. h_jump_node cannot exceed this; if it '//&
+         'does, the limiter is failing to enforce the bound.', &
+         'm', conversion=US%Z_to_m)
+      CS%id_h_jump_envelope_rel = register_diag_field('ice_shelf_model','h_jump_envelope_rel', &
+         CS%diag%axesB1, Time, &
+         'h_jump_envelope normalised by the mean of the contributing cell means.', 'nondim')
       CS%id_h_source_rate = register_diag_field('ice_shelf_model','h_source_rate',CS%diag%axesT1, Time, &
          'Cell-mean thickness source rate (basal melt + surface SMB) consumed by the last DG advect step', &
          'm s-1', conversion=US%Z_to_m*US%s_to_T)
@@ -1422,11 +1433,20 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
                                                        !! B-grid node [Z ~> m], 0 where <2 touching cells
   real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_n_rel ! h_jump_n normalised by the mean cell-mean
                                                        !! thickness over the same touching cells [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: Hmax_Bd, Hmin_Bd ! per-B-node cell-mean envelope built from
+                                                           !! hmask=1 and hmask=3 cells, identical to
+                                                           !! the one used by the nodal AFC limiter
+                                                           !! [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: count_Bd     ! number of contributing cells per B-node [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_env   ! Hmax_B - Hmin_B at each B-node [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_env_rel ! Envelope width / mean Hbar [nondim]
   real :: h_cSW, h_cSE, h_cNW, h_cNE              ! corner thickness candidates at a B-node [Z ~> m]
   real :: Hb_SW, Hb_SE, Hb_NW, Hb_NE              ! cell-mean thickness for each touching cell [Z ~> m]
   real :: hmax_b, hmin_b                          ! max and min of valid corner candidates [Z ~> m]
   real :: Hbar_sum                                ! sum of valid cell-mean thicknesses [Z ~> m]
   real :: Hbar_avg                                ! arithmetic mean of valid cell-mean thicknesses [Z ~> m]
+  real :: cell_mean_val_d                         ! envelope contribution from one cell [Z ~> m]
+  real, parameter :: H_LARGE_D = 1.0e30           ! Sentinel for "no contributing cell"
   integer :: n_valid                              ! number of touching cells with hmask==1 [nondim]
   logical :: vSW, vSE, vNW, vNE                   ! per-touching-cell validity flags
   integer :: ii, jj                               ! touching-cell indices on the T-grid
@@ -1547,6 +1567,61 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       enddo ; enddo
       if (CS%id_h_jump_node     > 0) call post_data(CS%id_h_jump_node,     h_jump_n,     CS%diag)
       if (CS%id_h_jump_node_rel > 0) call post_data(CS%id_h_jump_node_rel, h_jump_n_rel, CS%diag)
+    endif
+    if ((CS%id_h_jump_envelope > 0 .or. CS%id_h_jump_envelope_rel > 0) .and. associated(CS%h_nodal)) then
+      ! Reconstruct the per-B-node cell-mean envelope Hmax_B - Hmin_B that
+      ! the nodal slope / AFC limiter uses as its bound on corner thickness.
+      ! Identical construction to nodal_AFC_limit / nodal_Kuzmin_limit so
+      ! h_jump_node should never exceed h_jump_envelope when AFC is the
+      ! active limiter. Built independent of the active limiter so it is
+      ! always meaningful as a smoothness diagnostic of the cell-mean field.
+      call pass_corner_field(CS%h_nodal, G)
+      Hmax_Bd(:,:) = -H_LARGE_D
+      Hmin_Bd(:,:) =  H_LARGE_D
+      count_Bd(:,:) = 0.0
+      do j = G%jsd, G%jed ; do i = G%isd, G%ied
+        if (ISS%hmask(i,j) == 1.0) then
+          cell_mean_val_d = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
+        elseif (ISS%hmask(i,j) == 3.0) then
+          cell_mean_val_d = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
+        else
+          cycle
+        endif
+        if (i-1 >= G%IsdB .and. j-1 >= G%JsdB) then
+          Hmax_Bd(i-1, j-1) = max(Hmax_Bd(i-1, j-1), cell_mean_val_d)
+          Hmin_Bd(i-1, j-1) = min(Hmin_Bd(i-1, j-1), cell_mean_val_d)
+          count_Bd(i-1, j-1) = count_Bd(i-1, j-1) + 1.0
+        endif
+        if (i <= G%IedB .and. j-1 >= G%JsdB) then
+          Hmax_Bd(i,   j-1) = max(Hmax_Bd(i,   j-1), cell_mean_val_d)
+          Hmin_Bd(i,   j-1) = min(Hmin_Bd(i,   j-1), cell_mean_val_d)
+          count_Bd(i,   j-1) = count_Bd(i,   j-1) + 1.0
+        endif
+        if (i-1 >= G%IsdB .and. j <= G%JedB) then
+          Hmax_Bd(i-1, j  ) = max(Hmax_Bd(i-1, j  ), cell_mean_val_d)
+          Hmin_Bd(i-1, j  ) = min(Hmin_Bd(i-1, j  ), cell_mean_val_d)
+          count_Bd(i-1, j  ) = count_Bd(i-1, j  ) + 1.0
+        endif
+        if (i <= G%IedB .and. j <= G%JedB) then
+          Hmax_Bd(i,   j  ) = max(Hmax_Bd(i,   j  ), cell_mean_val_d)
+          Hmin_Bd(i,   j  ) = min(Hmin_Bd(i,   j  ), cell_mean_val_d)
+          count_Bd(i,   j  ) = count_Bd(i,   j  ) + 1.0
+        endif
+      enddo ; enddo
+      call pass_var(Hmax_Bd,  G%domain, position=CORNER)
+      call pass_var(Hmin_Bd,  G%domain, position=CORNER)
+      call pass_var(count_Bd, G%domain, position=CORNER)
+      h_jump_env(:,:)     = 0.0
+      h_jump_env_rel(:,:) = 0.0
+      do J = G%JscB, G%JecB ; do I = G%IscB, G%IecB
+        if (count_Bd(I,J) < 1.5) cycle
+        if (Hmax_Bd(I,J) <= -H_LARGE_D + 1.0 .or. Hmin_Bd(I,J) >= H_LARGE_D - 1.0) cycle
+        h_jump_env(I,J)     = Hmax_Bd(I,J) - Hmin_Bd(I,J)
+        h_jump_env_rel(I,J) = h_jump_env(I,J) / &
+                              max(CS%min_h_shelf, 0.5*(Hmax_Bd(I,J) + Hmin_Bd(I,J)))
+      enddo ; enddo
+      if (CS%id_h_jump_envelope     > 0) call post_data(CS%id_h_jump_envelope,     h_jump_env,     CS%diag)
+      if (CS%id_h_jump_envelope_rel > 0) call post_data(CS%id_h_jump_envelope_rel, h_jump_env_rel, CS%diag)
     endif
     if (CS%id_h_source_rate > 0 .and. associated(CS%h_source_rate_last)) &
         call post_data(CS%id_h_source_rate, CS%h_source_rate_last, CS%diag)
