@@ -8835,6 +8835,9 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
 
   real, dimension(SZDIB_(G),SZDJB_(G)) :: Hmax_B, Hmin_B
   real, dimension(SZDIB_(G),SZDJB_(G)) :: count_B
+  real, dimension(SZDI_(G),SZDJ_(G))   :: H_cell    ! Cell-mean field for Park-Kim stencil [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G))   :: pk_factor ! Park-Kim smooth-extrema factor [nondim, 0..1]
+  real :: pk_d1x, pk_d1y, pk_d2x, pk_d2y, pk_d1_mag, pk_d2_mag, pk_slack
   real, parameter :: H_LARGE = 1.0e30
   ! Bound-tolerance constants: relax the MLP-u2 vertex envelope by
   ! max(BOUND_TOL_ABS, BOUND_TOL_REL * envelope_width) before applying
@@ -8847,6 +8850,9 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
   ! Tolerances for the max-product iterative projection.
   real, parameter :: LP_TOL = 1.0e-10      ! [nondim] feasibility tolerance
   integer, parameter :: MP_MAX_ITER = 20   ! Iteration cap for max-product convergence
+  ! Park-Kim MLP-u2 smooth-extrema indicator parameters.
+  real, parameter :: SMOOTH_KAPPA = 1.0    ! [nondim] curvature/slope ratio threshold
+  real, parameter :: PK_FLOOR_FRAC = 1.0e-6 ! [nondim] floor on d1 magnitude as fraction of |Hbar|
   real :: cell_mean_val
   real :: Hbar, Hbar_new
   real :: h11, h21, h12, h22
@@ -8874,6 +8880,10 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
   Hmax_B(:,:)  = -H_LARGE
   Hmin_B(:,:)  =  H_LARGE
   count_B(:,:) = 0.0
+  ! Also build a 2D cell-mean field H_cell for the Park-Kim smooth-extrema
+  ! indicator below. Sentinel value H_LARGE marks unavailable cells (hmask=0
+  ! or hmask=2). Both the envelope and H_cell are built in the same pass.
+  H_cell(:,:) = H_LARGE
   do j = G%jsd, G%jed ; do i = G%isd, G%ied
     if (ISS%hmask(i,j) == 1.0) then
       cell_mean_val = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
@@ -8882,6 +8892,7 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
     else
       cycle
     endif
+    H_cell(i, j) = cell_mean_val
     if (i-1 >= G%IsdB .and. j-1 >= G%JsdB) then
       Hmax_B(i-1, j-1) = max(Hmax_B(i-1, j-1), cell_mean_val)
       Hmin_B(i-1, j-1) = min(Hmin_B(i-1, j-1), cell_mean_val)
@@ -8906,6 +8917,40 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
   call pass_var(Hmax_B,  G%domain, position=CORNER)
   call pass_var(Hmin_B,  G%domain, position=CORNER)
   call pass_var(count_B, G%domain, position=CORNER)
+
+  ! Park-Kim MLP-u2 smooth-extrema indicator (Park & Kim 2014, JCP 274).
+  ! At each owned cell K = (i, j), compute the second-difference / first-
+  ! difference ratio in x and y over the cell-mean field. A cell is at a
+  ! "smooth extremum" if the cell-mean curvature is bounded relative to the
+  ! cell-mean gradient magnitude (i.e., the field varies smoothly through
+  ! K without sign-changing oscillations). For such cells, the MLP-u2
+  ! envelope is relaxed to allow corner extrapolation by half the local
+  ! envelope width - that's the natural slope-induced overshoot a smooth
+  ! Q1 field produces at the corner of an extremum cell.
+  !
+  ! pk_factor in [0, 1]:  1 = fully smooth (full envelope expansion),
+  !                       0 = oscillatory (no expansion, strict MLP-u2).
+  ! Linearly interpolated in between via SMOOTH_KAPPA.
+  pk_factor(:,:) = 0.0
+  do j = G%jsc, G%jec ; do i = G%isc, G%iec
+    if (ISS%hmask(i,j) /= 1.0) cycle
+    if (H_cell(i-1, j) >= H_LARGE - 1.0 .or. H_cell(i+1, j) >= H_LARGE - 1.0 .or. &
+        H_cell(i, j-1) >= H_LARGE - 1.0 .or. H_cell(i, j+1) >= H_LARGE - 1.0) cycle
+    pk_d1x = 0.5 * (H_cell(i+1, j) - H_cell(i-1, j))
+    pk_d1y = 0.5 * (H_cell(i, j+1) - H_cell(i, j-1))
+    pk_d2x = (H_cell(i-1, j) - 2.0 * H_cell(i, j)) + H_cell(i+1, j)
+    pk_d2y = (H_cell(i, j-1) - 2.0 * H_cell(i, j)) + H_cell(i, j+1)
+    pk_d1_mag = max(abs(pk_d1x), abs(pk_d1y), PK_FLOOR_FRAC * abs(H_cell(i, j)))
+    pk_d2_mag = max(abs(pk_d2x), abs(pk_d2y))
+    ! Smooth if d2 <= SMOOTH_KAPPA * d1_mag; oscillatory if d2 >= 2*SMOOTH_KAPPA * d1_mag.
+    if (pk_d2_mag <= SMOOTH_KAPPA * pk_d1_mag) then
+      pk_factor(i, j) = 1.0
+    elseif (pk_d2_mag >= 2.0 * SMOOTH_KAPPA * pk_d1_mag) then
+      pk_factor(i, j) = 0.0
+    else
+      pk_factor(i, j) = 1.0 - (pk_d2_mag - SMOOTH_KAPPA * pk_d1_mag) / (SMOOTH_KAPPA * pk_d1_mag)
+    endif
+  enddo ; enddo
 
   ! Reset diagnostic buffers (limiter inactive at non-hmask=1 cells -> phi=1, drift=0).
   if (associated(CS%dg_lim_phi_xi))     CS%dg_lim_phi_xi(:,:)     = 1.0
@@ -8961,8 +9006,14 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
           Hmin_B(I_node, J_node) <  H_LARGE - 1.0) then
         bound_tol = max(BOUND_TOL_ABS, &
                         BOUND_TOL_REL * (Hmax_B(I_node, J_node) - Hmin_B(I_node, J_node)))
-        bound_max(a,b) = Hmax_B(I_node, J_node) + bound_tol
-        bound_min(a,b) = Hmin_B(I_node, J_node) - bound_tol
+        ! Park-Kim MLP-u2 smooth-extrema expansion: relax the envelope by
+        ! pk_factor * 0.5 * envelope_width on each side. Fully smooth cells
+        ! (pk_factor = 1) get the maximum natural slope extrapolation
+        ! through the corner without triggering MLP. Oscillatory cells
+        ! (pk_factor = 0) get the strict MLP-u2 envelope.
+        pk_slack = 0.5 * pk_factor(i, j) * (Hmax_B(I_node, J_node) - Hmin_B(I_node, J_node))
+        bound_max(a,b) = Hmax_B(I_node, J_node) + bound_tol + pk_slack
+        bound_min(a,b) = Hmin_B(I_node, J_node) - bound_tol - pk_slack
       else
         bound_max(a,b) =  H_LARGE
         bound_min(a,b) = -H_LARGE
