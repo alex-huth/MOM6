@@ -8950,6 +8950,19 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
     ! then eta-slope. At each pass, the residual budget at a corner uses
     ! the already-limited contributions of higher modes plus full
     ! contributions of yet-to-be-limited modes.
+    ! For each pass, per corner: the limiter scales the mode's contribution
+    ! DOWN from full magnitude. dev > 0 with budget_high < 0 means the
+    ! upper bound is violated even at phi=0 (other modes already exceed);
+    ! we clip phi to 0 (least violation). dev > 0 with budget_low > 0
+    ! means the lower bound is undershot at phi=0 baseline; scaling down
+    ! makes that worse, but we can't push phi above 1 either - the lower-
+    ! bound undershoot is caused by OTHER modes and is not this mode's
+    ! to fix. So we ignore the budget_low > 0 case for dev > 0 (and
+    ! analogously budget_high < 0 for dev < 0): they would erroneously
+    ! reduce phi by treating a lower-limit-on-phi constraint as an upper
+    ! limit. Earlier versions of this code had that bug, which produced
+    ! random phi=0 cells in smooth interior regions where the OTHER modes'
+    ! contributions happened to push a corner just below its bound.
     phi_d = 1.0
     do b = 1, 2 ; do a = 1, 2
       exc_other = dev_b(a,b) + dev_c(a,b)
@@ -8958,10 +8971,8 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
       if (abs(dev_d(a,b)) > TINY_DEV) then
         if (dev_d(a,b) > 0.0) then
           ratio = budget_high / dev_d(a,b)
-          if (budget_low > 0.0) ratio = min(ratio, budget_low / dev_d(a,b))
         else
           ratio = budget_low  / dev_d(a,b)
-          if (budget_high < 0.0) ratio = min(ratio, budget_high / dev_d(a,b))
         endif
         phi_d = min(phi_d, max(0.0, ratio))
       endif
@@ -8976,10 +8987,8 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
       if (abs(dev_b(a,b)) > TINY_DEV) then
         if (dev_b(a,b) > 0.0) then
           ratio = budget_high / dev_b(a,b)
-          if (budget_low > 0.0) ratio = min(ratio, budget_low / dev_b(a,b))
         else
           ratio = budget_low  / dev_b(a,b)
-          if (budget_high < 0.0) ratio = min(ratio, budget_high / dev_b(a,b))
         endif
         phi_b = min(phi_b, max(0.0, ratio))
       endif
@@ -8994,10 +9003,8 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
       if (abs(dev_c(a,b)) > TINY_DEV) then
         if (dev_c(a,b) > 0.0) then
           ratio = budget_high / dev_c(a,b)
-          if (budget_low > 0.0) ratio = min(ratio, budget_low / dev_c(a,b))
         else
           ratio = budget_low  / dev_c(a,b)
-          if (budget_high < 0.0) ratio = min(ratio, budget_high / dev_c(a,b))
         endif
         phi_c = min(phi_c, max(0.0, ratio))
       endif
