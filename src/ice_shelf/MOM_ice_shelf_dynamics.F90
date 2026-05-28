@@ -8845,6 +8845,11 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
   ! physically meaningful overshoot for ice-shelf thickness (~1 m).
   real, parameter :: BOUND_TOL_ABS = 1.0e-4  ! [Z ~> m] absolute floor
   real, parameter :: BOUND_TOL_REL = 1.0e-6  ! [nondim] relative
+  ! Tie tolerance for the worst-offender-first hierarchical limiter: if the
+  ! three mode magnitudes are all within TIE_TOL of the largest, use a
+  ! single uniform scaling factor (rotation-symmetric) rather than the
+  ! biased hierarchical sequence. Set to 0.2 (20%).
+  real, parameter :: TIE_TOL = 0.2  ! [nondim]
   real :: cell_mean_val
   real :: Hbar, Hbar_new
   real :: h11, h21, h12, h22
@@ -8855,7 +8860,16 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
   real :: bound_max(2,2), bound_min(2,2)
   real :: bound_tol                          ! Per-corner relaxation of the envelope
   real :: phi_b, phi_c, phi_d
-  real :: budget_high, budget_low, exc_other, ratio
+  real :: dev_mode(3,2,2)                    ! Packed mode contributions per corner
+  real :: phi_mode(3)                        ! Per-mode scaling factors
+  real :: v_mode(3)                          ! Per-mode max |dev| over corners
+  real :: v_max_mode, v_min_mode             ! Max/min over modes of v_mode
+  real :: exc_corner(2,2)                    ! Sum of other modes' contributions per corner
+  real :: phi_this, phi_uniform              ! Working scaling factors
+  real :: dev_total                          ! Sum of all modes' contributions at a corner
+  integer :: order_modes(3)                  ! Mode indices sorted by descending magnitude
+  integer :: m_idx, m_other, rank_step
+  real :: budget_high, budget_low, ratio
   real :: h_new(2,2)
   integer :: i, j, a, b, I_node, J_node
 
@@ -8962,70 +8976,109 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
       endif
     enddo ; enddo
 
-    ! Hierarchical limiting. Cross-term first (highest mode), then xi-slope,
-    ! then eta-slope. At each pass, the residual budget at a corner uses
-    ! the already-limited contributions of higher modes plus full
-    ! contributions of yet-to-be-limited modes.
-    ! For each pass, per corner: the limiter scales the mode's contribution
-    ! DOWN from full magnitude. dev > 0 with budget_high < 0 means the
-    ! upper bound is violated even at phi=0 (other modes already exceed);
-    ! we clip phi to 0 (least violation). dev > 0 with budget_low > 0
-    ! means the lower bound is undershot at phi=0 baseline; scaling down
-    ! makes that worse, but we can't push phi above 1 either - the lower-
-    ! bound undershoot is caused by OTHER modes and is not this mode's
-    ! to fix. So we ignore the budget_low > 0 case for dev > 0 (and
-    ! analogously budget_high < 0 for dev < 0): they would erroneously
-    ! reduce phi by treating a lower-limit-on-phi constraint as an upper
-    ! limit. Earlier versions of this code had that bug, which produced
-    ! random phi=0 cells in smooth interior regions where the OTHER modes'
-    ! contributions happened to push a corner just below its bound.
-    phi_d = 1.0
-    do b = 1, 2 ; do a = 1, 2
-      exc_other = dev_b(a,b) + dev_c(a,b)
-      budget_high = bound_max(a,b) - Hbar - exc_other
-      budget_low  = bound_min(a,b) - Hbar - exc_other
-      if (abs(dev_d(a,b)) > TINY_DEV) then
-        if (dev_d(a,b) > 0.0) then
-          ratio = budget_high / dev_d(a,b)
-        else
-          ratio = budget_low  / dev_d(a,b)
-        endif
-        phi_d = min(phi_d, max(0.0, ratio))
-      endif
-    enddo ; enddo
-    phi_d = min(phi_d, 1.0)
+    ! Per-mode hierarchical limiting with worst-offender-first ordering
+    ! and single-phi fallback for ties. Pack dev arrays into a unified
+    ! mode-indexed array (m=1: xi-slope b, m=2: eta-slope c, m=3: cross d)
+    ! so the ordering can be chosen per cell based on which mode contributes
+    ! most to bound violation. Rotation-equivariant: the worst-offender
+    ! choice depends only on physical mode magnitudes, not on coordinate
+    ! frame.
+    dev_mode(1,:,:) = dev_b(:,:)
+    dev_mode(2,:,:) = dev_c(:,:)
+    dev_mode(3,:,:) = dev_d(:,:)
+    phi_mode(:) = 1.0
 
-    phi_b = 1.0
-    do b = 1, 2 ; do a = 1, 2
-      exc_other = dev_c(a,b) + phi_d * dev_d(a,b)
-      budget_high = bound_max(a,b) - Hbar - exc_other
-      budget_low  = bound_min(a,b) - Hbar - exc_other
-      if (abs(dev_b(a,b)) > TINY_DEV) then
-        if (dev_b(a,b) > 0.0) then
-          ratio = budget_high / dev_b(a,b)
-        else
-          ratio = budget_low  / dev_b(a,b)
-        endif
-        phi_b = min(phi_b, max(0.0, ratio))
-      endif
-    enddo ; enddo
-    phi_b = min(phi_b, 1.0)
+    v_mode(1) = max(abs(dev_b(1,1)), abs(dev_b(2,1)), abs(dev_b(1,2)), abs(dev_b(2,2)))
+    v_mode(2) = max(abs(dev_c(1,1)), abs(dev_c(2,1)), abs(dev_c(1,2)), abs(dev_c(2,2)))
+    v_mode(3) = max(abs(dev_d(1,1)), abs(dev_d(2,1)), abs(dev_d(1,2)), abs(dev_d(2,2)))
+    v_max_mode = max(v_mode(1), max(v_mode(2), v_mode(3)))
+    v_min_mode = min(v_mode(1), min(v_mode(2), v_mode(3)))
 
-    phi_c = 1.0
-    do b = 1, 2 ; do a = 1, 2
-      exc_other = phi_b * dev_b(a,b) + phi_d * dev_d(a,b)
-      budget_high = bound_max(a,b) - Hbar - exc_other
-      budget_low  = bound_min(a,b) - Hbar - exc_other
-      if (abs(dev_c(a,b)) > TINY_DEV) then
-        if (dev_c(a,b) > 0.0) then
-          ratio = budget_high / dev_c(a,b)
-        else
-          ratio = budget_low  / dev_c(a,b)
+    if (v_max_mode <= TINY_DEV) then
+      ! All modes negligible; no limiting needed.
+      phi_b = 1.0 ; phi_c = 1.0 ; phi_d = 1.0
+    elseif ((v_max_mode - v_min_mode) <= TIE_TOL * v_max_mode) then
+      ! All three modes are within TIE_TOL relative magnitude. Use a single
+      ! uniform scaling factor phi_uniform applied to the total deviation
+      ! at each corner. Symmetric across all modes (single-phi Zhang-Shu
+      ! at the corners): rotation-equivariant by construction, and gives
+      ! a balanced reduction at K_4 cells where multiple modes contribute
+      ! equally to overshoot.
+      phi_uniform = 1.0
+      do b = 1, 2 ; do a = 1, 2
+        dev_total = dev_b(a,b) + dev_c(a,b) + dev_d(a,b)
+        if (abs(dev_total) > TINY_DEV) then
+          if (dev_total > 0.0) then
+            ratio = (bound_max(a,b) - Hbar) / dev_total
+          else
+            ratio = (bound_min(a,b) - Hbar) / dev_total
+          endif
+          phi_uniform = min(phi_uniform, max(0.0, ratio))
         endif
-        phi_c = min(phi_c, max(0.0, ratio))
+      enddo ; enddo
+      phi_uniform = min(phi_uniform, 1.0)
+      phi_b = phi_uniform ; phi_c = phi_uniform ; phi_d = phi_uniform
+    else
+      ! Distinct violation magnitudes -> worst-offender-first hierarchical.
+      ! The mode with the largest |dev| is limited first (gets crushed
+      ! hardest); later modes face a smaller residual to fit, so they
+      ! survive at larger phi. Each mode-pick is rotation-equivariant
+      ! because it compares mode magnitudes that swap consistently under
+      ! a 90 deg rotation.
+      ! Sort indices by descending v_mode magnitude.
+      if (v_mode(1) >= v_mode(2) .and. v_mode(1) >= v_mode(3)) then
+        order_modes(1) = 1
+        if (v_mode(2) >= v_mode(3)) then
+          order_modes(2) = 2 ; order_modes(3) = 3
+        else
+          order_modes(2) = 3 ; order_modes(3) = 2
+        endif
+      elseif (v_mode(2) >= v_mode(1) .and. v_mode(2) >= v_mode(3)) then
+        order_modes(1) = 2
+        if (v_mode(1) >= v_mode(3)) then
+          order_modes(2) = 1 ; order_modes(3) = 3
+        else
+          order_modes(2) = 3 ; order_modes(3) = 1
+        endif
+      else
+        order_modes(1) = 3
+        if (v_mode(1) >= v_mode(2)) then
+          order_modes(2) = 1 ; order_modes(3) = 2
+        else
+          order_modes(2) = 2 ; order_modes(3) = 1
+        endif
       endif
-    enddo ; enddo
-    phi_c = min(phi_c, 1.0)
+
+      do rank_step = 1, 3
+        m_idx = order_modes(rank_step)
+        ! exc_other = sum of OTHER two modes' contributions, using the
+        ! current phi value for each (1.0 if not yet limited).
+        do b = 1, 2 ; do a = 1, 2
+          exc_corner(a,b) = 0.0
+          do m_other = 1, 3
+            if (m_other /= m_idx) exc_corner(a,b) = exc_corner(a,b) + &
+                                                    phi_mode(m_other) * dev_mode(m_other,a,b)
+          enddo
+        enddo ; enddo
+        ! Compute phi for this mode.
+        phi_this = 1.0
+        do b = 1, 2 ; do a = 1, 2
+          budget_high = bound_max(a,b) - Hbar - exc_corner(a,b)
+          budget_low  = bound_min(a,b) - Hbar - exc_corner(a,b)
+          if (abs(dev_mode(m_idx,a,b)) > TINY_DEV) then
+            if (dev_mode(m_idx,a,b) > 0.0) then
+              ratio = budget_high / dev_mode(m_idx,a,b)
+            else
+              ratio = budget_low  / dev_mode(m_idx,a,b)
+            endif
+            phi_this = min(phi_this, max(0.0, ratio))
+          endif
+        enddo ; enddo
+        phi_mode(m_idx) = min(phi_this, 1.0)
+      enddo
+
+      phi_b = phi_mode(1) ; phi_c = phi_mode(2) ; phi_d = phi_mode(3)
+    endif
 
     ! Reconstruct corners using orthogonalised modes (preserves Hbar exactly
     ! because each orthogonalised mode has zero cell_mean_w-weighted mean).
