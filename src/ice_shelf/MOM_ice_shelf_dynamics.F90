@@ -260,6 +260,12 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! thickness corners between RK stages.
                                   !! Mass is preserved exactly via orthogonalised
                                   !! mode templates against cell_mean_w.
+  logical :: dg_lim_isotropic     !< If true (and dg_hierarchical_lim is also true),
+                                  !! use isotropic single-phi Zhang-Shu MPP scaling
+                                  !! with Park-Kim MLP-u2 vertex-based envelopes
+                                  !! instead of the anisotropic per-mode max-product
+                                  !! limiter. Single phi per cell scales the full
+                                  !! deviation from Hbar at each corner.
   real, allocatable :: mu_lim_xi(:,:)     !< Cached orthogonalisation offset for the
                                           !! xi-slope mode template, per cell [nondim].
   real, allocatable :: mu_lim_eta(:,:)    !< Cached orthogonalisation offset for the
@@ -279,6 +285,12 @@ type, public :: ice_shelf_dyn_CS ; private
                                                               !! the limiter [Z ~> m].
                                                               !! Sanity check; should be
                                                               !! ~machine epsilon.
+  real, pointer, dimension(:,:) :: dg_lim_phi => NULL()       !< Per-cell limiter-strength
+                                                              !! diagnostic [nondim, 0..1].
+                                                              !! For isotropic: the unique phi.
+                                                              !! For anisotropic: min over the
+                                                              !! three mode phis at this cell
+                                                              !! (= the most-limiting factor).
   logical :: dg_art_visc          !< If true, add an artificial-viscosity face term
                                   !! +nu_face * (h_B - h_A) / dx_perp * dy at each
                                   !! interior DG face. With nu_face = coef*dx_perp*|u_face|
@@ -414,7 +426,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_h_jump_envelope = -1, id_h_jump_envelope_rel = -1, &
              id_h_overshoot_node = -1, id_h_overshoot_node_rel = -1, id_h_source_rate = -1, &
              id_dg_lim_phi_xi = -1, id_dg_lim_phi_eta = -1, id_dg_lim_phi_cross = -1, &
-             id_dg_lim_mass_drift = -1, &
+             id_dg_lim_mass_drift = -1, id_dg_lim_phi = -1, &
              id_phi_x_FV = -1, id_phi_y_FV = -1, &
              id_dg_art_visc_coef_u = -1, id_dg_art_visc_coef_v = -1
   real, pointer, dimension(:,:) :: dg_art_visc_coef_u => NULL() !< Per-face DG(1) artificial-
@@ -587,6 +599,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%dg_lim_phi_eta(isd:ied,jsd:jed),    source=1.0)
     allocate(CS%dg_lim_phi_cross(isd:ied,jsd:jed),  source=1.0)
     allocate(CS%dg_lim_mass_drift(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_lim_phi(isd:ied,jsd:jed),        source=1.0)
     allocate(CS%u_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%v_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%u_face_mask_bdry(IsdB:IedB,JsdB:JedB), source=-2.0)
@@ -1258,6 +1271,12 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          'Per-cell change in cell-mean thickness produced by the DG(1) hierarchical limiter. '//&
          'Should be ~machine epsilon when the orthogonalised mode templates are correct.', &
          'm', conversion=US%Z_to_m)
+      CS%id_dg_lim_phi = register_diag_field('ice_shelf_model','dg_lim_phi', &
+         CS%diag%axesT1, Time, &
+         'Per-cell DG(1) limiter strength [0,1]. 1 = no limiting at this cell, 0 = full '//&
+         'collapse. For the isotropic single-phi variant this is the unique scaling factor; '//&
+         'for the anisotropic per-mode variant this is the min over (phi_xi, phi_eta, phi_cross), '//&
+         'i.e. the most-limiting direction.', 'nondim')
     else
       CS%id_phi_x_FV = register_diag_field('ice_shelf_model','phi_x_FV',CS%diag%axesCu1, Time, &
          'Van Leer slope-limiter factor at each u-face from ice_shelf_advect_thickness_x '//&
@@ -1768,6 +1787,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_lim_phi_cross, CS%dg_lim_phi_cross, CS%diag)
     if (CS%id_dg_lim_mass_drift > 0 .and. associated(CS%dg_lim_mass_drift)) &
         call post_data(CS%id_dg_lim_mass_drift, CS%dg_lim_mass_drift, CS%diag)
+    if (CS%id_dg_lim_phi > 0 .and. associated(CS%dg_lim_phi)) &
+        call post_data(CS%id_dg_lim_phi, CS%dg_lim_phi, CS%diag)
     if (CS%id_dg_art_visc_coef_u > 0 .and. associated(CS%dg_art_visc_coef_u)) &
         call post_data(CS%id_dg_art_visc_coef_u, CS%dg_art_visc_coef_u, CS%diag)
     if (CS%id_dg_art_visc_coef_v > 0 .and. associated(CS%dg_art_visc_coef_v)) &
@@ -6302,6 +6323,7 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_lim_phi_eta))    deallocate(CS%dg_lim_phi_eta)
   if (associated(CS%dg_lim_phi_cross))  deallocate(CS%dg_lim_phi_cross)
   if (associated(CS%dg_lim_mass_drift)) deallocate(CS%dg_lim_mass_drift)
+  if (associated(CS%dg_lim_phi))        deallocate(CS%dg_lim_phi)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
   if (associated(CS%Jac)) deallocate(CS%Jac)
   if (associated(CS%Phi)) deallocate(CS%Phi)
@@ -8454,6 +8476,16 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "JCP 229, Park & Kim 2014 JCP 274.", &
                  default=.false., do_not_log=.not.CS%use_DG_thickness)
 
+  call get_param(param_file, mdl, "DG1_LIMITER_ISOTROPIC", CS%dg_lim_isotropic, &
+                 "If true (and DG1_HIERARCHICAL_LIMITER is also true), use the isotropic "//&
+                 "single-phi Zhang-Shu MPP variant with Park-Kim MLP-u2 vertex envelopes "//&
+                 "instead of the anisotropic per-mode max-product variant. The isotropic "//&
+                 "form scales the full deviation (h_nodal - Hbar) at each corner by a "//&
+                 "single per-cell factor; this is the textbook Zhang-Shu 2010 form and is "//&
+                 "trivially rotation-symmetric and mass-conservative.", &
+                 default=.false., do_not_log=(.not.CS%use_DG_thickness .or. &
+                                              .not.CS%dg_hierarchical_lim))
+
   call get_param(param_file, mdl, "DG1_ART_VISC", CS%dg_art_visc, &
                  "If true, add an artificial-viscosity face term to the DG(1) nodal "//&
                  "spatial operator. Per interior face, distributes the antisymmetric "//&
@@ -8837,8 +8869,11 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
   real, dimension(SZDIB_(G),SZDJB_(G)) :: count_B
   real, dimension(SZDI_(G),SZDJ_(G))   :: H_cell    ! Cell-mean field for Park-Kim stencil [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G))   :: pk_factor ! Park-Kim smooth-extrema factor [nondim, 0..1]
-  real :: pk_d1x, pk_d1y, pk_d2x, pk_d2y, pk_d1_mag, pk_d2_mag, pk_slack
+  real, dimension(SZDI_(G),SZDJ_(G))   :: pk_d2x_cell, pk_d2y_cell  ! Cell-mean second diffs [Z ~> m]
+  real :: pk_slack
+  real :: phi_iso, iso_dev                  ! Isotropic-variant scratch
   real, parameter :: H_LARGE = 1.0e30
+  real, parameter :: TINY_DEV = 1.0e-30    ! Threshold for skipping near-zero deviations
   ! Bound-tolerance constants: relax the MLP-u2 vertex envelope by
   ! max(BOUND_TOL_ABS, BOUND_TOL_REL * envelope_width) before applying
   ! the per-mode MPP scaling. Prevents spurious limiting at smooth local
@@ -8850,9 +8885,6 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
   ! Tolerances for the max-product iterative projection.
   real, parameter :: LP_TOL = 1.0e-10      ! [nondim] feasibility tolerance
   integer, parameter :: MP_MAX_ITER = 20   ! Iteration cap for max-product convergence
-  ! Park-Kim MLP-u2 smooth-extrema indicator parameters.
-  real, parameter :: SMOOTH_KAPPA = 1.0    ! [nondim] curvature/slope ratio threshold
-  real, parameter :: PK_FLOOR_FRAC = 1.0e-6 ! [nondim] floor on d1 magnitude as fraction of |Hbar|
   real :: cell_mean_val
   real :: Hbar, Hbar_new
   real :: h11, h21, h12, h22
@@ -8919,36 +8951,48 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
   call pass_var(count_B, G%domain, position=CORNER)
 
   ! Park-Kim MLP-u2 smooth-extrema indicator (Park & Kim 2014, JCP 274).
-  ! At each owned cell K = (i, j), compute the second-difference / first-
-  ! difference ratio in x and y over the cell-mean field. A cell is at a
-  ! "smooth extremum" if the cell-mean curvature is bounded relative to the
-  ! cell-mean gradient magnitude (i.e., the field varies smoothly through
-  ! K without sign-changing oscillations). For such cells, the MLP-u2
-  ! envelope is relaxed to allow corner extrapolation by half the local
-  ! envelope width - that's the natural slope-induced overshoot a smooth
-  ! Q1 field produces at the corner of an extremum cell.
-  !
-  ! pk_factor in [0, 1]:  1 = fully smooth (full envelope expansion),
-  !                       0 = oscillatory (no expansion, strict MLP-u2).
-  ! Linearly interpolated in between via SMOOTH_KAPPA.
+  ! Uses second-difference sign consistency across a wider stencil: a cell
+  ! is at a smooth extremum if its second-difference d2 has the same sign
+  ! as its neighbors' d2 in each direction. Smooth peaks have consistently
+  ! negative d2 over a 3-cell neighborhood; oscillations have alternating
+  ! signs. The sign-consistency check requires d2 at neighbouring cells,
+  ! hence Hbar in a 2-cell-deep halo. A pass_var on H_cell extends the
+  ! field across PE boundaries to the required depth.
+  call pass_var(H_cell, G%domain)
+  ! Step 1: compute d2x, d2y at every cell where the immediate-neighbour
+  ! cell means are available (1-deep halo from the owned cells).
+  pk_d2x_cell(:,:) = 0.0
+  pk_d2y_cell(:,:) = 0.0
+  do j = G%jsd+1, G%jed-1 ; do i = G%isd+1, G%ied-1
+    if (H_cell(i, j) >= H_LARGE - 1.0) cycle
+    if (H_cell(i-1, j) < H_LARGE - 1.0 .and. H_cell(i+1, j) < H_LARGE - 1.0) then
+      pk_d2x_cell(i, j) = (H_cell(i-1, j) - 2.0 * H_cell(i, j)) + H_cell(i+1, j)
+    endif
+    if (H_cell(i, j-1) < H_LARGE - 1.0 .and. H_cell(i, j+1) < H_LARGE - 1.0) then
+      pk_d2y_cell(i, j) = (H_cell(i, j-1) - 2.0 * H_cell(i, j)) + H_cell(i, j+1)
+    endif
+  enddo ; enddo
+
+  ! Step 2: per owned cell, check sign consistency of d2 in x and y over
+  ! the 3-cell stencil centred at K. If consistent in both directions, the
+  ! cell is at a smooth extremum and pk_factor = 1; otherwise 0.
   pk_factor(:,:) = 0.0
   do j = G%jsc, G%jec ; do i = G%isc, G%iec
     if (ISS%hmask(i,j) /= 1.0) cycle
-    if (H_cell(i-1, j) >= H_LARGE - 1.0 .or. H_cell(i+1, j) >= H_LARGE - 1.0 .or. &
-        H_cell(i, j-1) >= H_LARGE - 1.0 .or. H_cell(i, j+1) >= H_LARGE - 1.0) cycle
-    pk_d1x = 0.5 * (H_cell(i+1, j) - H_cell(i-1, j))
-    pk_d1y = 0.5 * (H_cell(i, j+1) - H_cell(i, j-1))
-    pk_d2x = (H_cell(i-1, j) - 2.0 * H_cell(i, j)) + H_cell(i+1, j)
-    pk_d2y = (H_cell(i, j-1) - 2.0 * H_cell(i, j)) + H_cell(i, j+1)
-    pk_d1_mag = max(abs(pk_d1x), abs(pk_d1y), PK_FLOOR_FRAC * abs(H_cell(i, j)))
-    pk_d2_mag = max(abs(pk_d2x), abs(pk_d2y))
-    ! Smooth if d2 <= SMOOTH_KAPPA * d1_mag; oscillatory if d2 >= 2*SMOOTH_KAPPA * d1_mag.
-    if (pk_d2_mag <= SMOOTH_KAPPA * pk_d1_mag) then
-      pk_factor(i, j) = 1.0
-    elseif (pk_d2_mag >= 2.0 * SMOOTH_KAPPA * pk_d1_mag) then
-      pk_factor(i, j) = 0.0
-    else
-      pk_factor(i, j) = 1.0 - (pk_d2_mag - SMOOTH_KAPPA * pk_d1_mag) / (SMOOTH_KAPPA * pk_d1_mag)
+    if (i-1 < G%isd+1 .or. i+1 > G%ied-1) cycle
+    if (j-1 < G%jsd+1 .or. j+1 > G%jed-1) cycle
+    ! d2 same sign in x at i-1, i, i+1?
+    if (((pk_d2x_cell(i-1, j) >= 0.0) .and. (pk_d2x_cell(i, j) >= 0.0) .and. &
+         (pk_d2x_cell(i+1, j) >= 0.0)) .or. &
+        ((pk_d2x_cell(i-1, j) <= 0.0) .and. (pk_d2x_cell(i, j) <= 0.0) .and. &
+         (pk_d2x_cell(i+1, j) <= 0.0))) then
+      ! d2 same sign in y at j-1, j, j+1?
+      if (((pk_d2y_cell(i, j-1) >= 0.0) .and. (pk_d2y_cell(i, j) >= 0.0) .and. &
+           (pk_d2y_cell(i, j+1) >= 0.0)) .or. &
+          ((pk_d2y_cell(i, j-1) <= 0.0) .and. (pk_d2y_cell(i, j) <= 0.0) .and. &
+           (pk_d2y_cell(i, j+1) <= 0.0))) then
+        pk_factor(i, j) = 1.0
+      endif
     endif
   enddo ; enddo
 
@@ -8957,6 +9001,7 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
   if (associated(CS%dg_lim_phi_eta))    CS%dg_lim_phi_eta(:,:)    = 1.0
   if (associated(CS%dg_lim_phi_cross))  CS%dg_lim_phi_cross(:,:)  = 1.0
   if (associated(CS%dg_lim_mass_drift)) CS%dg_lim_mass_drift(:,:) = 0.0
+  if (associated(CS%dg_lim_phi))        CS%dg_lim_phi(:,:)        = 1.0
 
   ! Per-cell hierarchical limiting.
   do j = G%jsc, G%jec ; do i = G%isc, G%iec
@@ -9006,12 +9051,14 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
           Hmin_B(I_node, J_node) <  H_LARGE - 1.0) then
         bound_tol = max(BOUND_TOL_ABS, &
                         BOUND_TOL_REL * (Hmax_B(I_node, J_node) - Hmin_B(I_node, J_node)))
-        ! Park-Kim MLP-u2 smooth-extrema expansion: relax the envelope by
-        ! pk_factor * 0.5 * envelope_width on each side. Fully smooth cells
-        ! (pk_factor = 1) get the maximum natural slope extrapolation
-        ! through the corner without triggering MLP. Oscillatory cells
-        ! (pk_factor = 0) get the strict MLP-u2 envelope.
-        pk_slack = 0.5 * pk_factor(i, j) * (Hmax_B(I_node, J_node) - Hmin_B(I_node, J_node))
+        ! Park-Kim MLP-u2 smooth-extrema expansion: relax the envelope to
+        ! absorb the natural Q1 corner extrapolation at smooth peaks. Slack
+        ! is the maximum of the envelope width and the local |d2| (which
+        ! drives smooth-peak overshoots when d1 is small), scaled by
+        ! pk_factor. Cells flagged as smooth (pk_factor = 1) get the full
+        ! slack; oscillatory cells (pk_factor = 0) get strict MLP-u2.
+        pk_slack = pk_factor(i, j) * max(Hmax_B(I_node, J_node) - Hmin_B(I_node, J_node), &
+                                          abs(pk_d2x_cell(i, j)) + abs(pk_d2y_cell(i, j)))
         bound_max(a,b) = Hmax_B(I_node, J_node) + bound_tol + pk_slack
         bound_min(a,b) = Hmin_B(I_node, J_node) - bound_tol - pk_slack
       else
@@ -9019,6 +9066,46 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
         bound_min(a,b) = -H_LARGE
       endif
     enddo ; enddo
+
+    if (CS%dg_lim_isotropic) then
+      ! Isotropic single-phi Zhang-Shu MPP (Zhang & Shu 2010 JCP 229) with
+      ! Park-Kim MLP-u2 vertex envelopes. Scales the entire deviation
+      ! (h_nodal - Hbar) at each corner by a single per-cell phi, found as
+      ! the largest factor in [0,1] that keeps every corner within its
+      ! relaxed envelope. Mass conservation is automatic: the deviation
+      ! field has zero cell_mean_w-weighted mean by construction.
+      phi_iso = 1.0
+      do b = 1, 2 ; do a = 1, 2
+        iso_dev = CS%h_nodal(i,j,a,b) - Hbar
+        if (abs(iso_dev) > TINY_DEV) then
+          if (iso_dev > 0.0) then
+            ratio = (bound_max(a,b) - Hbar) / iso_dev
+          else
+            ratio = (bound_min(a,b) - Hbar) / iso_dev
+          endif
+          phi_iso = min(phi_iso, max(0.0, ratio))
+        endif
+      enddo ; enddo
+      phi_iso = min(phi_iso, 1.0)
+
+      do b = 1, 2 ; do a = 1, 2
+        h_new(a,b) = Hbar + phi_iso * (CS%h_nodal(i,j,a,b) - Hbar)
+      enddo ; enddo
+
+      CS%h_nodal(i,j,1,1) = h_new(1,1) ; CS%h_nodal(i,j,2,1) = h_new(2,1)
+      CS%h_nodal(i,j,1,2) = h_new(1,2) ; CS%h_nodal(i,j,2,2) = h_new(2,2)
+
+      ! Per-mode phi diagnostics all equal in isotropic mode.
+      if (associated(CS%dg_lim_phi_xi))    CS%dg_lim_phi_xi(i,j)    = phi_iso
+      if (associated(CS%dg_lim_phi_eta))   CS%dg_lim_phi_eta(i,j)   = phi_iso
+      if (associated(CS%dg_lim_phi_cross)) CS%dg_lim_phi_cross(i,j) = phi_iso
+      if (associated(CS%dg_lim_phi))       CS%dg_lim_phi(i,j)       = phi_iso
+      if (associated(CS%dg_lim_mass_drift)) then
+        Hbar_new = nodal_cell_mean(h_new, CS%cell_mean_w(i,j,:,:))
+        CS%dg_lim_mass_drift(i,j) = Hbar_new - Hbar
+      endif
+      cycle  ! Skip the anisotropic max-product block below.
+    endif
 
     ! Max-product objective for per-mode scaling. Maximises
     !   phi_b * phi_c * phi_d
@@ -9128,6 +9215,7 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
     if (associated(CS%dg_lim_phi_xi))    CS%dg_lim_phi_xi(i,j)    = phi_b
     if (associated(CS%dg_lim_phi_eta))   CS%dg_lim_phi_eta(i,j)   = phi_c
     if (associated(CS%dg_lim_phi_cross)) CS%dg_lim_phi_cross(i,j) = phi_d
+    if (associated(CS%dg_lim_phi))       CS%dg_lim_phi(i,j)       = min(phi_b, min(phi_c, phi_d))
     if (associated(CS%dg_lim_mass_drift)) then
       Hbar_new = nodal_cell_mean(h_new, CS%cell_mean_w(i,j,:,:))
       CS%dg_lim_mass_drift(i,j) = Hbar_new - Hbar
