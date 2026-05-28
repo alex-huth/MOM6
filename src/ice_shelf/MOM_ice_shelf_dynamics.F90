@@ -8845,11 +8845,9 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
   ! physically meaningful overshoot for ice-shelf thickness (~1 m).
   real, parameter :: BOUND_TOL_ABS = 1.0e-4  ! [Z ~> m] absolute floor
   real, parameter :: BOUND_TOL_REL = 1.0e-6  ! [nondim] relative
-  ! Tie tolerance for the worst-offender-first hierarchical limiter: if the
-  ! three mode magnitudes are all within TIE_TOL of the largest, use a
-  ! single uniform scaling factor (rotation-symmetric) rather than the
-  ! biased hierarchical sequence. Set to 0.2 (20%).
-  real, parameter :: TIE_TOL = 0.2  ! [nondim]
+  ! Tolerances for the 3D LP vertex enumeration.
+  real, parameter :: LP_TOL = 1.0e-10      ! [nondim] feasibility tolerance
+  real, parameter :: LP_DET_TOL = 1.0e-30  ! [nondim] singular-matrix tolerance
   real :: cell_mean_val
   real :: Hbar, Hbar_new
   real :: h11, h21, h12, h22
@@ -8860,15 +8858,13 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
   real :: bound_max(2,2), bound_min(2,2)
   real :: bound_tol                          ! Per-corner relaxation of the envelope
   real :: phi_b, phi_c, phi_d
-  real :: dev_mode(3,2,2)                    ! Packed mode contributions per corner
-  real :: phi_mode(3)                        ! Per-mode scaling factors
-  real :: v_mode(3)                          ! Per-mode max |dev| over corners
-  real :: v_max_mode, v_min_mode             ! Max/min over modes of v_mode
-  real :: exc_corner(2,2)                    ! Sum of other modes' contributions per corner
-  real :: phi_this, phi_uniform              ! Working scaling factors
+  real :: phi_uniform                        ! Single-phi fallback scaling
   real :: dev_total                          ! Sum of all modes' contributions at a corner
-  integer :: order_modes(3)                  ! Mode indices sorted by descending magnitude
-  integer :: m_idx, m_other, rank_step
+  ! 3D LP scratch variables (constraints are A(:,k) . phi <= B(k) for k = 1..14).
+  real :: lp_A(3,14), lp_B(14)
+  real :: lp_det, lp_inv_det, lp_x(3), lp_best(3), lp_best_obj, lp_obj
+  integer :: lp_i, lp_j, lp_k, lp_q
+  logical :: lp_feasible_111, lp_vertex_ok, lp_found
   real :: budget_high, budget_low, ratio
   real :: h_new(2,2)
   integer :: i, j, a, b, I_node, J_node
@@ -8976,108 +8972,124 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
       endif
     enddo ; enddo
 
-    ! Per-mode hierarchical limiting with worst-offender-first ordering
-    ! and single-phi fallback for ties. Pack dev arrays into a unified
-    ! mode-indexed array (m=1: xi-slope b, m=2: eta-slope c, m=3: cross d)
-    ! so the ordering can be chosen per cell based on which mode contributes
-    ! most to bound violation. Rotation-equivariant: the worst-offender
-    ! choice depends only on physical mode magnitudes, not on coordinate
-    ! frame.
-    dev_mode(1,:,:) = dev_b(:,:)
-    dev_mode(2,:,:) = dev_c(:,:)
-    dev_mode(3,:,:) = dev_d(:,:)
-    phi_mode(:) = 1.0
+    ! 3D LP for the per-mode scaling factors. Maximises phi_b + phi_c + phi_d
+    ! subject to 8 corner inequality constraints (upper and lower envelope
+    ! per corner) and 6 box constraints (0 <= phi_i <= 1 for each mode).
+    ! The objective is symmetric in (phi_b, phi_c, phi_d), and the constraint
+    ! coefficients transform consistently under 90 deg grid rotation
+    ! (dev_b <-> dev_c with appropriate corner relabelling), so the LP
+    ! optimum is rotation-equivariant in algebraic structure.
+    !
+    ! The LP is solved by brute-force vertex enumeration: at each vertex of
+    ! the feasible polytope, 3 of the 14 constraints are active as
+    ! equalities; the vertex is the solution of that 3x3 linear system.
+    ! For each combination of 3 constraint indices, solve, check feasibility
+    ! of the remaining 11 constraints (within LP_TOL), and track the
+    ! maximum-objective feasible vertex. Most cells exit early when
+    ! (phi_b, phi_c, phi_d) = (1, 1, 1) is already feasible.
+    !
+    ! Encoding: constraint k has form A(1,k)*phi_b + A(2,k)*phi_c +
+    ! A(3,k)*phi_d <= B(k). Constraints 1-4 are corner upper bounds,
+    ! 5-8 are corner lower bounds (negated), 9-11 are phi_i <= 1, and
+    ! 12-14 are -phi_i <= 0.
+    do b = 1, 2 ; do a = 1, 2
+      lp_k = (b - 1) * 2 + a
+      lp_A(1, lp_k) =  dev_b(a,b)
+      lp_A(2, lp_k) =  dev_c(a,b)
+      lp_A(3, lp_k) =  dev_d(a,b)
+      lp_B(   lp_k) =  bound_max(a,b) - Hbar
+      lp_A(1, lp_k+4) = -dev_b(a,b)
+      lp_A(2, lp_k+4) = -dev_c(a,b)
+      lp_A(3, lp_k+4) = -dev_d(a,b)
+      lp_B(   lp_k+4) = -(bound_min(a,b) - Hbar)
+    enddo ; enddo
+    lp_A(:, 9) = (/ 1.0, 0.0, 0.0 /) ; lp_B(9)  = 1.0
+    lp_A(:,10) = (/ 0.0, 1.0, 0.0 /) ; lp_B(10) = 1.0
+    lp_A(:,11) = (/ 0.0, 0.0, 1.0 /) ; lp_B(11) = 1.0
+    lp_A(:,12) = (/-1.0, 0.0, 0.0 /) ; lp_B(12) = 0.0
+    lp_A(:,13) = (/ 0.0,-1.0, 0.0 /) ; lp_B(13) = 0.0
+    lp_A(:,14) = (/ 0.0, 0.0,-1.0 /) ; lp_B(14) = 0.0
 
-    v_mode(1) = max(abs(dev_b(1,1)), abs(dev_b(2,1)), abs(dev_b(1,2)), abs(dev_b(2,2)))
-    v_mode(2) = max(abs(dev_c(1,1)), abs(dev_c(2,1)), abs(dev_c(1,2)), abs(dev_c(2,2)))
-    v_mode(3) = max(abs(dev_d(1,1)), abs(dev_d(2,1)), abs(dev_d(1,2)), abs(dev_d(2,2)))
-    v_max_mode = max(v_mode(1), max(v_mode(2), v_mode(3)))
-    v_min_mode = min(v_mode(1), min(v_mode(2), v_mode(3)))
-
-    if (v_max_mode <= TINY_DEV) then
-      ! All modes negligible; no limiting needed.
-      phi_b = 1.0 ; phi_c = 1.0 ; phi_d = 1.0
-    elseif ((v_max_mode - v_min_mode) <= TIE_TOL * v_max_mode) then
-      ! All three modes are within TIE_TOL relative magnitude. Use a single
-      ! uniform scaling factor phi_uniform applied to the total deviation
-      ! at each corner. Symmetric across all modes (single-phi Zhang-Shu
-      ! at the corners): rotation-equivariant by construction, and gives
-      ! a balanced reduction at K_4 cells where multiple modes contribute
-      ! equally to overshoot.
-      phi_uniform = 1.0
-      do b = 1, 2 ; do a = 1, 2
-        dev_total = dev_b(a,b) + dev_c(a,b) + dev_d(a,b)
-        if (abs(dev_total) > TINY_DEV) then
-          if (dev_total > 0.0) then
-            ratio = (bound_max(a,b) - Hbar) / dev_total
-          else
-            ratio = (bound_min(a,b) - Hbar) / dev_total
-          endif
-          phi_uniform = min(phi_uniform, max(0.0, ratio))
-        endif
-      enddo ; enddo
-      phi_uniform = min(phi_uniform, 1.0)
-      phi_b = phi_uniform ; phi_c = phi_uniform ; phi_d = phi_uniform
-    else
-      ! Distinct violation magnitudes -> worst-offender-first hierarchical.
-      ! The mode with the largest |dev| is limited first (gets crushed
-      ! hardest); later modes face a smaller residual to fit, so they
-      ! survive at larger phi. Each mode-pick is rotation-equivariant
-      ! because it compares mode magnitudes that swap consistently under
-      ! a 90 deg rotation.
-      ! Sort indices by descending v_mode magnitude.
-      if (v_mode(1) >= v_mode(2) .and. v_mode(1) >= v_mode(3)) then
-        order_modes(1) = 1
-        if (v_mode(2) >= v_mode(3)) then
-          order_modes(2) = 2 ; order_modes(3) = 3
-        else
-          order_modes(2) = 3 ; order_modes(3) = 2
-        endif
-      elseif (v_mode(2) >= v_mode(1) .and. v_mode(2) >= v_mode(3)) then
-        order_modes(1) = 2
-        if (v_mode(1) >= v_mode(3)) then
-          order_modes(2) = 1 ; order_modes(3) = 3
-        else
-          order_modes(2) = 3 ; order_modes(3) = 1
-        endif
-      else
-        order_modes(1) = 3
-        if (v_mode(1) >= v_mode(2)) then
-          order_modes(2) = 1 ; order_modes(3) = 2
-        else
-          order_modes(2) = 2 ; order_modes(3) = 1
-        endif
+    ! Early exit: check if (1, 1, 1) is feasible. Only the 8 corner
+    ! constraints need to be checked (box constraints are trivially OK).
+    lp_feasible_111 = .true.
+    do lp_k = 1, 8
+      if ((lp_A(1,lp_k) + lp_A(2,lp_k)) + lp_A(3,lp_k) > lp_B(lp_k) + LP_TOL) then
+        lp_feasible_111 = .false. ; exit
       endif
+    enddo
 
-      do rank_step = 1, 3
-        m_idx = order_modes(rank_step)
-        ! exc_other = sum of OTHER two modes' contributions, using the
-        ! current phi value for each (1.0 if not yet limited).
-        do b = 1, 2 ; do a = 1, 2
-          exc_corner(a,b) = 0.0
-          do m_other = 1, 3
-            if (m_other /= m_idx) exc_corner(a,b) = exc_corner(a,b) + &
-                                                    phi_mode(m_other) * dev_mode(m_other,a,b)
-          enddo
-        enddo ; enddo
-        ! Compute phi for this mode.
-        phi_this = 1.0
-        do b = 1, 2 ; do a = 1, 2
-          budget_high = bound_max(a,b) - Hbar - exc_corner(a,b)
-          budget_low  = bound_min(a,b) - Hbar - exc_corner(a,b)
-          if (abs(dev_mode(m_idx,a,b)) > TINY_DEV) then
-            if (dev_mode(m_idx,a,b) > 0.0) then
-              ratio = budget_high / dev_mode(m_idx,a,b)
-            else
-              ratio = budget_low  / dev_mode(m_idx,a,b)
+    if (lp_feasible_111) then
+      phi_b = 1.0 ; phi_c = 1.0 ; phi_d = 1.0
+    else
+      ! Vertex enumeration. Brute-force loop over all unordered triples
+      ! of constraint indices.
+      lp_best_obj = -1.0
+      lp_best(1) = 1.0 ; lp_best(2) = 1.0 ; lp_best(3) = 1.0
+      lp_found = .false.
+      do lp_i = 1, 12
+        do lp_j = lp_i+1, 13
+          do lp_k = lp_j+1, 14
+            ! Solve 3x3 system A_active * x = B_active via Cramer's rule.
+            ! Rows of A_active are constraints lp_i, lp_j, lp_k.
+            lp_det = lp_A(1,lp_i) * ((lp_A(2,lp_j)*lp_A(3,lp_k)) - (lp_A(3,lp_j)*lp_A(2,lp_k))) &
+                   - lp_A(2,lp_i) * ((lp_A(1,lp_j)*lp_A(3,lp_k)) - (lp_A(3,lp_j)*lp_A(1,lp_k))) &
+                   + lp_A(3,lp_i) * ((lp_A(1,lp_j)*lp_A(2,lp_k)) - (lp_A(2,lp_j)*lp_A(1,lp_k)))
+            if (abs(lp_det) < LP_DET_TOL) cycle  ! Constraints linearly dependent.
+            lp_inv_det = 1.0 / lp_det
+            lp_x(1) = (lp_B(lp_i) * ((lp_A(2,lp_j)*lp_A(3,lp_k)) - (lp_A(3,lp_j)*lp_A(2,lp_k))) &
+                     - lp_A(2,lp_i) * ((lp_B(lp_j)*lp_A(3,lp_k)) - (lp_A(3,lp_j)*lp_B(lp_k))) &
+                     + lp_A(3,lp_i) * ((lp_B(lp_j)*lp_A(2,lp_k)) - (lp_A(2,lp_j)*lp_B(lp_k)))) * lp_inv_det
+            lp_x(2) = (lp_A(1,lp_i) * ((lp_B(lp_j)*lp_A(3,lp_k)) - (lp_A(3,lp_j)*lp_B(lp_k))) &
+                     - lp_B(lp_i) * ((lp_A(1,lp_j)*lp_A(3,lp_k)) - (lp_A(3,lp_j)*lp_A(1,lp_k))) &
+                     + lp_A(3,lp_i) * ((lp_A(1,lp_j)*lp_B(lp_k)) - (lp_B(lp_j)*lp_A(1,lp_k)))) * lp_inv_det
+            lp_x(3) = (lp_A(1,lp_i) * ((lp_A(2,lp_j)*lp_B(lp_k)) - (lp_B(lp_j)*lp_A(2,lp_k))) &
+                     - lp_A(2,lp_i) * ((lp_A(1,lp_j)*lp_B(lp_k)) - (lp_B(lp_j)*lp_A(1,lp_k))) &
+                     + lp_B(lp_i) * ((lp_A(1,lp_j)*lp_A(2,lp_k)) - (lp_A(2,lp_j)*lp_A(1,lp_k)))) * lp_inv_det
+            ! Check box and remaining constraints satisfied.
+            if (lp_x(1) < -LP_TOL .or. lp_x(1) > 1.0+LP_TOL) cycle
+            if (lp_x(2) < -LP_TOL .or. lp_x(2) > 1.0+LP_TOL) cycle
+            if (lp_x(3) < -LP_TOL .or. lp_x(3) > 1.0+LP_TOL) cycle
+            lp_vertex_ok = .true.
+            do lp_q = 1, 14
+              if (lp_q == lp_i .or. lp_q == lp_j .or. lp_q == lp_k) cycle
+              if ((lp_A(1,lp_q)*lp_x(1) + lp_A(2,lp_q)*lp_x(2)) + lp_A(3,lp_q)*lp_x(3) &
+                  > lp_B(lp_q) + LP_TOL) then
+                lp_vertex_ok = .false. ; exit
+              endif
+            enddo
+            if (.not. lp_vertex_ok) cycle
+            lp_obj = (lp_x(1) + lp_x(2)) + lp_x(3)
+            if (lp_obj > lp_best_obj + LP_TOL) then
+              lp_best_obj = lp_obj
+              lp_best(1) = lp_x(1) ; lp_best(2) = lp_x(2) ; lp_best(3) = lp_x(3)
+              lp_found = .true.
             endif
-            phi_this = min(phi_this, max(0.0, ratio))
-          endif
-        enddo ; enddo
-        phi_mode(m_idx) = min(phi_this, 1.0)
+          enddo
+        enddo
       enddo
 
-      phi_b = phi_mode(1) ; phi_c = phi_mode(2) ; phi_d = phi_mode(3)
+      if (lp_found) then
+        phi_b = max(0.0, min(1.0, lp_best(1)))
+        phi_c = max(0.0, min(1.0, lp_best(2)))
+        phi_d = max(0.0, min(1.0, lp_best(3)))
+      else
+        ! Fallback (should be rare): single-phi Zhang-Shu on total deviation.
+        phi_uniform = 1.0
+        do b = 1, 2 ; do a = 1, 2
+          dev_total = (dev_b(a,b) + dev_c(a,b)) + dev_d(a,b)
+          if (abs(dev_total) > TINY_DEV) then
+            if (dev_total > 0.0) then
+              ratio = (bound_max(a,b) - Hbar) / dev_total
+            else
+              ratio = (bound_min(a,b) - Hbar) / dev_total
+            endif
+            phi_uniform = min(phi_uniform, max(0.0, ratio))
+          endif
+        enddo ; enddo
+        phi_uniform = min(phi_uniform, 1.0)
+        phi_b = phi_uniform ; phi_c = phi_uniform ; phi_d = phi_uniform
+      endif
     endif
 
     ! Reconstruct corners using orthogonalised modes (preserves Hbar exactly
