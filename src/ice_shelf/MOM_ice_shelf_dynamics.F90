@@ -8837,6 +8837,14 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
   real, dimension(SZDIB_(G),SZDJB_(G)) :: count_B
   real, parameter :: H_LARGE = 1.0e30
   real, parameter :: TINY_DEV = 1.0e-30
+  ! Bound-tolerance constants: relax the MLP-u2 vertex envelope by
+  ! max(BOUND_TOL_ABS, BOUND_TOL_REL * envelope_width) before applying
+  ! the per-mode MPP scaling. Prevents spurious limiting at smooth local
+  ! extrema of the cell-mean field where the home cell happens to be the
+  ! envelope extremum at one corner. Both constants are well below any
+  ! physically meaningful overshoot for ice-shelf thickness (~1 m).
+  real, parameter :: BOUND_TOL_ABS = 1.0e-4  ! [Z ~> m] absolute floor
+  real, parameter :: BOUND_TOL_REL = 1.0e-6  ! [nondim] relative
   real :: cell_mean_val
   real :: Hbar, Hbar_new
   real :: h11, h21, h12, h22
@@ -8845,6 +8853,7 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
   real :: B_orth(2,2), C_orth(2,2), D_orth(2,2)
   real :: dev_b(2,2), dev_c(2,2), dev_d(2,2) ! per-corner mode contributions
   real :: bound_max(2,2), bound_min(2,2)
+  real :: bound_tol                          ! Per-corner relaxation of the envelope
   real :: phi_b, phi_c, phi_d
   real :: budget_high, budget_low, exc_other, ratio
   real :: h_new(2,2)
@@ -8932,14 +8941,21 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
     enddo ; enddo
 
     ! Per-corner vertex-based bounds (MLP-u2): corner (a,b) of cell (i,j)
-    ! attaches to B-node (I-1+a-1, J-1+b-1) = (i-2+a, j-2+b).
+    ! attaches to B-node (I-1+a-1, J-1+b-1) = (i-2+a, j-2+b). Bounds are
+    ! relaxed by a small tolerance (Venkatakrishnan 1993 style) so that
+    ! machine-precision overshoots at smooth local extrema of the cell-
+    ! mean field don't spuriously fire the limiter. The tolerance is
+    ! max(BOUND_TOL_ABS, BOUND_TOL_REL * envelope_width) per corner; both
+    ! constants are below any physically meaningful overshoot.
     do b = 1, 2 ; do a = 1, 2
       I_node = i - 2 + a ; J_node = j - 2 + b
       if (count_B(I_node, J_node) >= 1.5 .and. &
           Hmax_B(I_node, J_node) > -H_LARGE + 1.0 .and. &
           Hmin_B(I_node, J_node) <  H_LARGE - 1.0) then
-        bound_max(a,b) = Hmax_B(I_node, J_node)
-        bound_min(a,b) = Hmin_B(I_node, J_node)
+        bound_tol = max(BOUND_TOL_ABS, &
+                        BOUND_TOL_REL * (Hmax_B(I_node, J_node) - Hmin_B(I_node, J_node)))
+        bound_max(a,b) = Hmax_B(I_node, J_node) + bound_tol
+        bound_min(a,b) = Hmin_B(I_node, J_node) - bound_tol
       else
         bound_max(a,b) =  H_LARGE
         bound_min(a,b) = -H_LARGE
