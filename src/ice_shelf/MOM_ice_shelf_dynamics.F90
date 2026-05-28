@@ -254,6 +254,31 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! initialize_ice_flow_from_file. Requires USE_DG_THICKNESS.
   logical :: nodal_positivity     !< If true, apply Liu-style positivity-preserving limiter
                                   !! to the nodal DG(1) thickness corners.
+  logical :: dg_hierarchical_lim  !< If true, apply a per-mode hierarchical
+                                  !! Zhang-Shu QP-MPP slope limiter with MLP-u2
+                                  !! vertex-based bounds to the nodal DG(1)
+                                  !! thickness corners between RK stages.
+                                  !! Mass is preserved exactly via orthogonalised
+                                  !! mode templates against cell_mean_w.
+  real, allocatable :: mu_lim_xi(:,:)     !< Cached orthogonalisation offset for the
+                                          !! xi-slope mode template, per cell [nondim].
+  real, allocatable :: mu_lim_eta(:,:)    !< Cached orthogonalisation offset for the
+                                          !! eta-slope mode template, per cell [nondim].
+  real, allocatable :: mu_lim_cross(:,:)  !< Cached orthogonalisation offset for the
+                                          !! cross mode template, per cell [nondim].
+  real, pointer, dimension(:,:) :: dg_lim_phi_xi    => NULL() !< Per-cell xi-slope mode
+                                                              !! scaling factor from the
+                                                              !! last hierarchical-limiter
+                                                              !! call [nondim].
+  real, pointer, dimension(:,:) :: dg_lim_phi_eta   => NULL() !< Per-cell eta-slope mode
+                                                              !! scaling factor [nondim].
+  real, pointer, dimension(:,:) :: dg_lim_phi_cross => NULL() !< Per-cell cross mode
+                                                              !! scaling factor [nondim].
+  real, pointer, dimension(:,:) :: dg_lim_mass_drift => NULL() !< Per-cell change in
+                                                              !! cell-mean thickness from
+                                                              !! the limiter [Z ~> m].
+                                                              !! Sanity check; should be
+                                                              !! ~machine epsilon.
   logical :: dg_art_visc          !< If true, add an artificial-viscosity face term
                                   !! +nu_face * (h_B - h_A) / dx_perp * dy at each
                                   !! interior DG face. With nu_face = coef*dx_perp*|u_face|
@@ -388,6 +413,8 @@ type, public :: ice_shelf_dyn_CS ; private
              id_h_jump_node = -1, id_h_jump_node_rel = -1, &
              id_h_jump_envelope = -1, id_h_jump_envelope_rel = -1, &
              id_h_overshoot_node = -1, id_h_overshoot_node_rel = -1, id_h_source_rate = -1, &
+             id_dg_lim_phi_xi = -1, id_dg_lim_phi_eta = -1, id_dg_lim_phi_cross = -1, &
+             id_dg_lim_mass_drift = -1, &
              id_phi_x_FV = -1, id_phi_y_FV = -1, &
              id_dg_art_visc_coef_u = -1, id_dg_art_visc_coef_v = -1
   real, pointer, dimension(:,:) :: dg_art_visc_coef_u => NULL() !< Per-face DG(1) artificial-
@@ -553,6 +580,13 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%phi_y_FV(isd:ied,JsdB:JedB), source=1.0)
     allocate(CS%dg_art_visc_coef_u(IsdB:IedB,jsd:jed), source=0.0)
     allocate(CS%dg_art_visc_coef_v(isd:ied,JsdB:JedB), source=0.0)
+    allocate(CS%mu_lim_xi(isd:ied,jsd:jed),    source=0.0)
+    allocate(CS%mu_lim_eta(isd:ied,jsd:jed),   source=0.0)
+    allocate(CS%mu_lim_cross(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_lim_phi_xi(isd:ied,jsd:jed),     source=1.0)
+    allocate(CS%dg_lim_phi_eta(isd:ied,jsd:jed),    source=1.0)
+    allocate(CS%dg_lim_phi_cross(isd:ied,jsd:jed),  source=1.0)
+    allocate(CS%dg_lim_mass_drift(isd:ied,jsd:jed), source=0.0)
     allocate(CS%u_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%v_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%u_face_mask_bdry(IsdB:IedB,JsdB:JedB), source=-2.0)
@@ -1207,6 +1241,23 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          CS%diag%axesCv1, Time, &
          'Per-face DG(1) artificial-viscosity coefficient on v-faces (max over the 2 face '//&
          'Gauss points from the last spatial-operator call).', 'nondim')
+      CS%id_dg_lim_phi_xi = register_diag_field('ice_shelf_model','dg_lim_phi_xi', &
+         CS%diag%axesT1, Time, &
+         'Per-cell xi-slope (east-west) mode scaling factor from the DG(1) hierarchical '//&
+         'limiter [0,1]. 1 = no limiting, 0 = mode fully collapsed.', 'nondim')
+      CS%id_dg_lim_phi_eta = register_diag_field('ice_shelf_model','dg_lim_phi_eta', &
+         CS%diag%axesT1, Time, &
+         'Per-cell eta-slope (north-south) mode scaling factor from the DG(1) hierarchical '//&
+         'limiter [0,1].', 'nondim')
+      CS%id_dg_lim_phi_cross = register_diag_field('ice_shelf_model','dg_lim_phi_cross', &
+         CS%diag%axesT1, Time, &
+         'Per-cell cross (saddle/twist) mode scaling factor from the DG(1) hierarchical '//&
+         'limiter [0,1].', 'nondim')
+      CS%id_dg_lim_mass_drift = register_diag_field('ice_shelf_model','dg_lim_mass_drift', &
+         CS%diag%axesT1, Time, &
+         'Per-cell change in cell-mean thickness produced by the DG(1) hierarchical limiter. '//&
+         'Should be ~machine epsilon when the orthogonalised mode templates are correct.', &
+         'm', conversion=US%Z_to_m)
     else
       CS%id_phi_x_FV = register_diag_field('ice_shelf_model','phi_x_FV',CS%diag%axesCu1, Time, &
          'Van Leer slope-limiter factor at each u-face from ice_shelf_advect_thickness_x '//&
@@ -1709,6 +1760,14 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_phi_x_FV, CS%phi_x_FV, CS%diag)
     if (CS%id_phi_y_FV > 0 .and. associated(CS%phi_y_FV)) &
         call post_data(CS%id_phi_y_FV, CS%phi_y_FV, CS%diag)
+    if (CS%id_dg_lim_phi_xi > 0 .and. associated(CS%dg_lim_phi_xi)) &
+        call post_data(CS%id_dg_lim_phi_xi, CS%dg_lim_phi_xi, CS%diag)
+    if (CS%id_dg_lim_phi_eta > 0 .and. associated(CS%dg_lim_phi_eta)) &
+        call post_data(CS%id_dg_lim_phi_eta, CS%dg_lim_phi_eta, CS%diag)
+    if (CS%id_dg_lim_phi_cross > 0 .and. associated(CS%dg_lim_phi_cross)) &
+        call post_data(CS%id_dg_lim_phi_cross, CS%dg_lim_phi_cross, CS%diag)
+    if (CS%id_dg_lim_mass_drift > 0 .and. associated(CS%dg_lim_mass_drift)) &
+        call post_data(CS%id_dg_lim_mass_drift, CS%dg_lim_mass_drift, CS%diag)
     if (CS%id_dg_art_visc_coef_u > 0 .and. associated(CS%dg_art_visc_coef_u)) &
         call post_data(CS%id_dg_art_visc_coef_u, CS%dg_art_visc_coef_u, CS%diag)
     if (CS%id_dg_art_visc_coef_v > 0 .and. associated(CS%dg_art_visc_coef_v)) &
@@ -6236,6 +6295,13 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%phi_y_FV)) deallocate(CS%phi_y_FV)
   if (associated(CS%dg_art_visc_coef_u)) deallocate(CS%dg_art_visc_coef_u)
   if (associated(CS%dg_art_visc_coef_v)) deallocate(CS%dg_art_visc_coef_v)
+  if (allocated(CS%mu_lim_xi))    deallocate(CS%mu_lim_xi)
+  if (allocated(CS%mu_lim_eta))   deallocate(CS%mu_lim_eta)
+  if (allocated(CS%mu_lim_cross)) deallocate(CS%mu_lim_cross)
+  if (associated(CS%dg_lim_phi_xi))     deallocate(CS%dg_lim_phi_xi)
+  if (associated(CS%dg_lim_phi_eta))    deallocate(CS%dg_lim_phi_eta)
+  if (associated(CS%dg_lim_phi_cross))  deallocate(CS%dg_lim_phi_cross)
+  if (associated(CS%dg_lim_mass_drift)) deallocate(CS%dg_lim_mass_drift)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
   if (associated(CS%Jac)) deallocate(CS%Jac)
   if (associated(CS%Phi)) deallocate(CS%Phi)
@@ -8377,6 +8443,17 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "thickness from numerical noise.", &
                  default=.true., do_not_log=.not.CS%use_DG_thickness)
 
+  call get_param(param_file, mdl, "DG1_HIERARCHICAL_LIMITER", CS%dg_hierarchical_lim, &
+                 "If true, apply a per-mode hierarchical Zhang-Shu QP-MPP slope limiter "//&
+                 "with MLP-u2 vertex-based bounds (Park-Kim 2014) to the nodal DG(1) "//&
+                 "thickness corners between RK stages. Decomposes the in-cell bilinear "//&
+                 "polynomial into xi-slope, eta-slope, and cross-term modes and scales "//&
+                 "each independently to satisfy local cell-mean bounds at the corners. "//&
+                 "Mass is preserved exactly through orthogonalised mode templates against "//&
+                 "cell_mean_w. References: Krivodonova 2007 JCP 226, Zhang & Shu 2010 "//&
+                 "JCP 229, Park & Kim 2014 JCP 274.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
+
   call get_param(param_file, mdl, "DG1_ART_VISC", CS%dg_art_visc, &
                  "If true, add an artificial-viscosity face term to the DG(1) nodal "//&
                  "spatial operator. Per interior face, distributes the antisymmetric "//&
@@ -8532,7 +8609,41 @@ subroutine init_nodal_DG_metric(CS, G)
     CS%cell_mean_w(i,j,1,2) = (dyW/3.0 + dyE/6.0) * (dxS/6.0 + dxN/3.0)
     CS%cell_mean_w(i,j,2,2) = (dyW/6.0 + dyE/3.0) * (dxS/6.0 + dxN/3.0)
   enddo ; enddo
+
+  ! Cache the orthogonalisation offsets for the hierarchical-limiter mode
+  ! templates. The standard polynomial modes (xi-0.5, eta-0.5, (xi-0.5)(eta-0.5))
+  ! are not exactly orthogonal to the constant under non-uniform cell_mean_w
+  ! (curvilinear cells); subtracting their weighted-mean offset gives modes
+  ! that are exactly orthogonal to the constant, so per-mode scaling preserves
+  ! Hbar exactly. Offsets are tiny on near-Cartesian grids and zero on
+  ! perfectly uniform ones. Stored once at init since cell_mean_w is fixed.
+  if (allocated(CS%mu_lim_xi)) then
+    do j = jsd, jed ; do i = isd, ied
+      call compute_mu_lim_offsets(CS%cell_mean_w(i,j,:,:), &
+                                  CS%mu_lim_xi(i,j), CS%mu_lim_eta(i,j), CS%mu_lim_cross(i,j))
+    enddo ; enddo
+  endif
 end subroutine init_nodal_DG_metric
+
+!> Helper: orthogonalisation offsets so that the modal templates
+!! B_orth, C_orth, D_orth are exactly cell_mean_w-orthogonal to the constant
+!! mode (i.e., have zero weighted mean over the cell corners).
+pure subroutine compute_mu_lim_offsets(w_cell, mu_B, mu_C, mu_D)
+  real, dimension(2,2), intent(in)  :: w_cell  !< Per-cell cell_mean_w pre-normalised weights
+  real,                 intent(out) :: mu_B, mu_C, mu_D
+  real :: area
+  area = ((w_cell(1,1) + w_cell(2,2)) + (w_cell(1,2) + w_cell(2,1)))
+  if (area > 0.0) then
+    mu_B = (((-0.5)*w_cell(1,1) + (0.5)*w_cell(2,1)) + &
+            ((-0.5)*w_cell(1,2) + (0.5)*w_cell(2,2))) / area
+    mu_C = (((-0.5)*w_cell(1,1) + (-0.5)*w_cell(2,1)) + &
+            (( 0.5)*w_cell(1,2) + ( 0.5)*w_cell(2,2))) / area
+    mu_D = ((( 0.25)*w_cell(1,1) + (-0.25)*w_cell(2,1)) + &
+            ((-0.25)*w_cell(1,2) + ( 0.25)*w_cell(2,2))) / area
+  else
+    mu_B = 0.0 ; mu_C = 0.0 ; mu_D = 0.0
+  endif
+end subroutine compute_mu_lim_offsets
 
 !> For symmetric BGRID + reentrant domains, the wrap-mate B-nodes on either
 !! side of the periodic boundary are the same physical location, but each
@@ -8700,6 +8811,220 @@ subroutine nodal_positivity_limit(CS, G, ISS)
 
   call pass_corner_field(CS%h_nodal, G)
 end subroutine nodal_positivity_limit
+
+!> Per-mode hierarchical Zhang-Shu QP-MPP slope limiter for DG(1) thickness
+!! with MLP-u2 vertex-based bounds. Decomposes each cell's in-cell bilinear
+!! polynomial into (xi-slope, eta-slope, cross-term) modes and scales each
+!! independently so the limited corner values stay within the per-corner
+!! local cell-mean envelope drawn from the cells touching each B-node
+!! (Park-Kim 2014 vertex-based MLP family). Limiting hierarchy: cross first,
+!! then xi-slope, then eta-slope, each pass using the already-limited
+!! contributions from previous passes as part of the residual budget.
+!!
+!! Mass is preserved exactly: the mode templates are pre-orthogonalised
+!! against the cell_mean_w-weighted constant mode (cached as mu_lim_*),
+!! so each mode's contribution has zero weighted mean by construction.
+!!
+!! References: Krivodonova 2007 JCP 226 (hierarchical mode-by-mode limiting),
+!! Zhang & Shu 2010 JCP 229 (QP-MPP theorem), Park & Kim 2014 JCP 274
+!! (MLP-u2 vertex-based bound construction).
+subroutine nodal_hierarchical_limit(CS, G, ISS)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS
+  type(ocean_grid_type),  intent(in)    :: G
+  type(ice_shelf_state),  intent(in)    :: ISS
+
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: Hmax_B, Hmin_B
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: count_B
+  real, parameter :: H_LARGE = 1.0e30
+  real, parameter :: TINY_DEV = 1.0e-30
+  real :: cell_mean_val
+  real :: Hbar, Hbar_new
+  real :: h11, h21, h12, h22
+  real :: bb, cc, dd                         ! modal coefficients (uniform-w formulas)
+  real :: muB, muC, muD                      ! orthogonalisation offsets for this cell
+  real :: B_orth(2,2), C_orth(2,2), D_orth(2,2)
+  real :: dev_b(2,2), dev_c(2,2), dev_d(2,2) ! per-corner mode contributions
+  real :: bound_max(2,2), bound_min(2,2)
+  real :: phi_b, phi_c, phi_d
+  real :: budget_high, budget_low, exc_other, ratio
+  real :: h_new(2,2)
+  integer :: i, j, a, b, I_node, J_node
+
+  if (.not. associated(CS%h_nodal)) return
+
+  ! Build vertex-based cell-mean envelope at each B-node (Park-Kim MLP-u2
+  ! style). Includes hmask=1 and hmask=3 (Dirichlet) cells; skips hmask=0/2.
+  call pass_corner_field(CS%h_nodal, G)
+  Hmax_B(:,:)  = -H_LARGE
+  Hmin_B(:,:)  =  H_LARGE
+  count_B(:,:) = 0.0
+  do j = G%jsd, G%jed ; do i = G%isd, G%ied
+    if (ISS%hmask(i,j) == 1.0) then
+      cell_mean_val = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
+    elseif (ISS%hmask(i,j) == 3.0) then
+      cell_mean_val = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
+    else
+      cycle
+    endif
+    if (i-1 >= G%IsdB .and. j-1 >= G%JsdB) then
+      Hmax_B(i-1, j-1) = max(Hmax_B(i-1, j-1), cell_mean_val)
+      Hmin_B(i-1, j-1) = min(Hmin_B(i-1, j-1), cell_mean_val)
+      count_B(i-1, j-1) = count_B(i-1, j-1) + 1.0
+    endif
+    if (i   <= G%IedB .and. j-1 >= G%JsdB) then
+      Hmax_B(i,   j-1) = max(Hmax_B(i,   j-1), cell_mean_val)
+      Hmin_B(i,   j-1) = min(Hmin_B(i,   j-1), cell_mean_val)
+      count_B(i,   j-1) = count_B(i,   j-1) + 1.0
+    endif
+    if (i-1 >= G%IsdB .and. j   <= G%JedB) then
+      Hmax_B(i-1, j  ) = max(Hmax_B(i-1, j  ), cell_mean_val)
+      Hmin_B(i-1, j  ) = min(Hmin_B(i-1, j  ), cell_mean_val)
+      count_B(i-1, j  ) = count_B(i-1, j  ) + 1.0
+    endif
+    if (i   <= G%IedB .and. j   <= G%JedB) then
+      Hmax_B(i,   j  ) = max(Hmax_B(i,   j  ), cell_mean_val)
+      Hmin_B(i,   j  ) = min(Hmin_B(i,   j  ), cell_mean_val)
+      count_B(i,   j  ) = count_B(i,   j  ) + 1.0
+    endif
+  enddo ; enddo
+  call pass_var(Hmax_B,  G%domain, position=CORNER)
+  call pass_var(Hmin_B,  G%domain, position=CORNER)
+  call pass_var(count_B, G%domain, position=CORNER)
+
+  ! Reset diagnostic buffers (limiter inactive at non-hmask=1 cells -> phi=1, drift=0).
+  if (associated(CS%dg_lim_phi_xi))     CS%dg_lim_phi_xi(:,:)     = 1.0
+  if (associated(CS%dg_lim_phi_eta))    CS%dg_lim_phi_eta(:,:)    = 1.0
+  if (associated(CS%dg_lim_phi_cross))  CS%dg_lim_phi_cross(:,:)  = 1.0
+  if (associated(CS%dg_lim_mass_drift)) CS%dg_lim_mass_drift(:,:) = 0.0
+
+  ! Per-cell hierarchical limiting.
+  do j = G%jsc, G%jec ; do i = G%isc, G%iec
+    if (ISS%hmask(i,j) /= 1.0) cycle
+
+    ! Cell mean (exact, using non-uniform cell_mean_w).
+    Hbar = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
+
+    h11 = CS%h_nodal(i,j,1,1) ; h21 = CS%h_nodal(i,j,2,1)
+    h12 = CS%h_nodal(i,j,1,2) ; h22 = CS%h_nodal(i,j,2,2)
+
+    ! Standard polynomial mode coefficients (uniform-weight formulas). Under
+    ! non-uniform cell_mean_w these are not the exact L2(w) projections but
+    ! the *reconstruction* below uses orthogonalised templates that preserve
+    ! Hbar exactly, so mass conservation is unaffected.
+    bb = 0.5 * ((h21 + h22) - (h11 + h12))            ! east-mean - west-mean
+    cc = 0.5 * ((h12 + h22) - (h11 + h21))            ! north-mean - south-mean
+    dd = (h11 + h22) - (h12 + h21)                    ! diagonal vs anti-diagonal
+
+    ! Orthogonalised mode templates per corner: standard polynomial values
+    ! minus their cell_mean_w-weighted means (cached).
+    muB = CS%mu_lim_xi(i,j) ; muC = CS%mu_lim_eta(i,j) ; muD = CS%mu_lim_cross(i,j)
+    B_orth(1,1) = -0.5  - muB ; B_orth(2,1) =  0.5  - muB
+    B_orth(1,2) = -0.5  - muB ; B_orth(2,2) =  0.5  - muB
+    C_orth(1,1) = -0.5  - muC ; C_orth(2,1) = -0.5  - muC
+    C_orth(1,2) =  0.5  - muC ; C_orth(2,2) =  0.5  - muC
+    D_orth(1,1) =  0.25 - muD ; D_orth(2,1) = -0.25 - muD
+    D_orth(1,2) = -0.25 - muD ; D_orth(2,2) =  0.25 - muD
+
+    do b = 1, 2 ; do a = 1, 2
+      dev_b(a,b) = bb * B_orth(a,b)
+      dev_c(a,b) = cc * C_orth(a,b)
+      dev_d(a,b) = dd * D_orth(a,b)
+    enddo ; enddo
+
+    ! Per-corner vertex-based bounds (MLP-u2): corner (a,b) of cell (i,j)
+    ! attaches to B-node (I-1+a-1, J-1+b-1) = (i-2+a, j-2+b).
+    do b = 1, 2 ; do a = 1, 2
+      I_node = i - 2 + a ; J_node = j - 2 + b
+      if (count_B(I_node, J_node) >= 1.5 .and. &
+          Hmax_B(I_node, J_node) > -H_LARGE + 1.0 .and. &
+          Hmin_B(I_node, J_node) <  H_LARGE - 1.0) then
+        bound_max(a,b) = Hmax_B(I_node, J_node)
+        bound_min(a,b) = Hmin_B(I_node, J_node)
+      else
+        bound_max(a,b) =  H_LARGE
+        bound_min(a,b) = -H_LARGE
+      endif
+    enddo ; enddo
+
+    ! Hierarchical limiting. Cross-term first (highest mode), then xi-slope,
+    ! then eta-slope. At each pass, the residual budget at a corner uses
+    ! the already-limited contributions of higher modes plus full
+    ! contributions of yet-to-be-limited modes.
+    phi_d = 1.0
+    do b = 1, 2 ; do a = 1, 2
+      exc_other = dev_b(a,b) + dev_c(a,b)
+      budget_high = bound_max(a,b) - Hbar - exc_other
+      budget_low  = bound_min(a,b) - Hbar - exc_other
+      if (abs(dev_d(a,b)) > TINY_DEV) then
+        if (dev_d(a,b) > 0.0) then
+          ratio = budget_high / dev_d(a,b)
+          if (budget_low > 0.0) ratio = min(ratio, budget_low / dev_d(a,b))
+        else
+          ratio = budget_low  / dev_d(a,b)
+          if (budget_high < 0.0) ratio = min(ratio, budget_high / dev_d(a,b))
+        endif
+        phi_d = min(phi_d, max(0.0, ratio))
+      endif
+    enddo ; enddo
+    phi_d = min(phi_d, 1.0)
+
+    phi_b = 1.0
+    do b = 1, 2 ; do a = 1, 2
+      exc_other = dev_c(a,b) + phi_d * dev_d(a,b)
+      budget_high = bound_max(a,b) - Hbar - exc_other
+      budget_low  = bound_min(a,b) - Hbar - exc_other
+      if (abs(dev_b(a,b)) > TINY_DEV) then
+        if (dev_b(a,b) > 0.0) then
+          ratio = budget_high / dev_b(a,b)
+          if (budget_low > 0.0) ratio = min(ratio, budget_low / dev_b(a,b))
+        else
+          ratio = budget_low  / dev_b(a,b)
+          if (budget_high < 0.0) ratio = min(ratio, budget_high / dev_b(a,b))
+        endif
+        phi_b = min(phi_b, max(0.0, ratio))
+      endif
+    enddo ; enddo
+    phi_b = min(phi_b, 1.0)
+
+    phi_c = 1.0
+    do b = 1, 2 ; do a = 1, 2
+      exc_other = phi_b * dev_b(a,b) + phi_d * dev_d(a,b)
+      budget_high = bound_max(a,b) - Hbar - exc_other
+      budget_low  = bound_min(a,b) - Hbar - exc_other
+      if (abs(dev_c(a,b)) > TINY_DEV) then
+        if (dev_c(a,b) > 0.0) then
+          ratio = budget_high / dev_c(a,b)
+          if (budget_low > 0.0) ratio = min(ratio, budget_low / dev_c(a,b))
+        else
+          ratio = budget_low  / dev_c(a,b)
+          if (budget_high < 0.0) ratio = min(ratio, budget_high / dev_c(a,b))
+        endif
+        phi_c = min(phi_c, max(0.0, ratio))
+      endif
+    enddo ; enddo
+    phi_c = min(phi_c, 1.0)
+
+    ! Reconstruct corners using orthogonalised modes (preserves Hbar exactly
+    ! because each orthogonalised mode has zero cell_mean_w-weighted mean).
+    do b = 1, 2 ; do a = 1, 2
+      h_new(a,b) = Hbar + phi_b * dev_b(a,b) + phi_c * dev_c(a,b) + phi_d * dev_d(a,b)
+    enddo ; enddo
+
+    CS%h_nodal(i,j,1,1) = h_new(1,1) ; CS%h_nodal(i,j,2,1) = h_new(2,1)
+    CS%h_nodal(i,j,1,2) = h_new(1,2) ; CS%h_nodal(i,j,2,2) = h_new(2,2)
+
+    ! Diagnostics.
+    if (associated(CS%dg_lim_phi_xi))    CS%dg_lim_phi_xi(i,j)    = phi_b
+    if (associated(CS%dg_lim_phi_eta))   CS%dg_lim_phi_eta(i,j)   = phi_c
+    if (associated(CS%dg_lim_phi_cross)) CS%dg_lim_phi_cross(i,j) = phi_d
+    if (associated(CS%dg_lim_mass_drift)) then
+      Hbar_new = nodal_cell_mean(h_new, CS%cell_mean_w(i,j,:,:))
+      CS%dg_lim_mass_drift(i,j) = Hbar_new - Hbar
+    endif
+  enddo ; enddo
+
+  call pass_corner_field(CS%h_nodal, G)
+end subroutine nodal_hierarchical_limit
 
 !> Apply the per-cell tensor-product Q1 mass-matrix inverse:
 !! out(a,b) = sum_{a',b'} Minv_xi(a,a') * Minv_eta(b,b') * rhs(a',b').
@@ -9058,8 +9383,9 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   ! source enters each SSP-RK2 stage as a simple additive term on dh.
   call project_h_source_rate_to_nodes(CS, ISS, G, S_node)
 
-  ! Stage 1: positivity floor -> spatial op -> M^-1 -> Euler step (+ source).
+  ! Stage 1: positivity floor -> hierarchical limiter -> spatial op -> M^-1 -> Euler step.
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
+  if (CS%dg_hierarchical_lim) call nodal_hierarchical_limit(CS, G, ISS)
   call pass_corner_field(CS%h_nodal, G)
   call DG1_nodal_spatial_operator(CS, G, hmask, CS%h_nodal, rhs, uh_ice, vh_ice, time_step)
   do j = jsc, jec ; do i = isc, iec
@@ -9072,8 +9398,9 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   enddo ; enddo
   call pass_corner_field(CS%h_nodal, G)
 
-  ! Stage 2: positivity floor -> spatial op -> M^-1 -> SSP-RK2 combine (+ source).
+  ! Stage 2: positivity floor -> hierarchical limiter -> spatial op -> M^-1 -> SSP-RK2 combine.
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
+  if (CS%dg_hierarchical_lim) call nodal_hierarchical_limit(CS, G, ISS)
   h_curr(:,:,:,:) = CS%h_nodal(:,:,:,:)
   call DG1_nodal_spatial_operator(CS, G, hmask, h_curr, rhs, uh_ice, vh_ice, time_step)
   do j = jsc, jec ; do i = isc, iec
@@ -9092,8 +9419,9 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   CS%h_source_rate_last(:,:) = CS%h_source_rate(:,:)
   CS%h_source_rate(:,:) = 0.0
 
-  ! Final positivity floor.
+  ! Final positivity floor + optional hierarchical limit on the SSP-RK2 result.
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
+  if (CS%dg_hierarchical_lim) call nodal_hierarchical_limit(CS, G, ISS)
   call pass_corner_field(CS%h_nodal, G)
 
   ! Average uh_ice, vh_ice over the 2 stages (SSP-RK2 equal weight).
