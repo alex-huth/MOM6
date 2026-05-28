@@ -8874,6 +8874,12 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
   real :: phi_iso, iso_dev                  ! Isotropic-variant scratch
   real, parameter :: H_LARGE = 1.0e30
   real, parameter :: TINY_DEV = 1.0e-30    ! Threshold for skipping near-zero deviations
+  ! Park-Kim slack coefficients. PK_SLACK_D2 is the natural-overshoot
+  ! coefficient for a smooth Q1 quadratic peak: corner - bound ~ |d2|/12.
+  ! PK_SLACK_ENV is a small extra envelope-width margin to absorb
+  ! sub-quadratic curvature. Both apply only at smooth-flagged cells.
+  real, parameter :: PK_SLACK_D2  = 1.0/12.0  ! ~0.083
+  real, parameter :: PK_SLACK_ENV = 0.05      ! 5% of envelope width
   ! Bound-tolerance constants: relax the MLP-u2 vertex envelope by
   ! max(BOUND_TOL_ABS, BOUND_TOL_REL * envelope_width) before applying
   ! the per-mode MPP scaling. Prevents spurious limiting at smooth local
@@ -9051,14 +9057,15 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
           Hmin_B(I_node, J_node) <  H_LARGE - 1.0) then
         bound_tol = max(BOUND_TOL_ABS, &
                         BOUND_TOL_REL * (Hmax_B(I_node, J_node) - Hmin_B(I_node, J_node)))
-        ! Park-Kim MLP-u2 smooth-extrema expansion: relax the envelope to
-        ! absorb the natural Q1 corner extrapolation at smooth peaks. Slack
-        ! is the maximum of the envelope width and the local |d2| (which
-        ! drives smooth-peak overshoots when d1 is small), scaled by
-        ! pk_factor. Cells flagged as smooth (pk_factor = 1) get the full
-        ! slack; oscillatory cells (pk_factor = 0) get strict MLP-u2.
-        pk_slack = pk_factor(i, j) * max(Hmax_B(I_node, J_node) - Hmin_B(I_node, J_node), &
-                                          abs(pk_d2x_cell(i, j)) + abs(pk_d2y_cell(i, j)))
+        ! Park-Kim MLP-u2 smooth-extrema expansion: relax the envelope by
+        ! the theoretical Q1 smooth-peak overshoot magnitude. From the
+        ! Taylor expansion of a quadratic field, corner - bound_max at a
+        ! smooth peak is ~ |d2|/12. We use (|d2x| + |d2y|)/12 plus a small
+        ! fraction of the envelope width as the slack. Cells flagged as
+        ! smooth (pk_factor = 1) get the full slack; oscillatory cells
+        ! (pk_factor = 0) get strict MLP-u2 (slack = 0).
+        pk_slack = pk_factor(i, j) * (PK_SLACK_D2 * (abs(pk_d2x_cell(i, j)) + abs(pk_d2y_cell(i, j))) + &
+                                       PK_SLACK_ENV * (Hmax_B(I_node, J_node) - Hmin_B(I_node, J_node)))
         bound_max(a,b) = Hmax_B(I_node, J_node) + bound_tol + pk_slack
         bound_min(a,b) = Hmin_B(I_node, J_node) - bound_tol - pk_slack
       else
