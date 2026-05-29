@@ -9251,6 +9251,349 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
   call pass_corner_field(CS%h_nodal, G)
 end subroutine nodal_hierarchical_limit
 
+!> Subgrid (Phisub) cell-mean of surface elevation s(x,y) = h - bed (grounded) or
+!! (1 - rho_i/rho_w)*h (floating), with per-sub-QP flotation determination. Used
+!! at grounding-line cells so the cell-mean of s respects partial grounding the
+!! same way the strong-form driving stress integration does.
+pure real function subgrid_cell_mean_s(Phisub, h_nodal_cell, bed_corners, &
+                                       rhoi_rhow, min_h_shelf) result(Sbar)
+  real, dimension(:,:,:,:,:,:), intent(in) :: Phisub  !< Sub-grid quadrature weights [nondim]
+  real, dimension(2,2),         intent(in) :: h_nodal_cell !< Q1 nodal thickness [Z ~> m]
+  real, dimension(2,2),         intent(in) :: bed_corners  !< Bed depth at the 4 cell corners
+                                                           !! [Z ~> m]
+  real, intent(in) :: rhoi_rhow   !< Ice/ocean density ratio [nondim]
+  real, intent(in) :: min_h_shelf !< Positivity floor for thickness [Z ~> m]
+
+  real :: h_gp        ! Bilinear-interpolated thickness at a sub-QP [Z ~> m]
+  real :: bed_gp      ! Bilinear-interpolated bed depth at a sub-QP [Z ~> m]
+  real :: s_gp        ! Surface elevation at a sub-QP [Z ~> m]
+  real :: subarea     ! Reference-cell area of one sub-cell [nondim]
+  real :: accum       ! Running area-weighted sum of s [Z ~> m]
+  integer :: nsub, ii, jj, qx, qy
+  logical :: is_grounded
+
+  nsub    = size(Phisub, 3)
+  subarea = 1.0 / real(nsub)**2
+
+  ! sum over all (ii,jj,qx,qy) of (0.25 * subarea * s_gp) gives the area-weighted
+  ! cell-mean of s on the reference cell [0,1]^2 (sum of weights = 1).
+  accum = 0.0
+  do jj = 1, nsub ; do ii = 1, nsub ; do qy = 1, 2 ; do qx = 1, 2
+    h_gp = ((Phisub(qx,qy,ii,jj,1,1) * h_nodal_cell(1,1)) + &
+            (Phisub(qx,qy,ii,jj,2,2) * h_nodal_cell(2,2))) + &
+           ((Phisub(qx,qy,ii,jj,1,2) * h_nodal_cell(1,2)) + &
+            (Phisub(qx,qy,ii,jj,2,1) * h_nodal_cell(2,1)))
+    h_gp = max(h_gp, min_h_shelf)
+    bed_gp = ((Phisub(qx,qy,ii,jj,1,1) * bed_corners(1,1)) + &
+              (Phisub(qx,qy,ii,jj,2,2) * bed_corners(2,2))) + &
+             ((Phisub(qx,qy,ii,jj,1,2) * bed_corners(1,2)) + &
+              (Phisub(qx,qy,ii,jj,2,1) * bed_corners(2,1)))
+    is_grounded = (rhoi_rhow * h_gp - bed_gp > 0.0)
+    if (is_grounded) then
+      s_gp = h_gp - bed_gp
+    else
+      s_gp = (1.0 - rhoi_rhow) * h_gp
+    endif
+    accum = accum + (0.25 * subarea) * s_gp
+  enddo ; enddo ; enddo ; enddo
+  Sbar = accum
+end function subgrid_cell_mean_s
+
+!> Well-balanced surface-elevation limiter for DG(1) ice-shelf thickness.
+!! Limits the surface elevation s instead of thickness h, matching the
+!! well-balancing principle from shallow-water DG (Audusse 2004 hydrostatic
+!! reconstruction, Xing-Shu 2005 well-balanced DG): on rough bedrock the
+!! equilibrium state has dh/dx ~ dbed/dx, so limiting h destroys the
+!! compensation and produces spurious surface slopes equal to the bed slope.
+!! Limiting s preserves the dynamically smooth variable directly.
+!!
+!! Per-corner surface elevation:
+!!   grounded corner (rhoi_rhow*h > bed):  s = h - bed
+!!   floating corner:                       s = (1 - rhoi_rhow)*h
+!! Flotation guarantees the formulas agree at the GL so s is continuous within
+!! a cell with mixed corners.
+!!
+!! Cell-mean of s for the envelope:
+!!   fully grounded or fully floating cell: closed-form linear in h.
+!!   GL cell (0 < ground_frac < 1): Phisub subgrid quadrature (the same Phisub
+!!   used by the strong-form driving stress integration).
+!!
+!! Algorithm per cell:
+!!   1) Build s_nodal at each corner using pre-limit flotation state.
+!!   2) Isotropic Zhang-Shu single-phi MPP with Park-Kim MLP-u2 slack on s.
+!!   3) Reconstruct h corner-by-corner from limited s using the *frozen*
+!!      pre-limit flotation state (avoids mid-step flotation flips).
+!!   4) Mass-fix uniform shift: h_final = h_recon + (Hbar_old - Hbar_new) so
+!!      cell_mean(h) is restored exactly to its pre-limit value at every
+!!      limited cell.
+!!
+!! References: Audusse et al. 2004 SIAM JSC 25, Xing & Shu 2005 JCP 208,
+!! Zhang & Shu 2010 JCP 229, Park & Kim 2014 JCP 274.
+subroutine nodal_surface_slope_limit(CS, G, ISS)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS
+  type(ocean_grid_type),  intent(in)    :: G
+  type(ice_shelf_state),  intent(in)    :: ISS
+
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: Smax_B, Smin_B   ! Per-B-node max/min of cell-mean
+                                                           ! s over touching cells [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: count_B          ! Number of touching valid cells
+                                                           ! at each B-node [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G))   :: S_cell           ! Cell-mean of s [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G))   :: pk_factor        ! Park-Kim smooth-extrema flag,
+                                                           ! 0 or 1 [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G))   :: pk_d2x_cell      ! Second x-difference of S_cell
+                                                           ! [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G))   :: pk_d2y_cell      ! Second y-difference of S_cell
+                                                           ! [Z ~> m]
+  real :: pk_slack    ! Park-Kim envelope relaxation [Z ~> m]
+  real :: bound_tol   ! Per-corner Venkatakrishnan-style envelope tolerance [Z ~> m]
+  real :: env_width   ! Smax_B - Smin_B at a B-node [Z ~> m]
+  real :: phi_iso     ! Isotropic per-cell MPP scaling factor [nondim]
+  real :: s_dev_ab    ! Per-corner deviation s_nodal - Sbar [Z ~> m]
+  real :: ratio       ! Per-corner s-bound / s-deviation ratio [nondim]
+  real, parameter :: H_LARGE = 1.0e30      ! Sentinel for "no envelope" [Z ~> m]
+  real, parameter :: TINY_DEV = 1.0e-30    ! Skip threshold for near-zero deviation [Z ~> m]
+  real, parameter :: PK_SLACK_D2  = 1.0/12.0  ! Q1 smooth-peak overshoot coefficient [nondim]
+  real, parameter :: PK_SLACK_ENV = 0.05      ! Envelope-width slack fraction [nondim]
+  real, parameter :: BOUND_TOL_ABS = 1.0e-4   ! Absolute envelope floor [Z ~> m]
+  real, parameter :: BOUND_TOL_REL = 1.0e-6   ! Relative envelope floor [nondim]
+  real :: rhoi_rhow         ! Ice/ocean density ratio rho_i/rho_w [nondim]
+  real :: one_minus_r       ! 1 - rhoi_rhow [nondim]
+  real :: inv_one_minus_r   ! 1 / (1 - rhoi_rhow) [nondim]
+  real :: Sbar              ! Cell-mean surface elevation [Z ~> m]
+  real :: Hbar_old          ! Pre-limit cell-mean thickness [Z ~> m]
+  real :: Hbar_new          ! Reconstructed cell-mean thickness before mass-fix [Z ~> m]
+  real :: shift             ! Mass-fix uniform shift Hbar_old - Hbar_new [Z ~> m]
+  real :: bed_c(2,2)        ! Bed depth at the 4 cell corners [Z ~> m]
+  logical :: cg(2,2)        ! Per-corner pre-limit grounded flag
+  logical :: cell_is_GL     ! True if the cell has mixed grounded/floating corners
+  real :: s_nodal(2,2)      ! Per-corner pre-limit surface elevation [Z ~> m]
+  real :: s_limited(2,2)    ! Per-corner post-limit surface elevation [Z ~> m]
+  real :: s_bound_max(2,2)  ! Per-corner relaxed upper s-bound [Z ~> m]
+  real :: s_bound_min(2,2)  ! Per-corner relaxed lower s-bound [Z ~> m]
+  real :: h_recon(2,2)      ! Per-corner reconstructed thickness before mass-fix [Z ~> m]
+  real :: hbdry_val         ! Dirichlet h_bdry_val floored by min_h_shelf [Z ~> m]
+  real :: bed_avg_bdry      ! Average bed depth over 4 corners (Dirichlet cell) [Z ~> m]
+  integer :: i, j, a, b, I_node, J_node
+
+  if (.not. associated(CS%h_nodal)) return
+  if (.not. associated(CS%Phisub)) return  ! Subgrid weights required for GL cells
+
+  rhoi_rhow       = CS%density_ice / CS%density_ocean_avg
+  one_minus_r     = 1.0 - rhoi_rhow
+  inv_one_minus_r = 1.0 / one_minus_r
+
+  call pass_corner_field(CS%h_nodal, G)
+
+  ! 1) Build S_cell = cell-mean of surface elevation s over the data domain.
+  !    For each cell, classify the cell as fully grounded / fully floating / GL
+  !    by the per-corner flotation test on (h_nodal, bed_node). GL cells use
+  !    Phisub subgrid quadrature to integrate s respecting subgrid GL position.
+  S_cell(:,:) = H_LARGE
+  do j = G%jsd, G%jed ; do i = G%isd, G%ied
+    if (ISS%hmask(i,j) == 1.0) then
+      ! Gather bed at corners and per-corner pre-limit flotation state.
+      bed_c(1,1) = CS%bed_node(i-1,j-1) ; bed_c(2,1) = CS%bed_node(i,j-1)
+      bed_c(1,2) = CS%bed_node(i-1,j  ) ; bed_c(2,2) = CS%bed_node(i,j  )
+      cg(1,1) = (rhoi_rhow * CS%h_nodal(i,j,1,1) > bed_c(1,1))
+      cg(2,1) = (rhoi_rhow * CS%h_nodal(i,j,2,1) > bed_c(2,1))
+      cg(1,2) = (rhoi_rhow * CS%h_nodal(i,j,1,2) > bed_c(1,2))
+      cg(2,2) = (rhoi_rhow * CS%h_nodal(i,j,2,2) > bed_c(2,2))
+      cell_is_GL = .not. ((cg(1,1) .and. cg(2,1) .and. cg(1,2) .and. cg(2,2)) .or. &
+                          (.not.(cg(1,1) .or. cg(2,1) .or. cg(1,2) .or. cg(2,2))))
+      if (cell_is_GL) then
+        S_cell(i,j) = subgrid_cell_mean_s(CS%Phisub, CS%h_nodal(i,j,:,:), bed_c, &
+                                          rhoi_rhow, CS%min_h_shelf)
+      else
+        do b = 1, 2 ; do a = 1, 2
+          if (cg(a,b)) then
+            s_nodal(a,b) = CS%h_nodal(i,j,a,b) - bed_c(a,b)
+          else
+            s_nodal(a,b) = one_minus_r * CS%h_nodal(i,j,a,b)
+          endif
+        enddo ; enddo
+        S_cell(i,j) = nodal_cell_mean(s_nodal, CS%cell_mean_w(i,j,:,:))
+      endif
+    elseif (ISS%hmask(i,j) == 3.0) then
+      ! Dirichlet thickness BC: derive s from h_bdry_val and the average bed at
+      ! this cell's 4 corners. Use the same flotation test on the cell-average
+      ! bed to choose the formula.
+      hbdry_val = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
+      bed_avg_bdry = 0.25 * ((CS%bed_node(i-1,j-1) + CS%bed_node(i,j  )) + &
+                             (CS%bed_node(i,  j-1) + CS%bed_node(i-1,j)))
+      if (rhoi_rhow * hbdry_val > bed_avg_bdry) then
+        S_cell(i,j) = hbdry_val - bed_avg_bdry
+      else
+        S_cell(i,j) = one_minus_r * hbdry_val
+      endif
+    else
+      cycle
+    endif
+  enddo ; enddo
+
+  ! 2) Scatter S_cell to B-nodes -> Smax_B, Smin_B (MLP-u2 vertex envelope on s).
+  Smax_B(:,:) = -H_LARGE
+  Smin_B(:,:) =  H_LARGE
+  count_B(:,:) = 0.0
+  do j = G%jsd, G%jed ; do i = G%isd, G%ied
+    if (S_cell(i,j) >= H_LARGE - 1.0) cycle
+    if (i-1 >= G%IsdB .and. j-1 >= G%JsdB) then
+      Smax_B(i-1, j-1) = max(Smax_B(i-1, j-1), S_cell(i,j))
+      Smin_B(i-1, j-1) = min(Smin_B(i-1, j-1), S_cell(i,j))
+      count_B(i-1, j-1) = count_B(i-1, j-1) + 1.0
+    endif
+    if (i   <= G%IedB .and. j-1 >= G%JsdB) then
+      Smax_B(i,   j-1) = max(Smax_B(i,   j-1), S_cell(i,j))
+      Smin_B(i,   j-1) = min(Smin_B(i,   j-1), S_cell(i,j))
+      count_B(i,   j-1) = count_B(i,   j-1) + 1.0
+    endif
+    if (i-1 >= G%IsdB .and. j   <= G%JedB) then
+      Smax_B(i-1, j  ) = max(Smax_B(i-1, j  ), S_cell(i,j))
+      Smin_B(i-1, j  ) = min(Smin_B(i-1, j  ), S_cell(i,j))
+      count_B(i-1, j  ) = count_B(i-1, j  ) + 1.0
+    endif
+    if (i   <= G%IedB .and. j   <= G%JedB) then
+      Smax_B(i,   j  ) = max(Smax_B(i,   j  ), S_cell(i,j))
+      Smin_B(i,   j  ) = min(Smin_B(i,   j  ), S_cell(i,j))
+      count_B(i,   j  ) = count_B(i,   j  ) + 1.0
+    endif
+  enddo ; enddo
+  call pass_var(Smax_B,  G%domain, position=CORNER)
+  call pass_var(Smin_B,  G%domain, position=CORNER)
+  call pass_var(count_B, G%domain, position=CORNER)
+
+  ! 3) Park-Kim MLP-u2 smooth-extrema indicator on S_cell. Same 3-cell stencil
+  !    sign-consistency check (Park & Kim 2014 JCP 274) but applied to the
+  !    surface-elevation field, which is the dynamically smooth variable.
+  call pass_var(S_cell, G%domain)
+  pk_d2x_cell(:,:) = 0.0
+  pk_d2y_cell(:,:) = 0.0
+  do j = G%jsd+1, G%jed-1 ; do i = G%isd+1, G%ied-1
+    if (S_cell(i, j) >= H_LARGE - 1.0) cycle
+    if (S_cell(i-1, j) < H_LARGE - 1.0 .and. S_cell(i+1, j) < H_LARGE - 1.0) then
+      pk_d2x_cell(i, j) = (S_cell(i-1, j) - 2.0 * S_cell(i, j)) + S_cell(i+1, j)
+    endif
+    if (S_cell(i, j-1) < H_LARGE - 1.0 .and. S_cell(i, j+1) < H_LARGE - 1.0) then
+      pk_d2y_cell(i, j) = (S_cell(i, j-1) - 2.0 * S_cell(i, j)) + S_cell(i, j+1)
+    endif
+  enddo ; enddo
+  pk_factor(:,:) = 0.0
+  do j = G%jsc, G%jec ; do i = G%isc, G%iec
+    if (ISS%hmask(i,j) /= 1.0) cycle
+    if (i-1 < G%isd+1 .or. i+1 > G%ied-1) cycle
+    if (j-1 < G%jsd+1 .or. j+1 > G%jed-1) cycle
+    if (((pk_d2x_cell(i-1, j) >= 0.0) .and. (pk_d2x_cell(i, j) >= 0.0) .and. &
+         (pk_d2x_cell(i+1, j) >= 0.0)) .or. &
+        ((pk_d2x_cell(i-1, j) <= 0.0) .and. (pk_d2x_cell(i, j) <= 0.0) .and. &
+         (pk_d2x_cell(i+1, j) <= 0.0))) then
+      if (((pk_d2y_cell(i, j-1) >= 0.0) .and. (pk_d2y_cell(i, j) >= 0.0) .and. &
+           (pk_d2y_cell(i, j+1) >= 0.0)) .or. &
+          ((pk_d2y_cell(i, j-1) <= 0.0) .and. (pk_d2y_cell(i, j) <= 0.0) .and. &
+           (pk_d2y_cell(i, j+1) <= 0.0))) then
+        pk_factor(i, j) = 1.0
+      endif
+    endif
+  enddo ; enddo
+
+  ! Reset diagnostic buffers (limiter inactive at non-hmask=1 cells -> phi=1, drift=0).
+  if (associated(CS%dg_lim_phi_xi))     CS%dg_lim_phi_xi(:,:)     = 1.0
+  if (associated(CS%dg_lim_phi_eta))    CS%dg_lim_phi_eta(:,:)    = 1.0
+  if (associated(CS%dg_lim_phi_cross))  CS%dg_lim_phi_cross(:,:)  = 1.0
+  if (associated(CS%dg_lim_mass_drift)) CS%dg_lim_mass_drift(:,:) = 0.0
+  if (associated(CS%dg_lim_phi))        CS%dg_lim_phi(:,:)        = 1.0
+  if (associated(CS%dg_lim_pk_factor))  CS%dg_lim_pk_factor(:,:)  = pk_factor(:,:)
+
+  ! 4) Per-cell isotropic limit on s, reconstruct h, mass-fix uniform shift.
+  do j = G%jsc, G%jec ; do i = G%isc, G%iec
+    if (ISS%hmask(i,j) /= 1.0) cycle
+
+    ! Snapshot pre-limit h-cell-mean for the mass-fix shift below.
+    Hbar_old = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
+
+    ! Bed at corners and frozen per-corner flotation state.
+    bed_c(1,1) = CS%bed_node(i-1,j-1) ; bed_c(2,1) = CS%bed_node(i,j-1)
+    bed_c(1,2) = CS%bed_node(i-1,j  ) ; bed_c(2,2) = CS%bed_node(i,j  )
+    cg(1,1) = (rhoi_rhow * CS%h_nodal(i,j,1,1) > bed_c(1,1))
+    cg(2,1) = (rhoi_rhow * CS%h_nodal(i,j,2,1) > bed_c(2,1))
+    cg(1,2) = (rhoi_rhow * CS%h_nodal(i,j,1,2) > bed_c(1,2))
+    cg(2,2) = (rhoi_rhow * CS%h_nodal(i,j,2,2) > bed_c(2,2))
+
+    ! s_nodal at each corner.
+    do b = 1, 2 ; do a = 1, 2
+      if (cg(a,b)) then
+        s_nodal(a,b) = CS%h_nodal(i,j,a,b) - bed_c(a,b)
+      else
+        s_nodal(a,b) = one_minus_r * CS%h_nodal(i,j,a,b)
+      endif
+    enddo ; enddo
+
+    Sbar = S_cell(i,j)
+
+    ! Per-corner relaxed s-envelope (MLP-u2 + Park-Kim smooth-extrema slack).
+    do b = 1, 2 ; do a = 1, 2
+      I_node = i - 2 + a ; J_node = j - 2 + b
+      if (count_B(I_node, J_node) >= 1.5 .and. &
+          Smax_B(I_node, J_node) > -H_LARGE + 1.0 .and. &
+          Smin_B(I_node, J_node) <  H_LARGE - 1.0) then
+        env_width = Smax_B(I_node, J_node) - Smin_B(I_node, J_node)
+        bound_tol = max(BOUND_TOL_ABS, BOUND_TOL_REL * env_width)
+        pk_slack = pk_factor(i, j) * &
+                   (PK_SLACK_D2 * (abs(pk_d2x_cell(i, j)) + abs(pk_d2y_cell(i, j))) + &
+                    PK_SLACK_ENV * env_width)
+        s_bound_max(a,b) = Smax_B(I_node, J_node) + bound_tol + pk_slack
+        s_bound_min(a,b) = Smin_B(I_node, J_node) - bound_tol - pk_slack
+      else
+        s_bound_max(a,b) =  H_LARGE
+        s_bound_min(a,b) = -H_LARGE
+      endif
+    enddo ; enddo
+
+    ! Isotropic single-phi Zhang-Shu MPP on s.
+    phi_iso = 1.0
+    do b = 1, 2 ; do a = 1, 2
+      s_dev_ab = s_nodal(a,b) - Sbar
+      if (abs(s_dev_ab) > TINY_DEV) then
+        if (s_dev_ab > 0.0) then
+          ratio = (s_bound_max(a,b) - Sbar) / s_dev_ab
+        else
+          ratio = (s_bound_min(a,b) - Sbar) / s_dev_ab
+        endif
+        phi_iso = min(phi_iso, max(0.0, ratio))
+      endif
+    enddo ; enddo
+    phi_iso = min(phi_iso, 1.0)
+
+    ! Reconstruct limited s, then h corner-by-corner using frozen flotation state.
+    do b = 1, 2 ; do a = 1, 2
+      s_limited(a,b) = Sbar + phi_iso * (s_nodal(a,b) - Sbar)
+      if (cg(a,b)) then
+        h_recon(a,b) = s_limited(a,b) + bed_c(a,b)
+      else
+        h_recon(a,b) = s_limited(a,b) * inv_one_minus_r
+      endif
+    enddo ; enddo
+
+    ! Mass-fix uniform shift: restore cell_mean(h) exactly. Hbar_new - Hbar_old
+    ! is reported as dg_lim_mass_drift so the user sees the raw drift the
+    ! reconstruction *would* produce (mainly from the piecewise s<->h Jacobian
+    ! across the GL within mixed-flotation cells) before the shift hides it.
+    Hbar_new = nodal_cell_mean(h_recon, CS%cell_mean_w(i,j,:,:))
+    if (associated(CS%dg_lim_mass_drift)) CS%dg_lim_mass_drift(i,j) = Hbar_new - Hbar_old
+    shift = Hbar_old - Hbar_new
+    CS%h_nodal(i,j,1,1) = h_recon(1,1) + shift
+    CS%h_nodal(i,j,2,1) = h_recon(2,1) + shift
+    CS%h_nodal(i,j,1,2) = h_recon(1,2) + shift
+    CS%h_nodal(i,j,2,2) = h_recon(2,2) + shift
+
+    if (associated(CS%dg_lim_phi_xi))    CS%dg_lim_phi_xi(i,j)    = phi_iso
+    if (associated(CS%dg_lim_phi_eta))   CS%dg_lim_phi_eta(i,j)   = phi_iso
+    if (associated(CS%dg_lim_phi_cross)) CS%dg_lim_phi_cross(i,j) = phi_iso
+    if (associated(CS%dg_lim_phi))       CS%dg_lim_phi(i,j)       = phi_iso
+  enddo ; enddo
+
+  call pass_corner_field(CS%h_nodal, G)
+end subroutine nodal_surface_slope_limit
+
 !> Apply the per-cell tensor-product Q1 mass-matrix inverse:
 !! out(a,b) = sum_{a',b'} Minv_xi(a,a') * Minv_eta(b,b') * rhs(a',b').
 pure subroutine apply_nodal_DG_mass_inverse(Minv_xi_cell, Minv_eta_cell, rhs, out)
@@ -9610,7 +9953,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
 
   ! Stage 1: positivity floor -> hierarchical limiter -> spatial op -> M^-1 -> Euler step.
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
-  if (CS%dg_hierarchical_lim) call nodal_hierarchical_limit(CS, G, ISS)
+  if (CS%dg_hierarchical_lim) call nodal_surface_slope_limit(CS, G, ISS)
   call pass_corner_field(CS%h_nodal, G)
   call DG1_nodal_spatial_operator(CS, G, hmask, CS%h_nodal, rhs, uh_ice, vh_ice, time_step)
   do j = jsc, jec ; do i = isc, iec
@@ -9625,7 +9968,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
 
   ! Stage 2: positivity floor -> hierarchical limiter -> spatial op -> M^-1 -> SSP-RK2 combine.
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
-  if (CS%dg_hierarchical_lim) call nodal_hierarchical_limit(CS, G, ISS)
+  if (CS%dg_hierarchical_lim) call nodal_surface_slope_limit(CS, G, ISS)
   h_curr(:,:,:,:) = CS%h_nodal(:,:,:,:)
   call DG1_nodal_spatial_operator(CS, G, hmask, h_curr, rhs, uh_ice, vh_ice, time_step)
   do j = jsc, jec ; do i = isc, iec
@@ -9646,7 +9989,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
 
   ! Final positivity floor + optional hierarchical limit on the SSP-RK2 result.
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
-  if (CS%dg_hierarchical_lim) call nodal_hierarchical_limit(CS, G, ISS)
+  if (CS%dg_hierarchical_lim) call nodal_surface_slope_limit(CS, G, ISS)
   call pass_corner_field(CS%h_nodal, G)
 
   ! Average uh_ice, vh_ice over the 2 stages (SSP-RK2 equal weight).
