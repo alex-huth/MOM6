@@ -266,6 +266,15 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! instead of the anisotropic per-mode max-product
                                   !! limiter. Single phi per cell scales the full
                                   !! deviation from Hbar at each corner.
+  real :: dg_venkat_K             !< Venkatakrishnan-style gradient-proportional
+                                  !! slack coefficient for the surface-slope limiter.
+                                  !! Adds K * (|dS/dx| + |dS/dy|) * Delta_ref / 2 to
+                                  !! the per-corner envelope tolerance, where the
+                                  !! cell-mean gradient is estimated by centred
+                                  !! differences of S_cell. K = 1 covers the corner-
+                                  !! vs-Sbar offset of a globally linear field
+                                  !! exactly; K > 1 allows further curvature
+                                  !! tolerance. K = 0 disables the term [nondim].
   real, allocatable :: mu_lim_xi(:,:)     !< Cached orthogonalisation offset for the
                                           !! xi-slope mode template, per cell [nondim].
   real, allocatable :: mu_lim_eta(:,:)    !< Cached orthogonalisation offset for the
@@ -8504,6 +8513,18 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  default=.false., do_not_log=(.not.CS%use_DG_thickness .or. &
                                               .not.CS%dg_hierarchical_lim))
 
+  call get_param(param_file, mdl, "DG1_VENKAT_K", CS%dg_venkat_K, &
+                 "Venkatakrishnan-style gradient-proportional slack coefficient added "//&
+                 "to the surface-slope limiter envelope. Adds K*(|dS/dx|+|dS/dy|)/4 to "//&
+                 "the per-cell slack, where the cell-mean S-gradient is estimated by "//&
+                 "centred differences of the cell-mean surface elevation S_cell. K=1 "//&
+                 "covers the corner-vs-Sbar offset of a globally linear S field exactly "//&
+                 "so the limiter passes through linear gradients regardless of the "//&
+                 "Park-Kim smoothness flag. K>1 allows additional curvature tolerance; "//&
+                 "K=0 disables the term and reverts to Park-Kim slack only.", &
+                 units="nondim", default=1.0, &
+                 do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_hierarchical_lim))
+
   call get_param(param_file, mdl, "DG1_ART_VISC", CS%dg_art_visc, &
                  "If true, add an artificial-viscosity face term to the DG(1) nodal "//&
                  "spatial operator. Per interior face, distributes the antisymmetric "//&
@@ -9348,6 +9369,11 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
   real :: pk_slack    ! Park-Kim envelope relaxation [Z ~> m]
   real :: bound_tol   ! Per-corner Venkatakrishnan-style envelope tolerance [Z ~> m]
   real :: env_width   ! Smax_B - Smin_B at a B-node [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G))   :: venkat_slack    ! Per-cell gradient-proportional
+                                                          ! slack from centred differences
+                                                          ! of S_cell [Z ~> m]
+  real :: grad_S_x    ! Centred-difference estimate of cell-mean dS/dx [Z ~> m]
+  real :: grad_S_y    ! Centred-difference estimate of cell-mean dS/dy [Z ~> m]
   real :: phi_iso     ! Isotropic per-cell MPP scaling factor [nondim]
   real :: s_dev_ab    ! Per-corner deviation s_nodal - Sbar [Z ~> m]
   real :: ratio       ! Per-corner s-bound / s-deviation ratio [nondim]
@@ -9477,6 +9503,26 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
       pk_d2y_cell(i, j) = (S_cell(i, j-1) - 2.0 * S_cell(i, j)) + S_cell(i, j+1)
     endif
   enddo ; enddo
+  ! Venkatakrishnan-style per-cell gradient-proportional slack from centred
+  ! differences of S_cell. Corner-vs-Sbar offset of a linear Q1 field with
+  ! cell-mean gradients (grad_S_x, grad_S_y) is (|grad_S_x|+|grad_S_y|)/2
+  ! when grad_S is expressed per cell width. We estimate grad per cell by the
+  ! centred difference of neighbour cell means (= 2 cells apart), giving
+  ! grad_S_x ~ (S(i+1)-S(i-1))/2 in per-cell units; halved again for the
+  ! half-cell-width corner offset gives /4. K = DG1_VENKAT_K scales the term;
+  ! K = 1 grants exactly the linear-field corner offset.
+  venkat_slack(:,:) = 0.0
+  do j = G%jsd+1, G%jed-1 ; do i = G%isd+1, G%ied-1
+    if (S_cell(i, j) >= H_LARGE - 1.0) cycle
+    grad_S_x = 0.0
+    grad_S_y = 0.0
+    if (S_cell(i-1, j) < H_LARGE - 1.0 .and. S_cell(i+1, j) < H_LARGE - 1.0) &
+      grad_S_x = S_cell(i+1, j) - S_cell(i-1, j)
+    if (S_cell(i, j-1) < H_LARGE - 1.0 .and. S_cell(i, j+1) < H_LARGE - 1.0) &
+      grad_S_y = S_cell(i, j+1) - S_cell(i, j-1)
+    venkat_slack(i, j) = CS%dg_venkat_K * 0.25 * (abs(grad_S_x) + abs(grad_S_y))
+  enddo ; enddo
+
   pk_factor(:,:) = 0.0
   do j = G%jsc, G%jec ; do i = G%isc, G%iec
     if (ISS%hmask(i,j) /= 1.0) cycle
@@ -9517,6 +9563,8 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
     cg(2,1) = (rhoi_rhow * CS%h_nodal(i,j,2,1) > bed_c(2,1))
     cg(1,2) = (rhoi_rhow * CS%h_nodal(i,j,1,2) > bed_c(1,2))
     cg(2,2) = (rhoi_rhow * CS%h_nodal(i,j,2,2) > bed_c(2,2))
+    cell_is_GL = .not. ((cg(1,1) .and. cg(2,1) .and. cg(1,2) .and. cg(2,2)) .or. &
+                        (.not.(cg(1,1) .or. cg(2,1) .or. cg(1,2) .or. cg(2,2))))
 
     ! s_nodal at each corner.
     do b = 1, 2 ; do a = 1, 2
@@ -9540,8 +9588,8 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
         pk_slack = pk_factor(i, j) * &
                    (PK_SLACK_D2 * (abs(pk_d2x_cell(i, j)) + abs(pk_d2y_cell(i, j))) + &
                     PK_SLACK_ENV * env_width)
-        s_bound_max(a,b) = Smax_B(I_node, J_node) + bound_tol + pk_slack
-        s_bound_min(a,b) = Smin_B(I_node, J_node) - bound_tol - pk_slack
+        s_bound_max(a,b) = Smax_B(I_node, J_node) + bound_tol + pk_slack + venkat_slack(i, j)
+        s_bound_min(a,b) = Smin_B(I_node, J_node) - bound_tol - pk_slack - venkat_slack(i, j)
       else
         s_bound_max(a,b) =  H_LARGE
         s_bound_min(a,b) = -H_LARGE
@@ -9563,27 +9611,40 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
     enddo ; enddo
     phi_iso = min(phi_iso, 1.0)
 
-    ! Reconstruct limited s, then h corner-by-corner using frozen flotation state.
-    do b = 1, 2 ; do a = 1, 2
-      s_limited(a,b) = Sbar + phi_iso * (s_nodal(a,b) - Sbar)
-      if (cg(a,b)) then
-        h_recon(a,b) = s_limited(a,b) + bed_c(a,b)
-      else
-        h_recon(a,b) = s_limited(a,b) * inv_one_minus_r
-      endif
-    enddo ; enddo
-
-    ! Mass-fix uniform shift: restore cell_mean(h) exactly. Hbar_new - Hbar_old
-    ! is reported as dg_lim_mass_drift so the user sees the raw drift the
-    ! reconstruction *would* produce (mainly from the piecewise s<->h Jacobian
-    ! across the GL within mixed-flotation cells) before the shift hides it.
-    Hbar_new = nodal_cell_mean(h_recon, CS%cell_mean_w(i,j,:,:))
-    if (associated(CS%dg_lim_mass_drift)) CS%dg_lim_mass_drift(i,j) = Hbar_new - Hbar_old
-    shift = Hbar_old - Hbar_new
-    CS%h_nodal(i,j,1,1) = h_recon(1,1) + shift
-    CS%h_nodal(i,j,2,1) = h_recon(2,1) + shift
-    CS%h_nodal(i,j,1,2) = h_recon(1,2) + shift
-    CS%h_nodal(i,j,2,2) = h_recon(2,2) + shift
+    if (cell_is_GL) then
+      ! GL cells: apply phi (computed from s-envelope) directly to h to avoid the
+      ! s<->h Jacobian discontinuity at the in-cell GL. Mass is trivially
+      ! conserved (linear scaling of deviation from Hbar). Well-balanced
+      ! reconstruction is given up inside GL cells only; the s-based firing
+      ! decision still benefits from the smooth-surface criterion.
+      do b = 1, 2 ; do a = 1, 2
+        h_recon(a,b) = Hbar_old + phi_iso * (CS%h_nodal(i,j,a,b) - Hbar_old)
+      enddo ; enddo
+      if (associated(CS%dg_lim_mass_drift)) CS%dg_lim_mass_drift(i,j) = 0.0
+      CS%h_nodal(i,j,1,1) = h_recon(1,1) ; CS%h_nodal(i,j,2,1) = h_recon(2,1)
+      CS%h_nodal(i,j,1,2) = h_recon(1,2) ; CS%h_nodal(i,j,2,2) = h_recon(2,2)
+    else
+      ! Non-GL cells: full well-balanced reconstruction. Limit s, recover h
+      ! corner-by-corner from the frozen flotation state, then mass-fix uniform
+      ! shift to restore cell_mean(h) exactly (handles FP roundoff in
+      ! nodal_cell_mean; the algorithmic drift is zero by linearity on
+      ! uniform-formula cells).
+      do b = 1, 2 ; do a = 1, 2
+        s_limited(a,b) = Sbar + phi_iso * (s_nodal(a,b) - Sbar)
+        if (cg(a,b)) then
+          h_recon(a,b) = s_limited(a,b) + bed_c(a,b)
+        else
+          h_recon(a,b) = s_limited(a,b) * inv_one_minus_r
+        endif
+      enddo ; enddo
+      Hbar_new = nodal_cell_mean(h_recon, CS%cell_mean_w(i,j,:,:))
+      if (associated(CS%dg_lim_mass_drift)) CS%dg_lim_mass_drift(i,j) = Hbar_new - Hbar_old
+      shift = Hbar_old - Hbar_new
+      CS%h_nodal(i,j,1,1) = h_recon(1,1) + shift
+      CS%h_nodal(i,j,2,1) = h_recon(2,1) + shift
+      CS%h_nodal(i,j,1,2) = h_recon(1,2) + shift
+      CS%h_nodal(i,j,2,2) = h_recon(2,2) + shift
+    endif
 
     if (associated(CS%dg_lim_phi_xi))    CS%dg_lim_phi_xi(i,j)    = phi_iso
     if (associated(CS%dg_lim_phi_eta))   CS%dg_lim_phi_eta(i,j)   = phi_iso
