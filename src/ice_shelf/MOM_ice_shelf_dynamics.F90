@@ -291,6 +291,14 @@ type, public :: ice_shelf_dyn_CS ; private
                                                               !! For anisotropic: min over the
                                                               !! three mode phis at this cell
                                                               !! (= the most-limiting factor).
+  real, pointer, dimension(:,:) :: dg_lim_pk_factor => NULL() !< Park-Kim MLP-u2 smooth-extrema
+                                                              !! indicator [nondim, 0 or 1].
+                                                              !! 1 where the Park-Kim sign-
+                                                              !! consistency check flags the
+                                                              !! cell as a smooth extremum and
+                                                              !! grants full slack; 0 where the
+                                                              !! check rejects and strict MLP-u2
+                                                              !! bounds apply.
   logical :: dg_art_visc          !< If true, add an artificial-viscosity face term
                                   !! +nu_face * (h_B - h_A) / dx_perp * dy at each
                                   !! interior DG face. With nu_face = coef*dx_perp*|u_face|
@@ -426,7 +434,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_h_jump_envelope = -1, id_h_jump_envelope_rel = -1, &
              id_h_overshoot_node = -1, id_h_overshoot_node_rel = -1, id_h_source_rate = -1, &
              id_dg_lim_phi_xi = -1, id_dg_lim_phi_eta = -1, id_dg_lim_phi_cross = -1, &
-             id_dg_lim_mass_drift = -1, id_dg_lim_phi = -1, &
+             id_dg_lim_mass_drift = -1, id_dg_lim_phi = -1, id_dg_lim_pk_factor = -1, &
              id_phi_x_FV = -1, id_phi_y_FV = -1, &
              id_dg_art_visc_coef_u = -1, id_dg_art_visc_coef_v = -1
   real, pointer, dimension(:,:) :: dg_art_visc_coef_u => NULL() !< Per-face DG(1) artificial-
@@ -600,6 +608,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%dg_lim_phi_cross(isd:ied,jsd:jed),  source=1.0)
     allocate(CS%dg_lim_mass_drift(isd:ied,jsd:jed), source=0.0)
     allocate(CS%dg_lim_phi(isd:ied,jsd:jed),        source=1.0)
+    allocate(CS%dg_lim_pk_factor(isd:ied,jsd:jed),  source=0.0)
     allocate(CS%u_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%v_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%u_face_mask_bdry(IsdB:IedB,JsdB:JedB), source=-2.0)
@@ -1277,6 +1286,12 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          'collapse. For the isotropic single-phi variant this is the unique scaling factor; '//&
          'for the anisotropic per-mode variant this is the min over (phi_xi, phi_eta, phi_cross), '//&
          'i.e. the most-limiting direction.', 'nondim')
+      CS%id_dg_lim_pk_factor = register_diag_field('ice_shelf_model','dg_lim_pk_factor', &
+         CS%diag%axesT1, Time, &
+         'Park-Kim MLP-u2 smooth-extrema indicator from the DG(1) hierarchical limiter. '//&
+         '1 where the second-difference sign-consistency check across the 3-cell stencil in '//&
+         'both x and y flags the cell as a smooth extremum (full slack granted); 0 where the '//&
+         'check rejects and strict MLP-u2 vertex bounds apply.', 'nondim')
     else
       CS%id_phi_x_FV = register_diag_field('ice_shelf_model','phi_x_FV',CS%diag%axesCu1, Time, &
          'Van Leer slope-limiter factor at each u-face from ice_shelf_advect_thickness_x '//&
@@ -1789,6 +1804,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_lim_mass_drift, CS%dg_lim_mass_drift, CS%diag)
     if (CS%id_dg_lim_phi > 0 .and. associated(CS%dg_lim_phi)) &
         call post_data(CS%id_dg_lim_phi, CS%dg_lim_phi, CS%diag)
+    if (CS%id_dg_lim_pk_factor > 0 .and. associated(CS%dg_lim_pk_factor)) &
+        call post_data(CS%id_dg_lim_pk_factor, CS%dg_lim_pk_factor, CS%diag)
     if (CS%id_dg_art_visc_coef_u > 0 .and. associated(CS%dg_art_visc_coef_u)) &
         call post_data(CS%id_dg_art_visc_coef_u, CS%dg_art_visc_coef_u, CS%diag)
     if (CS%id_dg_art_visc_coef_v > 0 .and. associated(CS%dg_art_visc_coef_v)) &
@@ -6324,6 +6341,7 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_lim_phi_cross))  deallocate(CS%dg_lim_phi_cross)
   if (associated(CS%dg_lim_mass_drift)) deallocate(CS%dg_lim_mass_drift)
   if (associated(CS%dg_lim_phi))        deallocate(CS%dg_lim_phi)
+  if (associated(CS%dg_lim_pk_factor))  deallocate(CS%dg_lim_pk_factor)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
   if (associated(CS%Jac)) deallocate(CS%Jac)
   if (associated(CS%Phi)) deallocate(CS%Phi)
@@ -9008,6 +9026,7 @@ subroutine nodal_hierarchical_limit(CS, G, ISS)
   if (associated(CS%dg_lim_phi_cross))  CS%dg_lim_phi_cross(:,:)  = 1.0
   if (associated(CS%dg_lim_mass_drift)) CS%dg_lim_mass_drift(:,:) = 0.0
   if (associated(CS%dg_lim_phi))        CS%dg_lim_phi(:,:)        = 1.0
+  if (associated(CS%dg_lim_pk_factor))  CS%dg_lim_pk_factor(:,:)  = pk_factor(:,:)
 
   ! Per-cell hierarchical limiting.
   do j = G%jsc, G%jec ; do i = G%isc, G%iec
