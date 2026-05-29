@@ -445,7 +445,10 @@ type, public :: ice_shelf_dyn_CS ; private
              id_dg_lim_phi_xi = -1, id_dg_lim_phi_eta = -1, id_dg_lim_phi_cross = -1, &
              id_dg_lim_mass_drift = -1, id_dg_lim_phi = -1, id_dg_lim_pk_factor = -1, &
              id_phi_x_FV = -1, id_phi_y_FV = -1, &
-             id_dg_art_visc_coef_u = -1, id_dg_art_visc_coef_v = -1
+             id_dg_art_visc_coef_u = -1, id_dg_art_visc_coef_v = -1, &
+             id_h_jump_face_u = -1, id_h_jump_face_v = -1, &
+             id_s_jump_face_u = -1, id_s_jump_face_v = -1, &
+             id_un_face_u = -1, id_un_face_v = -1
   real, pointer, dimension(:,:) :: dg_art_visc_coef_u => NULL() !< Per-face DG(1) artificial-
                                                        !! viscosity coefficient on u-faces
                                                        !! [nondim], stored as the max over
@@ -1272,6 +1275,36 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          CS%diag%axesCv1, Time, &
          'Per-face DG(1) artificial-viscosity coefficient on v-faces (max over the 2 face '//&
          'Gauss points from the last spatial-operator call).', 'nondim')
+      CS%id_h_jump_face_u = register_diag_field('ice_shelf_model','h_jump_face_u', &
+         CS%diag%axesCu1, Time, &
+         'DG(1) broken-Q1 thickness jump across u-faces (max |[h]| over the 2 face nodes). '//&
+         'Localises the inter-element discontinuity to a single face, unlike the B-node '//&
+         'max-min h_jump_node which conflates the up-to-4 faces meeting at a corner.', &
+         'm', conversion=US%Z_to_m)
+      CS%id_h_jump_face_v = register_diag_field('ice_shelf_model','h_jump_face_v', &
+         CS%diag%axesCv1, Time, &
+         'DG(1) broken-Q1 thickness jump across v-faces (max |[h]| over the 2 face nodes).', &
+         'm', conversion=US%Z_to_m)
+      CS%id_s_jump_face_u = register_diag_field('ice_shelf_model','s_jump_face_u', &
+         CS%diag%axesCu1, Time, &
+         'DG(1) surface-elevation jump across u-faces (max |[s]| over the 2 face nodes, '//&
+         'per-side flotation). This is the quantity the sub-grid driving stress consumes '//&
+         '(jump_factor = rho*g*{h}*[s]); unlike [h] it accounts for the nonlinear '//&
+         'grounded/floating thickness-to-surface map across the grounding line.', &
+         'm', conversion=US%Z_to_m)
+      CS%id_s_jump_face_v = register_diag_field('ice_shelf_model','s_jump_face_v', &
+         CS%diag%axesCv1, Time, &
+         'DG(1) surface-elevation jump across v-faces (max |[s]| over the 2 face nodes, '//&
+         'per-side flotation).', 'm', conversion=US%Z_to_m)
+      CS%id_un_face_u = register_diag_field('ice_shelf_model','un_face_u', &
+         CS%diag%axesCu1, Time, &
+         'Face-normal ice speed |u.n| on u-faces (mean of the 2 endpoint B-node u_shelf '//&
+         'values). Pair with h_jump_face_u / s_jump_face_u to test whether jumps accumulate '//&
+         'at shear-margin faces where u.n ~ 0.', 'm s-1', conversion=US%L_T_to_m_s)
+      CS%id_un_face_v = register_diag_field('ice_shelf_model','un_face_v', &
+         CS%diag%axesCv1, Time, &
+         'Face-normal ice speed |v.n| on v-faces (mean of the 2 endpoint B-node v_shelf '//&
+         'values). Pair with h_jump_face_v / s_jump_face_v.', 'm s-1', conversion=US%L_T_to_m_s)
       CS%id_dg_lim_phi_xi = register_diag_field('ice_shelf_model','dg_lim_phi_xi', &
          CS%diag%axesT1, Time, &
          'Per-cell xi-slope (east-west) mode scaling factor from the DG(1) hierarchical '//&
@@ -1589,6 +1622,16 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
   integer :: n_valid                              ! number of touching cells with hmask==1 [nondim]
   logical :: vSW, vSE, vNW, vNE                   ! per-touching-cell validity flags
   integer :: ii, jj                               ! touching-cell indices on the T-grid
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: hjump_fu ! per-u-face DG(1) thickness jump max|[h]| [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: sjump_fu ! per-u-face surface-elevation jump max|[s]| [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: un_fu    ! per-u-face |u.n| [L T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJB_(G)) :: hjump_fv ! per-v-face DG(1) thickness jump max|[h]| [Z ~> m]
+  real, dimension(SZDI_(G),SZDJB_(G)) :: sjump_fv ! per-v-face surface-elevation jump max|[s]| [Z ~> m]
+  real, dimension(SZDI_(G),SZDJB_(G)) :: un_fv    ! per-v-face |v.n| [L T-1 ~> m s-1]
+  real :: rr                                      ! ice/ocean density ratio [nondim]
+  real :: bed1, bed2                              ! bed elevation at the 2 face-endpoint nodes [Z ~> m]
+  real :: h_m1, h_p1, h_m2, h_p2                  ! minus/plus side corner thickness at nodes 1,2 [Z ~> m]
+  real :: s_m1, s_p1, s_m2, s_p2                  ! minus/plus side surface elevation at nodes 1,2 [Z ~> m]
 
   integer :: i, j
 
@@ -1796,6 +1839,60 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         if (CS%id_h_overshoot_node     > 0) call post_data(CS%id_h_overshoot_node,     h_over_n,     CS%diag)
         if (CS%id_h_overshoot_node_rel > 0) call post_data(CS%id_h_overshoot_node_rel, h_over_n_rel, CS%diag)
       endif
+    endif
+    if ((CS%id_h_jump_face_u > 0 .or. CS%id_h_jump_face_v > 0 .or. &
+         CS%id_s_jump_face_u > 0 .or. CS%id_s_jump_face_v > 0 .or. &
+         CS%id_un_face_u > 0 .or. CS%id_un_face_v > 0) .and. associated(CS%h_nodal)) then
+      ! Per-face inter-element jump of the broken-Q1 thickness, split onto u-faces
+      ! (Cu) and v-faces (Cv) and reported in both thickness [h] and surface
+      ! elevation [s]. Unlike h_jump_node (max-min over the up-to-4 corners at a
+      ! B-node), this attributes the discontinuity to a single face, so it can be
+      ! correlated against un_face to test whether jumps accumulate at shear-margin
+      ! faces where u.n ~ 0 (the advectively-uncoupled, undamped jump mode).
+      call pass_corner_field(CS%h_nodal, G)
+      call pass_var(CS%bed_node, G%domain, position=CORNER)
+      call pass_vector(CS%u_shelf, CS%v_shelf, G%domain, TO_ALL, BGRID_NE)
+      rr = CS%density_ice / CS%density_ocean_avg
+      hjump_fu(:,:) = 0.0 ; sjump_fu(:,:) = 0.0 ; un_fu(:,:) = 0.0
+      hjump_fv(:,:) = 0.0 ; sjump_fv(:,:) = 0.0 ; un_fv(:,:) = 0.0
+      ! u-faces: minus side = west cell (I,j) east edge, plus side = east cell
+      ! (I+1,j) west edge; endpoint nodes 1=south (I,j-1), 2=north (I,j).
+      do j = G%jsc, G%jec ; do I = G%IscB, G%IecB
+        if (ISS%hmask(I,j) /= 1.0) cycle
+        if (ISS%hmask(I+1,j) /= 1.0) cycle
+        bed1 = CS%bed_node(I,j-1) ; bed2 = CS%bed_node(I,j)
+        h_m1 = CS%h_nodal(I,  j,2,1) ; h_p1 = CS%h_nodal(I+1,j,1,1)
+        h_m2 = CS%h_nodal(I,  j,2,2) ; h_p2 = CS%h_nodal(I+1,j,1,2)
+        s_m1 = merge(h_m1-bed1, (1.0-rr)*h_m1, rr*h_m1-bed1 > 0.0)
+        s_p1 = merge(h_p1-bed1, (1.0-rr)*h_p1, rr*h_p1-bed1 > 0.0)
+        s_m2 = merge(h_m2-bed2, (1.0-rr)*h_m2, rr*h_m2-bed2 > 0.0)
+        s_p2 = merge(h_p2-bed2, (1.0-rr)*h_p2, rr*h_p2-bed2 > 0.0)
+        hjump_fu(I,j) = max(abs(h_m1-h_p1), abs(h_m2-h_p2))
+        sjump_fu(I,j) = max(abs(s_m1-s_p1), abs(s_m2-s_p2))
+        un_fu(I,j) = abs(0.5*(CS%u_shelf(I,j-1) + CS%u_shelf(I,j)))
+      enddo ; enddo
+      ! v-faces: minus side = south cell (i,J) north edge, plus side = north cell
+      ! (i,J+1) south edge; endpoint nodes 1=west (i-1,J), 2=east (i,J).
+      do J = G%JscB, G%JecB ; do i = G%isc, G%iec
+        if (ISS%hmask(i,J) /= 1.0) cycle
+        if (ISS%hmask(i,J+1) /= 1.0) cycle
+        bed1 = CS%bed_node(i-1,J) ; bed2 = CS%bed_node(i,J)
+        h_m1 = CS%h_nodal(i,J,  1,2) ; h_p1 = CS%h_nodal(i,J+1,1,1)
+        h_m2 = CS%h_nodal(i,J,  2,2) ; h_p2 = CS%h_nodal(i,J+1,2,1)
+        s_m1 = merge(h_m1-bed1, (1.0-rr)*h_m1, rr*h_m1-bed1 > 0.0)
+        s_p1 = merge(h_p1-bed1, (1.0-rr)*h_p1, rr*h_p1-bed1 > 0.0)
+        s_m2 = merge(h_m2-bed2, (1.0-rr)*h_m2, rr*h_m2-bed2 > 0.0)
+        s_p2 = merge(h_p2-bed2, (1.0-rr)*h_p2, rr*h_p2-bed2 > 0.0)
+        hjump_fv(i,J) = max(abs(h_m1-h_p1), abs(h_m2-h_p2))
+        sjump_fv(i,J) = max(abs(s_m1-s_p1), abs(s_m2-s_p2))
+        un_fv(i,J) = abs(0.5*(CS%v_shelf(i-1,J) + CS%v_shelf(i,J)))
+      enddo ; enddo
+      if (CS%id_h_jump_face_u > 0) call post_data(CS%id_h_jump_face_u, hjump_fu, CS%diag)
+      if (CS%id_h_jump_face_v > 0) call post_data(CS%id_h_jump_face_v, hjump_fv, CS%diag)
+      if (CS%id_s_jump_face_u > 0) call post_data(CS%id_s_jump_face_u, sjump_fu, CS%diag)
+      if (CS%id_s_jump_face_v > 0) call post_data(CS%id_s_jump_face_v, sjump_fv, CS%diag)
+      if (CS%id_un_face_u > 0) call post_data(CS%id_un_face_u, un_fu, CS%diag)
+      if (CS%id_un_face_v > 0) call post_data(CS%id_un_face_v, un_fv, CS%diag)
     endif
     if (CS%id_h_source_rate > 0 .and. associated(CS%h_source_rate_last)) &
         call post_data(CS%id_h_source_rate, CS%h_source_rate_last, CS%diag)
