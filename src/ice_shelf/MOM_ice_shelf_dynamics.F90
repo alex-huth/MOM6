@@ -452,7 +452,8 @@ type, public :: ice_shelf_dyn_CS ; private
              id_h_nodal_SW = -1, id_h_nodal_SE = -1, id_h_nodal_NW = -1, id_h_nodal_NE = -1, &
              id_h_jump_node = -1, id_h_jump_node_rel = -1, &
              id_h_jump_envelope = -1, id_h_jump_envelope_rel = -1, &
-             id_h_overshoot_node = -1, id_h_overshoot_node_rel = -1, id_h_source_rate = -1, &
+             id_h_overshoot_node = -1, id_h_overshoot_node_rel = -1, &
+             id_s_overshoot_node = -1, id_s_overshoot_node_rel = -1, id_h_source_rate = -1, &
              id_dg_lim_phi_xi = -1, id_dg_lim_phi_eta = -1, id_dg_lim_phi_cross = -1, &
              id_dg_lim_mass_drift = -1, id_dg_lim_phi = -1, id_dg_lim_pk_factor = -1, &
              id_phi_x_FV = -1, id_phi_y_FV = -1, &
@@ -1274,6 +1275,19 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       CS%id_h_overshoot_node_rel = register_diag_field('ice_shelf_model','h_overshoot_node_rel', &
          CS%diag%axesB1, Time, &
          'h_overshoot_node normalised by 0.5*(Hmax_B + Hmin_B).', 'nondim')
+      CS%id_s_overshoot_node = register_diag_field('ice_shelf_model','s_overshoot_node', &
+         CS%diag%axesB1, Time, &
+         'Per-B-node Barth-Jespersen overshoot in the surface-elevation field: max over the '//&
+         'touching DG(1) corner s values of max(0, s_corner - Smax_B, Smin_B - s_corner), with '//&
+         'corner s computed by per-side flotation from h_corner and bed_node, and [Smin_B, '//&
+         'Smax_B] the envelope of cell-mean surfaces (Hbar projected with cell-center bed via '//&
+         'flotation) over the cells touching the node. The s-space analogue of h_overshoot_node: '//&
+         'isolates the driving-stress-relevant spurious surface mode from the harmless '//&
+         'thickness-only overshoot that disappears across the grounding line under flotation.', &
+         'm', conversion=US%Z_to_m)
+      CS%id_s_overshoot_node_rel = register_diag_field('ice_shelf_model','s_overshoot_node_rel', &
+         CS%diag%axesB1, Time, &
+         's_overshoot_node normalised by 0.5*(|Smax_B| + |Smin_B|).', 'nondim')
       CS%id_h_source_rate = register_diag_field('ice_shelf_model','h_source_rate',CS%diag%axesT1, Time, &
          'Cell-mean thickness source rate (basal melt + surface SMB) consumed by the last DG advect step', &
          'm s-1', conversion=US%Z_to_m*US%s_to_T)
@@ -1622,6 +1636,13 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
   real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_env_rel ! Envelope width / mean Hbar [nondim]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: h_over_n     ! BJ-overshoot magnitude at each B-node [Z ~> m]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: h_over_n_rel ! Overshoot normalised by envelope mean [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: Smax_Bd, Smin_Bd ! Per-B-node cell-mean surface envelope [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: s_over_n     ! BJ-overshoot magnitude in s at each B-node [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: s_over_n_rel ! s-overshoot normalised by envelope mean [nondim]
+  real :: cell_mean_s_d                            ! Cell-mean surface contribution [Z ~> m]
+  real :: s_cSW, s_cSE, s_cNW, s_cNE               ! Corner surface elevations at a B-node [Z ~> m]
+  real :: bed_B                                    ! Bed elevation at the B-node, single-valued [Z ~> m]
+  real :: over_b_s                                 ! Per-corner BJ violation in s at a B-node [Z ~> m]
   real :: over_b                                  ! Per-corner BJ-bound violation [Z ~> m]
   real :: h_cSW, h_cSE, h_cNW, h_cNE              ! corner thickness candidates at a B-node [Z ~> m]
   real :: Hb_SW, Hb_SE, Hb_NW, Hb_NE              ! cell-mean thickness for each touching cell [Z ~> m]
@@ -1762,15 +1783,18 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       if (CS%id_h_jump_node_rel > 0) call post_data(CS%id_h_jump_node_rel, h_jump_n_rel, CS%diag)
     endif
     if ((CS%id_h_jump_envelope > 0 .or. CS%id_h_jump_envelope_rel > 0 .or. &
-         CS%id_h_overshoot_node > 0 .or. CS%id_h_overshoot_node_rel > 0) .and. &
+         CS%id_h_overshoot_node > 0 .or. CS%id_h_overshoot_node_rel > 0 .or. &
+         CS%id_s_overshoot_node > 0 .or. CS%id_s_overshoot_node_rel > 0) .and. &
         associated(CS%h_nodal)) then
-      ! Per-B-node cell-mean envelope width Hmax_B - Hmin_B. Reports the
-      ! local roughness of the cell-mean thickness field; useful as a
-      ! smoothness diagnostic regardless of whether any face-jump
-      ! stabilisation is active.
+      ! Per-B-node cell-mean envelope width Hmax_B - Hmin_B and (for s-overshoot)
+      ! the analogous surface envelope [Smin_B, Smax_B], built from the cell-mean
+      ! thickness projected with the cell-center bed under flotation.
       call pass_corner_field(CS%h_nodal, G)
+      rr = CS%density_ice / CS%density_ocean_avg
       Hmax_Bd(:,:) = -H_LARGE_D
       Hmin_Bd(:,:) =  H_LARGE_D
+      Smax_Bd(:,:) = -H_LARGE_D
+      Smin_Bd(:,:) =  H_LARGE_D
       count_Bd(:,:) = 0.0
       do j = G%jsd, G%jed ; do i = G%isd, G%ied
         if (ISS%hmask(i,j) == 1.0) then
@@ -1780,29 +1804,44 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         else
           cycle
         endif
+        if (rr*cell_mean_val_d - CS%bed_elev(i,j) > 0.0) then
+          cell_mean_s_d = cell_mean_val_d - CS%bed_elev(i,j)
+        else
+          cell_mean_s_d = (1.0 - rr)*cell_mean_val_d
+        endif
         if (i-1 >= G%IsdB .and. j-1 >= G%JsdB) then
           Hmax_Bd(i-1, j-1) = max(Hmax_Bd(i-1, j-1), cell_mean_val_d)
           Hmin_Bd(i-1, j-1) = min(Hmin_Bd(i-1, j-1), cell_mean_val_d)
+          Smax_Bd(i-1, j-1) = max(Smax_Bd(i-1, j-1), cell_mean_s_d)
+          Smin_Bd(i-1, j-1) = min(Smin_Bd(i-1, j-1), cell_mean_s_d)
           count_Bd(i-1, j-1) = count_Bd(i-1, j-1) + 1.0
         endif
         if (i <= G%IedB .and. j-1 >= G%JsdB) then
           Hmax_Bd(i,   j-1) = max(Hmax_Bd(i,   j-1), cell_mean_val_d)
           Hmin_Bd(i,   j-1) = min(Hmin_Bd(i,   j-1), cell_mean_val_d)
+          Smax_Bd(i,   j-1) = max(Smax_Bd(i,   j-1), cell_mean_s_d)
+          Smin_Bd(i,   j-1) = min(Smin_Bd(i,   j-1), cell_mean_s_d)
           count_Bd(i,   j-1) = count_Bd(i,   j-1) + 1.0
         endif
         if (i-1 >= G%IsdB .and. j <= G%JedB) then
           Hmax_Bd(i-1, j  ) = max(Hmax_Bd(i-1, j  ), cell_mean_val_d)
           Hmin_Bd(i-1, j  ) = min(Hmin_Bd(i-1, j  ), cell_mean_val_d)
+          Smax_Bd(i-1, j  ) = max(Smax_Bd(i-1, j  ), cell_mean_s_d)
+          Smin_Bd(i-1, j  ) = min(Smin_Bd(i-1, j  ), cell_mean_s_d)
           count_Bd(i-1, j  ) = count_Bd(i-1, j  ) + 1.0
         endif
         if (i <= G%IedB .and. j <= G%JedB) then
           Hmax_Bd(i,   j  ) = max(Hmax_Bd(i,   j  ), cell_mean_val_d)
           Hmin_Bd(i,   j  ) = min(Hmin_Bd(i,   j  ), cell_mean_val_d)
+          Smax_Bd(i,   j  ) = max(Smax_Bd(i,   j  ), cell_mean_s_d)
+          Smin_Bd(i,   j  ) = min(Smin_Bd(i,   j  ), cell_mean_s_d)
           count_Bd(i,   j  ) = count_Bd(i,   j  ) + 1.0
         endif
       enddo ; enddo
       call pass_var(Hmax_Bd,  G%domain, position=CORNER)
       call pass_var(Hmin_Bd,  G%domain, position=CORNER)
+      call pass_var(Smax_Bd,  G%domain, position=CORNER)
+      call pass_var(Smin_Bd,  G%domain, position=CORNER)
       call pass_var(count_Bd, G%domain, position=CORNER)
       h_jump_env(:,:)     = 0.0
       h_jump_env_rel(:,:) = 0.0
@@ -1849,6 +1888,55 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         enddo ; enddo
         if (CS%id_h_overshoot_node     > 0) call post_data(CS%id_h_overshoot_node,     h_over_n,     CS%diag)
         if (CS%id_h_overshoot_node_rel > 0) call post_data(CS%id_h_overshoot_node_rel, h_over_n_rel, CS%diag)
+      endif
+      ! BJ-overshoot in the surface-elevation field. Corner s computed by per-side
+      ! flotation from h_corner and the B-node bed (single-valued at the node, so all
+      ! co-located corners share bed_B), then compared against the cell-mean s envelope.
+      ! Discriminator for the driving-stress-relevant spurious surface mode: small
+      ! s-overshoot with large h-overshoot is the harmless flotation-only effect, large
+      ! s-overshoot is a real spurious surface oscillation that corrupts driving stress.
+      if (CS%id_s_overshoot_node > 0 .or. CS%id_s_overshoot_node_rel > 0) then
+        call pass_var(CS%bed_node, G%domain, position=CORNER)
+        s_over_n(:,:)     = 0.0
+        s_over_n_rel(:,:) = 0.0
+        do J = G%JscB, G%JecB ; do I = G%IscB, G%IecB
+          if (count_Bd(I,J) < 1.5) cycle
+          if (Smax_Bd(I,J) <= -H_LARGE_D + 1.0 .or. Smin_Bd(I,J) >= H_LARGE_D - 1.0) cycle
+          bed_B = CS%bed_node(I,J)
+          ii = I   ; jj = J     ; vSW = (ISS%hmask(ii,jj) == 1.0)
+          s_cSW = 0.0
+          if (vSW) then
+            h_cSW = CS%h_nodal(ii,jj,2,2)
+            s_cSW = merge(h_cSW - bed_B, (1.0 - rr)*h_cSW, rr*h_cSW - bed_B > 0.0)
+          endif
+          ii = I+1 ; jj = J     ; vSE = (ISS%hmask(ii,jj) == 1.0)
+          s_cSE = 0.0
+          if (vSE) then
+            h_cSE = CS%h_nodal(ii,jj,1,2)
+            s_cSE = merge(h_cSE - bed_B, (1.0 - rr)*h_cSE, rr*h_cSE - bed_B > 0.0)
+          endif
+          ii = I   ; jj = J+1   ; vNW = (ISS%hmask(ii,jj) == 1.0)
+          s_cNW = 0.0
+          if (vNW) then
+            h_cNW = CS%h_nodal(ii,jj,2,1)
+            s_cNW = merge(h_cNW - bed_B, (1.0 - rr)*h_cNW, rr*h_cNW - bed_B > 0.0)
+          endif
+          ii = I+1 ; jj = J+1   ; vNE = (ISS%hmask(ii,jj) == 1.0)
+          s_cNE = 0.0
+          if (vNE) then
+            h_cNE = CS%h_nodal(ii,jj,1,1)
+            s_cNE = merge(h_cNE - bed_B, (1.0 - rr)*h_cNE, rr*h_cNE - bed_B > 0.0)
+          endif
+          over_b_s = 0.0
+          if (vSW) over_b_s = max(over_b_s, s_cSW - Smax_Bd(I,J), Smin_Bd(I,J) - s_cSW)
+          if (vSE) over_b_s = max(over_b_s, s_cSE - Smax_Bd(I,J), Smin_Bd(I,J) - s_cSE)
+          if (vNW) over_b_s = max(over_b_s, s_cNW - Smax_Bd(I,J), Smin_Bd(I,J) - s_cNW)
+          if (vNE) over_b_s = max(over_b_s, s_cNE - Smax_Bd(I,J), Smin_Bd(I,J) - s_cNE)
+          s_over_n(I,J)     = over_b_s
+          s_over_n_rel(I,J) = over_b_s / max(CS%min_h_shelf, 0.5*(abs(Smax_Bd(I,J)) + abs(Smin_Bd(I,J))))
+        enddo ; enddo
+        if (CS%id_s_overshoot_node     > 0) call post_data(CS%id_s_overshoot_node,     s_over_n,     CS%diag)
+        if (CS%id_s_overshoot_node_rel > 0) call post_data(CS%id_s_overshoot_node_rel, s_over_n_rel, CS%diag)
       endif
     endif
     if ((CS%id_h_jump_face_u > 0 .or. CS%id_h_jump_face_v > 0 .or. &
@@ -9885,8 +9973,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: rel_jump           ! |[[h]]| / H_ref at a face QP [nondim]
   real :: coef_face          ! Per-face viscosity coefficient incl. shock-capturing amp [nondim]
   real :: coef_face_max      ! Per-face CFL-based upper cap on coef_face [nondim]
-  real :: dh_eq              ! Driving jump for the viscosity: (h_B-h_A), or its well-balanced [Z ~> m]
-                             ! surface-jump equivalent when DG1_ART_VISC_WELL_BALANCED is set.
+  real :: dh_eq              ! Well-balanced equivalent thickness jump (surface-jump-derived) [Z ~> m]
+                             ! driving the viscosity flux.
   real :: bed_qp             ! Bed elevation at a face QP [Z ~> m]
   real :: rhoi_rhow_wb       ! Ice/ocean density ratio for the well-balanced jump [nondim]
   real :: u_floor_qp         ! Strain-rate-scaled velocity-independent floor at a face QP [L T-1 ~> m s-1]
