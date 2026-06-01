@@ -311,8 +311,8 @@ type, public :: ice_shelf_dyn_CS ; private
   real :: dg_art_visc_c_max       !< Peak dimensionless coefficient on the DG(1) artificial-
                                   !! viscosity face flux at fully-shocky faces [nondim].
                                   !! Face coefficient ramps from 0 (smooth) to c_max (shocky)
-                                  !! via the jump-decay smoothness indicator
-                                  !! r_face = |Delta h_eq| / (H_ref * dx_perp): smooth faces
+                                  !! via the relative-jump smoothness indicator
+                                  !! r_face = |Delta h_eq| / H_ref: smooth faces
                                   !! receive ~0 damping (preserving optimal mesh convergence
                                   !! on smooth solutions); shocky faces receive c_max scaled
                                   !! by the advective speed + strain-rate floor. c_max = 0
@@ -8744,8 +8744,8 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "Peak dimensionless coefficient on the DG(1) artificial-viscosity face "//&
                  "flux at fully-shocky faces. Face coefficient ramps from 0 (smooth) to "//&
                  "c_max (shocky) via the smoothness indicator r_face = |Delta h_eq| / "//&
-                 "(H_ref * dx_perp), which scales as O(dx) on smooth solutions and "//&
-                 "O(1/dx) at genuine discontinuities. Smooth regions therefore receive "//&
+                 "H_ref, which scales as O(dx^2) on smooth solutions and O(1) at "//&
+                 "genuine discontinuities. Smooth regions therefore receive "//&
                  "~0 damping, preserving optimal O(dx^2) mesh convergence; only shocky "//&
                  "faces dissipate. c_max = 0 disables the viscosity. Typical 0.5-2.0. "//&
                  "An automatic per-cell CFL bound (kcell/dt with kcell = 0.5) scales "//&
@@ -9943,7 +9943,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: visc_flux_qp       ! Artificial-viscosity face flux per QP, antisymmetric [Z L2 T-1]
   real :: Hbar_A, Hbar_B     ! Cell-mean thickness on the two sides of a DG face [Z ~> m]
   real :: H_ref              ! Reference thickness for the smoothness ratio [Z ~> m]
-  real :: r_face             ! Jump-decay smoothness ratio |Delta h_eq|/(H_ref*dx_perp) [nondim]
+  real :: r_face             ! Smoothness ratio |Delta h_eq|/H_ref [nondim]
   real :: sigma_face         ! Piecewise-linear smoothness ramp sigma(r_face) in [0,1] [nondim]
   real :: dx_perp            ! Across-face length scale at the current face [L ~> m]
   real :: coef_face          ! Per-face viscosity coefficient post smoothness gate [nondim]
@@ -9966,8 +9966,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
                                          ! flux (hmask==1 interior, or hmask==3
                                          ! Dirichlet thickness BC used one-sided).
   ! Module-internal constants for the smoothness gate and per-cell CFL bound. Held
-  ! fixed because the indicator is dx-invariant by construction: r_face = O(dx) on
-  ! smooth solutions and O(1/dx) at discontinuities, so the same (r_lo, r_hi) gate
+  ! fixed because the indicator is dx-invariant by construction: r_face = O(dx^2)
+  ! on smooth solutions and O(1) at discontinuities, so the same (r_lo, r_hi) gate
   ! works across resolutions. kcell is the SSP-RK2 per-cell semi-discrete-diffusion
   ! stability budget. c_min = 0 (no baseline damping) preserves O(dx^2) mesh
   ! convergence in smooth regions.
@@ -10097,7 +10097,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   ! the surface jump, so a hydrostatically-continuous grounding line is not damped.
   ! c_face = c_min + (c_max - c_min) * sigma(r_face) ramps from 0 in smooth regions
   ! to c_max at shocks, where r_face = |Delta h_eq|/(H_ref*dx_perp) is the dx-
-  ! normalised jump-decay smoothness indicator: O(dx) smooth, O(1/dx) at jumps.
+  ! relative-jump smoothness indicator: O(dx^2) smooth, O(1) at jumps.
   ! u_eff = |u_face| + strain_coef*eps_e*dx_perp covers both advective and
   ! deformation-driven excitation of the broken-Q1 mode. A per-cell SSP-RK2
   ! semi-discrete-diffusion CFL budget (kcell/dt) scales all faces of any cell
@@ -10204,7 +10204,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         u_mag_face_max = max(u_mag_face_max, u_mag_qp)
       enddo
 
-      r_face = dh_eq_face_max / (H_ref * dx_perp)
+      r_face = dh_eq_face_max / H_ref
       if (r_face <= dg_art_visc_r_lo) then
         sigma_face = 0.0
       elseif (r_face >= dg_art_visc_r_hi) then
@@ -10364,7 +10364,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         u_mag_face_max = max(u_mag_face_max, u_mag_qp)
       enddo
 
-      r_face = dh_eq_face_max / (H_ref * dx_perp)
+      r_face = dh_eq_face_max / H_ref
       if (r_face <= dg_art_visc_r_lo) then
         sigma_face = 0.0
       elseif (r_face >= dg_art_visc_r_hi) then
