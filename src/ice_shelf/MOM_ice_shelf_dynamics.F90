@@ -260,6 +260,14 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! thickness corners between RK stages.
                                   !! Mass is preserved exactly via orthogonalised
                                   !! mode templates against cell_mean_w.
+  logical :: dg_lim_front_only    !< If true, restrict the hierarchical limiter
+                                  !! to cells touching at least one non-ice
+                                  !! (hmask != 1 and hmask != 3) cardinal
+                                  !! neighbour. Interior cells run unlimited,
+                                  !! preserving DG(1) accuracy; front cells get
+                                  !! the limiter to constrain the broken-Q1 mode
+                                  !! that amplifies at calving boundaries where
+                                  !! 3+ neighbours are hmask=0.
   logical :: dg_lim_isotropic     !< If true (and dg_hierarchical_lim is also true),
                                   !! use isotropic single-phi Zhang-Shu MPP scaling
                                   !! with Park-Kim MLP-u2 vertex-based envelopes
@@ -8759,6 +8767,19 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  default=.false., do_not_log=(.not.CS%use_DG_thickness .or. &
                                               .not.CS%dg_hierarchical_lim))
 
+  call get_param(param_file, mdl, "DG1_LIMITER_FRONT_ONLY", CS%dg_lim_front_only, &
+                 "If true (and DG1_HIERARCHICAL_LIMITER is also true), apply the limiter "//&
+                 "only at cells that touch at least one non-ice cardinal neighbour "//&
+                 "(hmask != 1 and != 3). Interior cells with 4 ice neighbours run "//&
+                 "unlimited, preserving full DG(1) accuracy on the bulk of the domain. "//&
+                 "Targets the broken-Q1 mode amplification at calving fronts and isolated "//&
+                 "few-connected cells where the limiter has no neighbour bound on the "//&
+                 "open sides and the mode runs free. Front cells (including any cell that "//&
+                 "becomes a front cell as the ice front advances) get the limiter "//&
+                 "automatically.", &
+                 default=.false., do_not_log=(.not.CS%use_DG_thickness .or. &
+                                              .not.CS%dg_hierarchical_lim))
+
   call get_param(param_file, mdl, "DG1_VENKAT_K", CS%dg_venkat_K, &
                  "Venkatakrishnan-style gradient-proportional slack coefficient added "//&
                  "to the surface-slope limiter envelope. Adds K*(|dS/dx|+|dS/dy|)/4 to "//&
@@ -9772,6 +9793,14 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
   ! 4) Per-cell isotropic limit on s, reconstruct h, mass-fix uniform shift.
   do j = G%jsc, G%jec ; do i = G%isc, G%iec
     if (ISS%hmask(i,j) /= 1.0) cycle
+    if (CS%dg_lim_front_only) then
+      ! Front cell = at least one cardinal neighbour is not active ice and not a
+      ! Dirichlet thickness BC. Limit only these; full DG(1) accuracy elsewhere.
+      if ((ISS%hmask(i-1,j) == 1.0 .or. ISS%hmask(i-1,j) == 3.0) .and. &
+          (ISS%hmask(i+1,j) == 1.0 .or. ISS%hmask(i+1,j) == 3.0) .and. &
+          (ISS%hmask(i,j-1) == 1.0 .or. ISS%hmask(i,j-1) == 3.0) .and. &
+          (ISS%hmask(i,j+1) == 1.0 .or. ISS%hmask(i,j+1) == 3.0)) cycle
+    endif
 
     ! Snapshot pre-limit h-cell-mean for the mass-fix shift below.
     Hbar_old = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
