@@ -308,38 +308,15 @@ type, public :: ice_shelf_dyn_CS ; private
                                                               !! grants full slack; 0 where the
                                                               !! check rejects and strict MLP-u2
                                                               !! bounds apply.
-  logical :: dg_art_visc          !< If true, add an artificial-viscosity face term
-                                  !! +nu_face * (h_B - h_A) / dx_perp * dy at each
-                                  !! interior DG face. With nu_face = coef*dx_perp*|u_face|
-                                  !! the dx_perp factor cancels, leaving an antisymmetric
-                                  !! face flux gw*coef*|u_face|*(h_B-h_A)*dy distributed
-                                  !! conservatively to the two adjacent cells.
-                                  !! Diffuses DG face jumps over time while preserving
-                                  !! the in-cell Q1 slope. Differs from a jump penalty
-                                  !! tau~|u.n|: |u_face|=sqrt(u^2+v^2) so the term still
-                                  !! damps jumps at shear-margin faces where u.n~=0.
-  real :: dg_art_visc_coef        !< Dimensionless coefficient on the DG(1) artificial
-                                  !! viscosity face flux [nondim]. nu_face = coef *
-                                  !! dx_perp * |u_face|. coef = 0 disables the viscosity;
-                                  !! coef -> infinity drives the face jump toward zero
-                                  !! (stabilised-CG limit). Typical values 0.01-0.1.
-  real :: dg_art_visc_gamma       !< Shock-capturing amplification of the artificial
-                                  !! viscosity coefficient [nondim]. coef_face is
-                                  !! multiplied by (1 + gamma * max(0, |[[h]]|/H_ref -
-                                  !! threshold)), where H_ref is the average cell-mean
-                                  !! thickness over the two cells touching the face.
-                                  !! gamma = 0 gives the plain linear viscosity; gamma > 0
-                                  !! leaves smooth faces near coef while strongly amplifying
-                                  !! at faces where the relative jump exceeds threshold.
-  real :: dg_art_visc_thresh      !< Relative-jump threshold at which the shock-capturing
-                                  !! amplification activates [nondim]. Faces with
-                                  !! |[[h]]|/H_ref below this value receive no amplification.
-  real :: dg_art_visc_cfl_safety  !< Safety fraction of the per-face CFL bound used as
-                                  !! an on-the-fly upper cap on the gated artificial-
-                                  !! viscosity coefficient [nondim]. Per-face cap is
-                                  !! coef_face_max = safety * dx_perp / (u_eff * dt) where
-                                  !! u_eff = |u_face| + u_floor. Active when
-                                  !! DG1_ART_VISC_GAMMA > 0 or DG1_ART_VISC_STRAIN_COEF > 0.
+  real :: dg_art_visc_c_max       !< Peak dimensionless coefficient on the DG(1) artificial-
+                                  !! viscosity face flux at fully-shocky faces [nondim].
+                                  !! Face coefficient ramps from 0 (smooth) to c_max (shocky)
+                                  !! via the jump-decay smoothness indicator
+                                  !! r_face = |Delta h_eq| / (H_ref * dx_perp): smooth faces
+                                  !! receive ~0 damping (preserving optimal mesh convergence
+                                  !! on smooth solutions); shocky faces receive c_max scaled
+                                  !! by the advective speed + strain-rate floor. c_max = 0
+                                  !! disables the viscosity entirely. Typical 0.5-2.0.
   real :: dg_art_visc_strain_coef !< Dimensionless coefficient on the velocity-independent
                                   !! strain-rate-scaled diffusivity floor for the DG(1)
                                   !! artificial viscosity [nondim]. Per-face floor velocity is
@@ -350,6 +327,16 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! interior faces where |u_face| ~ 0 but strain rate is
                                   !! nonzero. strain_coef = 0 (default) recovers the pure
                                   !! velocity-magnitude scaling.
+  real :: dg_slow_idle_u_tiny     !< Stagnant-jump diagnostic threshold on face-speed
+                                  !! magnitude [L T-1]. A face is flagged if |u_face| <
+                                  !! this value AND eps_e_face < eps_tiny AND |Delta h_eq|
+                                  !! > s_tol; persistent flags mark regions where neither
+                                  !! the |u| nor the strain-rate term damps the jump mode.
+  real :: dg_slow_idle_eps_tiny   !< Stagnant-jump diagnostic threshold on face strain rate
+                                  !! [T-1]. See dg_slow_idle_u_tiny.
+  real :: dg_slow_idle_s_tol      !< Stagnant-jump diagnostic threshold on |Delta h_eq|
+                                  !! (well-balanced thickness-equivalent surface jump) [Z].
+                                  !! See dg_slow_idle_u_tiny.
   logical :: dg_driving_stress_IBP !< If true, the DG(1) driving stress uses the
                                   !! integration-by-parts weak form with central P*
                                   !! (= 1/2(P_loc + P_ngh)) at interior faces. If false
@@ -458,17 +445,30 @@ type, public :: ice_shelf_dyn_CS ; private
              id_dg_lim_mass_drift = -1, id_dg_lim_phi = -1, id_dg_lim_pk_factor = -1, &
              id_phi_x_FV = -1, id_phi_y_FV = -1, &
              id_dg_art_visc_coef_u = -1, id_dg_art_visc_coef_v = -1, &
+             id_dg_slow_idle_face_u = -1, id_dg_slow_idle_face_v = -1, &
              id_h_jump_face_u = -1, id_h_jump_face_v = -1, &
              id_s_jump_face_u = -1, id_s_jump_face_v = -1, &
              id_un_face_u = -1, id_un_face_v = -1
   real, pointer, dimension(:,:) :: dg_art_visc_coef_u => NULL() !< Per-face DG(1) artificial-
                                                        !! viscosity coefficient on u-faces
-                                                       !! [nondim], stored as the max over
-                                                       !! the 2 face Gauss points from the
-                                                       !! last spatial-operator call.
-                                                       !! Diagnostic only.
+                                                       !! [nondim] (post per-cell CFL
+                                                       !! scaling), from the last spatial-
+                                                       !! operator call. Diagnostic only.
   real, pointer, dimension(:,:) :: dg_art_visc_coef_v => NULL() !< As dg_art_visc_coef_u but
                                                        !! on v-faces [nondim].
+  real, pointer, dimension(:,:) :: dg_slow_idle_face_u => NULL() !< Stagnant-jump indicator on
+                                                       !! u-faces [nondim, 0 or 1]. 1 where
+                                                       !! |u_face| < u_tiny AND eps_e_face
+                                                       !! < eps_tiny AND |Delta h_eq| > s_tol
+                                                       !! at the last spatial-operator call,
+                                                       !! flagging faces where neither the
+                                                       !! advective nor the strain-rate
+                                                       !! damping channel acts. Persistent
+                                                       !! non-zero values indicate that a
+                                                       !! constant velocity-floor B1 may
+                                                       !! be warranted.
+  real, pointer, dimension(:,:) :: dg_slow_idle_face_v => NULL() !< As dg_slow_idle_face_u but
+                                                       !! on v-faces [nondim, 0 or 1].
   real, pointer, dimension(:,:) :: phi_x_FV => NULL() !< Van Leer slope-limiter factor at each u-face
                                                        !! from ice_shelf_advect_thickness_x [nondim],
                                                        !! in [0,2]. Faces where the limiter branch was
@@ -624,6 +624,8 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%phi_y_FV(isd:ied,JsdB:JedB), source=1.0)
     allocate(CS%dg_art_visc_coef_u(IsdB:IedB,jsd:jed), source=0.0)
     allocate(CS%dg_art_visc_coef_v(isd:ied,JsdB:JedB), source=0.0)
+    allocate(CS%dg_slow_idle_face_u(IsdB:IedB,jsd:jed), source=0.0)
+    allocate(CS%dg_slow_idle_face_v(isd:ied,JsdB:JedB), source=0.0)
     allocate(CS%mu_lim_xi(isd:ied,jsd:jed),    source=0.0)
     allocate(CS%mu_lim_eta(isd:ied,jsd:jed),   source=0.0)
     allocate(CS%mu_lim_cross(isd:ied,jsd:jed), source=0.0)
@@ -1293,13 +1295,24 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          'm s-1', conversion=US%Z_to_m*US%s_to_T)
       CS%id_dg_art_visc_coef_u = register_diag_field('ice_shelf_model','dg_art_visc_coef_u', &
          CS%diag%axesCu1, Time, &
-         'Per-face DG(1) artificial-viscosity coefficient on u-faces (max over the 2 face '//&
-         'Gauss points from the last spatial-operator call). Shows where shock-capturing '//&
-         'amplification fires and where the CFL cap is binding.', 'nondim')
+         'Per-face DG(1) artificial-viscosity coefficient on u-faces (post per-cell CFL '//&
+         'scaling) from the last spatial-operator call. Smooth faces report ~0 (smoothness '//&
+         'gate off); shocky faces report up to DG1_ART_VISC_C_MAX; cells whose summed face '//&
+         'rates would exceed the per-cell stability budget are scaled below c_max.', 'nondim')
       CS%id_dg_art_visc_coef_v = register_diag_field('ice_shelf_model','dg_art_visc_coef_v', &
          CS%diag%axesCv1, Time, &
-         'Per-face DG(1) artificial-viscosity coefficient on v-faces (max over the 2 face '//&
-         'Gauss points from the last spatial-operator call).', 'nondim')
+         'Per-face DG(1) artificial-viscosity coefficient on v-faces. See dg_art_visc_coef_u.', &
+         'nondim')
+      CS%id_dg_slow_idle_face_u = register_diag_field('ice_shelf_model','dg_slow_idle_face_u', &
+         CS%diag%axesCu1, Time, &
+         'DG(1) stagnant-jump indicator on u-faces (0 or 1). 1 where |u_face| and the SSA '//&
+         'effective strain rate are both below internal tiny thresholds while the well-'//&
+         'balanced equivalent jump exceeds a tolerance. Diagnostic for whether the '//&
+         'velocity-magnitude + strain-rate damping channels both starve simultaneously; '//&
+         'persistent non-zero values motivate adding a constant velocity floor.', 'nondim')
+      CS%id_dg_slow_idle_face_v = register_diag_field('ice_shelf_model','dg_slow_idle_face_v', &
+         CS%diag%axesCv1, Time, &
+         'DG(1) stagnant-jump indicator on v-faces. See dg_slow_idle_face_u.', 'nondim')
       CS%id_h_jump_face_u = register_diag_field('ice_shelf_model','h_jump_face_u', &
          CS%diag%axesCu1, Time, &
          'DG(1) broken-Q1 thickness jump across u-faces (max |[h]| over the 2 face nodes). '//&
@@ -2015,6 +2028,10 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_art_visc_coef_u, CS%dg_art_visc_coef_u, CS%diag)
     if (CS%id_dg_art_visc_coef_v > 0 .and. associated(CS%dg_art_visc_coef_v)) &
         call post_data(CS%id_dg_art_visc_coef_v, CS%dg_art_visc_coef_v, CS%diag)
+    if (CS%id_dg_slow_idle_face_u > 0 .and. associated(CS%dg_slow_idle_face_u)) &
+        call post_data(CS%id_dg_slow_idle_face_u, CS%dg_slow_idle_face_u, CS%diag)
+    if (CS%id_dg_slow_idle_face_v > 0 .and. associated(CS%dg_slow_idle_face_v)) &
+        call post_data(CS%id_dg_slow_idle_face_v, CS%dg_slow_idle_face_v, CS%diag)
     if (CS%id_u_mask > 0) call post_data(CS%id_u_mask, CS%umask, CS%diag)
     if (CS%id_v_mask > 0) call post_data(CS%id_v_mask, CS%vmask, CS%diag)
     if (CS%id_ufb_mask > 0) call post_data(CS%id_ufb_mask, CS%u_face_mask_bdry, CS%diag)
@@ -6538,6 +6555,8 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%phi_y_FV)) deallocate(CS%phi_y_FV)
   if (associated(CS%dg_art_visc_coef_u)) deallocate(CS%dg_art_visc_coef_u)
   if (associated(CS%dg_art_visc_coef_v)) deallocate(CS%dg_art_visc_coef_v)
+  if (associated(CS%dg_slow_idle_face_u)) deallocate(CS%dg_slow_idle_face_u)
+  if (associated(CS%dg_slow_idle_face_v)) deallocate(CS%dg_slow_idle_face_v)
   if (allocated(CS%mu_lim_xi))    deallocate(CS%mu_lim_xi)
   if (allocated(CS%mu_lim_eta))   deallocate(CS%mu_lim_eta)
   if (allocated(CS%mu_lim_cross)) deallocate(CS%mu_lim_cross)
@@ -8721,81 +8740,35 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  units="nondim", default=1.0, &
                  do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_hierarchical_lim))
 
-  call get_param(param_file, mdl, "DG1_ART_VISC", CS%dg_art_visc, &
-                 "If true, add an artificial-viscosity face term to the DG(1) nodal "//&
-                 "spatial operator. Per interior face, distributes the antisymmetric "//&
-                 "flux gw*coef*|u_face|*(h_B-h_A)*dy to the two adjacent cells, where "//&
-                 "|u_face| = sqrt(u^2+v^2) at each face Gauss point. Diffuses inter-cell "//&
-                 "DG face jumps while preserving the in-cell Q1 slope used by the "//&
-                 "subgrid driving stress. Conservative across each face pair. Unlike "//&
-                 "a normal-velocity jump penalty (tau~|u.n|), the magnitude scaling "//&
-                 "still damps jumps at shear-margin faces where u.n~=0. coef -> "//&
-                 "infinity recovers a stabilised-CG-like behaviour; coef = 0 disables "//&
-                 "the viscosity and the DG advection runs with only the natural "//&
-                 "upwind dissipation.", &
-                 default=.false., do_not_log=.not.CS%use_DG_thickness)
-
-  call get_param(param_file, mdl, "DG1_ART_VISC_COEF", CS%dg_art_visc_coef, &
-                 "Dimensionless coefficient on the DG(1) artificial-viscosity face flux. "//&
-                 "Face viscosity nu_face = coef*dx_perp*|u_face|; the dx_perp cancels "//&
-                 "with the discrete Laplacian denominator so the face flux reduces to "//&
-                 "gw*coef*|u_face|*(h_B-h_A)*dy. Typical values 0.01-0.1; larger values "//&
-                 "give stronger jump dissipation and approach stabilised-CG behaviour.", &
-                 units="nondim", default=0.05, &
-                 do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_art_visc))
-
-  call get_param(param_file, mdl, "DG1_ART_VISC_GAMMA", CS%dg_art_visc_gamma, &
-                 "Shock-capturing amplification on the DG(1) artificial viscosity. The "//&
-                 "face coefficient is multiplied by (1 + gamma * max(0, |[[h]]|/H_ref - "//&
-                 "threshold)), where H_ref is the average cell-mean thickness over the "//&
-                 "two cells touching the face. gamma = 0 (default) recovers the plain "//&
-                 "linear viscosity. gamma > 0 leaves smooth faces near coef while "//&
-                 "strongly amplifying at faces where the relative jump exceeds "//&
-                 "DG1_ART_VISC_THRESHOLD. Typical values 5-20.", &
+  call get_param(param_file, mdl, "DG1_ART_VISC_C_MAX", CS%dg_art_visc_c_max, &
+                 "Peak dimensionless coefficient on the DG(1) artificial-viscosity face "//&
+                 "flux at fully-shocky faces. Face coefficient ramps from 0 (smooth) to "//&
+                 "c_max (shocky) via the smoothness indicator r_face = |Delta h_eq| / "//&
+                 "(H_ref * dx_perp), which scales as O(dx) on smooth solutions and "//&
+                 "O(1/dx) at genuine discontinuities. Smooth regions therefore receive "//&
+                 "~0 damping, preserving optimal O(dx^2) mesh convergence; only shocky "//&
+                 "faces dissipate. c_max = 0 disables the viscosity. Typical 0.5-2.0. "//&
+                 "An automatic per-cell CFL bound (kcell/dt with kcell = 0.5) scales "//&
+                 "all faces of any cell whose summed face rates would exceed the SSP-"//&
+                 "RK2 semi-discrete-diffusion stability budget.", &
                  units="nondim", default=0.0, &
-                 do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_art_visc))
-
-  call get_param(param_file, mdl, "DG1_ART_VISC_THRESHOLD", CS%dg_art_visc_thresh, &
-                 "Relative-jump threshold at which the DG(1) artificial-viscosity "//&
-                 "shock-capturing amplification activates. Faces with |[[h]]|/H_ref "//&
-                 "below this value receive no extra amplification beyond the linear "//&
-                 "coef term. Has no effect when DG1_ART_VISC_GAMMA = 0. Typical 0.05-0.2.", &
-                 units="nondim", default=0.1, &
-                 do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_art_visc &
-                             .or. CS%dg_art_visc_gamma == 0.0))
+                 do_not_log=.not.CS%use_DG_thickness)
 
   call get_param(param_file, mdl, "DG1_ART_VISC_STRAIN_COEF", CS%dg_art_visc_strain_coef, &
                  "Dimensionless coefficient on a velocity-independent strain-rate-scaled "//&
                  "diffusivity floor for the DG(1) artificial viscosity. Per face, "//&
                  "u_floor = strain_coef * eps_e_face * dx_perp is added to |u_face| in "//&
-                 "the antisymmetric face flux, where eps_e_face = sqrt(eps_xx^2 + "//&
-                 "eps_yy^2 + eps_xx*eps_yy + eps_xy^2) is the 2D SSA effective strain "//&
-                 "rate at the face midpoint. Fills the low-velocity / shear-margin hole "//&
-                 "in the pure |u_face| scaling: jumps are still damped where |u_face| -> "//&
-                 "0 but the strain rate is large (the failure mode where the broken-Q1 "//&
-                 "jump mode is excited by stretching but advectively uncoupled across "//&
-                 "the face). strain_coef = 0 (default) disables the floor and recovers "//&
-                 "the pure |u_face| scaling. Typical values 0.05-0.5 give shear-margin "//&
-                 "damping comparable to the linear coef at advective faces. The CFL cap "//&
-                 "(DG1_ART_VISC_CFL_SAFETY) auto-activates when strain_coef > 0 to bound "//&
-                 "the floor contribution.", &
+                 "the face flux, where eps_e_face is the 2D SSA second invariant at the "//&
+                 "face midpoint. Closes the shear-margin failure mode of pure |u_face| "//&
+                 "scaling (jumps excited by stretching but advectively uncoupled across "//&
+                 "the face). strain_coef = 0 (default) disables the floor. Typical 0.05-0.5.", &
                  units="nondim", default=0.0, &
-                 do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_art_visc))
+                 do_not_log=(.not.CS%use_DG_thickness .or. CS%dg_art_visc_c_max == 0.0))
 
-  call get_param(param_file, mdl, "DG1_ART_VISC_CFL_SAFETY", CS%dg_art_visc_cfl_safety, &
-                 "Safety fraction of the per-face CFL bound used as an on-the-fly upper "//&
-                 "cap on the artificial-viscosity coefficient. Per face, the cap is "//&
-                 "coef_face_max = safety * dx_perp / (u_eff * dt), where u_eff = "//&
-                 "|u_face| + u_floor, derived from the SSP-RK2 stability bound K*dt < 2 "//&
-                 "with K = 2*coef*u_eff/dx_perp. safety < 1 ensures CFL stability; "//&
-                 "smaller values (e.g. 0.1-0.25) also guard against the SSA-coupling "//&
-                 "positive-feedback that destabilises the scheme well below the strict "//&
-                 "CFL bound. Active when DG1_ART_VISC_GAMMA > 0 or "//&
-                 "DG1_ART_VISC_STRAIN_COEF > 0.", &
-                 units="nondim", default=0.25, &
-                 do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_art_visc &
-                             .or. (CS%dg_art_visc_gamma == 0.0 .and. &
-                                   CS%dg_art_visc_strain_coef == 0.0)))
+  ! Stagnant-jump diagnostic thresholds. Internal constants, not user knobs.
+  CS%dg_slow_idle_u_tiny   = 1.0e-9  * US%m_s_to_L_T
+  CS%dg_slow_idle_eps_tiny = 1.0e-12 * US%s_to_T
+  CS%dg_slow_idle_s_tol    = 1.0     * US%m_to_Z
 
   call get_param(param_file, mdl, "DG_DRIVING_STRESS_IBP", CS%dg_driving_stress_IBP, &
                  "If true, evaluate the DG(1) driving stress with the integration-by-parts "//&
@@ -9969,10 +9942,14 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: u_mag_qp           ! Velocity magnitude sqrt(u^2+v^2) at a face QP [L T-1 ~> m s-1]
   real :: visc_flux_qp       ! Artificial-viscosity face flux per QP, antisymmetric [Z L2 T-1]
   real :: Hbar_A, Hbar_B     ! Cell-mean thickness on the two sides of a DG face [Z ~> m]
-  real :: H_ref              ! Reference thickness for the relative jump [Z ~> m]
-  real :: rel_jump           ! |[[h]]| / H_ref at a face QP [nondim]
-  real :: coef_face          ! Per-face viscosity coefficient incl. shock-capturing amp [nondim]
-  real :: coef_face_max      ! Per-face CFL-based upper cap on coef_face [nondim]
+  real :: H_ref              ! Reference thickness for the smoothness ratio [Z ~> m]
+  real :: r_face             ! Jump-decay smoothness ratio |Delta h_eq|/(H_ref*dx_perp) [nondim]
+  real :: sigma_face         ! Piecewise-linear smoothness ramp sigma(r_face) in [0,1] [nondim]
+  real :: dx_perp            ! Across-face length scale at the current face [L ~> m]
+  real :: coef_face          ! Per-face viscosity coefficient post smoothness gate [nondim]
+  real :: u_eff_face_avg     ! Quadrature-averaged face speed [L T-1 ~> m s-1]
+  real :: rate_face          ! Per-face semi-discrete diffusion rate c*u_eff_avg*ell/dx_perp [T-1]
+  real :: scale_AB           ! Min of the two adjacent cells' per-cell CFL scale [nondim]
   real :: dh_eq              ! Well-balanced equivalent thickness jump (surface-jump-derived) [Z ~> m]
                              ! driving the viscosity flux.
   real :: bed_qp             ! Bed elevation at a face QP [Z ~> m]
@@ -9983,9 +9960,33 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: dudx_f, dudy_f, dvdx_f, dvdy_f ! Face-midpoint velocity gradients [T-1]
   real :: u_mn, u_pl, v_mn, v_pl ! 4-corner-averaged cell velocities on the [L T-1 ~> m s-1]
                                   ! minus/plus side of the face
+  real :: dh_eq_face_max     ! Max |Delta h_eq| over the 2 face QPs [Z ~> m]
+  real :: u_mag_face_max     ! Max |u_mag_qp| over the 2 face QPs [L T-1 ~> m s-1]
   logical :: valid_A_visc, valid_B_visc ! Side A/B participates in DG art-visc face
                                          ! flux (hmask==1 interior, or hmask==3
                                          ! Dirichlet thickness BC used one-sided).
+  ! Module-internal constants for the smoothness gate and per-cell CFL bound. Held
+  ! fixed because the indicator is dx-invariant by construction: r_face = O(dx) on
+  ! smooth solutions and O(1/dx) at discontinuities, so the same (r_lo, r_hi) gate
+  ! works across resolutions. kcell is the SSP-RK2 per-cell semi-discrete-diffusion
+  ! stability budget. c_min = 0 (no baseline damping) preserves O(dx^2) mesh
+  ! convergence in smooth regions.
+  real, parameter :: dg_art_visc_c_min = 0.0
+  real, parameter :: dg_art_visc_r_lo  = 0.1
+  real, parameter :: dg_art_visc_r_hi  = 1.0
+  real, parameter :: dg_art_visc_kcell = 0.5
+  ! Pass-1 workspace for the two-pass per-cell CFL restructure of the viscosity branch:
+  ! per-face desired coefficient, per-QP u_eff and Delta h_eq, and per-cell sum of face
+  ! rates. Sized over the same index ranges as the surrounding face loops.
+  real, dimension(SZDIB_(G),SZDJ_(G))   :: cK_E, rate_E
+  real, dimension(SZDI_(G),SZDJB_(G))   :: cK_N, rate_N
+  real, dimension(SZDIB_(G),SZDJ_(G),2) :: ueff_E, dheq_E
+  real, dimension(SZDI_(G),SZDJB_(G),2) :: ueff_N, dheq_N
+  logical, dimension(SZDIB_(G),SZDJ_(G)) :: active_E
+  logical, dimension(SZDI_(G),SZDJB_(G)) :: active_N
+  real, dimension(SZDI_(G),SZDJ_(G))    :: cell_scale
+  real :: S_K                ! Per-cell sum of face rates for the CFL bound [T-1]
+  integer :: i_lo, i_hi, j_lo, j_hi  ! One-sided clipping bounds for boundary strain
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_vol, rhs_face
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
@@ -9996,6 +9997,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   rhs_face(:,:,:,:) = 0.0
   if (associated(CS%dg_art_visc_coef_u)) CS%dg_art_visc_coef_u(:,:) = 0.0
   if (associated(CS%dg_art_visc_coef_v)) CS%dg_art_visc_coef_v(:,:) = 0.0
+  if (associated(CS%dg_slow_idle_face_u)) CS%dg_slow_idle_face_u(:,:) = 0.0
+  if (associated(CS%dg_slow_idle_face_v)) CS%dg_slow_idle_face_v(:,:) = 0.0
 
   ! Volume integral over each cell.
   do j = jsc, jec ; do i = isc, iec
@@ -10087,41 +10090,91 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     endif
   enddo ; enddo
 
-  ! East-face DG artificial viscosity. Adds the antisymmetric face flux
-  ! +gw*coef*|u_face|*(h_B - h_A)*dyCu at each face QP, which is the
-  ! discrete Laplacian face contribution with nu_face = coef*dx_perp*|u_face|
-  ! (the dx_perp factor cancels with the discrete gradient denominator).
-  ! Conservative per face pair: visc_flux_qp is added to cell A's owned face
-  ! corners with sign -1 and to cell B's with sign +1. |u_face| uses the
-  ! full velocity magnitude so jumps still damp at shear-margin faces where
-  ! u.n ~= 0 (the failure mode of a tau~|u.n| jump penalty).
-  if (CS%dg_art_visc) then
+  ! DG(1) artificial viscosity, face formulation.
+  ! Per face, the antisymmetric flux is +gw * c_face * u_eff * Delta h_eq * ell_face
+  ! at each QP, distributed conservatively to the two adjacent cells (-A, +B).
+  ! Driver is the well-balanced equivalent thickness jump Delta h_eq derived from
+  ! the surface jump, so a hydrostatically-continuous grounding line is not damped.
+  ! c_face = c_min + (c_max - c_min) * sigma(r_face) ramps from 0 in smooth regions
+  ! to c_max at shocks, where r_face = |Delta h_eq|/(H_ref*dx_perp) is the dx-
+  ! normalised jump-decay smoothness indicator: O(dx) smooth, O(1/dx) at jumps.
+  ! u_eff = |u_face| + strain_coef*eps_e*dx_perp covers both advective and
+  ! deformation-driven excitation of the broken-Q1 mode. A per-cell SSP-RK2
+  ! semi-discrete-diffusion CFL budget (kcell/dt) scales all faces of any cell
+  ! whose summed face rates would exceed stability. Weak one-sided imposition at
+  ! Dirichlet thickness BCs (hmask==3): the existing hmask==1 write guards on
+  ! rhs_face discard the BC-side update; the BC side uses h_bdry_val for h and Hbar.
+  if (CS%dg_art_visc_c_max > 0.0) then
+    active_E(:,:) = .false.
+    cK_E(:,:)     = 0.0
+    rate_E(:,:)   = 0.0
+    ueff_E(:,:,:) = 0.0
+    dheq_E(:,:,:) = 0.0
+    active_N(:,:) = .false.
+    cK_N(:,:)     = 0.0
+    rate_N(:,:)   = 0.0
+    ueff_N(:,:,:) = 0.0
+    dheq_N(:,:,:) = 0.0
+    cell_scale(:,:) = 1.0
+
+    ! Pass 1, east faces: compute per-QP (u_eff, Delta h_eq), face-level c_face and
+    ! semi-discrete diffusion rate, store for the scaled application in pass 2.
     do j = jsc, jec ; do i = isc-1, iec
       if (CS%u_face_mask(i,j) == 4.0) cycle  ! specified-flux face: viscosity undefined.
-      ! Weak one-sided imposition at Dirichlet thickness BCs (hmask==3): use
-      ! h_bdry_val for the BC side's face-QP thickness and Hbar, compute the
-      ! antisymmetric visc flux, and let the existing hmask==1 write guards
-      ! discard the BC-side update. Adds a bounded, sign-symmetric restoring
-      ! flux toward h_bdry_val at shared B-nodes (where broken-Q1 mode has no
-      ! damping mechanism) without making conservation any worse than the
-      ! existing BC accounting gap. CFL-bounded magnitude.
       valid_A_visc = (hmask(i,  j) == 1.0 .or. hmask(i,  j) == 3.0)
       valid_B_visc = (hmask(i+1,j) == 1.0 .or. hmask(i+1,j) == 3.0)
       if (.not. (valid_A_visc .and. valid_B_visc)) cycle
       if (.not. (hmask(i,j) == 1.0 .or. hmask(i+1,j) == 1.0)) cycle
-      if (CS%dg_art_visc_gamma > 0.0) then
-        if (hmask(i,j) == 3.0) then
-          Hbar_A = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
-        else
-          Hbar_A = nodal_cell_mean(h_nodal_in(i,  j,:,:), CS%cell_mean_w(i,  j,:,:))
-        endif
-        if (hmask(i+1,j) == 3.0) then
-          Hbar_B = max(CS%h_bdry_val(i+1,j), CS%min_h_shelf)
-        else
-          Hbar_B = nodal_cell_mean(h_nodal_in(i+1,j,:,:), CS%cell_mean_w(i+1,j,:,:))
-        endif
-        H_ref = max(CS%min_h_shelf, 0.5*(Hbar_A + Hbar_B))
+      active_E(i,j) = .true.
+
+      if (hmask(i,j) == 3.0) then
+        Hbar_A = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
+      else
+        Hbar_A = nodal_cell_mean(h_nodal_in(i,  j,:,:), CS%cell_mean_w(i,  j,:,:))
       endif
+      if (hmask(i+1,j) == 3.0) then
+        Hbar_B = max(CS%h_bdry_val(i+1,j), CS%min_h_shelf)
+      else
+        Hbar_B = nodal_cell_mean(h_nodal_in(i+1,j,:,:), CS%cell_mean_w(i+1,j,:,:))
+      endif
+      H_ref = max(CS%min_h_shelf, 0.5*(Hbar_A + Hbar_B))
+      dx_perp = G%dxCu(i,j)
+
+      ! Boundary-aware one-sided cell-centred velocities for the across-face strain.
+      ! When the i-1 or i+1 column is outside the data halo, collapse to the central
+      ! column (first-order one-sided difference instead of zeroing the floor).
+      i_lo = max(i-1, G%isd) ; i_hi = min(i+1, G%ied)
+      if (CS%dg_art_visc_strain_coef > 0.0) then
+        if (i_lo < i) then
+          u_mn = 0.25*((CS%u_shelf(i_lo,j-1) + CS%u_shelf(i,j-1)) + &
+                       (CS%u_shelf(i_lo,j  ) + CS%u_shelf(i,j  )))
+          v_mn = 0.25*((CS%v_shelf(i_lo,j-1) + CS%v_shelf(i,j-1)) + &
+                       (CS%v_shelf(i_lo,j  ) + CS%v_shelf(i,j  )))
+        else
+          u_mn = 0.5*(CS%u_shelf(i,j-1) + CS%u_shelf(i,j))
+          v_mn = 0.5*(CS%v_shelf(i,j-1) + CS%v_shelf(i,j))
+        endif
+        if (i_hi > i) then
+          u_pl = 0.25*((CS%u_shelf(i   ,j-1) + CS%u_shelf(i_hi,j-1)) + &
+                       (CS%u_shelf(i   ,j  ) + CS%u_shelf(i_hi,j  )))
+          v_pl = 0.25*((CS%v_shelf(i   ,j-1) + CS%v_shelf(i_hi,j-1)) + &
+                       (CS%v_shelf(i   ,j  ) + CS%v_shelf(i_hi,j  )))
+        else
+          u_pl = 0.5*(CS%u_shelf(i,j-1) + CS%u_shelf(i,j))
+          v_pl = 0.5*(CS%v_shelf(i,j-1) + CS%v_shelf(i,j))
+        endif
+        dudx_f = (u_pl - u_mn) / dx_perp
+        dvdx_f = (v_pl - v_mn) / dx_perp
+        dudy_f = (CS%u_shelf(i,j) - CS%u_shelf(i,j-1)) / G%dyCu(i,j)
+        dvdy_f = (CS%v_shelf(i,j) - CS%v_shelf(i,j-1)) / G%dyCu(i,j)
+        eps_e_face = dg1_face_eps_eff(dudx_f, dudy_f, dvdx_f, dvdy_f)
+      else
+        eps_e_face = 0.0
+      endif
+
+      dh_eq_face_max = 0.0
+      u_mag_face_max = 0.0
+      u_eff_face_avg = 0.0
       do gp = 1, 2
         if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
         t_co = 1.0 - t_face
@@ -10140,51 +10193,39 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         endif
         bed_qp = t_co*CS%bed_node(i,j-1) + t_face*CS%bed_node(i,j)
         dh_eq = dg1_wb_equiv_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
-        u_floor_qp = 0.0
-        if (CS%dg_art_visc_strain_coef > 0.0 .and. &
-            i-1 >= G%isd .and. i+1 <= G%ied) then
-          ! 4-corner-averaged cell velocities on each side of the east face. Endpoint
-          ! nodes (i,j-1), (i,j) are reused across both averages. eps_e is the SSA
-          ! second invariant evaluated at the face midpoint.
-          u_mn = 0.25*((CS%u_shelf(i-1,j-1) + CS%u_shelf(i,j-1)) + &
-                       (CS%u_shelf(i-1,j  ) + CS%u_shelf(i,j  )))
-          u_pl = 0.25*((CS%u_shelf(i  ,j-1) + CS%u_shelf(i+1,j-1)) + &
-                       (CS%u_shelf(i  ,j  ) + CS%u_shelf(i+1,j  )))
-          v_mn = 0.25*((CS%v_shelf(i-1,j-1) + CS%v_shelf(i,j-1)) + &
-                       (CS%v_shelf(i-1,j  ) + CS%v_shelf(i,j  )))
-          v_pl = 0.25*((CS%v_shelf(i  ,j-1) + CS%v_shelf(i+1,j-1)) + &
-                       (CS%v_shelf(i  ,j  ) + CS%v_shelf(i+1,j  )))
-          dudx_f = (u_pl - u_mn) / G%dxCu(i,j)
-          dvdx_f = (v_pl - v_mn) / G%dxCu(i,j)
-          dudy_f = (CS%u_shelf(i,j) - CS%u_shelf(i,j-1)) / G%dyCu(i,j)
-          dvdy_f = (CS%v_shelf(i,j) - CS%v_shelf(i,j-1)) / G%dyCu(i,j)
-          eps_e_face = dg1_face_eps_eff(dudx_f, dudy_f, dvdx_f, dvdy_f)
-          u_floor_qp = CS%dg_art_visc_strain_coef * eps_e_face * G%dxCu(i,j)
-        endif
+        u_floor_qp = CS%dg_art_visc_strain_coef * eps_e_face * dx_perp
         u_eff_qp = u_mag_qp + u_floor_qp
-        coef_face = CS%dg_art_visc_coef
-        if (CS%dg_art_visc_gamma > 0.0) then
-          rel_jump = abs(dh_eq) / H_ref
-          coef_face = coef_face * (1.0 + CS%dg_art_visc_gamma * &
-                                         max(0.0, rel_jump - CS%dg_art_visc_thresh))
-        endif
-        if ((CS%dg_art_visc_gamma > 0.0 .or. CS%dg_art_visc_strain_coef > 0.0) .and. &
-            u_eff_qp * dt > 0.0) then
-          coef_face_max = CS%dg_art_visc_cfl_safety * G%dxCu(i,j) / (u_eff_qp * dt)
-          coef_face = min(coef_face, coef_face_max)
-        endif
-        visc_flux_qp = gw * coef_face * u_eff_qp * dh_eq * G%dyCu(i,j)
-        if (associated(CS%dg_art_visc_coef_u)) &
-          CS%dg_art_visc_coef_u(i,j) = max(CS%dg_art_visc_coef_u(i,j), coef_face)
-        if (i >= isc .and. hmask(i,j) == 1.0) then
-          rhs_face(i,j,2,1) = rhs_face(i,j,2,1) + visc_flux_qp * t_co
-          rhs_face(i,j,2,2) = rhs_face(i,j,2,2) + visc_flux_qp * t_face
-        endif
-        if (i+1 <= iec .and. hmask(i+1,j) == 1.0) then
-          rhs_face(i+1,j,1,1) = rhs_face(i+1,j,1,1) - visc_flux_qp * t_co
-          rhs_face(i+1,j,1,2) = rhs_face(i+1,j,1,2) - visc_flux_qp * t_face
-        endif
+
+        ueff_E(i,j,gp) = u_eff_qp
+        dheq_E(i,j,gp) = dh_eq
+
+        u_eff_face_avg = u_eff_face_avg + gw*u_eff_qp
+        dh_eq_face_max = max(dh_eq_face_max, abs(dh_eq))
+        u_mag_face_max = max(u_mag_face_max, u_mag_qp)
       enddo
+
+      r_face = dh_eq_face_max / (H_ref * dx_perp)
+      if (r_face <= dg_art_visc_r_lo) then
+        sigma_face = 0.0
+      elseif (r_face >= dg_art_visc_r_hi) then
+        sigma_face = 1.0
+      else
+        sigma_face = (r_face - dg_art_visc_r_lo) / (dg_art_visc_r_hi - dg_art_visc_r_lo)
+      endif
+      coef_face = dg_art_visc_c_min + (CS%dg_art_visc_c_max - dg_art_visc_c_min) * sigma_face
+      cK_E(i,j) = coef_face
+      rate_face = coef_face * u_eff_face_avg * G%dyCu(i,j) / dx_perp
+      rate_E(i,j) = rate_face
+
+      ! Stagnant-jump diagnostic: |u| and eps_e both tiny while the equivalent jump
+      ! is non-negligible. Mark with 1.0 (otherwise stays at 0 from the reset).
+      if (associated(CS%dg_slow_idle_face_u)) then
+        if (u_mag_face_max < CS%dg_slow_idle_u_tiny .and. &
+            eps_e_face     < CS%dg_slow_idle_eps_tiny .and. &
+            dh_eq_face_max > CS%dg_slow_idle_s_tol) then
+          CS%dg_slow_idle_face_u(i,j) = 1.0
+        endif
+      endif
     enddo ; enddo
   endif
 
@@ -10239,28 +10280,61 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     endif
   enddo ; enddo
 
-  ! North-face DG artificial viscosity (analogous to east-face block above).
-  if (CS%dg_art_visc) then
+  ! Pass 1, north faces (analogous to east-face block above).
+  if (CS%dg_art_visc_c_max > 0.0) then
     do j = jsc-1, jec ; do i = isc, iec
       if (CS%v_face_mask(i,j) == 4.0) cycle
-      ! Weak one-sided imposition at hmask==3 - see east-face block for rationale.
       valid_A_visc = (hmask(i,j  ) == 1.0 .or. hmask(i,j  ) == 3.0)
       valid_B_visc = (hmask(i,j+1) == 1.0 .or. hmask(i,j+1) == 3.0)
       if (.not. (valid_A_visc .and. valid_B_visc)) cycle
       if (.not. (hmask(i,j) == 1.0 .or. hmask(i,j+1) == 1.0)) cycle
-      if (CS%dg_art_visc_gamma > 0.0) then
-        if (hmask(i,j) == 3.0) then
-          Hbar_A = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
-        else
-          Hbar_A = nodal_cell_mean(h_nodal_in(i,j,  :,:), CS%cell_mean_w(i,j,  :,:))
-        endif
-        if (hmask(i,j+1) == 3.0) then
-          Hbar_B = max(CS%h_bdry_val(i,j+1), CS%min_h_shelf)
-        else
-          Hbar_B = nodal_cell_mean(h_nodal_in(i,j+1,:,:), CS%cell_mean_w(i,j+1,:,:))
-        endif
-        H_ref = max(CS%min_h_shelf, 0.5*(Hbar_A + Hbar_B))
+      active_N(i,j) = .true.
+
+      if (hmask(i,j) == 3.0) then
+        Hbar_A = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
+      else
+        Hbar_A = nodal_cell_mean(h_nodal_in(i,j,  :,:), CS%cell_mean_w(i,j,  :,:))
       endif
+      if (hmask(i,j+1) == 3.0) then
+        Hbar_B = max(CS%h_bdry_val(i,j+1), CS%min_h_shelf)
+      else
+        Hbar_B = nodal_cell_mean(h_nodal_in(i,j+1,:,:), CS%cell_mean_w(i,j+1,:,:))
+      endif
+      H_ref = max(CS%min_h_shelf, 0.5*(Hbar_A + Hbar_B))
+      dx_perp = G%dyCv(i,j)
+
+      j_lo = max(j-1, G%jsd) ; j_hi = min(j+1, G%jed)
+      if (CS%dg_art_visc_strain_coef > 0.0) then
+        if (j_lo < j) then
+          u_mn = 0.25*((CS%u_shelf(i-1,j_lo) + CS%u_shelf(i,j_lo)) + &
+                       (CS%u_shelf(i-1,j   ) + CS%u_shelf(i,j   )))
+          v_mn = 0.25*((CS%v_shelf(i-1,j_lo) + CS%v_shelf(i,j_lo)) + &
+                       (CS%v_shelf(i-1,j   ) + CS%v_shelf(i,j   )))
+        else
+          u_mn = 0.5*(CS%u_shelf(i-1,j) + CS%u_shelf(i,j))
+          v_mn = 0.5*(CS%v_shelf(i-1,j) + CS%v_shelf(i,j))
+        endif
+        if (j_hi > j) then
+          u_pl = 0.25*((CS%u_shelf(i-1,j   ) + CS%u_shelf(i,j   )) + &
+                       (CS%u_shelf(i-1,j_hi) + CS%u_shelf(i,j_hi)))
+          v_pl = 0.25*((CS%v_shelf(i-1,j   ) + CS%v_shelf(i,j   )) + &
+                       (CS%v_shelf(i-1,j_hi) + CS%v_shelf(i,j_hi)))
+        else
+          u_pl = 0.5*(CS%u_shelf(i-1,j) + CS%u_shelf(i,j))
+          v_pl = 0.5*(CS%v_shelf(i-1,j) + CS%v_shelf(i,j))
+        endif
+        dudy_f = (u_pl - u_mn) / dx_perp
+        dvdy_f = (v_pl - v_mn) / dx_perp
+        dudx_f = (CS%u_shelf(i,j) - CS%u_shelf(i-1,j)) / G%dxCv(i,j)
+        dvdx_f = (CS%v_shelf(i,j) - CS%v_shelf(i-1,j)) / G%dxCv(i,j)
+        eps_e_face = dg1_face_eps_eff(dudx_f, dudy_f, dvdx_f, dvdy_f)
+      else
+        eps_e_face = 0.0
+      endif
+
+      dh_eq_face_max = 0.0
+      u_mag_face_max = 0.0
+      u_eff_face_avg = 0.0
       do gp = 1, 2
         if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
         t_co = 1.0 - t_face
@@ -10279,41 +10353,104 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         endif
         bed_qp = t_co*CS%bed_node(i-1,j) + t_face*CS%bed_node(i,j)
         dh_eq = dg1_wb_equiv_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
-        u_floor_qp = 0.0
-        if (CS%dg_art_visc_strain_coef > 0.0 .and. &
-            j-1 >= G%jsd .and. j+1 <= G%jed) then
-          ! Mirror of the east-face block: minus = south cell (i,j), plus = north
-          ! cell (i,j+1); along-face direction is x using the two endpoint B-nodes.
-          u_mn = 0.25*((CS%u_shelf(i-1,j-1) + CS%u_shelf(i,j-1)) + &
-                       (CS%u_shelf(i-1,j  ) + CS%u_shelf(i,j  )))
-          u_pl = 0.25*((CS%u_shelf(i-1,j  ) + CS%u_shelf(i,j  )) + &
-                       (CS%u_shelf(i-1,j+1) + CS%u_shelf(i,j+1)))
-          v_mn = 0.25*((CS%v_shelf(i-1,j-1) + CS%v_shelf(i,j-1)) + &
-                       (CS%v_shelf(i-1,j  ) + CS%v_shelf(i,j  )))
-          v_pl = 0.25*((CS%v_shelf(i-1,j  ) + CS%v_shelf(i,j  )) + &
-                       (CS%v_shelf(i-1,j+1) + CS%v_shelf(i,j+1)))
-          dudy_f = (u_pl - u_mn) / G%dyCv(i,j)
-          dvdy_f = (v_pl - v_mn) / G%dyCv(i,j)
-          dudx_f = (CS%u_shelf(i,j) - CS%u_shelf(i-1,j)) / G%dxCv(i,j)
-          dvdx_f = (CS%v_shelf(i,j) - CS%v_shelf(i-1,j)) / G%dxCv(i,j)
-          eps_e_face = dg1_face_eps_eff(dudx_f, dudy_f, dvdx_f, dvdy_f)
-          u_floor_qp = CS%dg_art_visc_strain_coef * eps_e_face * G%dyCv(i,j)
-        endif
+        u_floor_qp = CS%dg_art_visc_strain_coef * eps_e_face * dx_perp
         u_eff_qp = u_mag_qp + u_floor_qp
-        coef_face = CS%dg_art_visc_coef
-        if (CS%dg_art_visc_gamma > 0.0) then
-          rel_jump = abs(dh_eq) / H_ref
-          coef_face = coef_face * (1.0 + CS%dg_art_visc_gamma * &
-                                         max(0.0, rel_jump - CS%dg_art_visc_thresh))
+
+        ueff_N(i,j,gp) = u_eff_qp
+        dheq_N(i,j,gp) = dh_eq
+
+        u_eff_face_avg = u_eff_face_avg + gw*u_eff_qp
+        dh_eq_face_max = max(dh_eq_face_max, abs(dh_eq))
+        u_mag_face_max = max(u_mag_face_max, u_mag_qp)
+      enddo
+
+      r_face = dh_eq_face_max / (H_ref * dx_perp)
+      if (r_face <= dg_art_visc_r_lo) then
+        sigma_face = 0.0
+      elseif (r_face >= dg_art_visc_r_hi) then
+        sigma_face = 1.0
+      else
+        sigma_face = (r_face - dg_art_visc_r_lo) / (dg_art_visc_r_hi - dg_art_visc_r_lo)
+      endif
+      coef_face = dg_art_visc_c_min + (CS%dg_art_visc_c_max - dg_art_visc_c_min) * sigma_face
+      cK_N(i,j) = coef_face
+      rate_face = coef_face * u_eff_face_avg * G%dxCv(i,j) / dx_perp
+      rate_N(i,j) = rate_face
+
+      if (associated(CS%dg_slow_idle_face_v)) then
+        if (u_mag_face_max < CS%dg_slow_idle_u_tiny .and. &
+            eps_e_face     < CS%dg_slow_idle_eps_tiny .and. &
+            dh_eq_face_max > CS%dg_slow_idle_s_tol) then
+          CS%dg_slow_idle_face_v(i,j) = 1.0
         endif
-        if ((CS%dg_art_visc_gamma > 0.0 .or. CS%dg_art_visc_strain_coef > 0.0) .and. &
-            u_eff_qp * dt > 0.0) then
-          coef_face_max = CS%dg_art_visc_cfl_safety * G%dyCv(i,j) / (u_eff_qp * dt)
-          coef_face = min(coef_face, coef_face_max)
+      endif
+    enddo ; enddo
+
+    ! Aggregate per-cell rate sum and form scale = min(1, kcell/(S_K*dt)). Only owned
+    ! cells need scales (writes are guarded to hmask==1 cells); BC-side scale stays 1
+    ! and the min(scale_A, scale_B) below picks up the interior cell's budget.
+    do j = jsc, jec ; do i = isc, iec
+      if (hmask(i,j) /= 1.0) cycle
+      S_K = 0.0
+      if (active_E(i-1,j)) S_K = S_K + rate_E(i-1,j)
+      if (active_E(i  ,j)) S_K = S_K + rate_E(i  ,j)
+      if (active_N(i,j-1)) S_K = S_K + rate_N(i,j-1)
+      if (active_N(i,j  )) S_K = S_K + rate_N(i,j  )
+      if (S_K*dt > dg_art_visc_kcell) then
+        cell_scale(i,j) = dg_art_visc_kcell / (S_K*dt)
+      else
+        cell_scale(i,j) = 1.0
+      endif
+    enddo ; enddo
+
+    ! Pass 2, east faces: scaled application. Per-face scale_AB is the min of the two
+    ! adjacent owned cells' scales; non-owned (BC, halo) sides default to 1.
+    do j = jsc, jec ; do i = isc-1, iec
+      if (.not. active_E(i,j)) cycle
+      if (i >= isc .and. hmask(i,j) == 1.0) then
+        if (i+1 <= iec .and. hmask(i+1,j) == 1.0) then
+          scale_AB = min(cell_scale(i,j), cell_scale(i+1,j))
+        else
+          scale_AB = cell_scale(i,j)
         endif
-        visc_flux_qp = gw * coef_face * u_eff_qp * dh_eq * G%dxCv(i,j)
-        if (associated(CS%dg_art_visc_coef_v)) &
-          CS%dg_art_visc_coef_v(i,j) = max(CS%dg_art_visc_coef_v(i,j), coef_face)
+      else
+        scale_AB = cell_scale(i+1,j)
+      endif
+      coef_face = cK_E(i,j) * scale_AB
+      if (associated(CS%dg_art_visc_coef_u)) CS%dg_art_visc_coef_u(i,j) = coef_face
+      do gp = 1, 2
+        if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
+        t_co = 1.0 - t_face
+        visc_flux_qp = gw * coef_face * ueff_E(i,j,gp) * dheq_E(i,j,gp) * G%dyCu(i,j)
+        if (i >= isc .and. hmask(i,j) == 1.0) then
+          rhs_face(i,j,2,1) = rhs_face(i,j,2,1) + visc_flux_qp * t_co
+          rhs_face(i,j,2,2) = rhs_face(i,j,2,2) + visc_flux_qp * t_face
+        endif
+        if (i+1 <= iec .and. hmask(i+1,j) == 1.0) then
+          rhs_face(i+1,j,1,1) = rhs_face(i+1,j,1,1) - visc_flux_qp * t_co
+          rhs_face(i+1,j,1,2) = rhs_face(i+1,j,1,2) - visc_flux_qp * t_face
+        endif
+      enddo
+    enddo ; enddo
+
+    ! Pass 2, north faces.
+    do j = jsc-1, jec ; do i = isc, iec
+      if (.not. active_N(i,j)) cycle
+      if (j >= jsc .and. hmask(i,j) == 1.0) then
+        if (j+1 <= jec .and. hmask(i,j+1) == 1.0) then
+          scale_AB = min(cell_scale(i,j), cell_scale(i,j+1))
+        else
+          scale_AB = cell_scale(i,j)
+        endif
+      else
+        scale_AB = cell_scale(i,j+1)
+      endif
+      coef_face = cK_N(i,j) * scale_AB
+      if (associated(CS%dg_art_visc_coef_v)) CS%dg_art_visc_coef_v(i,j) = coef_face
+      do gp = 1, 2
+        if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
+        t_co = 1.0 - t_face
+        visc_flux_qp = gw * coef_face * ueff_N(i,j,gp) * dheq_N(i,j,gp) * G%dxCv(i,j)
         if (j >= jsc .and. hmask(i,j) == 1.0) then
           rhs_face(i,j,1,2) = rhs_face(i,j,1,2) + visc_flux_qp * t_co
           rhs_face(i,j,2,2) = rhs_face(i,j,2,2) + visc_flux_qp * t_face
