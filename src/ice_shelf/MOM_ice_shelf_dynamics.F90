@@ -9983,6 +9983,9 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: dudx_f, dudy_f, dvdx_f, dvdy_f ! Face-midpoint velocity gradients [T-1]
   real :: u_mn, u_pl, v_mn, v_pl ! 4-corner-averaged cell velocities on the [L T-1 ~> m s-1]
                                   ! minus/plus side of the face
+  logical :: valid_A_visc, valid_B_visc ! Side A/B participates in DG art-visc face
+                                         ! flux (hmask==1 interior, or hmask==3
+                                         ! Dirichlet thickness BC used one-sided).
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_vol, rhs_face
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
@@ -10095,15 +10098,28 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   if (CS%dg_art_visc) then
     do j = jsc, jec ; do i = isc-1, iec
       if (CS%u_face_mask(i,j) == 4.0) cycle  ! specified-flux face: viscosity undefined.
-      ! Skip faces touching Dirichlet thickness BCs (hmask==3). Those cells are
-      ! pinned to h_bdry_val between stages, so viscous flux into the BC cell is
-      ! discarded - making the coupling non-conservative and unphysically
-      ! pulling the interior cell toward h_bdry_val. The BC's inflow flux is
-      ! already handled correctly in the upwind block.
-      if (.not. (hmask(i,j) == 1.0 .and. hmask(i+1,j) == 1.0)) cycle
+      ! Weak one-sided imposition at Dirichlet thickness BCs (hmask==3): use
+      ! h_bdry_val for the BC side's face-QP thickness and Hbar, compute the
+      ! antisymmetric visc flux, and let the existing hmask==1 write guards
+      ! discard the BC-side update. Adds a bounded, sign-symmetric restoring
+      ! flux toward h_bdry_val at shared B-nodes (where broken-Q1 mode has no
+      ! damping mechanism) without making conservation any worse than the
+      ! existing BC accounting gap. CFL-bounded magnitude.
+      valid_A_visc = (hmask(i,  j) == 1.0 .or. hmask(i,  j) == 3.0)
+      valid_B_visc = (hmask(i+1,j) == 1.0 .or. hmask(i+1,j) == 3.0)
+      if (.not. (valid_A_visc .and. valid_B_visc)) cycle
+      if (.not. (hmask(i,j) == 1.0 .or. hmask(i+1,j) == 1.0)) cycle
       if (CS%dg_art_visc_gamma > 0.0) then
-        Hbar_A = nodal_cell_mean(h_nodal_in(i,  j,:,:), CS%cell_mean_w(i,  j,:,:))
-        Hbar_B = nodal_cell_mean(h_nodal_in(i+1,j,:,:), CS%cell_mean_w(i+1,j,:,:))
+        if (hmask(i,j) == 3.0) then
+          Hbar_A = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
+        else
+          Hbar_A = nodal_cell_mean(h_nodal_in(i,  j,:,:), CS%cell_mean_w(i,  j,:,:))
+        endif
+        if (hmask(i+1,j) == 3.0) then
+          Hbar_B = max(CS%h_bdry_val(i+1,j), CS%min_h_shelf)
+        else
+          Hbar_B = nodal_cell_mean(h_nodal_in(i+1,j,:,:), CS%cell_mean_w(i+1,j,:,:))
+        endif
         H_ref = max(CS%min_h_shelf, 0.5*(Hbar_A + Hbar_B))
       endif
       do gp = 1, 2
@@ -10112,8 +10128,16 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         u_at_qp = t_co*CS%u_shelf(i,j-1) + t_face*CS%u_shelf(i,j)
         v_at_qp = t_co*CS%v_shelf(i,j-1) + t_face*CS%v_shelf(i,j)
         u_mag_qp = sqrt(u_at_qp*u_at_qp + v_at_qp*v_at_qp)
-        h_A_qp  = t_co*h_nodal_in(i,  j,2,1) + t_face*h_nodal_in(i,  j,2,2)
-        h_B_qp  = t_co*h_nodal_in(i+1,j,1,1) + t_face*h_nodal_in(i+1,j,1,2)
+        if (hmask(i,j) == 3.0) then
+          h_A_qp = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
+        else
+          h_A_qp = t_co*h_nodal_in(i,  j,2,1) + t_face*h_nodal_in(i,  j,2,2)
+        endif
+        if (hmask(i+1,j) == 3.0) then
+          h_B_qp = max(CS%h_bdry_val(i+1,j), CS%min_h_shelf)
+        else
+          h_B_qp = t_co*h_nodal_in(i+1,j,1,1) + t_face*h_nodal_in(i+1,j,1,2)
+        endif
         bed_qp = t_co*CS%bed_node(i,j-1) + t_face*CS%bed_node(i,j)
         dh_eq = dg1_wb_equiv_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
         u_floor_qp = 0.0
@@ -10219,11 +10243,22 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   if (CS%dg_art_visc) then
     do j = jsc-1, jec ; do i = isc, iec
       if (CS%v_face_mask(i,j) == 4.0) cycle
-      ! Skip faces touching Dirichlet thickness BCs - see east-face block for rationale.
-      if (.not. (hmask(i,j) == 1.0 .and. hmask(i,j+1) == 1.0)) cycle
+      ! Weak one-sided imposition at hmask==3 - see east-face block for rationale.
+      valid_A_visc = (hmask(i,j  ) == 1.0 .or. hmask(i,j  ) == 3.0)
+      valid_B_visc = (hmask(i,j+1) == 1.0 .or. hmask(i,j+1) == 3.0)
+      if (.not. (valid_A_visc .and. valid_B_visc)) cycle
+      if (.not. (hmask(i,j) == 1.0 .or. hmask(i,j+1) == 1.0)) cycle
       if (CS%dg_art_visc_gamma > 0.0) then
-        Hbar_A = nodal_cell_mean(h_nodal_in(i,j,  :,:), CS%cell_mean_w(i,j,  :,:))
-        Hbar_B = nodal_cell_mean(h_nodal_in(i,j+1,:,:), CS%cell_mean_w(i,j+1,:,:))
+        if (hmask(i,j) == 3.0) then
+          Hbar_A = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
+        else
+          Hbar_A = nodal_cell_mean(h_nodal_in(i,j,  :,:), CS%cell_mean_w(i,j,  :,:))
+        endif
+        if (hmask(i,j+1) == 3.0) then
+          Hbar_B = max(CS%h_bdry_val(i,j+1), CS%min_h_shelf)
+        else
+          Hbar_B = nodal_cell_mean(h_nodal_in(i,j+1,:,:), CS%cell_mean_w(i,j+1,:,:))
+        endif
         H_ref = max(CS%min_h_shelf, 0.5*(Hbar_A + Hbar_B))
       endif
       do gp = 1, 2
@@ -10232,8 +10267,16 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         u_at_qp = t_co*CS%u_shelf(i-1,j) + t_face*CS%u_shelf(i,j)
         v_at_qp = t_co*CS%v_shelf(i-1,j) + t_face*CS%v_shelf(i,j)
         u_mag_qp = sqrt(u_at_qp*u_at_qp + v_at_qp*v_at_qp)
-        h_A_qp  = t_co*h_nodal_in(i,j,  1,2) + t_face*h_nodal_in(i,j,  2,2)
-        h_B_qp  = t_co*h_nodal_in(i,j+1,1,1) + t_face*h_nodal_in(i,j+1,2,1)
+        if (hmask(i,j) == 3.0) then
+          h_A_qp = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
+        else
+          h_A_qp = t_co*h_nodal_in(i,j,  1,2) + t_face*h_nodal_in(i,j,  2,2)
+        endif
+        if (hmask(i,j+1) == 3.0) then
+          h_B_qp = max(CS%h_bdry_val(i,j+1), CS%min_h_shelf)
+        else
+          h_B_qp = t_co*h_nodal_in(i,j+1,1,1) + t_face*h_nodal_in(i,j+1,2,1)
+        endif
         bed_qp = t_co*CS%bed_node(i-1,j) + t_face*CS%bed_node(i,j)
         dh_eq = dg1_wb_equiv_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
         u_floor_qp = 0.0
