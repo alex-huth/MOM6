@@ -448,6 +448,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_dg_slow_idle_face_u = -1, id_dg_slow_idle_face_v = -1, &
              id_h_jump_face_u = -1, id_h_jump_face_v = -1, &
              id_s_jump_face_u = -1, id_s_jump_face_v = -1, &
+             id_s_jump_face_u_rel = -1, id_s_jump_face_v_rel = -1, &
              id_un_face_u = -1, id_un_face_v = -1
   real, pointer, dimension(:,:) :: dg_art_visc_coef_u => NULL() !< Per-face DG(1) artificial-
                                                        !! viscosity coefficient on u-faces
@@ -1334,6 +1335,16 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          CS%diag%axesCv1, Time, &
          'DG(1) surface-elevation jump across v-faces (max |[s]| over the 2 face nodes, '//&
          'per-side flotation).', 'm', conversion=US%Z_to_m)
+      CS%id_s_jump_face_u_rel = register_diag_field('ice_shelf_model','s_jump_face_u_rel', &
+         CS%diag%axesCu1, Time, &
+         'Surface-elevation jump on u-faces relative to mean cell thickness, '//&
+         '|[s]| / max(min_h_shelf, 0.5*(Hbar_A + Hbar_B)). Approximates the relative '//&
+         'driving-stress contamination from spurious broken-Q1 jumps; healthy shelf '//&
+         'regions should sit well below 0.05 (steep grounded slopes can tolerate more).', &
+         'nondim')
+      CS%id_s_jump_face_v_rel = register_diag_field('ice_shelf_model','s_jump_face_v_rel', &
+         CS%diag%axesCv1, Time, &
+         'As s_jump_face_u_rel but on v-faces.', 'nondim')
       CS%id_un_face_u = register_diag_field('ice_shelf_model','un_face_u', &
          CS%diag%axesCu1, Time, &
          'Face-normal ice speed |u.n| on u-faces (mean of the 2 endpoint B-node u_shelf '//&
@@ -1669,10 +1680,13 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
   integer :: ii, jj                               ! touching-cell indices on the T-grid
   real, dimension(SZDIB_(G),SZDJ_(G)) :: hjump_fu ! per-u-face DG(1) thickness jump max|[h]| [Z ~> m]
   real, dimension(SZDIB_(G),SZDJ_(G)) :: sjump_fu ! per-u-face surface-elevation jump max|[s]| [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: sjump_fu_rel ! per-u-face |[s]|/Hbar_avg [nondim]
   real, dimension(SZDIB_(G),SZDJ_(G)) :: un_fu    ! per-u-face |u.n| [L T-1 ~> m s-1]
   real, dimension(SZDI_(G),SZDJB_(G)) :: hjump_fv ! per-v-face DG(1) thickness jump max|[h]| [Z ~> m]
   real, dimension(SZDI_(G),SZDJB_(G)) :: sjump_fv ! per-v-face surface-elevation jump max|[s]| [Z ~> m]
+  real, dimension(SZDI_(G),SZDJB_(G)) :: sjump_fv_rel ! per-v-face |[s]|/Hbar_avg [nondim]
   real, dimension(SZDI_(G),SZDJB_(G)) :: un_fv    ! per-v-face |v.n| [L T-1 ~> m s-1]
+  real :: Hbar_face_avg                           ! 0.5*(Hbar_A + Hbar_B) per face [Z ~> m]
   real :: rr                                      ! ice/ocean density ratio [nondim]
   real :: bed1, bed2                              ! bed elevation at the 2 face-endpoint nodes [Z ~> m]
   real :: h_m1, h_p1, h_m2, h_p2                  ! minus/plus side corner thickness at nodes 1,2 [Z ~> m]
@@ -1954,6 +1968,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
     endif
     if ((CS%id_h_jump_face_u > 0 .or. CS%id_h_jump_face_v > 0 .or. &
          CS%id_s_jump_face_u > 0 .or. CS%id_s_jump_face_v > 0 .or. &
+         CS%id_s_jump_face_u_rel > 0 .or. CS%id_s_jump_face_v_rel > 0 .or. &
          CS%id_un_face_u > 0 .or. CS%id_un_face_v > 0) .and. associated(CS%h_nodal)) then
       ! Per-face inter-element jump of the broken-Q1 thickness, split onto u-faces
       ! (Cu) and v-faces (Cv) and reported in both thickness [h] and surface
@@ -1965,8 +1980,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       call pass_var(CS%bed_node, G%domain, position=CORNER)
       call pass_vector(CS%u_shelf, CS%v_shelf, G%domain, TO_ALL, BGRID_NE)
       rr = CS%density_ice / CS%density_ocean_avg
-      hjump_fu(:,:) = 0.0 ; sjump_fu(:,:) = 0.0 ; un_fu(:,:) = 0.0
-      hjump_fv(:,:) = 0.0 ; sjump_fv(:,:) = 0.0 ; un_fv(:,:) = 0.0
+      hjump_fu(:,:) = 0.0 ; sjump_fu(:,:) = 0.0 ; sjump_fu_rel(:,:) = 0.0 ; un_fu(:,:) = 0.0
+      hjump_fv(:,:) = 0.0 ; sjump_fv(:,:) = 0.0 ; sjump_fv_rel(:,:) = 0.0 ; un_fv(:,:) = 0.0
       ! u-faces: minus side = west cell (I,j) east edge, plus side = east cell
       ! (I+1,j) west edge; endpoint nodes 1=south (I,j-1), 2=north (I,j).
       do j = G%jsc, G%jec ; do I = G%IscB, G%IecB
@@ -1981,6 +1996,12 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         s_p2 = merge(h_p2-bed2, (1.0-rr)*h_p2, rr*h_p2-bed2 > 0.0)
         hjump_fu(I,j) = max(abs(h_m1-h_p1), abs(h_m2-h_p2))
         sjump_fu(I,j) = max(abs(s_m1-s_p1), abs(s_m2-s_p2))
+        Hbar_face_avg = max(CS%min_h_shelf, 0.125*( &
+          (CS%h_nodal(I  ,j,1,1) + CS%h_nodal(I  ,j,2,1)) + &
+          (CS%h_nodal(I  ,j,1,2) + CS%h_nodal(I  ,j,2,2)) + &
+          (CS%h_nodal(I+1,j,1,1) + CS%h_nodal(I+1,j,2,1)) + &
+          (CS%h_nodal(I+1,j,1,2) + CS%h_nodal(I+1,j,2,2))))
+        sjump_fu_rel(I,j) = sjump_fu(I,j) / Hbar_face_avg
         un_fu(I,j) = abs(0.5*(CS%u_shelf(I,j-1) + CS%u_shelf(I,j)))
       enddo ; enddo
       ! v-faces: minus side = south cell (i,J) north edge, plus side = north cell
@@ -1997,12 +2018,22 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         s_p2 = merge(h_p2-bed2, (1.0-rr)*h_p2, rr*h_p2-bed2 > 0.0)
         hjump_fv(i,J) = max(abs(h_m1-h_p1), abs(h_m2-h_p2))
         sjump_fv(i,J) = max(abs(s_m1-s_p1), abs(s_m2-s_p2))
+        Hbar_face_avg = max(CS%min_h_shelf, 0.125*( &
+          (CS%h_nodal(i,J  ,1,1) + CS%h_nodal(i,J  ,2,1)) + &
+          (CS%h_nodal(i,J  ,1,2) + CS%h_nodal(i,J  ,2,2)) + &
+          (CS%h_nodal(i,J+1,1,1) + CS%h_nodal(i,J+1,2,1)) + &
+          (CS%h_nodal(i,J+1,1,2) + CS%h_nodal(i,J+1,2,2))))
+        sjump_fv_rel(i,J) = sjump_fv(i,J) / Hbar_face_avg
         un_fv(i,J) = abs(0.5*(CS%v_shelf(i-1,J) + CS%v_shelf(i,J)))
       enddo ; enddo
       if (CS%id_h_jump_face_u > 0) call post_data(CS%id_h_jump_face_u, hjump_fu, CS%diag)
       if (CS%id_h_jump_face_v > 0) call post_data(CS%id_h_jump_face_v, hjump_fv, CS%diag)
       if (CS%id_s_jump_face_u > 0) call post_data(CS%id_s_jump_face_u, sjump_fu, CS%diag)
       if (CS%id_s_jump_face_v > 0) call post_data(CS%id_s_jump_face_v, sjump_fv, CS%diag)
+      if (CS%id_s_jump_face_u_rel > 0) &
+          call post_data(CS%id_s_jump_face_u_rel, sjump_fu_rel, CS%diag)
+      if (CS%id_s_jump_face_v_rel > 0) &
+          call post_data(CS%id_s_jump_face_v_rel, sjump_fv_rel, CS%diag)
       if (CS%id_un_face_u > 0) call post_data(CS%id_un_face_u, un_fu, CS%diag)
       if (CS%id_un_face_v > 0) call post_data(CS%id_un_face_v, un_fv, CS%diag)
     endif
