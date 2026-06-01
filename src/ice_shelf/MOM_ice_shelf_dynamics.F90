@@ -10096,8 +10096,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   ! Driver is the well-balanced equivalent thickness jump Delta h_eq derived from
   ! the surface jump, so a hydrostatically-continuous grounding line is not damped.
   ! c_face = c_min + (c_max - c_min) * sigma(r_face) ramps from 0 in smooth regions
-  ! to c_max at shocks, where r_face = |Delta h_eq|/(H_ref*dx_perp) is the dx-
-  ! relative-jump smoothness indicator: O(dx^2) smooth, O(1) at jumps.
+  ! to c_max at shocks, where r_face = |Delta h_eq|/H_ref is the relative-jump
+  ! smoothness indicator: O(dx^2) smooth, O(1) at jumps.
   ! u_eff = |u_face| + strain_coef*eps_e*dx_perp covers both advective and
   ! deformation-driven excitation of the broken-Q1 mode. A per-cell SSP-RK2
   ! semi-discrete-diffusion CFL budget (kcell/dt) scales all faces of any cell
@@ -10214,7 +10214,10 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       endif
       coef_face = dg_art_visc_c_min + (CS%dg_art_visc_c_max - dg_art_visc_c_min) * sigma_face
       cK_E(i,j) = coef_face
-      rate_face = coef_face * u_eff_face_avg * G%dyCu(i,j) / dx_perp
+      ! Per-face SSP-RK2 semi-discrete diffusion eigenvalue contribution to the
+      ! cell-mean: dh_bar/dt += -c*u_eff*[h]/dx_perp. No ell factor (it cancels
+      ! between the face-integrated flux and the cell area).
+      rate_face = coef_face * u_eff_face_avg / dx_perp
       rate_E(i,j) = rate_face
 
       ! Stagnant-jump diagnostic: |u| and eps_e both tiny while the equivalent jump
@@ -10374,7 +10377,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       endif
       coef_face = dg_art_visc_c_min + (CS%dg_art_visc_c_max - dg_art_visc_c_min) * sigma_face
       cK_N(i,j) = coef_face
-      rate_face = coef_face * u_eff_face_avg * G%dxCv(i,j) / dx_perp
+      rate_face = coef_face * u_eff_face_avg / dx_perp
       rate_N(i,j) = rate_face
 
       if (associated(CS%dg_slow_idle_face_v)) then
