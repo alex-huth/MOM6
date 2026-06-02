@@ -10069,25 +10069,44 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
       is_clamped_corner(:,:) = .false.
       do b = 1, 2 ; do a = 1, 2
         I_node = i - 2 + a ; J_node = j - 2 + b
+        ! Two-pass scan of the 4 cells touching B-node (I_node, J_node).  Pass 1
+        ! collects any Dirichlet (hmask=3) contributions only; pass 2 collects
+        ! interior (hmask=1, fully anchored) contributions only.  Dirichlet
+        ! wins: if any hmask=3 cell touches the corner, use only those values
+        ! (and skip interior contributions) so the focus's nodal h at that
+        ! corner matches the externally-prescribed BC exactly, producing zero
+        ! jump at the hmask=3 interface.  Interior contributions are used only
+        ! when no Dirichlet is present at this corner.
         h_clamp_sum   = 0.0
         h_clamp_count = 0
-        ! Walk the 4 cells touching B-node (I_node, J_node).  In cell-index space
-        ! these are at (i-2+a+dx_cor, j-2+b+dy_cor) for dx_cor, dy_cor in {0,1};
-        ! the cell at (dx_cor=1, dy_cor=1) is the focus cell itself.  Skip self;
-        ! skip out-of-domain; collect anchored neighbours' h_nodal at this shared
-        ! B-node.  Neighbour's local corner index is (ac, bc) = (2-dx_cor, 2-dy_cor).
         do dy_cor = 0, 1 ; do dx_cor = 0, 1
           ic_neigh = i - 2 + a + dx_cor
           jc_neigh = j - 2 + b + dy_cor
           if (ic_neigh == i .and. jc_neigh == j) cycle
           if (ic_neigh < G%isd .or. ic_neigh > G%ied) cycle
           if (jc_neigh < G%jsd .or. jc_neigh > G%jed) cycle
-          if (.not. is_anchored(ic_neigh, jc_neigh)) cycle
+          if (ISS%hmask(ic_neigh, jc_neigh) /= 3.0) cycle
           ac_neigh = 2 - dx_cor
           bc_neigh = 2 - dy_cor
           h_clamp_sum   = h_clamp_sum + CS%h_nodal(ic_neigh, jc_neigh, ac_neigh, bc_neigh)
           h_clamp_count = h_clamp_count + 1
         enddo ; enddo
+        if (h_clamp_count == 0) then
+          ! No Dirichlet here; fall back to interior anchored cells.
+          do dy_cor = 0, 1 ; do dx_cor = 0, 1
+            ic_neigh = i - 2 + a + dx_cor
+            jc_neigh = j - 2 + b + dy_cor
+            if (ic_neigh == i .and. jc_neigh == j) cycle
+            if (ic_neigh < G%isd .or. ic_neigh > G%ied) cycle
+            if (jc_neigh < G%jsd .or. jc_neigh > G%jed) cycle
+            if (.not. is_anchored(ic_neigh, jc_neigh)) cycle
+            if (ISS%hmask(ic_neigh, jc_neigh) == 3.0) cycle  ! already handled in pass 1
+            ac_neigh = 2 - dx_cor
+            bc_neigh = 2 - dy_cor
+            h_clamp_sum   = h_clamp_sum + CS%h_nodal(ic_neigh, jc_neigh, ac_neigh, bc_neigh)
+            h_clamp_count = h_clamp_count + 1
+          enddo ; enddo
+        endif
         if (h_clamp_count >= 1) then
           h_target_corner(a,b) = h_clamp_sum / real(h_clamp_count)
           is_clamped_corner(a,b) = .true.
