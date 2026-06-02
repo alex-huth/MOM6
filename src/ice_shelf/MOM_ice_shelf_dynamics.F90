@@ -9659,10 +9659,10 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
   integer :: nfaces_ghost   ! Number of active face neighbours of a ghost cell [nondim]
   logical :: contrib_valid  ! True if a cell contributes an anchored value at a corner
   ! Front-only CG-clamp buffers.
-  real    :: s_target(2,2)             ! Per-corner clamp target s [Z ~> m]
+  real    :: h_target_corner(2,2)      ! Per-corner clamp target h [Z ~> m]
   logical :: is_clamped_corner(2,2)    ! True if corner is CG-clamped to anchored neighbour
-  real    :: s_clamp_sum               ! Accumulator for averaging anchored neighbour s [Z ~> m]
-  integer :: s_clamp_count             ! Number of anchored neighbours at a corner [nondim]
+  real    :: h_clamp_sum               ! Accumulator for averaging anchored neighbour h [Z ~> m]
+  integer :: h_clamp_count             ! Number of anchored neighbours at a corner [nondim]
   integer :: n_clamped                 ! Number of clamped corners on this cell [nondim]
   integer :: dx_cor, dy_cor            ! Offsets to walk the 4 cells touching a B-node [nondim]
   integer :: ic_neigh, jc_neigh        ! Neighbour cell index in the 4-cell stencil
@@ -10052,30 +10052,29 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
       ! Front-only mode: CG-clamp at corners shared with anchored
       ! (interior or Dirichlet) cells.  At every corner whose B-node
       ! is touched by at least one anchored cell, replace this cell's
-      ! s_nodal at that corner with the average of the anchored
-      ! neighbours' nodal s at the shared B-node.  This makes the
-      ! shared-corner jump exactly zero.  Corners with no anchored
-      ! neighbour (ocean-side / peer-side) are left alone.  Mass-fix
-      ! by uniformly shifting only the unclamped corners so the cell
-      ! mean is preserved exactly without disturbing the clamped
-      ! corners.
-      !
-      ! Applied at GL cells too: frozen per-corner flotation state keeps the
-      ! reconstruction well-defined.  Hbar is preserved exactly (linear in h);
-      ! S_cell may shift slightly since s<->h is nonlinear at the in-cell GL,
-      ! but S_cell is recomputed on the next call.
+      ! h_nodal at that corner with the average of the anchored
+      ! neighbours' h_nodal at the shared B-node.  Operating on h
+      ! directly (rather than going via s and per-corner flotation)
+      ! avoids the s<->h reconstruction mismatch that can arise when
+      ! focus's frozen flotation classification differs from a
+      ! neighbour's at the shared corner (e.g., focus thinned below
+      ! flotation, neighbour still grounded — same physical corner,
+      ! different cg state, inconsistent h).  Continuous h at the
+      ! shared corner implies continuous s as well (single bed_node).
+      ! Corners with no anchored neighbour (ocean-side / peer-side)
+      ! are left alone.  Mass-fix by uniformly shifting only the
+      ! unclamped corners so Hbar is preserved exactly.
       ! ============================================================
       n_clamped = 0
       is_clamped_corner(:,:) = .false.
-      s_target(:,:) = s_nodal(:,:)
       do b = 1, 2 ; do a = 1, 2
         I_node = i - 2 + a ; J_node = j - 2 + b
-        s_clamp_sum   = 0.0
-        s_clamp_count = 0
+        h_clamp_sum   = 0.0
+        h_clamp_count = 0
         ! Walk the 4 cells touching B-node (I_node, J_node).  In cell-index space
         ! these are at (i-2+a+dx_cor, j-2+b+dy_cor) for dx_cor, dy_cor in {0,1};
         ! the cell at (dx_cor=1, dy_cor=1) is the focus cell itself.  Skip self;
-        ! skip out-of-domain; collect anchored neighbours' nodal s at this shared
+        ! skip out-of-domain; collect anchored neighbours' h_nodal at this shared
         ! B-node.  Neighbour's local corner index is (ac, bc) = (2-dx_cor, 2-dy_cor).
         do dy_cor = 0, 1 ; do dx_cor = 0, 1
           ic_neigh = i - 2 + a + dx_cor
@@ -10086,11 +10085,11 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
           if (.not. is_anchored(ic_neigh, jc_neigh)) cycle
           ac_neigh = 2 - dx_cor
           bc_neigh = 2 - dy_cor
-          s_clamp_sum   = s_clamp_sum + s_nodal_cell(ic_neigh, jc_neigh, ac_neigh, bc_neigh)
-          s_clamp_count = s_clamp_count + 1
+          h_clamp_sum   = h_clamp_sum + CS%h_nodal(ic_neigh, jc_neigh, ac_neigh, bc_neigh)
+          h_clamp_count = h_clamp_count + 1
         enddo ; enddo
-        if (s_clamp_count >= 1) then
-          s_target(a,b) = s_clamp_sum / real(s_clamp_count)
+        if (h_clamp_count >= 1) then
+          h_target_corner(a,b) = h_clamp_sum / real(h_clamp_count)
           is_clamped_corner(a,b) = .true.
           n_clamped = n_clamped + 1
         endif
@@ -10102,23 +10101,24 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
         cycle
       endif
 
-      ! Reconstruct h at clamped corners from s_target via per-corner flotation.
-      ! Unclamped corners keep original h until the mass-fix shift below.
+      ! Clamped corners take the averaged anchored h directly.  Unclamped
+      ! corners keep original h until the mass-fix shift below.
       do b = 1, 2 ; do a = 1, 2
         if (is_clamped_corner(a,b)) then
-          if (cg(a,b)) then
-            h_recon(a,b) = s_target(a,b) + bed_c(a,b)
-          else
-            h_recon(a,b) = s_target(a,b) * inv_one_minus_r
-          endif
+          h_recon(a,b) = h_target_corner(a,b)
         else
           h_recon(a,b) = CS%h_nodal(i,j,a,b)
         endif
       enddo ; enddo
 
       ! Mass-fix: shift only the unclamped corners uniformly so that the cell
-      ! mean is restored to Hbar_old.  This keeps clamped-corner jumps at the
-      ! shared B-nodes exactly zero.
+      ! mean is restored to Hbar_old.  cell_mean_w has units L^2 (it is
+      ! integral of basis * Jacobian), so the cell mean is
+      !   Hbar = sum_{a,b} w(a,b)*h(a,b) / sum_{a,b} w(a,b).
+      ! Setting Hbar_new = Hbar_old and solving for the uniform shift on the
+      ! unclamped corners gives:
+      !   shift * w_unclamped_total =
+      !     Hbar_old * area_total - sum_clamped w*h_recon - sum_unclamped w*h_orig.
       Hbar_clamped_contrib = 0.0
       Hbar_unclamped_orig  = 0.0
       w_unclamped_total    = 0.0
@@ -10132,7 +10132,9 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
       enddo ; enddo
 
       if (w_unclamped_total > 1.0e-30) then
-        shift = (Hbar_old - Hbar_clamped_contrib - Hbar_unclamped_orig) / w_unclamped_total
+        shift = (Hbar_old * ((CS%cell_mean_w(i,j,1,1) + CS%cell_mean_w(i,j,2,2)) + &
+                             (CS%cell_mean_w(i,j,1,2) + CS%cell_mean_w(i,j,2,1))) - &
+                 Hbar_clamped_contrib - Hbar_unclamped_orig) / w_unclamped_total
       else
         ! All 4 corners clamped: no room to absorb mass-fix.  Accept the Hbar
         ! drift (rare; only happens if the cell has anchored neighbours at all
