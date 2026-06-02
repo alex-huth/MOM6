@@ -10034,6 +10034,19 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
                       PK_SLACK_ENV * env_width)
           s_bound_max(a,b) = s_nodal_max_B(I_node, J_node) + bound_tol + pk_slack + venkat_slack(i, j)
           s_bound_min(a,b) = s_nodal_min_B(I_node, J_node) - bound_tol - pk_slack - venkat_slack(i, j)
+          ! Ensure the per-corner bounds bracket Sbar (standard Zhang-Shu MPP
+          ! detail).  The anchored envelope deliberately excludes the front cell
+          ! itself to avoid mutual-peer drift; that exclusion can leave Sbar
+          ! outside [s_nodal_min_B, s_nodal_max_B] when, e.g., the shelf thins
+          ! sharply at the front (all anchored interior contributors sit above
+          ! Sbar_front).  Without this expansion the phi-scaling collapses to
+          ! zero on the side where the bound is on the wrong side of Sbar, and
+          ! the reconstruction degenerates to a flat cell-mean — producing
+          ! exactly the steep face jump that the front-only mode is meant to
+          ! suppress.  Including Sbar in the bounds keeps phi well-posed
+          ! without reintroducing drift (Sbar cannot drift relative to itself).
+          s_bound_max(a,b) = max(s_bound_max(a,b), Sbar)
+          s_bound_min(a,b) = min(s_bound_min(a,b), Sbar)
         else
           ! No anchored contributors at this corner: leave unconstrained.  This
           ! happens only at deep-band front corners with no interior or ghost
