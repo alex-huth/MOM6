@@ -8769,14 +8769,17 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
 
   call get_param(param_file, mdl, "DG1_LIMITER_FRONT_ONLY", CS%dg_lim_front_only, &
                  "If true (and DG1_HIERARCHICAL_LIMITER is also true), apply the limiter "//&
-                 "only at cells that touch at least one non-ice cardinal neighbour "//&
-                 "(hmask != 1 and != 3). Interior cells with 4 ice neighbours run "//&
-                 "unlimited, preserving full DG(1) accuracy on the bulk of the domain. "//&
-                 "Targets the broken-Q1 mode amplification at calving fronts and isolated "//&
-                 "few-connected cells where the limiter has no neighbour bound on the "//&
-                 "open sides and the mode runs free. Front cells (including any cell that "//&
-                 "becomes a front cell as the ice front advances) get the limiter "//&
-                 "automatically.", &
+                 "only at front cells (cells with at least one non-ice cardinal "//&
+                 "neighbour, hmask != 1 and != 3), using a nodal envelope built from "//&
+                 "interior-cell nodal s values plus ghost-cell extrapolated cell-means "//&
+                 "(linear extrap along each active face direction, zero-grad fallback, "//&
+                 "averaged over active directions). Front cells themselves do not "//&
+                 "contribute to the envelope, which prevents mutual-peer drift between "//&
+                 "adjacent front cells. Interior cells (all four cardinal neighbours "//&
+                 "active or Dirichlet) keep the unlimited broken-Q1 reconstruction. "//&
+                 "Targets the broken-Q1 mode amplification at calving fronts and "//&
+                 "isolated few-connected cells where the cell-mean envelope collapses "//&
+                 "(count_B=1) or fails to bound nodal mismatch at shared corners.", &
                  default=.false., do_not_log=(.not.CS%use_DG_thickness .or. &
                                               .not.CS%dg_hierarchical_lim))
 
@@ -9641,6 +9644,18 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
   real :: h_recon(2,2)      ! Per-corner reconstructed thickness before mass-fix [Z ~> m]
   real :: hbdry_val         ! Dirichlet h_bdry_val floored by min_h_shelf [Z ~> m]
   real :: bed_avg_bdry      ! Average bed depth over 4 corners (Dirichlet cell) [Z ~> m]
+  ! Front-only nodal+ghost envelope buffers.
+  real, dimension(:,:,:,:), allocatable :: s_nodal_cell ! Per-cell, per-corner s [Z ~> m]
+  real, dimension(:,:),     allocatable :: Sbar_ghost   ! Extrapolated mean s for hmask=0 [Z ~> m]
+  logical, dimension(:,:),  allocatable :: is_anchored  ! Cell is interior (or hmask=3) [nondim]
+  real, dimension(:,:),     allocatable :: s_nodal_max_B, s_nodal_min_B ! Anchored nodal envelope
+                                                                        ! at B-nodes [Z ~> m]
+  real, dimension(:,:),     allocatable :: anchor_count_B ! Number of anchored contributors at
+                                                          ! each B-node [nondim]
+  real    :: sum_extrap     ! Accumulator for face-direction ghost extrap [Z ~> m]
+  real    :: contrib_val    ! Per-cell, per-corner anchored contribution [Z ~> m]
+  integer :: nfaces_ghost   ! Number of active face neighbours of a ghost cell [nondim]
+  logical :: contrib_valid  ! True if a cell contributes an anchored value at a corner
   integer :: i, j, a, b, I_node, J_node
 
   if (.not. associated(CS%h_nodal)) return
@@ -9733,6 +9748,172 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
   !    sign-consistency check (Park & Kim 2014 JCP 274) but applied to the
   !    surface-elevation field, which is the dynamically smooth variable.
   call pass_var(S_cell, G%domain)
+
+  ! 3b) Build the anchored nodal+ghost envelope used in front-only limiter mode.
+  !     - Anchored cells = hmask==3 OR (hmask==1 AND all 4 cardinal neighbours active).
+  !     - Ghost cells (hmask==0 adjacent to an active cell) contribute extrapolated
+  !       Sbar (per-face directional rule, averaged over active face directions).
+  !     - Front cells (hmask==1 but not interior) do NOT contribute to the envelope.
+  !     The result (s_nodal_max_B/min_B, anchor_count_B) is used in the per-cell
+  !     limiter loop below when CS%dg_lim_front_only is true.
+  if (CS%dg_lim_front_only) then
+    allocate(s_nodal_cell(G%isd:G%ied, G%jsd:G%jed, 2, 2))
+    allocate(Sbar_ghost(G%isd:G%ied, G%jsd:G%jed))
+    allocate(is_anchored(G%isd:G%ied, G%jsd:G%jed))
+    allocate(s_nodal_max_B(G%IsdB:G%IedB, G%JsdB:G%JedB))
+    allocate(s_nodal_min_B(G%IsdB:G%IedB, G%JsdB:G%JedB))
+    allocate(anchor_count_B(G%IsdB:G%IedB, G%JsdB:G%JedB))
+
+    ! Step 1: per-cell nodal s for all active cells.  For hmask=1 use the per-corner
+    ! flotation test on (h_nodal, bed_node); for hmask=3 set all 4 corners to the
+    ! cell-mean S_cell (which encodes the Dirichlet hbdry value above bed_avg).
+    s_nodal_cell(:,:,:,:) = 0.0
+    do j = G%jsd, G%jed ; do i = G%isd, G%ied
+      if (ISS%hmask(i,j) == 1.0) then
+        bed_c(1,1) = CS%bed_node(i-1,j-1) ; bed_c(2,1) = CS%bed_node(i,j-1)
+        bed_c(1,2) = CS%bed_node(i-1,j  ) ; bed_c(2,2) = CS%bed_node(i,j  )
+        do b = 1, 2 ; do a = 1, 2
+          if (rhoi_rhow * CS%h_nodal(i,j,a,b) > bed_c(a,b)) then
+            s_nodal_cell(i,j,a,b) = CS%h_nodal(i,j,a,b) - bed_c(a,b)
+          else
+            s_nodal_cell(i,j,a,b) = one_minus_r * CS%h_nodal(i,j,a,b)
+          endif
+        enddo ; enddo
+      elseif (ISS%hmask(i,j) == 3.0) then
+        s_nodal_cell(i,j,1,1) = S_cell(i,j) ; s_nodal_cell(i,j,2,1) = S_cell(i,j)
+        s_nodal_cell(i,j,1,2) = S_cell(i,j) ; s_nodal_cell(i,j,2,2) = S_cell(i,j)
+      endif
+    enddo ; enddo
+
+    ! Step 2: anchored classification.  hmask=3 cells are externally pinned, so they
+    ! always anchor.  hmask=1 cells anchor only when all 4 cardinal neighbours are
+    ! active (a "fully interior" cell whose slope DOFs are pinned by DG dynamics).
+    is_anchored(:,:) = .false.
+    do j = G%jsd+1, G%jed-1 ; do i = G%isd+1, G%ied-1
+      if (ISS%hmask(i,j) == 3.0) then
+        is_anchored(i,j) = .true.
+      elseif (ISS%hmask(i,j) == 1.0) then
+        if ((ISS%hmask(i-1,j) == 1.0 .or. ISS%hmask(i-1,j) == 3.0) .and. &
+            (ISS%hmask(i+1,j) == 1.0 .or. ISS%hmask(i+1,j) == 3.0) .and. &
+            (ISS%hmask(i,j-1) == 1.0 .or. ISS%hmask(i,j-1) == 3.0) .and. &
+            (ISS%hmask(i,j+1) == 1.0 .or. ISS%hmask(i,j+1) == 3.0)) then
+          is_anchored(i,j) = .true.
+        endif
+      endif
+    enddo ; enddo
+
+    ! Step 3: Sbar_ghost for hmask=0 cells adjacent (by face) to an active cell.
+    ! For each active face direction d, use linear extrap if the 2-cell-inland
+    ! stencil along d is active (continues the along-flow gradient); otherwise
+    ! zero-grad copy.  Average over active face directions.  Floor at the thin-
+    ! shelf surface to suppress negative overshoots from steep upstream gradients.
+    Sbar_ghost(:,:) = H_LARGE
+    do j = G%jsd+1, G%jed-1 ; do i = G%isd+1, G%ied-1
+      if (ISS%hmask(i,j) /= 0.0) cycle
+      sum_extrap = 0.0
+      nfaces_ghost = 0
+      ! West face neighbour (i-1, j)
+      if (i-1 >= G%isd) then
+        if (ISS%hmask(i-1,j) == 1.0 .or. ISS%hmask(i-1,j) == 3.0) then
+          if (i-2 >= G%isd) then
+            if (ISS%hmask(i-2,j) == 1.0 .or. ISS%hmask(i-2,j) == 3.0) then
+              sum_extrap = sum_extrap + (2.0 * S_cell(i-1,j) - S_cell(i-2,j))
+            else
+              sum_extrap = sum_extrap + S_cell(i-1,j)
+            endif
+          else
+            sum_extrap = sum_extrap + S_cell(i-1,j)
+          endif
+          nfaces_ghost = nfaces_ghost + 1
+        endif
+      endif
+      ! East face neighbour (i+1, j)
+      if (i+1 <= G%ied) then
+        if (ISS%hmask(i+1,j) == 1.0 .or. ISS%hmask(i+1,j) == 3.0) then
+          if (i+2 <= G%ied) then
+            if (ISS%hmask(i+2,j) == 1.0 .or. ISS%hmask(i+2,j) == 3.0) then
+              sum_extrap = sum_extrap + (2.0 * S_cell(i+1,j) - S_cell(i+2,j))
+            else
+              sum_extrap = sum_extrap + S_cell(i+1,j)
+            endif
+          else
+            sum_extrap = sum_extrap + S_cell(i+1,j)
+          endif
+          nfaces_ghost = nfaces_ghost + 1
+        endif
+      endif
+      ! South face neighbour (i, j-1)
+      if (j-1 >= G%jsd) then
+        if (ISS%hmask(i,j-1) == 1.0 .or. ISS%hmask(i,j-1) == 3.0) then
+          if (j-2 >= G%jsd) then
+            if (ISS%hmask(i,j-2) == 1.0 .or. ISS%hmask(i,j-2) == 3.0) then
+              sum_extrap = sum_extrap + (2.0 * S_cell(i,j-1) - S_cell(i,j-2))
+            else
+              sum_extrap = sum_extrap + S_cell(i,j-1)
+            endif
+          else
+            sum_extrap = sum_extrap + S_cell(i,j-1)
+          endif
+          nfaces_ghost = nfaces_ghost + 1
+        endif
+      endif
+      ! North face neighbour (i, j+1)
+      if (j+1 <= G%jed) then
+        if (ISS%hmask(i,j+1) == 1.0 .or. ISS%hmask(i,j+1) == 3.0) then
+          if (j+2 <= G%jed) then
+            if (ISS%hmask(i,j+2) == 1.0 .or. ISS%hmask(i,j+2) == 3.0) then
+              sum_extrap = sum_extrap + (2.0 * S_cell(i,j+1) - S_cell(i,j+2))
+            else
+              sum_extrap = sum_extrap + S_cell(i,j+1)
+            endif
+          else
+            sum_extrap = sum_extrap + S_cell(i,j+1)
+          endif
+          nfaces_ghost = nfaces_ghost + 1
+        endif
+      endif
+      if (nfaces_ghost >= 1) then
+        Sbar_ghost(i,j) = max(sum_extrap / real(nfaces_ghost), &
+                              one_minus_r * CS%min_h_shelf)
+      endif
+    enddo ; enddo
+    call pass_var(Sbar_ghost, G%domain)
+
+    ! Step 4: scatter anchored contributions to B-nodes.  Each cell contributes one
+    ! value per corner: its nodal s if anchored; Sbar_ghost if hmask=0 with a valid
+    ! extrap; nothing otherwise (front cells deliberately do not contribute, which
+    ! breaks the mutual-peer drift mode).
+    s_nodal_max_B(:,:)  = -H_LARGE
+    s_nodal_min_B(:,:)  =  H_LARGE
+    anchor_count_B(:,:) = 0.0
+    do j = G%jsd, G%jed ; do i = G%isd, G%ied
+      do b = 1, 2 ; do a = 1, 2
+        I_node = i - 2 + a ; J_node = j - 2 + b
+        if (I_node < G%IsdB .or. I_node > G%IedB) cycle
+        if (J_node < G%JsdB .or. J_node > G%JedB) cycle
+        contrib_valid = .false.
+        contrib_val   = 0.0
+        if (is_anchored(i,j)) then
+          contrib_val   = s_nodal_cell(i,j,a,b)
+          contrib_valid = .true.
+        elseif (ISS%hmask(i,j) == 0.0) then
+          if (Sbar_ghost(i,j) < H_LARGE - 1.0) then
+            contrib_val   = Sbar_ghost(i,j)
+            contrib_valid = .true.
+          endif
+        endif
+        if (contrib_valid) then
+          s_nodal_max_B(I_node, J_node) = max(s_nodal_max_B(I_node, J_node), contrib_val)
+          s_nodal_min_B(I_node, J_node) = min(s_nodal_min_B(I_node, J_node), contrib_val)
+          anchor_count_B(I_node, J_node) = anchor_count_B(I_node, J_node) + 1.0
+        endif
+      enddo ; enddo
+    enddo ; enddo
+    call pass_var(s_nodal_max_B,  G%domain, position=CORNER)
+    call pass_var(s_nodal_min_B,  G%domain, position=CORNER)
+    call pass_var(anchor_count_B, G%domain, position=CORNER)
+  endif
+
   pk_d2x_cell(:,:) = 0.0
   pk_d2y_cell(:,:) = 0.0
   do j = G%jsd+1, G%jed-1 ; do i = G%isd+1, G%ied-1
@@ -9780,6 +9961,15 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
         pk_factor(i, j) = 1.0
       endif
     endif
+    ! Defensively zero pk_factor at front cells (cells with any hmask=0 cardinal
+    ! neighbour).  The sign-consistency check trivially passes when stencil
+    ! values are missing (replaced by 0), which would spuriously enable the
+    ! PK envelope-width slack term and relax the front-only clamp.  At front
+    ! cells we want the tightest clamp possible, so disable PK relaxation here.
+    if (ISS%hmask(i-1,j) /= 1.0 .and. ISS%hmask(i-1,j) /= 3.0) pk_factor(i, j) = 0.0
+    if (ISS%hmask(i+1,j) /= 1.0 .and. ISS%hmask(i+1,j) /= 3.0) pk_factor(i, j) = 0.0
+    if (ISS%hmask(i,j-1) /= 1.0 .and. ISS%hmask(i,j-1) /= 3.0) pk_factor(i, j) = 0.0
+    if (ISS%hmask(i,j+1) /= 1.0 .and. ISS%hmask(i,j+1) /= 3.0) pk_factor(i, j) = 0.0
   enddo ; enddo
 
   ! Reset diagnostic buffers (limiter inactive at non-hmask=1 cells -> phi=1, drift=0).
@@ -9827,21 +10017,45 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
     Sbar = S_cell(i,j)
 
     ! Per-corner relaxed s-envelope (MLP-u2 + Park-Kim smooth-extrema slack).
+    ! In front-only mode, swap the cell-mean envelope (Smax_B/Smin_B) for the
+    ! anchored nodal+ghost envelope (s_nodal_max_B/s_nodal_min_B).  The cell-mean
+    ! envelope cannot bound the nodal mismatch at corners shared with interior
+    ! cells; the nodal envelope compares directly against neighbour nodal values.
     do b = 1, 2 ; do a = 1, 2
       I_node = i - 2 + a ; J_node = j - 2 + b
-      if (count_B(I_node, J_node) >= 1.5 .and. &
-          Smax_B(I_node, J_node) > -H_LARGE + 1.0 .and. &
-          Smin_B(I_node, J_node) <  H_LARGE - 1.0) then
-        env_width = Smax_B(I_node, J_node) - Smin_B(I_node, J_node)
-        bound_tol = max(BOUND_TOL_ABS, BOUND_TOL_REL * env_width)
-        pk_slack = pk_factor(i, j) * &
-                   (PK_SLACK_D2 * (abs(pk_d2x_cell(i, j)) + abs(pk_d2y_cell(i, j))) + &
-                    PK_SLACK_ENV * env_width)
-        s_bound_max(a,b) = Smax_B(I_node, J_node) + bound_tol + pk_slack + venkat_slack(i, j)
-        s_bound_min(a,b) = Smin_B(I_node, J_node) - bound_tol - pk_slack - venkat_slack(i, j)
+      if (CS%dg_lim_front_only) then
+        if (anchor_count_B(I_node, J_node) >= 0.5 .and. &
+            s_nodal_max_B(I_node, J_node) > -H_LARGE + 1.0 .and. &
+            s_nodal_min_B(I_node, J_node) <  H_LARGE - 1.0) then
+          env_width = s_nodal_max_B(I_node, J_node) - s_nodal_min_B(I_node, J_node)
+          bound_tol = max(BOUND_TOL_ABS, BOUND_TOL_REL * env_width)
+          pk_slack = pk_factor(i, j) * &
+                     (PK_SLACK_D2 * (abs(pk_d2x_cell(i, j)) + abs(pk_d2y_cell(i, j))) + &
+                      PK_SLACK_ENV * env_width)
+          s_bound_max(a,b) = s_nodal_max_B(I_node, J_node) + bound_tol + pk_slack + venkat_slack(i, j)
+          s_bound_min(a,b) = s_nodal_min_B(I_node, J_node) - bound_tol - pk_slack - venkat_slack(i, j)
+        else
+          ! No anchored contributors at this corner: leave unconstrained.  This
+          ! happens only at deep-band front corners with no interior or ghost
+          ! reach; the artificial-viscosity scheme handles those.
+          s_bound_max(a,b) =  H_LARGE
+          s_bound_min(a,b) = -H_LARGE
+        endif
       else
-        s_bound_max(a,b) =  H_LARGE
-        s_bound_min(a,b) = -H_LARGE
+        if (count_B(I_node, J_node) >= 1.5 .and. &
+            Smax_B(I_node, J_node) > -H_LARGE + 1.0 .and. &
+            Smin_B(I_node, J_node) <  H_LARGE - 1.0) then
+          env_width = Smax_B(I_node, J_node) - Smin_B(I_node, J_node)
+          bound_tol = max(BOUND_TOL_ABS, BOUND_TOL_REL * env_width)
+          pk_slack = pk_factor(i, j) * &
+                     (PK_SLACK_D2 * (abs(pk_d2x_cell(i, j)) + abs(pk_d2y_cell(i, j))) + &
+                      PK_SLACK_ENV * env_width)
+          s_bound_max(a,b) = Smax_B(I_node, J_node) + bound_tol + pk_slack + venkat_slack(i, j)
+          s_bound_min(a,b) = Smin_B(I_node, J_node) - bound_tol - pk_slack - venkat_slack(i, j)
+        else
+          s_bound_max(a,b) =  H_LARGE
+          s_bound_min(a,b) = -H_LARGE
+        endif
       endif
     enddo ; enddo
 
@@ -9902,6 +10116,11 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
   enddo ; enddo
 
   call pass_corner_field(CS%h_nodal, G)
+
+  if (CS%dg_lim_front_only) then
+    deallocate(s_nodal_cell, Sbar_ghost, is_anchored)
+    deallocate(s_nodal_max_B, s_nodal_min_B, anchor_count_B)
+  endif
 end subroutine nodal_surface_slope_limit
 
 !> Apply the per-cell tensor-product Q1 mass-matrix inverse:
