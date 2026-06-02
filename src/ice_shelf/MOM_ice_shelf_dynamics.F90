@@ -10032,21 +10032,34 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
           pk_slack = pk_factor(i, j) * &
                      (PK_SLACK_D2 * (abs(pk_d2x_cell(i, j)) + abs(pk_d2y_cell(i, j))) + &
                       PK_SLACK_ENV * env_width)
-          s_bound_max(a,b) = s_nodal_max_B(I_node, J_node) + bound_tol + pk_slack + venkat_slack(i, j)
-          s_bound_min(a,b) = s_nodal_min_B(I_node, J_node) - bound_tol - pk_slack - venkat_slack(i, j)
-          ! Ensure the per-corner bounds bracket Sbar (standard Zhang-Shu MPP
-          ! detail).  The anchored envelope deliberately excludes the front cell
-          ! itself to avoid mutual-peer drift; that exclusion can leave Sbar
-          ! outside [s_nodal_min_B, s_nodal_max_B] when, e.g., the shelf thins
-          ! sharply at the front (all anchored interior contributors sit above
-          ! Sbar_front).  Without this expansion the phi-scaling collapses to
-          ! zero on the side where the bound is on the wrong side of Sbar, and
-          ! the reconstruction degenerates to a flat cell-mean — producing
-          ! exactly the steep face jump that the front-only mode is meant to
-          ! suppress.  Including Sbar in the bounds keeps phi well-posed
-          ! without reintroducing drift (Sbar cannot drift relative to itself).
-          s_bound_max(a,b) = max(s_bound_max(a,b), Sbar)
-          s_bound_min(a,b) = min(s_bound_min(a,b), Sbar)
+          ! The anchored envelope excludes the front cell itself (to break
+          ! mutual-peer drift), so at a given corner of a front cell the
+          ! anchored set can be entirely one-sided relative to Sbar.  Example,
+          ! for a 1-cell-thick front with row j-1 interior, row j+1 ocean:
+          !   - South corners: anchored contributors are interior nodal s,
+          !     all > Sbar_front (shelf thins toward the front).
+          !   - North corners: anchored contributors are ghost extraps,
+          !     all < Sbar_front.
+          ! Bracketing Sbar into the bound (max(..., Sbar)) makes phi
+          ! ill-posed: ratio = (Sbar - Sbar)/s_dev = 0 -> phi = 0 -> full
+          ! flatten, defeating the limiter.  Instead, *release* the side that
+          ! has no anchored information: if anchored_max sits at or below
+          ! Sbar, leave the upper bound unconstrained at that corner (and
+          ! symmetrically for the lower side).  The other side stays tight
+          ! against the actual anchored extremum.  Per-cell phi = min across
+          ! all 4 corners ensures that each direction (upper / lower) is
+          ! constrained by whichever corners do carry anchored information in
+          ! that direction.
+          if (s_nodal_max_B(I_node, J_node) > Sbar) then
+            s_bound_max(a,b) = s_nodal_max_B(I_node, J_node) + bound_tol + pk_slack + venkat_slack(i, j)
+          else
+            s_bound_max(a,b) =  H_LARGE
+          endif
+          if (s_nodal_min_B(I_node, J_node) < Sbar) then
+            s_bound_min(a,b) = s_nodal_min_B(I_node, J_node) - bound_tol - pk_slack - venkat_slack(i, j)
+          else
+            s_bound_min(a,b) = -H_LARGE
+          endif
         else
           ! No anchored contributors at this corner: leave unconstrained.  This
           ! happens only at deep-band front corners with no interior or ghost
