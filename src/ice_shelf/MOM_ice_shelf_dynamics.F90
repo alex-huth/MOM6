@@ -9879,10 +9879,20 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
     enddo ; enddo
     call pass_var(Sbar_ghost, G%domain)
 
-    ! Step 4: scatter anchored contributions to B-nodes.  Each cell contributes one
-    ! value per corner: its nodal s if anchored; Sbar_ghost if hmask=0 with a valid
-    ! extrap; nothing otherwise (front cells deliberately do not contribute, which
-    ! breaks the mutual-peer drift mode).
+    ! Step 4: scatter contributions to B-nodes.  Contributor rule:
+    !   - Anchored cell (hmask=3 or interior hmask=1): contributes its per-corner
+    !     nodal s value at this B-node (tightest, leverages the well-posed DG
+    !     dynamics in the bulk).
+    !   - Front cell (hmask=1, not anchored): contributes its cell mean S_cell(i,j).
+    !     Cell means are pinned by mass conservation (the limiter does not touch
+    !     them), so including front-cell means cannot drive unbounded peer drift
+    !     — only nodal contributions could.  Excluding their means is overly
+    !     restrictive: at corners surrounded only by front cells and ghosts, the
+    !     ghost-extrap envelope can collapse near Sbar_focus and over-clip even
+    !     when neighbouring front cells (which carry useful physical thickness
+    !     information through their means) are right there.
+    !   - Ghost cell (hmask=0): contributes Sbar_ghost.
+    ! Self-cell skipped (handled by Sbar inclusion in the per-corner bracket).
     s_nodal_max_B(:,:)  = -H_LARGE
     s_nodal_min_B(:,:)  =  H_LARGE
     anchor_count_B(:,:) = 0.0
@@ -9896,6 +9906,13 @@ subroutine nodal_surface_slope_limit(CS, G, ISS)
         if (is_anchored(i,j)) then
           contrib_val   = s_nodal_cell(i,j,a,b)
           contrib_valid = .true.
+        elseif (ISS%hmask(i,j) == 1.0) then
+          ! Front cell: contribute cell mean (not nodal), to avoid mutual nodal
+          ! drift between peers while still bounding the envelope by physics.
+          if (S_cell(i,j) < H_LARGE - 1.0) then
+            contrib_val   = S_cell(i,j)
+            contrib_valid = .true.
+          endif
         elseif (ISS%hmask(i,j) == 0.0) then
           if (Sbar_ghost(i,j) < H_LARGE - 1.0) then
             contrib_val   = Sbar_ghost(i,j)
