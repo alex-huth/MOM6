@@ -331,14 +331,18 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! faces, expressed as a multiple of |u_face| [nondim].
                                   !! At each ocean-side face the flux is replaced by
                                   !! F_LF = (1/2) u (h_int + h_ghost) - (alpha/2) (h_ghost - h_int)
-                                  !! where alpha = dg_lf_alpha_factor * |u_face| and h_ghost is
-                                  !! a linear extrapolation through the boundary cell from its
-                                  !! inland 2-cell stencil (zero-grad fallback when the
-                                  !! 2-cell-inland cell is not active).  alpha_factor = 1 gives
-                                  !! pure upwind (equivalent to no LF treatment); alpha_factor > 1
-                                  !! adds explicit dissipation proportional to the deviation of
-                                  !! the boundary nodal h from the smooth extrapolation.
-                                  !! 0 disables the LF treatment entirely. Typical 2-5.
+                                  !! where alpha = dg_lf_alpha_factor * |u_face|, h_int is the
+                                  !! focus cell's nodal h interpolated AT the face, and h_ghost
+                                  !! is the cell-mean linear field evaluated AT the face midpoint,
+                                  !! h_ghost = (3*Hbar(focus) - Hbar(2-cell-inland))/2 (zero-grad
+                                  !! fallback when the 2-cell-inland cell is not active).
+                                  !! alpha_factor = 1 gives pure upwind (no LF correction).
+                                  !! In a smooth-thinning steady state, h_int at the face equals
+                                  !! h_ghost by construction, so the LF correction vanishes —
+                                  !! the dissipation acts only on the deviation of the boundary
+                                  !! nodal h from the smooth-extrap face value, i.e., on the
+                                  !! broken-Q1 mode at the ocean-facing corners.  0 disables LF
+                                  !! entirely. Typical 2-5.
   real :: dg_slow_idle_u_tiny     !< Stagnant-jump diagnostic threshold on face-speed
                                   !! magnitude [L T-1]. A face is flagged if |u_face| <
                                   !! this value AND eps_e_face < eps_tiny AND |Delta h_eq|
@@ -8812,9 +8816,11 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "Lax-Friedrichs dissipation coefficient at hmask=0 ocean faces, "//&
                  "expressed as a multiple of |u_face|.  At each ocean-side face the "//&
                  "flux is F_LF = (1/2)*u*(h_int + h_ghost) - (alpha/2)*(h_ghost - h_int) "//&
-                 "with alpha = DG1_LF_ALPHA_FACTOR*|u_face|, where h_ghost is the linear "//&
-                 "extrapolation 2*Hbar(focus) - Hbar(2-cell-inland), or Hbar(focus) (zero "//&
-                 "gradient) when the 2-cell-inland cell is not active.  alpha_factor = 1 "//&
+                 "with alpha = DG1_LF_ALPHA_FACTOR*|u_face|.  h_ghost is the linear-extrap "//&
+                 "prediction OF THE FACE VALUE from the inland cell-mean gradient, "//&
+                 "h_ghost = (3*Hbar(focus) - Hbar(2-cell-inland))/2 (the cell-mean linear "//&
+                 "field evaluated at the face midpoint), or Hbar(focus) (zero-gradient) "//&
+                 "when the 2-cell-inland cell is not active.  alpha_factor = 1 "//&
                  "reduces exactly to pure upwind (no change); alpha_factor > 1 adds "//&
                  "explicit dissipation proportional to (h_int - h_ghost), which damps "//&
                  "broken-Q1 nodal drift at the ocean-facing corners of front cells without "//&
@@ -10174,7 +10180,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
             h_ghost_face = Hbar_cell(i,j)
             if (i-1 >= G%isd) then
               if (hmask(i-1,j) == 1.0 .or. hmask(i-1,j) == 3.0) then
-                h_ghost_face = 2.0*Hbar_cell(i,j) - Hbar_cell(i-1,j)
+                h_ghost_face = 0.5*(3.0*Hbar_cell(i,j) - Hbar_cell(i-1,j))
               endif
             endif
             flux_lf_extra = lf_extra_factor * abs(u_at_qp) * (h_upwind - h_ghost_face) * gw * G%dyCu(i,j)
@@ -10184,7 +10190,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
             h_ghost_face = Hbar_cell(i+1,j)
             if (i+2 <= G%ied) then
               if (hmask(i+2,j) == 1.0 .or. hmask(i+2,j) == 3.0) then
-                h_ghost_face = 2.0*Hbar_cell(i+1,j) - Hbar_cell(i+2,j)
+                h_ghost_face = 0.5*(3.0*Hbar_cell(i+1,j) - Hbar_cell(i+2,j))
               endif
             endif
             flux_lf_extra = lf_extra_factor * abs(u_at_qp) * (h_upwind - h_ghost_face) * gw * G%dyCu(i,j)
@@ -10394,7 +10400,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
             h_ghost_face = Hbar_cell(i,j)
             if (j-1 >= G%jsd) then
               if (hmask(i,j-1) == 1.0 .or. hmask(i,j-1) == 3.0) then
-                h_ghost_face = 2.0*Hbar_cell(i,j) - Hbar_cell(i,j-1)
+                h_ghost_face = 0.5*(3.0*Hbar_cell(i,j) - Hbar_cell(i,j-1))
               endif
             endif
             flux_lf_extra = lf_extra_factor * abs(v_at_qp) * (h_upwind - h_ghost_face) * gw * G%dxCv(i,j)
@@ -10403,7 +10409,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
             h_ghost_face = Hbar_cell(i,j+1)
             if (j+2 <= G%jed) then
               if (hmask(i,j+2) == 1.0 .or. hmask(i,j+2) == 3.0) then
-                h_ghost_face = 2.0*Hbar_cell(i,j+1) - Hbar_cell(i,j+2)
+                h_ghost_face = 0.5*(3.0*Hbar_cell(i,j+1) - Hbar_cell(i,j+2))
               endif
             endif
             flux_lf_extra = lf_extra_factor * abs(v_at_qp) * (h_upwind - h_ghost_face) * gw * G%dxCv(i,j)
