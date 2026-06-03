@@ -451,7 +451,6 @@ type, public :: ice_shelf_dyn_CS ; private
              id_s_jump_face_u_rel = -1, id_s_jump_face_v_rel = -1, &
              id_h_jump_face_u_signed = -1, id_h_jump_face_v_signed = -1, &
              id_s_jump_face_u_signed = -1, id_s_jump_face_v_signed = -1, &
-             id_s_jump_face_u_slopeRel = -1, id_s_jump_face_v_slopeRel = -1, &
              id_un_face_u = -1, id_un_face_v = -1
   real, pointer, dimension(:,:) :: dg_art_visc_coef_u => NULL() !< Per-face DG(1) artificial-
                                                        !! viscosity coefficient on u-faces
@@ -1373,19 +1372,6 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          'Signed surface-elevation jump on v-faces, mean over the 2 face nodes of '//&
          '(s_plus - s_minus) with per-side flotation and plus = north cell.', &
          'm', conversion=US%Z_to_m)
-      CS%id_s_jump_face_u_slopeRel = register_diag_field('ice_shelf_model', &
-         's_jump_face_u_slopeRel', CS%diag%axesCu1, Time, &
-         'Surface-elevation jump on u-faces relative to the expected smooth surface '//&
-         'gradient across the face: |[s]| / max(eps, |sx_face|*dxCu), with sx_face the '//&
-         'mean of the two adjacent cell-mean x-slopes (sx_shelf). Dimensionless O(1) for '//&
-         'resolved features; >>1 indicates jumps in excess of what the smooth slope '//&
-         'predicts (under-damped oscillation or under-resolved sharp feature). Active '//&
-         'only when sx_shelf is being computed (id_sx_shelf, id_sy_shelf, or '//&
-         'id_surf_slope_mag_shelf registered).', 'nondim')
-      CS%id_s_jump_face_v_slopeRel = register_diag_field('ice_shelf_model', &
-         's_jump_face_v_slopeRel', CS%diag%axesCv1, Time, &
-         'As s_jump_face_u_slopeRel but on v-faces, with sy_face the mean of the two '//&
-         'adjacent sy_shelf values and dyCv as the across-face length.', 'nondim')
       CS%id_un_face_u = register_diag_field('ice_shelf_model','un_face_u', &
          CS%diag%axesCu1, Time, &
          'Face-normal ice speed |u.n| on u-faces (mean of the 2 endpoint B-node u_shelf '//&
@@ -1724,14 +1710,12 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
   real, dimension(SZDIB_(G),SZDJ_(G)) :: sjump_fu_rel ! per-u-face |[s]|/Hbar_avg [nondim]
   real, dimension(SZDIB_(G),SZDJ_(G)) :: hjump_fu_sgn ! signed u-face [h] = mean(h_plus - h_minus) [Z ~> m]
   real, dimension(SZDIB_(G),SZDJ_(G)) :: sjump_fu_sgn ! signed u-face [s] = mean(s_plus - s_minus) [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJ_(G)) :: sjump_fu_slopeRel ! |[s]|/(|sx_face|*dxCu) [nondim]
   real, dimension(SZDIB_(G),SZDJ_(G)) :: un_fu    ! per-u-face |u.n| [L T-1 ~> m s-1]
   real, dimension(SZDI_(G),SZDJB_(G)) :: hjump_fv ! per-v-face DG(1) thickness jump max|[h]| [Z ~> m]
   real, dimension(SZDI_(G),SZDJB_(G)) :: sjump_fv ! per-v-face surface-elevation jump max|[s]| [Z ~> m]
   real, dimension(SZDI_(G),SZDJB_(G)) :: sjump_fv_rel ! per-v-face |[s]|/Hbar_avg [nondim]
   real, dimension(SZDI_(G),SZDJB_(G)) :: hjump_fv_sgn ! signed v-face [h] = mean(h_plus - h_minus) [Z ~> m]
   real, dimension(SZDI_(G),SZDJB_(G)) :: sjump_fv_sgn ! signed v-face [s] = mean(s_plus - s_minus) [Z ~> m]
-  real, dimension(SZDI_(G),SZDJB_(G)) :: sjump_fv_slopeRel ! |[s]|/(|sy_face|*dyCv) [nondim]
   real, dimension(SZDI_(G),SZDJB_(G)) :: un_fv    ! per-v-face |v.n| [L T-1 ~> m s-1]
   real :: Hbar_face_avg                           ! 0.5*(Hbar_A + Hbar_B) per face [Z ~> m]
   real :: rr                                      ! ice/ocean density ratio [nondim]
@@ -2028,9 +2012,9 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       call pass_vector(CS%u_shelf, CS%v_shelf, G%domain, TO_ALL, BGRID_NE)
       rr = CS%density_ice / CS%density_ocean_avg
       hjump_fu(:,:) = 0.0 ; sjump_fu(:,:) = 0.0 ; sjump_fu_rel(:,:) = 0.0 ; un_fu(:,:) = 0.0
-      hjump_fu_sgn(:,:) = 0.0 ; sjump_fu_sgn(:,:) = 0.0 ; sjump_fu_slopeRel(:,:) = 0.0
+      hjump_fu_sgn(:,:) = 0.0 ; sjump_fu_sgn(:,:) = 0.0
       hjump_fv(:,:) = 0.0 ; sjump_fv(:,:) = 0.0 ; sjump_fv_rel(:,:) = 0.0 ; un_fv(:,:) = 0.0
-      hjump_fv_sgn(:,:) = 0.0 ; sjump_fv_sgn(:,:) = 0.0 ; sjump_fv_slopeRel(:,:) = 0.0
+      hjump_fv_sgn(:,:) = 0.0 ; sjump_fv_sgn(:,:) = 0.0
       ! u-faces: minus side = west cell (I,j) east edge, plus side = east cell
       ! (I+1,j) west edge; endpoint nodes 1=south (I,j-1), 2=north (I,j).
       do j = G%jsc, G%jec ; do I = G%IscB, G%IecB
@@ -2047,12 +2031,6 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         sjump_fu(I,j) = max(abs(s_m1-s_p1), abs(s_m2-s_p2))
         hjump_fu_sgn(I,j) = 0.5*((h_p1 - h_m1) + (h_p2 - h_m2))
         sjump_fu_sgn(I,j) = 0.5*((s_p1 - s_m1) + (s_p2 - s_m2))
-        if (CS%id_s_jump_face_u_slopeRel > 0) then
-          ! sx_face = mean of west/east cell-mean x-slopes (sx_shelf is [Z L-1]);
-          ! expected smooth jump across the face is |sx_face|*dxCu in [Z].
-          sjump_fu_slopeRel(I,j) = sjump_fu(I,j) / &
-              max(1.0e-30, abs(0.5*(CS%sx_shelf(I,j) + CS%sx_shelf(I+1,j))) * G%dxCu(I,j))
-        endif
         Hbar_face_avg = max(CS%min_h_shelf, 0.125*( &
           (CS%h_nodal(I  ,j,1,1) + CS%h_nodal(I  ,j,2,1)) + &
           (CS%h_nodal(I  ,j,1,2) + CS%h_nodal(I  ,j,2,2)) + &
@@ -2077,10 +2055,6 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         sjump_fv(i,J) = max(abs(s_m1-s_p1), abs(s_m2-s_p2))
         hjump_fv_sgn(i,J) = 0.5*((h_p1 - h_m1) + (h_p2 - h_m2))
         sjump_fv_sgn(i,J) = 0.5*((s_p1 - s_m1) + (s_p2 - s_m2))
-        if (CS%id_s_jump_face_v_slopeRel > 0) then
-          sjump_fv_slopeRel(i,J) = sjump_fv(i,J) / &
-              max(1.0e-30, abs(0.5*(CS%sy_shelf(i,J) + CS%sy_shelf(i,J+1))) * G%dyCv(i,J))
-        endif
         Hbar_face_avg = max(CS%min_h_shelf, 0.125*( &
           (CS%h_nodal(i,J  ,1,1) + CS%h_nodal(i,J  ,2,1)) + &
           (CS%h_nodal(i,J  ,1,2) + CS%h_nodal(i,J  ,2,2)) + &
@@ -2101,10 +2075,6 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
           call post_data(CS%id_s_jump_face_u_signed, sjump_fu_sgn, CS%diag)
       if (CS%id_s_jump_face_v_signed > 0) &
           call post_data(CS%id_s_jump_face_v_signed, sjump_fv_sgn, CS%diag)
-      if (CS%id_s_jump_face_u_slopeRel > 0) &
-          call post_data(CS%id_s_jump_face_u_slopeRel, sjump_fu_slopeRel, CS%diag)
-      if (CS%id_s_jump_face_v_slopeRel > 0) &
-          call post_data(CS%id_s_jump_face_v_slopeRel, sjump_fv_slopeRel, CS%diag)
       if (CS%id_s_jump_face_u_rel > 0) &
           call post_data(CS%id_s_jump_face_u_rel, sjump_fu_rel, CS%diag)
       if (CS%id_s_jump_face_v_rel > 0) &
@@ -7205,8 +7175,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   taudx(:,:) = 0.0 ; taudy(:,:) = 0.0
   taudx_b(:,:,:) = 0.0 ; taudy_b(:,:,:) = 0.0
 
-  if (CS%id_sx_shelf > 0 .or.  CS%id_sy_shelf > 0 .or. CS%id_surf_slope_mag_shelf > 0 .or. &
-      CS%id_s_jump_face_u_slopeRel > 0 .or. CS%id_s_jump_face_v_slopeRel > 0) then
+  if (CS%id_sx_shelf > 0 .or.  CS%id_sy_shelf > 0 .or. CS%id_surf_slope_mag_shelf > 0) then
     calc_slope_diag=.true.
   else
     calc_slope_diag=.false.
@@ -7996,8 +7965,7 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
   taudx(:,:) = 0.0 ; taudy(:,:) = 0.0
   taudx_b(:,:,:) = 0.0 ; taudy_b(:,:,:) = 0.0
 
-  calc_slope_diag = (CS%id_sx_shelf > 0 .or. CS%id_sy_shelf > 0 .or. CS%id_surf_slope_mag_shelf > 0 .or. &
-                     CS%id_s_jump_face_u_slopeRel > 0 .or. CS%id_s_jump_face_v_slopeRel > 0)
+  calc_slope_diag = (CS%id_sx_shelf > 0 .or. CS%id_sy_shelf > 0 .or. CS%id_surf_slope_mag_shelf > 0)
 
   do j=jsc-1,jec+1 ; do i=isc-1,iec+1
     if (ISS%hmask(i,j) /= 1 .and. ISS%hmask(i,j) /= 3) cycle
