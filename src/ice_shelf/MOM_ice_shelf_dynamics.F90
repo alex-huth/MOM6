@@ -2184,7 +2184,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
                            (CS%h_nodal(i,j,2,2) - CS%h_nodal(i,j,1,2)))
           dH_across = gx_lsq_d * G%dxT(i,j)
           if (abs(dH_across) > 0.01 * max(Hbar_face_avg, CS%min_h_shelf) .and. &
-              abs(dH_across) > 0.3  * abs(dH_within)               .and. &
+              abs(dH_across) > 0.3  * abs(dH_within)                     .and. &
+              abs(dH_within) > 0.3  * abs(dH_across)                     .and. &
               dH_within*dH_across < 0.0) then
             slope_mm_x(i,j) = - dH_within*dH_across / &
               max(max(dH_within*dH_within, dH_across*dH_across), slope_eps_sq)
@@ -2196,7 +2197,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
                            (CS%h_nodal(i,j,2,2) - CS%h_nodal(i,j,2,1)))
           dH_across = gy_lsq_d * G%dyT(i,j)
           if (abs(dH_across) > 0.01 * max(Hbar_face_avg, CS%min_h_shelf) .and. &
-              abs(dH_across) > 0.3  * abs(dH_within)               .and. &
+              abs(dH_across) > 0.3  * abs(dH_within)                     .and. &
+              abs(dH_within) > 0.3  * abs(dH_across)                     .and. &
               dH_within*dH_across < 0.0) then
             slope_mm_y(i,j) = - dH_within*dH_across / &
               max(max(dH_within*dH_within, dH_across*dH_across), slope_eps_sq)
