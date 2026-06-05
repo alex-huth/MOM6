@@ -2171,14 +2171,23 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         if (ISS%hmask(i,j) /= 1.0) cycle
         ! Cell-centred LSQ gradient (matches the sign-test limiter's reconstruction
         ! so a hit here corresponds exactly to the limiter's reset criterion).
+        ! Already gates out incomplete stencils and local x / y extrema; here we
+        ! additionally suppress comparisons where the cross-cell trend is too weak
+        ! relative to the within-cell mode -- in those cells the within-cell shape
+        ! is dominated by curvature / saddle structure from the corner-init
+        ! projection and the sign of gx (the residual mean trend) is uninformative.
         call lsq_cell_gradient(CS, G, ISS, i, j, gx_lsq_d, gy_lsq_d, ok_x_lsq_d, ok_y_lsq_d)
+        Hbar_face_avg = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
         ! x direction
         if (ok_x_lsq_d) then
           dH_within = 0.5*((CS%h_nodal(i,j,2,1) - CS%h_nodal(i,j,1,1)) + &
                            (CS%h_nodal(i,j,2,2) - CS%h_nodal(i,j,1,2)))
           dH_across = gx_lsq_d * G%dxT(i,j)
-          if (dH_within*dH_across < 0.0) then
-            slope_mm_x(i,j) = - dH_within*dH_across / max(dH_across*dH_across, slope_eps_sq)
+          if (abs(dH_across) > 0.01 * max(Hbar_face_avg, CS%min_h_shelf) .and. &
+              abs(dH_across) > 0.3  * abs(dH_within)               .and. &
+              dH_within*dH_across < 0.0) then
+            slope_mm_x(i,j) = - dH_within*dH_across / &
+              max(max(dH_within*dH_within, dH_across*dH_across), slope_eps_sq)
           endif
         endif
         ! y direction
@@ -2186,8 +2195,11 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
           dH_within = 0.5*((CS%h_nodal(i,j,1,2) - CS%h_nodal(i,j,1,1)) + &
                            (CS%h_nodal(i,j,2,2) - CS%h_nodal(i,j,2,1)))
           dH_across = gy_lsq_d * G%dyT(i,j)
-          if (dH_within*dH_across < 0.0) then
-            slope_mm_y(i,j) = - dH_within*dH_across / max(dH_across*dH_across, slope_eps_sq)
+          if (abs(dH_across) > 0.01 * max(Hbar_face_avg, CS%min_h_shelf) .and. &
+              abs(dH_across) > 0.3  * abs(dH_within)               .and. &
+              dH_within*dH_across < 0.0) then
+            slope_mm_y(i,j) = - dH_within*dH_across / &
+              max(max(dH_within*dH_within, dH_across*dH_across), slope_eps_sq)
           endif
         endif
       enddo ; enddo
