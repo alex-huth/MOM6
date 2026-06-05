@@ -1780,6 +1780,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
   real, dimension(SZDI_(G),SZDJB_(G)) :: eps_fv   ! per-v-face eps_e [T-1 ~> s-1]
   real :: dH_within, dH_across   ! In-cell and across-cell thickness differences [Z ~> m]
   real :: slope_eps_sq           ! Denominator floor for the mismatch ratio [Z2 ~> m2]
+  real :: gx_lsq_d, gy_lsq_d     ! LSQ cell-centred gradient [Z L-1] for the diagnostic
+  logical :: ok_x_lsq_d, ok_y_lsq_d ! LSQ per-direction validity for the diagnostic
   real :: u_mn_d, v_mn_d, u_pl_d, v_pl_d ! Side-averaged velocities for eps_e [L T-1 ~> m s-1]
   real :: dudx_d, dudy_d, dvdx_d, dvdy_d ! Face-midpoint velocity gradients [T-1 ~> s-1]
   integer :: i_lo_d, i_hi_d, j_lo_d, j_hi_d ! Boundary-aware neighbour indices
@@ -2167,26 +2169,25 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       slope_eps_sq = (0.1*CS%min_h_shelf)**2
       do j = G%jsc, G%jec ; do i = G%isc, G%iec
         if (ISS%hmask(i,j) /= 1.0) cycle
+        ! Cell-centred LSQ gradient (matches the sign-test limiter's reconstruction
+        ! so a hit here corresponds exactly to the limiter's reset criterion).
+        call lsq_cell_gradient(CS, G, ISS, i, j, gx_lsq_d, gy_lsq_d, ok_x_lsq_d, ok_y_lsq_d)
         ! x direction
-        if (i-1 >= G%isd .and. i+1 <= G%ied) then
-          if (ISS%hmask(i-1,j) == 1.0 .and. ISS%hmask(i+1,j) == 1.0) then
-            dH_within = 0.5*((CS%h_nodal(i,j,2,1) - CS%h_nodal(i,j,1,1)) + &
-                             (CS%h_nodal(i,j,2,2) - CS%h_nodal(i,j,1,2)))
-            dH_across = 0.5*(ISS%h_shelf(i+1,j) - ISS%h_shelf(i-1,j))
-            if (dH_within*dH_across < 0.0) then
-              slope_mm_x(i,j) = - dH_within*dH_across / max(dH_across*dH_across, slope_eps_sq)
-            endif
+        if (ok_x_lsq_d) then
+          dH_within = 0.5*((CS%h_nodal(i,j,2,1) - CS%h_nodal(i,j,1,1)) + &
+                           (CS%h_nodal(i,j,2,2) - CS%h_nodal(i,j,1,2)))
+          dH_across = gx_lsq_d * G%dxT(i,j)
+          if (dH_within*dH_across < 0.0) then
+            slope_mm_x(i,j) = - dH_within*dH_across / max(dH_across*dH_across, slope_eps_sq)
           endif
         endif
         ! y direction
-        if (j-1 >= G%jsd .and. j+1 <= G%jed) then
-          if (ISS%hmask(i,j-1) == 1.0 .and. ISS%hmask(i,j+1) == 1.0) then
-            dH_within = 0.5*((CS%h_nodal(i,j,1,2) - CS%h_nodal(i,j,1,1)) + &
-                             (CS%h_nodal(i,j,2,2) - CS%h_nodal(i,j,2,1)))
-            dH_across = 0.5*(ISS%h_shelf(i,j+1) - ISS%h_shelf(i,j-1))
-            if (dH_within*dH_across < 0.0) then
-              slope_mm_y(i,j) = - dH_within*dH_across / max(dH_across*dH_across, slope_eps_sq)
-            endif
+        if (ok_y_lsq_d) then
+          dH_within = 0.5*((CS%h_nodal(i,j,1,2) - CS%h_nodal(i,j,1,1)) + &
+                           (CS%h_nodal(i,j,2,2) - CS%h_nodal(i,j,2,1)))
+          dH_across = gy_lsq_d * G%dyT(i,j)
+          if (dH_within*dH_across < 0.0) then
+            slope_mm_y(i,j) = - dH_within*dH_across / max(dH_across*dH_across, slope_eps_sq)
           endif
         endif
       enddo ; enddo
@@ -9264,6 +9265,66 @@ pure real function nodal_cell_mean(h_cell, w_cell) result(Hbar)
   endif
 end function nodal_cell_mean
 
+!> Cell-centred least-squares gradient of the cell-mean thickness using up to 8
+!! neighbours (4 cardinal + 4 diagonal). Inverse-distance-squared weighting.
+!! Returns gx, gy in [Z L-1] and per-direction validity flags. Falls back to a
+!! 1-D axis fit if the cross sum is rank-deficient (e.g. only x-neighbours
+!! present). Neighbours with hmask /= 1 and /= 3 are skipped, matching the
+!! sign-test limiter's neighbour eligibility.
+subroutine lsq_cell_gradient(CS, G, ISS, i, j, gx, gy, ok_x, ok_y)
+  type(ice_shelf_dyn_CS), intent(in) :: CS
+  type(ocean_grid_type),  intent(in) :: G
+  type(ice_shelf_state),  intent(in) :: ISS
+  integer, intent(in) :: i, j
+  real,    intent(out) :: gx, gy        !< Cell-centred LSQ gradient [Z L-1]
+  logical, intent(out) :: ok_x, ok_y    !< True if gx / gy is well-defined
+
+  real :: Hbar_C, Hbar_n, dx_n, dy_n, dH_n, w_n, r2
+  real :: Sxx, Syy, Sxy, bx, by, det
+  integer :: di, dj, in, jn
+
+  ok_x = .false. ; ok_y = .false. ; gx = 0.0 ; gy = 0.0
+  Sxx = 0.0 ; Syy = 0.0 ; Sxy = 0.0 ; bx = 0.0 ; by = 0.0
+
+  Hbar_C = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
+
+  do dj = -1, 1 ; do di = -1, 1
+    if (di == 0 .and. dj == 0) cycle
+    in = i + di ; jn = j + dj
+    if (in < G%isd .or. in > G%ied) cycle
+    if (jn < G%jsd .or. jn > G%jed) cycle
+    if (ISS%hmask(in,jn) /= 1.0 .and. ISS%hmask(in,jn) /= 3.0) cycle
+
+    Hbar_n = nodal_cell_mean(CS%h_nodal(in,jn,:,:), CS%cell_mean_w(in,jn,:,:))
+    dx_n = 0.5*(G%dxT(i,j) + G%dxT(in,jn)) * real(di)
+    dy_n = 0.5*(G%dyT(i,j) + G%dyT(in,jn)) * real(dj)
+    r2 = dx_n*dx_n + dy_n*dy_n
+    if (r2 <= 0.0) cycle
+    w_n = 1.0 / r2
+    dH_n = Hbar_n - Hbar_C
+
+    Sxx = Sxx + w_n*dx_n*dx_n
+    Syy = Syy + w_n*dy_n*dy_n
+    Sxy = Sxy + w_n*dx_n*dy_n
+    bx  = bx  + w_n*dx_n*dH_n
+    by  = by  + w_n*dy_n*dH_n
+  enddo ; enddo
+
+  det = Sxx*Syy - Sxy*Sxy
+  if (Sxx > 0.0 .and. Syy > 0.0 .and. det > 0.0) then
+    gx = (Syy*bx - Sxy*by) / det
+    gy = (Sxx*by - Sxy*bx) / det
+    ok_x = .true. ; ok_y = .true.
+  else
+    if (Sxx > 0.0) then
+      gx = bx / Sxx ; ok_x = .true.
+    endif
+    if (Syy > 0.0) then
+      gy = by / Syy ; ok_y = .true.
+    endif
+  endif
+end subroutine lsq_cell_gradient
+
 !> Publish ISS%h_shelf from CS%h_nodal as the area-weighted mean.
 subroutine recompute_h_shelf_from_nodal(CS, ISS, G)
   type(ice_shelf_dyn_CS), intent(in) :: CS
@@ -9391,10 +9452,9 @@ subroutine nodal_sign_test_limit(CS, G, ISS)
 
   integer :: i, j
   real :: Hbar_C        ! Reference cell mean for the magnitude floor [Z ~> m]
-  real :: Hbar_W, Hbar_E, Hbar_S, Hbar_N  ! Neighbour cell means [Z ~> m]
-  logical :: have_W, have_E, have_S, have_N
   real :: phi_x_within, phi_y_within  ! Current within-cell slope modes [Z ~> m]
-  real :: phi_x_rec, phi_y_rec        ! Cross-cell reconstruction estimates [Z ~> m]
+  real :: gx_lsq, gy_lsq              ! LSQ cell-centred gradient [Z L-1]
+  logical :: ok_x_lsq, ok_y_lsq       ! LSQ per-direction validity flags
   real :: floor_x, floor_y            ! Per-cell magnitude floors [Z ~> m]
   real :: delta_x, delta_y            ! Per-corner offset applied on reset [Z ~> m]
 
@@ -9410,75 +9470,26 @@ subroutine nodal_sign_test_limit(CS, G, ISS)
     phi_y_within = 0.5*((CS%h_nodal(i,j,1,2) + CS%h_nodal(i,j,2,2)) &
                       - (CS%h_nodal(i,j,1,1) + CS%h_nodal(i,j,2,1)))
 
-    ! Cell means computed locally from h_nodal so the limiter sees the freshest
+    ! Cell mean computed locally from h_nodal so the limiter sees the freshest
     ! state between RK stages (ISS%h_shelf is only republished after the full
     ! advection step). Same area-weighting as recompute_h_shelf_from_nodal.
     Hbar_C = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
     floor_x = CS%dg_sign_lim_floor_rel * max(Hbar_C, CS%min_h_shelf)
     floor_y = floor_x
 
-    ! Cross-cell reconstruction in x: prefer centred diff, fall back to one-sided.
-    have_W = .false. ; have_E = .false.
-    if (i-1 >= G%isd) then
-      if (ISS%hmask(i-1,j) == 1.0 .or. ISS%hmask(i-1,j) == 3.0) then
-        Hbar_W = nodal_cell_mean(CS%h_nodal(i-1,j,:,:), CS%cell_mean_w(i-1,j,:,:))
-        have_W = .true.
-      endif
-    endif
-    if (i+1 <= G%ied) then
-      if (ISS%hmask(i+1,j) == 1.0 .or. ISS%hmask(i+1,j) == 3.0) then
-        Hbar_E = nodal_cell_mean(CS%h_nodal(i+1,j,:,:), CS%cell_mean_w(i+1,j,:,:))
-        have_E = .true.
-      endif
-    endif
-    if (have_W .and. have_E) then
-      phi_x_rec = 0.5*(Hbar_E - Hbar_W)
-    elseif (have_E) then
-      phi_x_rec = Hbar_E - Hbar_C
-    elseif (have_W) then
-      phi_x_rec = Hbar_C - Hbar_W
-    else
-      phi_x_rec = 0.0
-    endif
-
-    ! Cross-cell reconstruction in y: same pattern.
-    have_S = .false. ; have_N = .false.
-    if (j-1 >= G%jsd) then
-      if (ISS%hmask(i,j-1) == 1.0 .or. ISS%hmask(i,j-1) == 3.0) then
-        Hbar_S = nodal_cell_mean(CS%h_nodal(i,j-1,:,:), CS%cell_mean_w(i,j-1,:,:))
-        have_S = .true.
-      endif
-    endif
-    if (j+1 <= G%jed) then
-      if (ISS%hmask(i,j+1) == 1.0 .or. ISS%hmask(i,j+1) == 3.0) then
-        Hbar_N = nodal_cell_mean(CS%h_nodal(i,j+1,:,:), CS%cell_mean_w(i,j+1,:,:))
-        have_N = .true.
-      endif
-    endif
-    if (have_S .and. have_N) then
-      phi_y_rec = 0.5*(Hbar_N - Hbar_S)
-    elseif (have_N) then
-      phi_y_rec = Hbar_N - Hbar_C
-    elseif (have_S) then
-      phi_y_rec = Hbar_C - Hbar_S
-    else
-      phi_y_rec = 0.0
-    endif
+    ! Cross-cell reconstruction: least-squares cell-centred gradient from up to
+    ! 8 neighbours. Captures rotated/anisotropic ridges that the 1-D E-W (N-S)
+    ! central diff cannot see -- the latter aliases y-variation of the gradient
+    ! into the x estimate, producing false sign disagreements on smooth shelves
+    ! with non-uniform-width flow or oblique grounding lines.
+    call lsq_cell_gradient(CS, G, ISS, i, j, gx_lsq, gy_lsq, ok_x_lsq, ok_y_lsq)
 
     ! Sign-test reset, gated by magnitude floor. Only acts when phi_within and
-    ! phi_rec strictly disagree in sign AND phi_within is above the noise floor.
-    ! No clip on sign-agreeing slopes (preserves sub-cell features); reset target
-    ! is zero, not phi_rec. Resetting to zero rather than phi_rec:
-    !   (i) makes the limited output continuous in phi_within (the jump at the
-    !       sign-flip boundary collapses to zero, since both sides approach 0),
-    !  (ii) bounds chatter magnitude by |phi_within| (the noise itself) rather
-    !       than |phi_rec| (the resolved-gradient amplitude),
-    ! (iii) gives the physically correct within-cell surface slope at bed-kink
-    !       cells with flat true surface: the cross-cell H gradient there is
-    !       bed-induced, and propagating it to within-cell H would produce a
-    !       spurious within-cell surface slope; reset to zero correctly leaves
-    !       no within-cell surface contribution. phi_rec is used only to
-    !       identify the "wrong sign" via the sign-test product.
+    ! the LSQ gradient strictly disagree in sign AND phi_within is above the
+    ! noise floor. Sign comparison is unit-free: phi_x_within [Z] has the same
+    ! sign as the within-cell d h/d x [Z L-1] (positive 1/dxT scale factor).
+    ! Reset target is zero, not the LSQ value -- see prior commit message for
+    ! the three reasons (continuity, chatter bound, bed-kink physicality).
     !
     ! Application is via uniform per-edge offsets to leave the cell mean,
     ! orthogonal slope mode, and saddle mode untouched. Adding delta_x/2 to both
@@ -9488,10 +9499,10 @@ subroutine nodal_sign_test_limit(CS, G, ISS)
     ! the simple average of the four corners invariant.
     delta_x = 0.0
     delta_y = 0.0
-    if (abs(phi_x_within) > floor_x .and. phi_x_within*phi_x_rec < 0.0) then
+    if (ok_x_lsq .and. abs(phi_x_within) > floor_x .and. phi_x_within*gx_lsq < 0.0) then
       delta_x = - phi_x_within
     endif
-    if (abs(phi_y_within) > floor_y .and. phi_y_within*phi_y_rec < 0.0) then
+    if (ok_y_lsq .and. abs(phi_y_within) > floor_y .and. phi_y_within*gy_lsq < 0.0) then
       delta_y = - phi_y_within
     endif
 
