@@ -9267,36 +9267,24 @@ end function nodal_cell_mean
 
 !> Cell-centred least-squares gradient of the cell-mean thickness using up to 8
 !! neighbours (4 cardinal + 4 diagonal). Inverse-distance-squared weighting.
-!! Returns gx, gy in [Z L-1] and per-direction validity flags. ok_x/ok_y are
-!! true only when (a) the LSQ fit has full rank in that axis, (b) at least one
-!! neighbour exists on each side of the axis, and (c) the cell is not a local
-!! extremum in that axis (Hbar_E - Hbar_C and Hbar_C - Hbar_W have the same
-!! non-zero sign; analogously for N - C and C - S). Neighbours with
-!! hmask /= 1 and /= 3 are skipped, matching the sign-test limiter's
-!! neighbour eligibility. The monotonicity gate suppresses the case where
-!! phi_within and the LSQ gradient legitimately disagree because the cell
-!! straddles a local ridge / valley / saddle in that axis -- both the
-!! sign-test limiter and the dg_slope_mismatch diagnostic become uninformative
-!! there.
+!! Returns gx, gy in [Z L-1] and per-direction validity flags. Falls back to a
+!! 1-D axis fit if the cross sum is rank-deficient (e.g. only x-neighbours
+!! present). Neighbours with hmask /= 1 and /= 3 are skipped, matching the
+!! sign-test limiter's neighbour eligibility.
 subroutine lsq_cell_gradient(CS, G, ISS, i, j, gx, gy, ok_x, ok_y)
   type(ice_shelf_dyn_CS), intent(in) :: CS
   type(ocean_grid_type),  intent(in) :: G
   type(ice_shelf_state),  intent(in) :: ISS
   integer, intent(in) :: i, j
   real,    intent(out) :: gx, gy        !< Cell-centred LSQ gradient [Z L-1]
-  logical, intent(out) :: ok_x, ok_y    !< True if gx / gy is reliable and the
-                                        !! cell is locally monotonic in that axis
+  logical, intent(out) :: ok_x, ok_y    !< True if gx / gy is well-defined
 
   real :: Hbar_C, Hbar_n, dx_n, dy_n, dH_n, w_n, r2
   real :: Sxx, Syy, Sxy, bx, by, det
-  real :: dH_west, dH_east, dH_south, dH_north    ! Hbar_neighbour - Hbar_C on the 4 cardinals [Z]
-  logical :: have_W, have_E, have_S, have_N
   integer :: di, dj, in, jn
 
   ok_x = .false. ; ok_y = .false. ; gx = 0.0 ; gy = 0.0
   Sxx = 0.0 ; Syy = 0.0 ; Sxy = 0.0 ; bx = 0.0 ; by = 0.0
-  have_W = .false. ; have_E = .false. ; have_S = .false. ; have_N = .false.
-  dH_west = 0.0 ; dH_east = 0.0 ; dH_south = 0.0 ; dH_north = 0.0
 
   Hbar_C = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
 
@@ -9320,12 +9308,6 @@ subroutine lsq_cell_gradient(CS, G, ISS, i, j, gx, gy, ok_x, ok_y)
     Sxy = Sxy + w_n*dx_n*dy_n
     bx  = bx  + w_n*dx_n*dH_n
     by  = by  + w_n*dy_n*dH_n
-
-    ! Cache cardinal-neighbour differences for the monotonicity gate.
-    if (dj == 0 .and. di == -1) then ; dH_west = dH_n ; have_W = .true. ; endif
-    if (dj == 0 .and. di ==  1) then ; dH_east = dH_n ; have_E = .true. ; endif
-    if (di == 0 .and. dj == -1) then ; dH_south = dH_n ; have_S = .true. ; endif
-    if (di == 0 .and. dj ==  1) then ; dH_north = dH_n ; have_N = .true. ; endif
   enddo ; enddo
 
   det = Sxx*Syy - Sxy*Sxy
@@ -9339,26 +9321,6 @@ subroutine lsq_cell_gradient(CS, G, ISS, i, j, gx, gy, ok_x, ok_y)
     endif
     if (Syy > 0.0) then
       gy = by / Syy ; ok_y = .true.
-    endif
-  endif
-
-  ! Stencil-completeness + local-monotonicity gates per axis. Require both
-  ! cardinal neighbours present on the axis and a monotonic trend across the
-  ! cell. Strict "> 0" excludes the flat case (one side equal to C), which
-  ! would otherwise indicate a near-extremum where the sign of gradient is
-  ! ambiguous.
-  if (ok_x) then
-    if (.not. (have_W .and. have_E)) then
-      ok_x = .false. ; gx = 0.0
-    elseif (-dH_west * dH_east <= 0.0) then
-      ok_x = .false. ; gx = 0.0
-    endif
-  endif
-  if (ok_y) then
-    if (.not. (have_S .and. have_N)) then
-      ok_y = .false. ; gy = 0.0
-    elseif (-dH_south * dH_north <= 0.0) then
-      ok_y = .false. ; gy = 0.0
     endif
   endif
 end subroutine lsq_cell_gradient
