@@ -452,7 +452,8 @@ type, public :: ice_shelf_dyn_CS ; private
              id_s_jump_face_u_rel = -1, id_s_jump_face_v_rel = -1, &
              id_h_jump_face_u_signed = -1, id_h_jump_face_v_signed = -1, &
              id_s_jump_face_u_signed = -1, id_s_jump_face_v_signed = -1, &
-             id_un_face_u = -1, id_un_face_v = -1
+             id_un_face_u = -1, id_un_face_v = -1, &
+             id_dg_eps_face_u = -1, id_dg_eps_face_v = -1
   real, pointer, dimension(:,:) :: dg_art_visc_coef_u => NULL() !< Per-face DG(1) artificial-
                                                        !! viscosity coefficient on u-faces
                                                        !! [nondim] (post per-cell CFL
@@ -1390,6 +1391,19 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          CS%diag%axesCv1, Time, &
          'Face-normal ice speed |v.n| on v-faces (mean of the 2 endpoint B-node v_shelf '//&
          'values). Pair with h_jump_face_v / s_jump_face_v.', 'm s-1', conversion=US%L_T_to_m_s)
+      CS%id_dg_eps_face_u = register_diag_field('ice_shelf_model','dg_eps_face_u', &
+         CS%diag%axesCu1, Time, &
+         'Effective SSA strain rate eps_e at u-face midpoints, computed by the same '//&
+         'boundary-aware stencil used by the DG(1) artificial viscosity. Multiply by '//&
+         'DG1_ART_VISC_STRAIN_COEF * dxCu to get the strain-driven velocity floor '//&
+         '(u_floor = alpha*eps_e*dx_perp); compare with un_face_u to see where the floor '//&
+         'beats advection. Posted unconditionally so it can be used to tune '//&
+         'DG1_ART_VISC_STRAIN_COEF before turning the viscosity on.', &
+         'yr-1', conversion=365.0*86400.0*US%s_to_T)
+      CS%id_dg_eps_face_v = register_diag_field('ice_shelf_model','dg_eps_face_v', &
+         CS%diag%axesCv1, Time, &
+         'As dg_eps_face_u but on v-faces.', &
+         'yr-1', conversion=365.0*86400.0*US%s_to_T)
       CS%id_dg_lim_phi_xi = register_diag_field('ice_shelf_model','dg_lim_phi_xi', &
          CS%diag%axesT1, Time, &
          'Per-cell xi-slope (east-west) mode scaling factor from the DG(1) hierarchical '//&
@@ -1730,6 +1744,11 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
   real, dimension(SZDI_(G),SZDJB_(G)) :: hjump_fv_sgn ! signed v-face [h] = mean(h_plus - h_minus) [Z ~> m]
   real, dimension(SZDI_(G),SZDJB_(G)) :: sjump_fv_sgn ! signed v-face [s] = mean(s_plus - s_minus) [Z ~> m]
   real, dimension(SZDI_(G),SZDJB_(G)) :: un_fv    ! per-v-face |v.n| [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: eps_fu   ! per-u-face eps_e [T-1 ~> s-1]
+  real, dimension(SZDI_(G),SZDJB_(G)) :: eps_fv   ! per-v-face eps_e [T-1 ~> s-1]
+  real :: u_mn_d, v_mn_d, u_pl_d, v_pl_d ! Side-averaged velocities for eps_e [L T-1 ~> m s-1]
+  real :: dudx_d, dudy_d, dvdx_d, dvdy_d ! Face-midpoint velocity gradients [T-1 ~> s-1]
+  integer :: i_lo_d, i_hi_d, j_lo_d, j_hi_d ! Boundary-aware neighbour indices
   real :: Hbar_face_avg                           ! 0.5*(Hbar_A + Hbar_B) per face [Z ~> m]
   real :: rr                                      ! ice/ocean density ratio [nondim]
   real :: bed1, bed2                              ! bed elevation at the 2 face-endpoint nodes [Z ~> m]
@@ -2101,6 +2120,73 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
           call post_data(CS%id_s_jump_face_v_rel, sjump_fv_rel, CS%diag)
       if (CS%id_un_face_u > 0) call post_data(CS%id_un_face_u, un_fu, CS%diag)
       if (CS%id_un_face_v > 0) call post_data(CS%id_un_face_v, un_fv, CS%diag)
+    endif
+    ! Per-face SSA effective strain rate eps_e using the same boundary-aware stencil
+    ! as the DG(1) artificial viscosity. Posted unconditionally of art_visc on/off so
+    ! it can be used to tune DG1_ART_VISC_STRAIN_COEF in advance.
+    if (CS%id_dg_eps_face_u > 0) then
+      eps_fu(:,:) = 0.0
+      do j = G%jsc, G%jec ; do I = G%IscB, G%IecB
+        if (ISS%hmask(I,  j) /= 1.0 .and. ISS%hmask(I,  j) /= 3.0) cycle
+        if (ISS%hmask(I+1,j) /= 1.0 .and. ISS%hmask(I+1,j) /= 3.0) cycle
+        i_lo_d = max(I-1, G%isd) ; i_hi_d = min(I+1, G%ied)
+        if (i_lo_d < I) then
+          u_mn_d = 0.25*((CS%u_shelf(i_lo_d,j-1) + CS%u_shelf(I,j-1)) + &
+                         (CS%u_shelf(i_lo_d,j  ) + CS%u_shelf(I,j  )))
+          v_mn_d = 0.25*((CS%v_shelf(i_lo_d,j-1) + CS%v_shelf(I,j-1)) + &
+                         (CS%v_shelf(i_lo_d,j  ) + CS%v_shelf(I,j  )))
+        else
+          u_mn_d = 0.5*(CS%u_shelf(I,j-1) + CS%u_shelf(I,j))
+          v_mn_d = 0.5*(CS%v_shelf(I,j-1) + CS%v_shelf(I,j))
+        endif
+        if (i_hi_d > I) then
+          u_pl_d = 0.25*((CS%u_shelf(I    ,j-1) + CS%u_shelf(i_hi_d,j-1)) + &
+                         (CS%u_shelf(I    ,j  ) + CS%u_shelf(i_hi_d,j  )))
+          v_pl_d = 0.25*((CS%v_shelf(I    ,j-1) + CS%v_shelf(i_hi_d,j-1)) + &
+                         (CS%v_shelf(I    ,j  ) + CS%v_shelf(i_hi_d,j  )))
+        else
+          u_pl_d = 0.5*(CS%u_shelf(I,j-1) + CS%u_shelf(I,j))
+          v_pl_d = 0.5*(CS%v_shelf(I,j-1) + CS%v_shelf(I,j))
+        endif
+        dudx_d = (u_pl_d - u_mn_d) / G%dxCu(I,j)
+        dvdx_d = (v_pl_d - v_mn_d) / G%dxCu(I,j)
+        dudy_d = (CS%u_shelf(I,j) - CS%u_shelf(I,j-1)) / G%dyCu(I,j)
+        dvdy_d = (CS%v_shelf(I,j) - CS%v_shelf(I,j-1)) / G%dyCu(I,j)
+        eps_fu(I,j) = dg1_face_eps_eff(dudx_d, dudy_d, dvdx_d, dvdy_d)
+      enddo ; enddo
+      call post_data(CS%id_dg_eps_face_u, eps_fu, CS%diag)
+    endif
+    if (CS%id_dg_eps_face_v > 0) then
+      eps_fv(:,:) = 0.0
+      do J = G%JscB, G%JecB ; do i = G%isc, G%iec
+        if (ISS%hmask(i,J  ) /= 1.0 .and. ISS%hmask(i,J  ) /= 3.0) cycle
+        if (ISS%hmask(i,J+1) /= 1.0 .and. ISS%hmask(i,J+1) /= 3.0) cycle
+        j_lo_d = max(J-1, G%jsd) ; j_hi_d = min(J+1, G%jed)
+        if (j_lo_d < J) then
+          u_mn_d = 0.25*((CS%u_shelf(i-1,j_lo_d) + CS%u_shelf(i,j_lo_d)) + &
+                         (CS%u_shelf(i-1,J     ) + CS%u_shelf(i,J     )))
+          v_mn_d = 0.25*((CS%v_shelf(i-1,j_lo_d) + CS%v_shelf(i,j_lo_d)) + &
+                         (CS%v_shelf(i-1,J     ) + CS%v_shelf(i,J     )))
+        else
+          u_mn_d = 0.5*(CS%u_shelf(i-1,J) + CS%u_shelf(i,J))
+          v_mn_d = 0.5*(CS%v_shelf(i-1,J) + CS%v_shelf(i,J))
+        endif
+        if (j_hi_d > J) then
+          u_pl_d = 0.25*((CS%u_shelf(i-1,J     ) + CS%u_shelf(i,J     )) + &
+                         (CS%u_shelf(i-1,j_hi_d) + CS%u_shelf(i,j_hi_d)))
+          v_pl_d = 0.25*((CS%v_shelf(i-1,J     ) + CS%v_shelf(i,J     )) + &
+                         (CS%v_shelf(i-1,j_hi_d) + CS%v_shelf(i,j_hi_d)))
+        else
+          u_pl_d = 0.5*(CS%u_shelf(i-1,J) + CS%u_shelf(i,J))
+          v_pl_d = 0.5*(CS%v_shelf(i-1,J) + CS%v_shelf(i,J))
+        endif
+        dudy_d = (u_pl_d - u_mn_d) / G%dyCv(i,J)
+        dvdy_d = (v_pl_d - v_mn_d) / G%dyCv(i,J)
+        dudx_d = (CS%u_shelf(i,J) - CS%u_shelf(i-1,J)) / G%dxCv(i,J)
+        dvdx_d = (CS%v_shelf(i,J) - CS%v_shelf(i-1,J)) / G%dxCv(i,J)
+        eps_fv(i,J) = dg1_face_eps_eff(dudx_d, dudy_d, dvdx_d, dvdy_d)
+      enddo ; enddo
+      call post_data(CS%id_dg_eps_face_v, eps_fv, CS%diag)
     endif
     if (CS%id_h_source_rate > 0 .and. associated(CS%h_source_rate_last)) &
         call post_data(CS%id_h_source_rate, CS%h_source_rate_last, CS%diag)
