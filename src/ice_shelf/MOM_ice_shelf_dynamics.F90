@@ -275,6 +275,21 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! vs-Sbar offset of a globally linear field
                                   !! exactly; K > 1 allows further curvature
                                   !! tolerance. K = 0 disables the term [nondim].
+  logical :: dg_sign_limiter      !< If true, apply a sign-test moment limiter that
+                                  !! resets within-cell x/y slope modes to the cross-
+                                  !! cell mean-difference reconstruction whenever the
+                                  !! within-cell slope sign disagrees with the resolved
+                                  !! cross-cell slope. Cell mean is preserved exactly.
+                                  !! Targets bed-roughness-induced broken-Q1 modes that
+                                  !! the surface-jump art-visc sensor cannot see.
+                                  !! Krivodonova-style moment limiter, modified to act
+                                  !! only on sign disagreement (preserves large in-cell
+                                  !! slopes that agree in sign, i.e. sub-cell driving
+                                  !! stress at grounding lines and calving fronts).
+  real :: dg_sign_lim_floor_rel   !< Relative magnitude floor for the sign-test limiter
+                                  !! [nondim]. Within-cell slopes with magnitude below
+                                  !! floor*Hbar_cell are treated as noise and left
+                                  !! untouched even on sign disagreement.
   real, allocatable :: mu_lim_xi(:,:)     !< Cached orthogonalisation offset for the
                                           !! xi-slope mode template, per cell [nondim].
   real, allocatable :: mu_lim_eta(:,:)    !< Cached orthogonalisation offset for the
@@ -8981,6 +8996,30 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  units="nondim", default=1.0, &
                  do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_hierarchical_lim))
 
+  call get_param(param_file, mdl, "DG1_SIGN_LIMITER", CS%dg_sign_limiter, &
+                 "If true, apply a sign-test moment limiter to the DG(1) within-cell "//&
+                 "x and y slope modes between RK stages. For each cell, the within-cell "//&
+                 "slope phi_within is compared against the cross-cell slope phi_across "//&
+                 "= 0.5*(Hbar_neighbour_plus - Hbar_neighbour_minus) reconstructed from "//&
+                 "neighbour cell means. When the two have opposite sign AND |phi_within| "//&
+                 "exceeds DG1_SIGN_LIMITER_FLOOR_REL*Hbar_cell, phi_within is hard-reset "//&
+                 "to phi_across (the L2-optimal-from-means estimate). When signs agree, "//&
+                 "phi_within is preserved at full magnitude regardless of size -- "//&
+                 "preserves sub-cell driving stress at grounding lines and calving "//&
+                 "fronts. Cell mean is preserved exactly. Targets bed-roughness-induced "//&
+                 "broken-Q1 modes that the surface-jump art-visc sensor cannot see. "//&
+                 "Asymmetric variant of the Krivodonova 2007 moment limiter.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
+
+  call get_param(param_file, mdl, "DG1_SIGN_LIMITER_FLOOR_REL", CS%dg_sign_lim_floor_rel, &
+                 "Relative magnitude floor for the sign-test moment limiter. Within-cell "//&
+                 "slopes with |phi_within| < FLOOR_REL * Hbar_cell are treated as "//&
+                 "noise-level and left untouched even on sign disagreement. Avoids "//&
+                 "amplifying tiny slopes through sign-flip resets. Typical values "//&
+                 "0.005 to 0.02.", &
+                 units="nondim", default=0.01, &
+                 do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_sign_limiter))
+
   call get_param(param_file, mdl, "DG1_ART_VISC_C_MAX", CS%dg_art_visc_c_max, &
                  "Peak dimensionless coefficient on the DG(1) artificial-viscosity face "//&
                  "flux at fully-shocky faces. Face coefficient ramps from 0 (smooth) to "//&
@@ -9312,6 +9351,137 @@ subroutine nodal_positivity_limit(CS, G, ISS)
 
   call pass_corner_field(CS%h_nodal, G)
 end subroutine nodal_positivity_limit
+
+!> Sign-test moment limiter for DG(1) thickness. For each interior cell with
+!! hmask==1, compares the within-cell x and y slope modes against the cross-cell
+!! slope reconstructed from neighbour cell means (0.5*(Hbar_+ - Hbar_-) in each
+!! direction). When the within-cell slope disagrees in sign with the cross-cell
+!! slope AND has magnitude above DG1_SIGN_LIMITER_FLOOR_REL * Hbar_cell, the
+!! within-cell mode is hard-reset to the cross-cell value (the L2-optimal
+!! reconstruction from neighbour means). When signs agree, the within-cell slope
+!! is preserved at full magnitude.
+!!
+!! Targets bed-roughness-induced broken-Q1 modes that the surface-jump artificial-
+!! viscosity sensor cannot see (small surface jumps in absolute terms but
+!! contradicting the resolved cross-cell gradient). Asymmetric variant of the
+!! Krivodonova 2007 moment limiter: no minmod-style downward clip on slopes that
+!! agree in sign, so sub-cell driving stress at grounding lines and calving fronts
+!! is preserved at full magnitude. Cell mean is preserved exactly.
+!!
+!! Cross-cell reconstruction uses centred differences when both neighbours have
+!! hmask in {1,3}, one-sided differences otherwise, and zero (no action) when no
+!! neighbour cell mean is available.
+subroutine nodal_sign_test_limit(CS, G, ISS)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS
+  type(ocean_grid_type),  intent(inout) :: G
+  type(ice_shelf_state),  intent(in)    :: ISS
+
+  integer :: i, j
+  real :: Hbar_C        ! Reference cell mean for the magnitude floor [Z ~> m]
+  real :: Hbar_W, Hbar_E, Hbar_S, Hbar_N  ! Neighbour cell means [Z ~> m]
+  logical :: have_W, have_E, have_S, have_N
+  real :: phi_x_within, phi_y_within  ! Current within-cell slope modes [Z ~> m]
+  real :: phi_x_rec, phi_y_rec        ! Cross-cell reconstruction estimates [Z ~> m]
+  real :: floor_x, floor_y            ! Per-cell magnitude floors [Z ~> m]
+  real :: delta_x, delta_y            ! Per-corner offset applied on reset [Z ~> m]
+
+  do j = G%jsc, G%jec ; do i = G%isc, G%iec
+    if (ISS%hmask(i,j) /= 1.0) cycle
+
+    ! Within-cell slope modes from corner values (simple half-difference of edge
+    ! averages):
+    !   phi_x = 0.5*((SE+NE) - (SW+NW))   [east-edge minus west-edge average]
+    !   phi_y = 0.5*((NW+NE) - (SW+SE))   [north-edge minus south-edge average]
+    phi_x_within = 0.5*((CS%h_nodal(i,j,2,1) + CS%h_nodal(i,j,2,2)) &
+                      - (CS%h_nodal(i,j,1,1) + CS%h_nodal(i,j,1,2)))
+    phi_y_within = 0.5*((CS%h_nodal(i,j,1,2) + CS%h_nodal(i,j,2,2)) &
+                      - (CS%h_nodal(i,j,1,1) + CS%h_nodal(i,j,2,1)))
+
+    ! Cell means computed locally from h_nodal so the limiter sees the freshest
+    ! state between RK stages (ISS%h_shelf is only republished after the full
+    ! advection step). Same area-weighting as recompute_h_shelf_from_nodal.
+    Hbar_C = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
+    floor_x = CS%dg_sign_lim_floor_rel * max(Hbar_C, CS%min_h_shelf)
+    floor_y = floor_x
+
+    ! Cross-cell reconstruction in x: prefer centred diff, fall back to one-sided.
+    have_W = .false. ; have_E = .false.
+    if (i-1 >= G%isd) then
+      if (ISS%hmask(i-1,j) == 1.0 .or. ISS%hmask(i-1,j) == 3.0) then
+        Hbar_W = nodal_cell_mean(CS%h_nodal(i-1,j,:,:), CS%cell_mean_w(i-1,j,:,:))
+        have_W = .true.
+      endif
+    endif
+    if (i+1 <= G%ied) then
+      if (ISS%hmask(i+1,j) == 1.0 .or. ISS%hmask(i+1,j) == 3.0) then
+        Hbar_E = nodal_cell_mean(CS%h_nodal(i+1,j,:,:), CS%cell_mean_w(i+1,j,:,:))
+        have_E = .true.
+      endif
+    endif
+    if (have_W .and. have_E) then
+      phi_x_rec = 0.5*(Hbar_E - Hbar_W)
+    elseif (have_E) then
+      phi_x_rec = Hbar_E - Hbar_C
+    elseif (have_W) then
+      phi_x_rec = Hbar_C - Hbar_W
+    else
+      phi_x_rec = 0.0
+    endif
+
+    ! Cross-cell reconstruction in y: same pattern.
+    have_S = .false. ; have_N = .false.
+    if (j-1 >= G%jsd) then
+      if (ISS%hmask(i,j-1) == 1.0 .or. ISS%hmask(i,j-1) == 3.0) then
+        Hbar_S = nodal_cell_mean(CS%h_nodal(i,j-1,:,:), CS%cell_mean_w(i,j-1,:,:))
+        have_S = .true.
+      endif
+    endif
+    if (j+1 <= G%jed) then
+      if (ISS%hmask(i,j+1) == 1.0 .or. ISS%hmask(i,j+1) == 3.0) then
+        Hbar_N = nodal_cell_mean(CS%h_nodal(i,j+1,:,:), CS%cell_mean_w(i,j+1,:,:))
+        have_N = .true.
+      endif
+    endif
+    if (have_S .and. have_N) then
+      phi_y_rec = 0.5*(Hbar_N - Hbar_S)
+    elseif (have_N) then
+      phi_y_rec = Hbar_N - Hbar_C
+    elseif (have_S) then
+      phi_y_rec = Hbar_C - Hbar_S
+    else
+      phi_y_rec = 0.0
+    endif
+
+    ! Sign-test reset, gated by magnitude floor. Only acts when phi_within and
+    ! phi_rec strictly disagree in sign AND phi_within is above the noise floor.
+    ! No clip on sign-agreeing slopes (preserves sub-cell features); reset target
+    ! is phi_rec (the L2-optimal-from-means estimate), not zero.
+    !
+    ! Application is via uniform per-edge offsets to leave the cell mean,
+    ! orthogonal slope mode, and saddle mode untouched. Adding delta_x/2 to both
+    ! east corners and subtracting delta_x/2 from both west corners shifts the
+    ! east-edge average by +delta_x/2 and the west-edge average by -delta_x/2,
+    ! changing phi_x by exactly delta_x while leaving phi_y, the saddle, and
+    ! the simple average of the four corners invariant.
+    delta_x = 0.0
+    delta_y = 0.0
+    if (abs(phi_x_within) > floor_x .and. phi_x_within*phi_x_rec < 0.0) then
+      delta_x = phi_x_rec - phi_x_within
+    endif
+    if (abs(phi_y_within) > floor_y .and. phi_y_within*phi_y_rec < 0.0) then
+      delta_y = phi_y_rec - phi_y_within
+    endif
+
+    if (delta_x /= 0.0 .or. delta_y /= 0.0) then
+      CS%h_nodal(i,j,1,1) = CS%h_nodal(i,j,1,1) - 0.5*delta_x - 0.5*delta_y  ! SW
+      CS%h_nodal(i,j,2,1) = CS%h_nodal(i,j,2,1) + 0.5*delta_x - 0.5*delta_y  ! SE
+      CS%h_nodal(i,j,1,2) = CS%h_nodal(i,j,1,2) - 0.5*delta_x + 0.5*delta_y  ! NW
+      CS%h_nodal(i,j,2,2) = CS%h_nodal(i,j,2,2) + 0.5*delta_x + 0.5*delta_y  ! NE
+    endif
+  enddo ; enddo
+
+  call pass_corner_field(CS%h_nodal, G)
+end subroutine nodal_sign_test_limit
 
 !> Per-mode hierarchical Zhang-Shu QP-MPP slope limiter for DG(1) thickness
 !! with MLP-u2 vertex-based bounds. Decomposes each cell's in-cell bilinear
@@ -10755,9 +10925,11 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   ! source enters each SSP-RK2 stage as a simple additive term on dh.
   call project_h_source_rate_to_nodes(CS, ISS, G, S_node)
 
-  ! Stage 1: positivity floor -> hierarchical limiter -> spatial op -> M^-1 -> Euler step.
+  ! Stage 1: positivity floor -> hierarchical limiter -> sign-test limiter ->
+  ! spatial op -> M^-1 -> Euler step.
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
   if (CS%dg_hierarchical_lim) call nodal_surface_slope_limit(CS, G, ISS)
+  if (CS%dg_sign_limiter) call nodal_sign_test_limit(CS, G, ISS)
   call pass_corner_field(CS%h_nodal, G)
   call DG1_nodal_spatial_operator(CS, G, hmask, CS%h_nodal, rhs, uh_ice, vh_ice, time_step)
   do j = jsc, jec ; do i = isc, iec
@@ -10770,9 +10942,11 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   enddo ; enddo
   call pass_corner_field(CS%h_nodal, G)
 
-  ! Stage 2: positivity floor -> hierarchical limiter -> spatial op -> M^-1 -> SSP-RK2 combine.
+  ! Stage 2: positivity floor -> hierarchical limiter -> sign-test limiter ->
+  ! spatial op -> M^-1 -> SSP-RK2 combine.
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
   if (CS%dg_hierarchical_lim) call nodal_surface_slope_limit(CS, G, ISS)
+  if (CS%dg_sign_limiter) call nodal_sign_test_limit(CS, G, ISS)
   h_curr(:,:,:,:) = CS%h_nodal(:,:,:,:)
   call DG1_nodal_spatial_operator(CS, G, hmask, h_curr, rhs, uh_ice, vh_ice, time_step)
   do j = jsc, jec ; do i = isc, iec
@@ -10791,9 +10965,10 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   CS%h_source_rate_last(:,:) = CS%h_source_rate(:,:)
   CS%h_source_rate(:,:) = 0.0
 
-  ! Final positivity floor + optional hierarchical limit on the SSP-RK2 result.
+  ! Final positivity floor + optional hierarchical + sign-test on the SSP-RK2 result.
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
   if (CS%dg_hierarchical_lim) call nodal_surface_slope_limit(CS, G, ISS)
+  if (CS%dg_sign_limiter) call nodal_sign_test_limit(CS, G, ISS)
   call pass_corner_field(CS%h_nodal, G)
 
   ! Average uh_ice, vh_ice over the 2 stages (SSP-RK2 equal weight).
