@@ -446,6 +446,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_dg_lim_mass_drift = -1, id_dg_lim_phi = -1, id_dg_lim_pk_factor = -1, &
              id_phi_x_FV = -1, id_phi_y_FV = -1, &
              id_dg_art_visc_coef_u = -1, id_dg_art_visc_coef_v = -1, &
+             id_dg_art_visc_nu_u = -1, id_dg_art_visc_nu_v = -1, &
              id_dg_slow_idle_face_u = -1, id_dg_slow_idle_face_v = -1, &
              id_h_jump_face_u = -1, id_h_jump_face_v = -1, &
              id_s_jump_face_u = -1, id_s_jump_face_v = -1, &
@@ -461,6 +462,17 @@ type, public :: ice_shelf_dyn_CS ; private
                                                        !! operator call. Diagnostic only.
   real, pointer, dimension(:,:) :: dg_art_visc_coef_v => NULL() !< As dg_art_visc_coef_u but
                                                        !! on v-faces [nondim].
+  real, pointer, dimension(:,:) :: dg_art_visc_nu_u => NULL() !< Per-face effective DG(1)
+                                                       !! artificial viscosity on u-faces
+                                                       !! [m2 s-1], = c_face*u_eff*dx_perp
+                                                       !! (post per-cell CFL scaling).
+                                                       !! Comparable to a physical diffusivity:
+                                                       !! the face flux equals nu * [h_eq] /
+                                                       !! dx_perp * dy_face. Distinguishes
+                                                       !! gate-active-but-quiet faces from
+                                                       !! gate-active-and-damping faces.
+  real, pointer, dimension(:,:) :: dg_art_visc_nu_v => NULL() !< As dg_art_visc_nu_u but on
+                                                       !! v-faces [m2 s-1].
   real, pointer, dimension(:,:) :: dg_slow_idle_face_u => NULL() !< Stagnant-jump indicator on
                                                        !! u-faces [nondim, 0 or 1]. 1 where
                                                        !! |u_face| < u_tiny AND eps_e_face
@@ -629,6 +641,8 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%phi_y_FV(isd:ied,JsdB:JedB), source=1.0)
     allocate(CS%dg_art_visc_coef_u(IsdB:IedB,jsd:jed), source=0.0)
     allocate(CS%dg_art_visc_coef_v(isd:ied,JsdB:JedB), source=0.0)
+    allocate(CS%dg_art_visc_nu_u(IsdB:IedB,jsd:jed), source=0.0)
+    allocate(CS%dg_art_visc_nu_v(isd:ied,JsdB:JedB), source=0.0)
     allocate(CS%dg_slow_idle_face_u(IsdB:IedB,jsd:jed), source=0.0)
     allocate(CS%dg_slow_idle_face_v(isd:ied,JsdB:JedB), source=0.0)
     allocate(CS%mu_lim_xi(isd:ied,jsd:jed),    source=0.0)
@@ -1316,6 +1330,20 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          CS%diag%axesCv1, Time, &
          'Per-face DG(1) artificial-viscosity coefficient on v-faces. See dg_art_visc_coef_u.', &
          'nondim')
+      CS%id_dg_art_visc_nu_u = register_diag_field('ice_shelf_model','dg_art_visc_nu_u', &
+         CS%diag%axesCu1, Time, &
+         'Per-face effective DG(1) artificial viscosity on u-faces (post per-cell CFL scaling), '//&
+         'nu = c_face * u_eff_face_mean * dx_perp, with u_eff = |u_face| + '//&
+         'DG1_ART_VISC_STRAIN_COEF * eps_e_face * dx_perp. Comparable to a physical '//&
+         'diffusivity: face flux = nu * [h_eq] / dx_perp * dy_face. Distinguishes '//&
+         'gate-active-but-quiet faces (low u_eff -> small nu despite c_face = c_max) from '//&
+         'gate-active-and-damping faces (large u_eff -> large nu). Use with c_face to '//&
+         'separate gate response from actual damping rate.', &
+         'm2 s-1', conversion=US%L_T_to_m_s*US%L_to_m)
+      CS%id_dg_art_visc_nu_v = register_diag_field('ice_shelf_model','dg_art_visc_nu_v', &
+         CS%diag%axesCv1, Time, &
+         'As dg_art_visc_nu_u but on v-faces.', &
+         'm2 s-1', conversion=US%L_T_to_m_s*US%L_to_m)
       CS%id_dg_slow_idle_face_u = register_diag_field('ice_shelf_model','dg_slow_idle_face_u', &
          CS%diag%axesCu1, Time, &
          'DG(1) stagnant-jump indicator on u-faces (0 or 1). 1 where |u_face| and the SSA '//&
@@ -2210,6 +2238,10 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_art_visc_coef_u, CS%dg_art_visc_coef_u, CS%diag)
     if (CS%id_dg_art_visc_coef_v > 0 .and. associated(CS%dg_art_visc_coef_v)) &
         call post_data(CS%id_dg_art_visc_coef_v, CS%dg_art_visc_coef_v, CS%diag)
+    if (CS%id_dg_art_visc_nu_u > 0 .and. associated(CS%dg_art_visc_nu_u)) &
+        call post_data(CS%id_dg_art_visc_nu_u, CS%dg_art_visc_nu_u, CS%diag)
+    if (CS%id_dg_art_visc_nu_v > 0 .and. associated(CS%dg_art_visc_nu_v)) &
+        call post_data(CS%id_dg_art_visc_nu_v, CS%dg_art_visc_nu_v, CS%diag)
     if (CS%id_dg_slow_idle_face_u > 0 .and. associated(CS%dg_slow_idle_face_u)) &
         call post_data(CS%id_dg_slow_idle_face_u, CS%dg_slow_idle_face_u, CS%diag)
     if (CS%id_dg_slow_idle_face_v > 0 .and. associated(CS%dg_slow_idle_face_v)) &
@@ -6737,6 +6769,8 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%phi_y_FV)) deallocate(CS%phi_y_FV)
   if (associated(CS%dg_art_visc_coef_u)) deallocate(CS%dg_art_visc_coef_u)
   if (associated(CS%dg_art_visc_coef_v)) deallocate(CS%dg_art_visc_coef_v)
+  if (associated(CS%dg_art_visc_nu_u)) deallocate(CS%dg_art_visc_nu_u)
+  if (associated(CS%dg_art_visc_nu_v)) deallocate(CS%dg_art_visc_nu_v)
   if (associated(CS%dg_slow_idle_face_u)) deallocate(CS%dg_slow_idle_face_u)
   if (associated(CS%dg_slow_idle_face_v)) deallocate(CS%dg_slow_idle_face_v)
   if (allocated(CS%mu_lim_xi))    deallocate(CS%mu_lim_xi)
@@ -10179,6 +10213,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   rhs_face(:,:,:,:) = 0.0
   if (associated(CS%dg_art_visc_coef_u)) CS%dg_art_visc_coef_u(:,:) = 0.0
   if (associated(CS%dg_art_visc_coef_v)) CS%dg_art_visc_coef_v(:,:) = 0.0
+  if (associated(CS%dg_art_visc_nu_u)) CS%dg_art_visc_nu_u(:,:) = 0.0
+  if (associated(CS%dg_art_visc_nu_v)) CS%dg_art_visc_nu_v(:,:) = 0.0
   if (associated(CS%dg_slow_idle_face_u)) CS%dg_slow_idle_face_u(:,:) = 0.0
   if (associated(CS%dg_slow_idle_face_v)) CS%dg_slow_idle_face_v(:,:) = 0.0
 
@@ -10603,6 +10639,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       endif
       coef_face = cK_E(i,j) * scale_AB
       if (associated(CS%dg_art_visc_coef_u)) CS%dg_art_visc_coef_u(i,j) = coef_face
+      if (associated(CS%dg_art_visc_nu_u)) &
+        CS%dg_art_visc_nu_u(i,j) = coef_face * 0.5*(ueff_E(i,j,1) + ueff_E(i,j,2)) * G%dxCu(i,j)
       do gp = 1, 2
         if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
         t_co = 1.0 - t_face
@@ -10632,6 +10670,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       endif
       coef_face = cK_N(i,j) * scale_AB
       if (associated(CS%dg_art_visc_coef_v)) CS%dg_art_visc_coef_v(i,j) = coef_face
+      if (associated(CS%dg_art_visc_nu_v)) &
+        CS%dg_art_visc_nu_v(i,j) = coef_face * 0.5*(ueff_N(i,j,1) + ueff_N(i,j,2)) * G%dyCv(i,j)
       do gp = 1, 2
         if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
         t_co = 1.0 - t_face
