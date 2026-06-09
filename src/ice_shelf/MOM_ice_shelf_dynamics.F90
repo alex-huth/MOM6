@@ -317,6 +317,15 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! on smooth solutions); shocky faces receive c_max scaled
                                   !! by the advective speed + strain-rate floor. c_max = 0
                                   !! disables the viscosity entirely. Typical 0.5-2.0.
+  real :: dg_art_visc_advect_coef !< Dimensionless multiplier on the |u_face| advective
+                                  !! contribution to u_eff in the DG(1) artificial viscosity
+                                  !! [nondim]. Per face, u_eff = advect_coef * |u_face|
+                                  !! + strain_coef * eps_e_face * dx_perp. advect_coef = 1
+                                  !! (default) preserves the original formulation;
+                                  !! advect_coef = 0 drops the |u| term entirely so damping
+                                  !! is purely strain-rate-based (yielding a strictly grid-
+                                  !! invariant damping timescale at the cost of leaving fast
+                                  !! advective regions undamped if eps_e_face is also small).
   real :: dg_art_visc_strain_coef !< Dimensionless coefficient on the velocity-independent
                                   !! strain-rate-scaled diffusivity floor for the DG(1)
                                   !! artificial viscosity [nondim]. Per-face floor velocity is
@@ -8970,6 +8979,17 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  units="nondim", default=0.0, &
                  do_not_log=.not.CS%use_DG_thickness)
 
+  call get_param(param_file, mdl, "DG1_ART_VISC_ADVECT_COEF", CS%dg_art_visc_advect_coef, &
+                 "Dimensionless multiplier on the |u_face| advective contribution to u_eff "//&
+                 "in the DG(1) artificial viscosity. Per face, u_eff = advect_coef*|u_face| "//&
+                 "+ strain_coef*eps_e_face*dx_perp. advect_coef = 1 (default) preserves the "//&
+                 "original formulation; advect_coef = 0 drops the |u| term entirely so the "//&
+                 "damping timescale is set purely by strain rate (grid-invariant by "//&
+                 "construction). Useful for testing the |u| term's contribution to "//&
+                 "resolution-dependent tuning.", &
+                 units="nondim", default=1.0, &
+                 do_not_log=(.not.CS%use_DG_thickness .or. CS%dg_art_visc_c_max == 0.0))
+
   call get_param(param_file, mdl, "DG1_ART_VISC_STRAIN_COEF", CS%dg_art_visc_strain_coef, &
                  "Dimensionless coefficient on a velocity-independent strain-rate-scaled "//&
                  "diffusivity floor for the DG(1) artificial viscosity. Per face, "//&
@@ -10412,7 +10432,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         bed_qp = t_co*CS%bed_node(i,j-1) + t_face*CS%bed_node(i,j)
         dh_eq = dg1_wb_equiv_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
         u_floor_qp = CS%dg_art_visc_strain_coef * eps_e_face * dx_perp
-        u_eff_qp = u_mag_qp + u_floor_qp
+        u_eff_qp = CS%dg_art_visc_advect_coef * u_mag_qp + u_floor_qp
 
         ueff_E(i,j,gp) = u_eff_qp
         dheq_E(i,j,gp) = dh_eq
@@ -10575,7 +10595,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         bed_qp = t_co*CS%bed_node(i-1,j) + t_face*CS%bed_node(i,j)
         dh_eq = dg1_wb_equiv_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
         u_floor_qp = CS%dg_art_visc_strain_coef * eps_e_face * dx_perp
-        u_eff_qp = u_mag_qp + u_floor_qp
+        u_eff_qp = CS%dg_art_visc_advect_coef * u_mag_qp + u_floor_qp
 
         ueff_N(i,j,gp) = u_eff_qp
         dheq_N(i,j,gp) = dh_eq
