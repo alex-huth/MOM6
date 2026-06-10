@@ -413,6 +413,15 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! exactly 0/1 and defeats the subgrid GL scheme. Force
                                   !! magnitudes (rho*g*h, grad h, face-jump terms) always
                                   !! use the true DG h_nodal. Default false.
+  real :: dg_gl_gate_deficit_scale !< Regularization scale s for inverse-flotation-deficit
+                                  !! weighting of the h_flot node average [Z ~> m]. <= 0
+                                  !! (default 0) gives the plain arithmetic corner mean; > 0
+                                  !! weights each corner by 1/(|r*h - bed| + s) so the side
+                                  !! nearer flotation dominates, preventing a large one-sided
+                                  !! thickness jump at the GL face from dragging the gate's
+                                  !! flotation crossing far into the lighter cell. Small s
+                                  !! approaches pinning straddling faces at flotation (dead
+                                  !! band; avoid); large s approaches the arithmetic mean.
   logical :: calve_to_mask       !< If true, calve off the ice shelf when it passes the edge of a mask.
   real :: min_thickness_simple_calve !< min. ice shelf thickness criteria for calving [Z ~> m].
   real :: T_shelf_missing   !< An ice shelf temperature to use where there is no ice shelf [C ~> degC]
@@ -6196,26 +6205,44 @@ subroutine update_OD_ffrac_uncoupled(CS, G, h_shelf)
 end subroutine update_OD_ffrac_uncoupled
 
 !> Build the continuous (C0) flotation-gate thickness field CS%h_flot from the DG
-!! nodal thickness. Each B-grid node value is the arithmetic mean of the h_nodal
-!! corner values of all adjacent ice cells (hmask 1 or 3), written back into every
+!! nodal thickness. Each B-grid node value is an average of the h_nodal corner
+!! values of all adjacent ice cells (hmask 1 or 3), written back into every
 !! participating cell's corner slot so that cells sharing a node hold identical
-!! values. The average is a locator, not a mass field: it commits the flotation
-!! crossing to a single position inside any inter-cell thickness jump, so the
-!! grounded/floating gates vary continuously as the grounding line migrates
-!! through faces. Must be called by all PEs (contains halo exchanges).
+!! values. With DG_GL_GATE_DEFICIT_SCALE <= 0 the average is arithmetic; with a
+!! positive scale s each corner is weighted by 1/(|d_k| + s), where
+!! d_k = (rho_i/rho_w)*h_k - bed is that corner's flotation deficit, so the side
+!! nearer flotation dominates and a large one-sided jump at the grounding-line
+!! face cannot drag the gate far into the lighter cell. s -> infinity recovers
+!! the arithmetic mean; s -> 0 pins straddling faces exactly at flotation, which
+!! reintroduces a dead band (gate insensitive to thickness changes while the
+!! face straddles) and should be avoided. The gate is a locator, not a mass
+!! field: it commits the flotation crossing to a single position inside any
+!! inter-cell thickness jump, so the grounded/floating gates vary continuously
+!! as the grounding line migrates through faces. Must be called by all PEs
+!! (contains halo exchanges).
 subroutine compute_h_flot(CS, ISS, G)
   type(ice_shelf_dyn_CS), intent(inout) :: CS  !< The ice shelf dynamics control structure
   type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe
                                                !! the ice-shelf state
   type(ocean_grid_type),  intent(in)    :: G   !< The grid structure used by the ice shelf.
 
-  real    :: h_sum   ! Sum of h_nodal corner values at the node [Z ~> m]
-  real    :: h_avg   ! Node-averaged thickness [Z ~> m]
+  real    :: h_corner(4) ! h_nodal corner values gathered at the node [Z ~> m]
+  real    :: w_sum   ! Sum of corner weights [Z-1 ~> m-1] (deficit weighting) or [nondim]
+  real    :: hw_sum  ! Weight-thickness sum [nondim] (deficit weighting) or [Z ~> m]
+  real    :: w_k     ! Weight of one corner [Z-1 ~> m-1] (deficit weighting) or [nondim]
+  real    :: h_avg   ! Node-averaged gate thickness [Z ~> m]
+  real    :: bed_n   ! Bed depth at the node [Z ~> m]
+  real    :: rhoi_rhow ! Ice/ocean density ratio [nondim]
+  real    :: s_def   ! Deficit-weighting regularization scale [Z ~> m]
   integer :: n_cells ! Number of ice cells (hmask 1 or 3) sharing the node
-  integer :: i, j, isd, ied, jsd, jed
+  integer :: i, j, k, isd, ied, jsd, jed
   logical :: vSW, vSE, vNW, vNE ! True if the cell on that side of the node is ice
+  logical :: deficit_weighting  ! True if DG_GL_GATE_DEFICIT_SCALE > 0
 
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+  rhoi_rhow = CS%density_ice / CS%density_ocean_avg
+  s_def = CS%dg_gl_gate_deficit_scale
+  deficit_weighting = (s_def > 0.0)
 
   ! Ensure h_nodal halo corners are current before averaging across PE edges.
   call pass_corner_field(CS%h_nodal, G)
@@ -6231,13 +6258,32 @@ subroutine compute_h_flot(CS, ISS, G)
     vNW = (ISS%hmask(i  ,j+1) == 1.0 .or. ISS%hmask(i  ,j+1) == 3.0)
     vNE = (ISS%hmask(i+1,j+1) == 1.0 .or. ISS%hmask(i+1,j+1) == 3.0)
 
-    h_sum = 0.0 ; n_cells = 0
-    if (vSW) then ; h_sum = h_sum + CS%h_nodal(i  ,j  ,2,2) ; n_cells = n_cells + 1 ; endif
-    if (vSE) then ; h_sum = h_sum + CS%h_nodal(i+1,j  ,1,2) ; n_cells = n_cells + 1 ; endif
-    if (vNW) then ; h_sum = h_sum + CS%h_nodal(i  ,j+1,2,1) ; n_cells = n_cells + 1 ; endif
-    if (vNE) then ; h_sum = h_sum + CS%h_nodal(i+1,j+1,1,1) ; n_cells = n_cells + 1 ; endif
+    n_cells = 0
+    if (vSW) then ; n_cells = n_cells + 1 ; h_corner(n_cells) = CS%h_nodal(i  ,j  ,2,2) ; endif
+    if (vSE) then ; n_cells = n_cells + 1 ; h_corner(n_cells) = CS%h_nodal(i+1,j  ,1,2) ; endif
+    if (vNW) then ; n_cells = n_cells + 1 ; h_corner(n_cells) = CS%h_nodal(i  ,j+1,2,1) ; endif
+    if (vNE) then ; n_cells = n_cells + 1 ; h_corner(n_cells) = CS%h_nodal(i+1,j+1,1,1) ; endif
     if (n_cells == 0) cycle
-    h_avg = h_sum / real(n_cells)
+
+    if (deficit_weighting) then
+      ! Inverse-deficit weighting: corners nearer flotation dominate. The node
+      ! (I,J) = (i,j) is the NE corner of cell (i,j), so the bed there is
+      ! bed_node(i,j) (single-valued; the bed field is continuous).
+      bed_n = CS%bed_node(i,j)
+      w_sum = 0.0 ; hw_sum = 0.0
+      do k=1,n_cells
+        w_k = 1.0 / (abs((rhoi_rhow * h_corner(k)) - bed_n) + s_def)
+        w_sum = w_sum + w_k
+        hw_sum = hw_sum + (w_k * h_corner(k))
+      enddo
+      h_avg = hw_sum / w_sum
+    else
+      hw_sum = 0.0
+      do k=1,n_cells
+        hw_sum = hw_sum + h_corner(k)
+      enddo
+      h_avg = hw_sum / real(n_cells)
+    endif
 
     if (vSW) CS%h_flot(i  ,j  ,2,2) = h_avg
     if (vSE) CS%h_flot(i+1,j  ,1,2) = h_avg
@@ -9335,6 +9381,21 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "DG thickness. Has no effect on the IBP driving-stress path "//&
                  "(DG_DRIVING_STRESS_IBP = True) beyond its influence on ground_frac.", &
                  default=.false., do_not_log=.not.CS%use_DG_thickness)
+
+  call get_param(param_file, mdl, "DG_GL_GATE_DEFICIT_SCALE", CS%dg_gl_gate_deficit_scale, &
+                 "Regularization scale s for inverse-flotation-deficit weighting of the "//&
+                 "DG_GL_GATE_CONTINUOUS node average. <= 0 gives the plain arithmetic "//&
+                 "corner mean. > 0 weights each corner of the gate field by "//&
+                 "1/(|(rho_i/rho_w)*h - bed| + s), so the side nearer flotation "//&
+                 "dominates and a large one-sided thickness jump at the grounding-line "//&
+                 "face cannot drag the gate's flotation crossing far into the lighter "//&
+                 "cell. Small s approaches pinning straddling faces exactly at "//&
+                 "flotation, which makes the gate insensitive to thickness changes "//&
+                 "while the face straddles (a dead band) and should be avoided; large "//&
+                 "s approaches the arithmetic mean. A few meters is a reasonable "//&
+                 "starting value. Meaningful only when DG_GL_GATE_CONTINUOUS is true.", &
+                 units="m", default=0.0, scale=US%m_to_Z, &
+                 do_not_log=.not.(CS%use_DG_thickness .and. CS%dg_gl_gate_continuous))
 
 end subroutine read_nodal_limiter_params
 
