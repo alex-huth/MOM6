@@ -10898,9 +10898,10 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       endif
     enddo ; enddo
 
-    ! Aggregate per-cell rate sum and form scale = min(1, kcell/(S_K*dt)). Only owned
-    ! cells need scales (writes are guarded to hmask==1 cells); BC-side scale stays 1
-    ! and the min(scale_A, scale_B) below picks up the interior cell's budget.
+    ! Aggregate per-cell rate sum and form scale = min(1, kcell/(S_K*dt)). Each PE
+    ! computes scales for its owned cells (all four face rates of an owned cell are
+    ! available locally); non-ice and BC cells keep scale 1 so the min(scale_A,
+    ! scale_B) below picks up the interior cell's budget at one-sided faces.
     do j = jsc, jec ; do i = isc, iec
       if (hmask(i,j) /= 1.0) cycle
       S_K = 0.0
@@ -10916,20 +10917,19 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       if (associated(CS%dg_art_visc_cell_scale)) &
         CS%dg_art_visc_cell_scale(i,j) = cell_scale(i,j)
     enddo ; enddo
+    ! Halo-update the scales so that a face on a PE boundary (or a reentrant seam)
+    ! sees both adjacent cells' budgets: without this, each side would apply only
+    ! its own cell's throttle, breaking the antisymmetric flux pair (local
+    ! non-conservation) and making an engaged cap layout-dependent.
+    call pass_var(cell_scale, G%domain)
 
-    ! Pass 2, east faces: scaled application. Per-face scale_AB is the min of the two
-    ! adjacent owned cells' scales; non-owned (BC, halo) sides default to 1.
+    ! Pass 2, east faces: scaled application. Per-face scale_AB is the min of the
+    ! two adjacent cells' scales; after the halo update both sides are valid on
+    ! every active face (non-ice and BC cells carry scale 1), so the same value is
+    ! formed on whichever PE computes the face and the antisymmetric pair is exact.
     do j = jsc, jec ; do i = isc-1, iec
       if (.not. active_E(i,j)) cycle
-      if (i >= isc .and. hmask(i,j) == 1.0) then
-        if (i+1 <= iec .and. hmask(i+1,j) == 1.0) then
-          scale_AB = min(cell_scale(i,j), cell_scale(i+1,j))
-        else
-          scale_AB = cell_scale(i,j)
-        endif
-      else
-        scale_AB = cell_scale(i+1,j)
-      endif
+      scale_AB = min(cell_scale(i,j), cell_scale(i+1,j))
       coef_face = cK_E(i,j) * scale_AB
       if (associated(CS%dg_art_visc_coef_u)) CS%dg_art_visc_coef_u(i,j) = coef_face
       if (associated(CS%dg_art_visc_nu_u)) &
@@ -10952,15 +10952,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     ! Pass 2, north faces.
     do j = jsc-1, jec ; do i = isc, iec
       if (.not. active_N(i,j)) cycle
-      if (j >= jsc .and. hmask(i,j) == 1.0) then
-        if (j+1 <= jec .and. hmask(i,j+1) == 1.0) then
-          scale_AB = min(cell_scale(i,j), cell_scale(i,j+1))
-        else
-          scale_AB = cell_scale(i,j)
-        endif
-      else
-        scale_AB = cell_scale(i,j+1)
-      endif
+      scale_AB = min(cell_scale(i,j), cell_scale(i,j+1))
       coef_face = cK_N(i,j) * scale_AB
       if (associated(CS%dg_art_visc_coef_v)) CS%dg_art_visc_coef_v(i,j) = coef_face
       if (associated(CS%dg_art_visc_nu_v)) &
