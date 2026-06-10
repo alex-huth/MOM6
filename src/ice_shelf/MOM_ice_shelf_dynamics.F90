@@ -140,6 +140,16 @@ type, public :: ice_shelf_dyn_CS ; private
                                                        !! cell-local corner (a in {1,2} = west/east, b in {1,2} =
                                                        !! south/north). Each cell owns its own 4 corner values;
                                                        !! jumps across faces are allowed (true DG).
+  real, pointer, dimension(:,:,:,:) :: h_flot => NULL() !< Continuous (C0) flotation-gate thickness in the same
+                                                       !! per-cell 4-corner layout as h_nodal [Z ~> m]. Each corner
+                                                       !! value is the arithmetic mean of the h_nodal values of all
+                                                       !! ice cells (hmask 1 or 3) sharing that B-grid node, so
+                                                       !! cells sharing a node hold identical values. Used only in
+                                                       !! flotation tests (grounded/floating gates, ground_frac,
+                                                       !! Coulomb effective pressure) when DG_GL_GATE_CONTINUOUS is
+                                                       !! true; never used as a mass or force magnitude. Recomputed
+                                                       !! from h_nodal by compute_h_flot at the start of each outer
+                                                       !! velocity solve.
   real, pointer, dimension(:,:,:,:) :: Minv_xi => NULL() !< Per-cell 2x2 inverse of the 1D Q1 mass-matrix factor in
                                                        !! the xi direction [L-1 ~> m-1].
   real, pointer, dimension(:,:,:,:) :: Minv_eta => NULL() !< Per-cell 2x2 inverse of the 1D Q1 mass-matrix factor in
@@ -392,6 +402,17 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! flux (large jumps). ~0.05-0.2 engages on real h
                                   !! discontinuities; >>1 is effectively disabled
                                   !! (r << 1 in typical flows) [nondim].
+  logical :: dg_gl_gate_continuous !< If true, evaluate all grounded/floating decisions
+                                  !! (basal-friction gates, ground_frac, Coulomb effective
+                                  !! pressure, and the strong-form driving-stress branch
+                                  !! selector) on the continuous node-averaged thickness
+                                  !! field h_flot instead of each cell's own DG h_nodal.
+                                  !! Prevents the flotation crossing from hiding inside an
+                                  !! inter-cell thickness jump, which otherwise lets the
+                                  !! grounding line lock at cell faces with ground_frac
+                                  !! exactly 0/1 and defeats the subgrid GL scheme. Force
+                                  !! magnitudes (rho*g*h, grad h, face-jump terms) always
+                                  !! use the true DG h_nodal. Default false.
   logical :: calve_to_mask       !< If true, calve off the ice shelf when it passes the edge of a mask.
   real :: min_thickness_simple_calve !< min. ice shelf thickness criteria for calving [Z ~> m].
   real :: T_shelf_missing   !< An ice shelf temperature to use where there is no ice shelf [C ~> degC]
@@ -677,6 +698,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%bed_elev(isd:ied,jsd:jed), source=0.0)
     allocate(CS%bed_node(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%h_nodal(isd:ied,jsd:jed,1:2,1:2), source=0.0)
+    allocate(CS%h_flot(isd:ied,jsd:jed,1:2,1:2), source=0.0)
     allocate(CS%Minv_xi(isd:ied,jsd:jed,1:2,1:2), source=0.0)
     allocate(CS%Minv_eta(isd:ied,jsd:jed,1:2,1:2), source=0.0)
     allocate(CS%cell_mean_w(isd:ied,jsd:jed,1:2,1:2), source=0.0)
@@ -1554,6 +1576,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     !IS_dynamics_post_data is called before update_ice_shelf
     if (CS%id_taudx_shelf>0 .or. CS%id_taudy_shelf>0) then
       if (CS%use_DG_thickness) then
+        if (CS%dg_gl_gate_continuous) call compute_h_flot(CS, ISS, G)
         if (CS%dg_driving_stress_IBP) then
           call calc_shelf_driving_stress_DG(CS, ISS, G, US, CS%taudx_shelf, CS%taudy_shelf, CS%OD_av)
         else
@@ -2707,6 +2730,9 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   if (CS%GL_regularize .and. .not. CS%use_DG_thickness) then
     call interpolate_H_to_B(G, ISS%h_shelf, ISS%hmask, H_node, CS%min_h_shelf)
   endif
+  ! Refresh the continuous flotation-gate field before any grounded/floating
+  ! decisions are made for this outer solve (h is frozen for its duration).
+  if (CS%use_DG_thickness .and. CS%dg_gl_gate_continuous) call compute_h_flot(CS, ISS, G)
   call compute_ground_frac(CS, ISS, G, H_node)
 
   ! Calculate RHS
@@ -4724,6 +4750,8 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   real :: rho_ice_g_LtoZ ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
   logical :: do_DG       ! Local flag for DG basal friction mode
   logical :: grounded_qp ! Whether this quadrature point is grounded (for DG per-qp check)
+  real, dimension(:,:,:,:), pointer :: hgate ! Thickness field for the flotation
+                         ! test: h_flot under DG_GL_GATE_CONTINUOUS, else h_nodal [Z ~> m]
   integer :: iq, jq, iphi, jphi, i, j, ilq, jlq, Itgt, Jtgt, qp, qpv
   logical :: visc_qp4
   logical :: use_newton  ! Whether to apply Newton tangent stiffness corrections
@@ -4751,6 +4779,8 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   if (do_DG) then
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
     rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
+    hgate => CS%h_nodal
+    if (CS%dg_gl_gate_continuous) hgate => CS%h_flot
   endif
 
   uret(:,:) = 0.0 ; vret(:,:) = 0.0
@@ -4817,12 +4847,14 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
         ! exact Jacobian of the Picard residual, enabling quadratic convergence for all friction exponents.
         grounded_qp = merge(CS%ground_frac(i,j) >= 1.0, CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
         if (grounded_qp) then
-          ! DG mode: per-Gauss-point grounding check and fB computation
+          ! DG mode: per-Gauss-point grounding check and fB computation. h_gp is used
+          ! only as a flotation measure (gate + effective pressure), so it is read from
+          ! hgate (h_flot under DG_GL_GATE_CONTINUOUS).
           if (do_DG) then
-            h_gp = ((CS%h_nodal(i,j,1,1) * (xquad(3-iq) * xquad(3-jq))) + &
-                    (CS%h_nodal(i,j,2,2) * (xquad(iq)   * xquad(jq))))  + &
-                   ((CS%h_nodal(i,j,2,1) * (xquad(iq)   * xquad(3-jq))) + &
-                    (CS%h_nodal(i,j,1,2) * (xquad(3-iq) * xquad(jq))))
+            h_gp = ((hgate(i,j,1,1) * (xquad(3-iq) * xquad(3-jq))) + &
+                    (hgate(i,j,2,2) * (xquad(iq)   * xquad(jq))))  + &
+                   ((hgate(i,j,2,1) * (xquad(iq)   * xquad(3-jq))) + &
+                    (hgate(i,j,1,2) * (xquad(3-iq) * xquad(jq))))
             h_gp = max(h_gp, CS%min_h_shelf)
             bed_gp = ((CS%bed_node(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
                       (CS%bed_node(I,J)     * (xquad(iq)   * xquad(jq))))  + &
@@ -4932,13 +4964,16 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
         ! Picard and Newton Jacobian are both computed inside CG_action_subgrid_basal.
         Hcell(:,:) = H_node(I-1:I,J-1:J)
         if (do_DG) then
+          ! h_nodal_cell is used inside only as a flotation measure (sub-qp gate +
+          ! effective pressure), so the gate field is passed (h_flot under
+          ! DG_GL_GATE_CONTINUOUS).
           call CG_action_subgrid_basal(CS, G, US, Phisub, Hcell, &
               u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
               u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
               bathyT(i,j), dens_ratio, i, j, fB_e, use_newton, Usub, Vsub, &
               G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
               use_DG=.true., h_shelf_cell=h_shelf(i,j), &
-              h_nodal_cell=CS%h_nodal(i,j,:,:), &
+              h_nodal_cell=hgate(i,j,:,:), &
               bed_corners=CS%bed_node(I-1:I,J-1:J))
         else
           call CG_action_subgrid_basal(CS, G, US, Phisub, Hcell, &
@@ -4996,7 +5031,10 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
   real,                   intent(in) :: IareaT !< The inverse of the cell area at the tracer point [L-2 ~> m-2]
   logical,       optional, intent(in) :: use_DG       !< If true, use DG thickness and bed_node [nondim]
   real,          optional, intent(in) :: h_shelf_cell  !< Cell-averaged ice thickness [Z ~> m]
-  real, dimension(2,2), optional, intent(in) :: h_nodal_cell !< Q1 nodal thickness at the 4 cell corners [Z ~> m]
+  real, dimension(2,2), optional, intent(in) :: h_nodal_cell !< Q1 thickness at the 4 cell corners, used
+                                          !! only as a flotation measure (sub-qp gate + effective
+                                          !! pressure); the caller passes h_flot here under
+                                          !! DG_GL_GATE_CONTINUOUS [Z ~> m]
   real, dimension(2,2), optional, intent(in) :: bed_corners !< Bed elevation at element corners [Z ~> m]
 
   real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: Ucontr_sub, Vcontr_sub
@@ -5314,6 +5352,8 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
   real :: rho_ice_g_LtoZ ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
   logical :: do_DG       ! Local flag for DG basal friction mode
   logical :: grounded_qp ! Whether this quadrature point is grounded
+  real, dimension(:,:,:,:), pointer :: hgate ! Thickness field for the flotation
+                         ! test: h_flot under DG_GL_GATE_CONTINUOUS, else h_nodal [Z ~> m]
   real, dimension(2)   :: xquad
   real, dimension(2,2) :: Hcell, u_diag_sub, v_diag_sub  ! Subgrid diagonal contributions [R L2 Z T-1 ~> kg s-1]
   real, dimension(2,2,4) :: u_diag_qp, v_diag_qp
@@ -5339,6 +5379,8 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
   if (do_DG) then
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
     rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
+    hgate => CS%h_nodal
+    if (CS%dg_gl_gate_continuous) hgate => CS%h_flot
   endif
 
   u_diag_b(:,:,:)=0.0
@@ -5377,10 +5419,12 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
       grounded_qp = merge(CS%ground_frac(i,j) >= 1.0, CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
       if (grounded_qp) then
         if (do_DG) then
-          h_gp = ((CS%h_nodal(i,j,1,1) * (xquad(3-iq) * xquad(3-jq))) + &
-                  (CS%h_nodal(i,j,2,2) * (xquad(iq)   * xquad(jq))))  + &
-                 ((CS%h_nodal(i,j,2,1) * (xquad(iq)   * xquad(3-jq))) + &
-                  (CS%h_nodal(i,j,1,2) * (xquad(3-iq) * xquad(jq))))
+          ! h_gp is used only as a flotation measure (gate + effective pressure), so it
+          ! is read from hgate (h_flot under DG_GL_GATE_CONTINUOUS).
+          h_gp = ((hgate(i,j,1,1) * (xquad(3-iq) * xquad(3-jq))) + &
+                  (hgate(i,j,2,2) * (xquad(iq)   * xquad(jq))))  + &
+                 ((hgate(i,j,2,1) * (xquad(iq)   * xquad(3-jq))) + &
+                  (hgate(i,j,1,2) * (xquad(3-iq) * xquad(jq))))
           h_gp = max(h_gp, CS%min_h_shelf)
           ! Bed at the QP with the same rotation-paired bilinear pattern as
           ! u_curr_qp below, for symmetric rotation-cancel structure.
@@ -5501,12 +5545,15 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
       ! The sub-qp flotation test handles grounding fraction; no external ground_frac scaling needed.
       Hcell(:,:) = H_node(I-1:I,J-1:J)
       if (do_DG) then
+        ! h_nodal_cell is used inside only as a flotation measure (sub-qp gate +
+        ! effective pressure), so the gate field is passed (h_flot under
+        ! DG_GL_GATE_CONTINUOUS).
         call CG_diagonal_subgrid_basal(CS, G, US, Phisub, Hcell, &
             u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
             CS%bed_elev(i,j), dens_ratio, i, j, fB_e, u_diag_sub, v_diag_sub, &
             G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
             use_DG=.true., h_shelf_cell=h_shelf(i,j), &
-            h_nodal_cell=CS%h_nodal(i,j,:,:), &
+            h_nodal_cell=hgate(i,j,:,:), &
             bed_corners=CS%bed_node(I-1:I,J-1:J))
       else
         call CG_diagonal_subgrid_basal(CS, G, US, Phisub, Hcell, &
@@ -5561,7 +5608,10 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
   real,                   intent(in)  :: IareaT !< The inverse of the cell area at the tracer point [L-2 ~> m-2]
   logical,       optional, intent(in) :: use_DG       !< If true, use DG thickness and bed_node [nondim]
   real,          optional, intent(in) :: h_shelf_cell  !< Cell-averaged ice thickness [Z ~> m]
-  real, dimension(2,2), optional, intent(in) :: h_nodal_cell !< Q1 nodal thickness at the 4 cell corners [Z ~> m]
+  real, dimension(2,2), optional, intent(in) :: h_nodal_cell !< Q1 thickness at the 4 cell corners, used
+                                          !! only as a flotation measure (sub-qp gate + effective
+                                          !! pressure); the caller passes h_flot here under
+                                          !! DG_GL_GATE_CONTINUOUS [Z ~> m]
   real, dimension(2,2), optional, intent(in) :: bed_corners !< Bed elevation at element corners [Z ~> m]
 
   real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: u_diag_sub, v_diag_sub
@@ -6145,6 +6195,61 @@ subroutine update_OD_ffrac_uncoupled(CS, G, h_shelf)
 
 end subroutine update_OD_ffrac_uncoupled
 
+!> Build the continuous (C0) flotation-gate thickness field CS%h_flot from the DG
+!! nodal thickness. Each B-grid node value is the arithmetic mean of the h_nodal
+!! corner values of all adjacent ice cells (hmask 1 or 3), written back into every
+!! participating cell's corner slot so that cells sharing a node hold identical
+!! values. The average is a locator, not a mass field: it commits the flotation
+!! crossing to a single position inside any inter-cell thickness jump, so the
+!! grounded/floating gates vary continuously as the grounding line migrates
+!! through faces. Must be called by all PEs (contains halo exchanges).
+subroutine compute_h_flot(CS, ISS, G)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS  !< The ice shelf dynamics control structure
+  type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe
+                                               !! the ice-shelf state
+  type(ocean_grid_type),  intent(in)    :: G   !< The grid structure used by the ice shelf.
+
+  real    :: h_sum   ! Sum of h_nodal corner values at the node [Z ~> m]
+  real    :: h_avg   ! Node-averaged thickness [Z ~> m]
+  integer :: n_cells ! Number of ice cells (hmask 1 or 3) sharing the node
+  integer :: i, j, isd, ied, jsd, jed
+  logical :: vSW, vSE, vNW, vNE ! True if the cell on that side of the node is ice
+
+  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+
+  ! Ensure h_nodal halo corners are current before averaging across PE edges.
+  call pass_corner_field(CS%h_nodal, G)
+
+  CS%h_flot(:,:,:,:) = 0.0
+
+  ! Loop over B-grid nodes (I,J); the 4 surrounding cells are (i,j) to the SW
+  ! [corner (2,2)], (i+1,j) to the SE [corner (1,2)], (i,j+1) to the NW
+  ! [corner (2,1)], and (i+1,j+1) to the NE [corner (1,1)].
+  do j=jsd,jed-1 ; do i=isd,ied-1
+    vSW = (ISS%hmask(i  ,j  ) == 1.0 .or. ISS%hmask(i  ,j  ) == 3.0)
+    vSE = (ISS%hmask(i+1,j  ) == 1.0 .or. ISS%hmask(i+1,j  ) == 3.0)
+    vNW = (ISS%hmask(i  ,j+1) == 1.0 .or. ISS%hmask(i  ,j+1) == 3.0)
+    vNE = (ISS%hmask(i+1,j+1) == 1.0 .or. ISS%hmask(i+1,j+1) == 3.0)
+
+    h_sum = 0.0 ; n_cells = 0
+    if (vSW) then ; h_sum = h_sum + CS%h_nodal(i  ,j  ,2,2) ; n_cells = n_cells + 1 ; endif
+    if (vSE) then ; h_sum = h_sum + CS%h_nodal(i+1,j  ,1,2) ; n_cells = n_cells + 1 ; endif
+    if (vNW) then ; h_sum = h_sum + CS%h_nodal(i  ,j+1,2,1) ; n_cells = n_cells + 1 ; endif
+    if (vNE) then ; h_sum = h_sum + CS%h_nodal(i+1,j+1,1,1) ; n_cells = n_cells + 1 ; endif
+    if (n_cells == 0) cycle
+    h_avg = h_sum / real(n_cells)
+
+    if (vSW) CS%h_flot(i  ,j  ,2,2) = h_avg
+    if (vSE) CS%h_flot(i+1,j  ,1,2) = h_avg
+    if (vNW) CS%h_flot(i  ,j+1,2,1) = h_avg
+    if (vNE) CS%h_flot(i+1,j+1,1,1) = h_avg
+  enddo ; enddo
+
+  ! Fill halo corners that this PE's node loop could not reach.
+  call pass_corner_field(CS%h_flot, G)
+
+end subroutine compute_h_flot
+
 !> Set CS%ground_frac to the fraction of sub-grid integration points that are
 !! grounded. Only active under GL_regularize=True; in that path the sub-grid uses
 !! n_sub_regularize x n_sub_regularize sub-cells with 2x2 Gauss points each (the same
@@ -6167,10 +6272,17 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
   real :: h_ip, bed_ip   ! Ice thickness and bed elevation at a sub-IP [Z ~> m]
   real :: bed_corners(2,2) ! Bed elevation at the 4 B-grid corners of a cell [Z ~> m]
   real :: H_corners(2,2)   ! Ice thickness at the 4 B-grid corners (non-DG path) [Z ~> m]
+  real, dimension(:,:,:,:), pointer :: hgate ! Thickness field for the flotation
+                         ! test: h_flot under DG_GL_GATE_CONTINUOUS, else h_nodal [Z ~> m]
   integer :: i, j, isub, jsub, iq, jq, n_total, n_grounded
   integer :: isc, iec, jsc, jec
 
   if (.not. CS%GL_regularize) return
+
+  if (CS%use_DG_thickness) then
+    hgate => CS%h_nodal
+    if (CS%dg_gl_gate_continuous) hgate => CS%h_flot
+  endif
 
   rhoi_rhow = CS%density_ice / CS%density_ocean_avg
   n_total = CS%n_sub_regularize * CS%n_sub_regularize * 4
@@ -6195,10 +6307,10 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
     do jsub=1,CS%n_sub_regularize ; do isub=1,CS%n_sub_regularize
       do jq=1,2 ; do iq=1,2
         if (CS%use_DG_thickness) then
-          h_ip = ((CS%Phisub(iq,jq,isub,jsub,1,1)*CS%h_nodal(i,j,1,1)) + &
-                  (CS%Phisub(iq,jq,isub,jsub,2,2)*CS%h_nodal(i,j,2,2))) + &
-                 ((CS%Phisub(iq,jq,isub,jsub,2,1)*CS%h_nodal(i,j,2,1)) + &
-                  (CS%Phisub(iq,jq,isub,jsub,1,2)*CS%h_nodal(i,j,1,2)))
+          h_ip = ((CS%Phisub(iq,jq,isub,jsub,1,1)*hgate(i,j,1,1)) + &
+                  (CS%Phisub(iq,jq,isub,jsub,2,2)*hgate(i,j,2,2))) + &
+                 ((CS%Phisub(iq,jq,isub,jsub,2,1)*hgate(i,j,2,1)) + &
+                  (CS%Phisub(iq,jq,isub,jsub,1,2)*hgate(i,j,1,2)))
           h_ip = max(h_ip, CS%min_h_shelf)
         else
           h_ip = ((CS%Phisub(iq,jq,isub,jsub,1,1)*H_corners(1,1)) + &
@@ -6814,6 +6926,7 @@ subroutine ice_shelf_dyn_end(CS)
   deallocate(CS%OD_rt, CS%OD_av)
   deallocate(CS%t_bdry_val, CS%bed_elev, CS%bed_node)
   if (associated(CS%h_nodal)) deallocate(CS%h_nodal)
+  if (associated(CS%h_flot)) deallocate(CS%h_flot)
   if (associated(CS%Minv_xi)) deallocate(CS%Minv_xi)
   if (associated(CS%Minv_eta)) deallocate(CS%Minv_eta)
   if (associated(CS%cell_mean_w)) deallocate(CS%cell_mean_w)
@@ -7992,7 +8105,8 @@ end subroutine add_strong_ice_front_face
 !! K_thresh = 0 (full central edge flux); K_thresh > 0 ramps blend from 0
 !! at small relative jumps to 1 at large jumps.
 subroutine add_strong_mixed_interior_face(face_length, face_sign, &
-    h_loc_A, h_loc_B, h_ngh_A, h_ngh_B, b_corner_A, b_corner_B, &
+    h_loc_A, h_loc_B, h_ngh_A, h_ngh_B, hg_loc_A, hg_loc_B, hg_ngh_A, hg_ngh_B, &
+    b_corner_A, b_corner_B, &
     K_thresh, rho, rhow, rhoi_rhow, grav, min_h_shelf, &
     xquad, face_A, face_B)
   real, intent(in)    :: face_length      !< Face length [L ~> m]
@@ -8001,6 +8115,12 @@ subroutine add_strong_mixed_interior_face(face_length, face_sign, &
   real, intent(in)    :: h_loc_B          !< Local-cell h_nodal at face endpoint B [Z ~> m]
   real, intent(in)    :: h_ngh_A          !< Neighbour-cell h_nodal at face endpoint A [Z ~> m]
   real, intent(in)    :: h_ngh_B          !< Neighbour-cell h_nodal at face endpoint B [Z ~> m]
+  real, intent(in)    :: hg_loc_A         !< Local-side gate thickness for the flotation test at
+                                          !! endpoint A; equals h_loc_A unless DG_GL_GATE_CONTINUOUS [Z ~> m]
+  real, intent(in)    :: hg_loc_B         !< Local-side gate thickness at endpoint B [Z ~> m]
+  real, intent(in)    :: hg_ngh_A         !< Neighbour-side gate thickness at endpoint A; equals the
+                                          !! local-side gate under DG_GL_GATE_CONTINUOUS [Z ~> m]
+  real, intent(in)    :: hg_ngh_B         !< Neighbour-side gate thickness at endpoint B [Z ~> m]
   real, intent(in)    :: b_corner_A       !< bed depth at face endpoint A [Z ~> m]
   real, intent(in)    :: b_corner_B       !< bed depth at face endpoint B [Z ~> m]
   real, intent(in)    :: K_thresh         !< Venkatakrishnan-style blend threshold [nondim]
@@ -8014,13 +8134,17 @@ subroutine add_strong_mixed_interior_face(face_length, face_sign, &
   real, intent(inout) :: face_B           !< Accumulator for corner B [R L3 Z T-2 ~> kg m s-2]
 
   real :: hL_A, hL_B, hN_A, hN_B, b_A, b_B
+  real :: hgL_A, hgL_B, hgN_A, hgN_B
   real :: t_face, h_loc, h_ngh, b_loc
+  real :: hg_loc, hg_ngh
   real :: s_loc, s_ngh, h_avg, jump_factor
   real :: delta_h, r2, s_blend, phi_A, phi_B
   integer :: gp_face
 
   hL_A = max(h_loc_A, min_h_shelf) ; hL_B = max(h_loc_B, min_h_shelf)
   hN_A = max(h_ngh_A, min_h_shelf) ; hN_B = max(h_ngh_B, min_h_shelf)
+  hgL_A = max(hg_loc_A, min_h_shelf) ; hgL_B = max(hg_loc_B, min_h_shelf)
+  hgN_A = max(hg_ngh_A, min_h_shelf) ; hgN_B = max(hg_ngh_B, min_h_shelf)
   b_A = b_corner_A ; b_B = b_corner_B
 
   do gp_face = 1, 2
@@ -8028,14 +8152,18 @@ subroutine add_strong_mixed_interior_face(face_length, face_sign, &
     h_loc = (1.0 - t_face)*hL_A + t_face*hL_B
     h_ngh = (1.0 - t_face)*hN_A + t_face*hN_B
     b_loc = (1.0 - t_face)*b_A + t_face*b_B
+    hg_loc = (1.0 - t_face)*hgL_A + t_face*hgL_B
+    hg_ngh = (1.0 - t_face)*hgN_A + t_face*hgN_B
 
-    ! Per-side surface elevation using each side's local flotation test.
-    if (rhoi_rhow * h_loc - b_loc > 0.0) then
+    ! Per-side surface elevation. The flotation test uses the gate thickness
+    ! (h_flot under DG_GL_GATE_CONTINUOUS, in which case both sides see the same
+    ! gate and take the same branch); the s magnitudes use each side's own h.
+    if (rhoi_rhow * hg_loc - b_loc > 0.0) then
       s_loc = h_loc - b_loc                          ! grounded
     else
       s_loc = (1.0 - rhoi_rhow) * h_loc              ! floating
     endif
-    if (rhoi_rhow * h_ngh - b_loc > 0.0) then
+    if (rhoi_rhow * hg_ngh - b_loc > 0.0) then
       s_ngh = h_ngh - b_loc                          ! grounded
     else
       s_ngh = (1.0 - rhoi_rhow) * h_ngh              ! floating
@@ -8099,6 +8227,7 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
   real :: rhoi_rhow  ! Ice/ocean density ratio [nondim]
   real :: grav       ! Gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
   real :: h_gp                  ! Ice thickness at a qp [Z ~> m]
+  real :: hg_gp                 ! Gate thickness at a qp for the flotation test [Z ~> m]
   real :: dhdx_gp, dhdy_gp      ! Thickness gradients in physical coords [Z L-1 ~> nondim]
   real :: bed_gp                ! Bed depth at a qp [Z ~> m]
   real :: dbdx_gp, dbdy_gp      ! Bed-depth gradients in physical coords [Z L-1 ~> nondim]
@@ -8106,6 +8235,8 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
   real :: dsdx_gp, dsdy_gp      ! Surface gradients in physical coords [nondim]
                                 ! Note: CS%bed_node is depth-positive (matches CS%bed_elev),
                                 ! so for grounded ice s = h - bed and grad(s) = grad(h) - grad(bed).
+  real, dimension(:,:,:,:), pointer :: hgate ! Thickness field for the flotation
+                                ! test: h_flot under DG_GL_GATE_CONTINUOUS, else h_nodal [Z ~> m]
   real :: a_qp, d_qp            ! Per-qp interpolated cell-edge spacings [L ~> m]
   real :: weight                ! Per-qp quadrature weight including Jacobian [L2 ~> m2]
   real :: phi_val               ! Bilinear nodal basis value at a qp [nondim]
@@ -8162,6 +8293,9 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
 
   calc_slope_diag = (CS%id_sx_shelf > 0 .or. CS%id_sy_shelf > 0 .or. CS%id_surf_slope_mag_shelf > 0)
 
+  hgate => CS%h_nodal
+  if (CS%dg_gl_gate_continuous) hgate => CS%h_flot
+
   do j=jsc-1,jec+1 ; do i=isc-1,iec+1
     if (ISS%hmask(i,j) /= 1 .and. ISS%hmask(i,j) /= 3) cycle
 
@@ -8176,7 +8310,7 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
     ! Volume integral: subgrid dispatch in the GL band, main-grid 2x2 Gauss otherwise.
     if (CS%GL_regularize .and. CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0) then
       call calc_shelf_driving_stress_DG_strong_subgrid(CS, CS%Phisub, &
-          CS%h_nodal(i,j,:,:), bed_corners, &
+          CS%h_nodal(i,j,:,:), hgate(i,j,:,:), bed_corners, &
           dxCv_S, dxCv_N, dyCu_W, dyCu_E, &
           rho, rhow, rhoi_rhow, grav, vol_dx, vol_dy, &
           CS%sx_shelf(i,j), CS%sy_shelf(i,j), calc_slope_diag)
@@ -8212,10 +8346,18 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
         dbdx_gp = dbdx_ref / a_qp
         dbdy_gp = dbdy_ref / d_qp
 
+        ! Flotation gate from hgate; magnitudes (h_gp, dhdx/dhdy) stay on the true
+        ! DG h_nodal. hgate == h_nodal unless DG_GL_GATE_CONTINUOUS is true.
+        hg_gp = ((hgate(i,j,1,1) * (xquad(3-iq) * xquad(3-jq))) + &
+                 (hgate(i,j,2,2) * (xquad(iq)   * xquad(jq))))  + &
+                ((hgate(i,j,2,1) * (xquad(iq)   * xquad(3-jq))) + &
+                 (hgate(i,j,1,2) * (xquad(3-iq) * xquad(jq))))
+        hg_gp = max(hg_gp, CS%min_h_shelf)
+
         if (CS%GL_couple) then
           is_grounded = (CS%ground_frac(i,j) >= 1.0)
         else
-          is_grounded = (rhoi_rhow * h_gp - bed_gp > 0.0)
+          is_grounded = (rhoi_rhow * hg_gp - bed_gp > 0.0)
         endif
 
         if (is_grounded) then
@@ -8290,6 +8432,8 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
       call add_strong_mixed_interior_face(G%dyCu(I-1,j), -1.0, &
         CS%h_nodal(i,j,1,1),   CS%h_nodal(i,j,1,2), &
         CS%h_nodal(i-1,j,2,1), CS%h_nodal(i-1,j,2,2), &
+        hgate(i,j,1,1),   hgate(i,j,1,2), &
+        hgate(i-1,j,2,1), hgate(i-1,j,2,2), &
         bed_corners(1,1), bed_corners(1,2), CS%dg_face_flux_K_thresh, &
         rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
         face_dx_W_A, face_dx_W_B)
@@ -8308,6 +8452,8 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
       call add_strong_mixed_interior_face(G%dyCu(I,j), +1.0, &
         CS%h_nodal(i,j,2,1),   CS%h_nodal(i,j,2,2), &
         CS%h_nodal(i+1,j,1,1), CS%h_nodal(i+1,j,1,2), &
+        hgate(i,j,2,1),   hgate(i,j,2,2), &
+        hgate(i+1,j,1,1), hgate(i+1,j,1,2), &
         bed_corners(2,1), bed_corners(2,2), CS%dg_face_flux_K_thresh, &
         rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
         face_dx_E_A, face_dx_E_B)
@@ -8326,6 +8472,8 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
       call add_strong_mixed_interior_face(G%dxCv(i,J-1), -1.0, &
         CS%h_nodal(i,j,1,1),   CS%h_nodal(i,j,2,1), &
         CS%h_nodal(i,j-1,1,2), CS%h_nodal(i,j-1,2,2), &
+        hgate(i,j,1,1),   hgate(i,j,2,1), &
+        hgate(i,j-1,1,2), hgate(i,j-1,2,2), &
         bed_corners(1,1), bed_corners(2,1), CS%dg_face_flux_K_thresh, &
         rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
         face_dy_S_A, face_dy_S_B)
@@ -8344,6 +8492,8 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
       call add_strong_mixed_interior_face(G%dxCv(i,J), +1.0, &
         CS%h_nodal(i,j,1,2),   CS%h_nodal(i,j,2,2), &
         CS%h_nodal(i,j+1,1,1), CS%h_nodal(i,j+1,2,1), &
+        hgate(i,j,1,2),   hgate(i,j,2,2), &
+        hgate(i,j+1,1,1), hgate(i,j+1,2,1), &
         bed_corners(1,2), bed_corners(2,2), CS%dg_face_flux_K_thresh, &
         rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
         face_dy_N_A, face_dy_N_B)
@@ -8384,12 +8534,15 @@ end subroutine calc_shelf_driving_stress_DG_strong
 !! comparison. No face integrals here; the ice-front Neumann is applied at
 !! the main-grid cell edges by the caller.
 subroutine calc_shelf_driving_stress_DG_strong_subgrid(CS, Phisub, &
-    h_nodal_cell, bed_corners, &
+    h_nodal_cell, h_gate_cell, bed_corners, &
     dxCv_S, dxCv_N, dyCu_W, dyCu_E, &
     rho, rhow, rhoi_rhow, grav, vol_dx, vol_dy, sx_shelf, sy_shelf, calc_slope_diag)
   type(ice_shelf_dyn_CS), intent(in) :: CS    !< Ice shelf control structure
   real, dimension(:,:,:,:,:,:), intent(in) :: Phisub !< Sub-grid quadrature weights [nondim]
   real, dimension(2,2), intent(in) :: h_nodal_cell !< Q1 nodal thickness at the 4 corners [Z ~> m]
+  real, dimension(2,2), intent(in) :: h_gate_cell !< Gate thickness for the flotation test at the 4
+                                          !! corners; equals h_nodal_cell unless
+                                          !! DG_GL_GATE_CONTINUOUS is true [Z ~> m]
   real, dimension(2,2), intent(in) :: bed_corners !< Bed depth at the 4 cell corners [Z ~> m]
   real, intent(in) :: dxCv_S         !< Cell x-length on south face [L ~> m]
   real, intent(in) :: dxCv_N         !< Cell x-length on north face [L ~> m]
@@ -8413,6 +8566,7 @@ subroutine calc_shelf_driving_stress_DG_strong_subgrid(CS, Phisub, &
   real :: slope_w_total
   real, dimension(2,2,2,2) :: qp_dx, qp_dy
   real :: h_gp, dhdx_gp, dhdy_gp
+  real :: hg_gp  ! Gate thickness at the sub-qp for the flotation test [Z ~> m]
   real :: bed_gp, dbdx_gp, dbdy_gp
   real :: dbdx_ref, dbdy_ref
   real :: dsdx_gp, dsdy_gp
@@ -8463,8 +8617,12 @@ subroutine calc_shelf_driving_stress_DG_strong_subgrid(CS, Phisub, &
       ! Sub-QP-local floating/grounded selector. For the strong form we use
       ! the local hydrostatic test even when CS%GL_couple is true, because
       ! the whole point of the subgrid is to resolve sub-cell GL position
-      ! that a cell-mean ground_frac smears.
-      is_grounded = (rhoi_rhow * h_gp - bed_gp > 0.0)
+      ! that a cell-mean ground_frac smears. The test uses the gate thickness
+      ! (h_flot under DG_GL_GATE_CONTINUOUS); magnitudes keep h_nodal_cell.
+      hg_gp = ((Phisub(qx,qy,i,j,1,1)*h_gate_cell(1,1)) + (Phisub(qx,qy,i,j,2,2)*h_gate_cell(2,2))) + &
+              ((Phisub(qx,qy,i,j,1,2)*h_gate_cell(1,2)) + (Phisub(qx,qy,i,j,2,1)*h_gate_cell(2,1)))
+      hg_gp = max(hg_gp, CS%min_h_shelf)
+      is_grounded = (rhoi_rhow * hg_gp - bed_gp > 0.0)
 
       if (is_grounded) then
         dsdx_gp = dhdx_gp - dbdx_gp
@@ -9164,6 +9322,19 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "because r << 1 in typical near-C0 nodal Q1 flows. Has no effect when "//&
                  "USE_DG_THICKNESS is false or DG_DRIVING_STRESS_IBP is true.", &
                  units="nondim", default=-1.0, do_not_log=.not.CS%use_DG_thickness)
+
+  call get_param(param_file, mdl, "DG_GL_GATE_CONTINUOUS", CS%dg_gl_gate_continuous, &
+                 "If true, evaluate all grounded/floating decisions (basal-friction "//&
+                 "flotation gates, ground_frac, Coulomb effective pressure, and the "//&
+                 "strong-form driving-stress branch selector) on a continuous "//&
+                 "node-averaged thickness field instead of each cell's own DG nodal "//&
+                 "thickness. This prevents the flotation crossing from hiding inside "//&
+                 "an inter-cell thickness jump, which otherwise lets the grounding "//&
+                 "line lock at cell faces (ground_frac exactly 0 or 1) and bypass the "//&
+                 "subgrid grounding-line scheme. Force magnitudes always use the true "//&
+                 "DG thickness. Has no effect on the IBP driving-stress path "//&
+                 "(DG_DRIVING_STRESS_IBP = True) beyond its influence on ground_frac.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
 
 end subroutine read_nodal_limiter_params
 
