@@ -524,6 +524,8 @@ type, public :: ice_shelf_dyn_CS ; private
              id_phi_x_FV = -1, id_phi_y_FV = -1, &
              id_dg_art_visc_coef_u = -1, id_dg_art_visc_coef_v = -1, &
              id_dg_art_visc_nu_u = -1, id_dg_art_visc_nu_v = -1, &
+             id_dg_art_visc_excess_frac_u = -1, id_dg_art_visc_excess_frac_v = -1, &
+             id_dg_art_visc_allow_u = -1, id_dg_art_visc_allow_v = -1, &
              id_dg_art_visc_cell_scale = -1, &
              id_dg_slow_idle_face_u = -1, id_dg_slow_idle_face_v = -1, &
              id_h_jump_face_u = -1, id_h_jump_face_v = -1, &
@@ -551,6 +553,21 @@ type, public :: ice_shelf_dyn_CS ; private
                                                        !! gate-active-and-damping faces.
   real, pointer, dimension(:,:) :: dg_art_visc_nu_v => NULL() !< As dg_art_visc_nu_u but on
                                                        !! v-faces [m2 s-1].
+  real, pointer, dimension(:,:) :: dg_art_visc_excess_frac_u => NULL() !< Fraction of the
+                                                       !! well-balanced surface jump treated
+                                                       !! as excess by the EXCESS_JUMP
+                                                       !! allowance on u-faces [nondim],
+                                                       !! max over the 2 face QPs of
+                                                       !! |ds_use|/|ds_qp|. Diagnostic only.
+  real, pointer, dimension(:,:) :: dg_art_visc_excess_frac_v => NULL() !< As
+                                                       !! dg_art_visc_excess_frac_u but on
+                                                       !! v-faces [nondim].
+  real, pointer, dimension(:,:) :: dg_art_visc_allow_u => NULL() !< Mean-supported surface-
+                                                       !! jump allowance |ds_bar| on u-faces
+                                                       !! [Z ~> m], max over the 2 face QPs.
+                                                       !! Diagnostic only.
+  real, pointer, dimension(:,:) :: dg_art_visc_allow_v => NULL() !< As dg_art_visc_allow_u
+                                                       !! but on v-faces [Z ~> m].
   real, pointer, dimension(:,:) :: dg_art_visc_cell_scale => NULL() !< Per-cell DG(1)
                                                        !! artificial-viscosity cap throttle
                                                        !! factor [nondim]; 1 where the
@@ -729,6 +746,10 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%dg_art_visc_coef_v(isd:ied,JsdB:JedB), source=0.0)
     allocate(CS%dg_art_visc_nu_u(IsdB:IedB,jsd:jed), source=0.0)
     allocate(CS%dg_art_visc_nu_v(isd:ied,JsdB:JedB), source=0.0)
+    allocate(CS%dg_art_visc_excess_frac_u(IsdB:IedB,jsd:jed), source=0.0)
+    allocate(CS%dg_art_visc_excess_frac_v(isd:ied,JsdB:JedB), source=0.0)
+    allocate(CS%dg_art_visc_allow_u(IsdB:IedB,jsd:jed), source=0.0)
+    allocate(CS%dg_art_visc_allow_v(isd:ied,JsdB:JedB), source=0.0)
     allocate(CS%dg_art_visc_cell_scale(isd:ied,jsd:jed), source=1.0)
     allocate(CS%dg_slow_idle_face_u(IsdB:IedB,jsd:jed), source=0.0)
     allocate(CS%dg_slow_idle_face_v(isd:ied,JsdB:JedB), source=0.0)
@@ -1431,6 +1452,30 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          CS%diag%axesCv1, Time, &
          'As dg_art_visc_nu_u but on v-faces.', &
          'm2 s-1', conversion=US%L_T_to_m_s*US%L_to_m)
+      CS%id_dg_art_visc_excess_frac_u = register_diag_field('ice_shelf_model', &
+         'dg_art_visc_excess_frac_u', CS%diag%axesCu1, Time, &
+         'Fraction of the well-balanced surface jump treated as excess by the DG(1) '//&
+         'artificial-viscosity EXCESS_JUMP allowance on u-faces (max over the 2 face QPs '//&
+         'of |ds_use|/|ds_qp|). 1 with near-zero dg_art_visc_allow_u means the cell means '//&
+         'lend the jump no support (slope-only structure, or a grounding-line-straddle '//&
+         'face where the mean-branch allowance breaks down); 1 with a large exceeded '//&
+         'allowance means genuine envelope escape (viscosity load-bearing); << 1 means '//&
+         'only the edge of mean-supported structure is being shaved. Only meaningful '//&
+         'with DG1_ART_VISC_EXCESS_JUMP=True (reports 0 otherwise).', 'nondim')
+      CS%id_dg_art_visc_excess_frac_v = register_diag_field('ice_shelf_model', &
+         'dg_art_visc_excess_frac_v', CS%diag%axesCv1, Time, &
+         'As dg_art_visc_excess_frac_u but on v-faces.', 'nondim')
+      CS%id_dg_art_visc_allow_u = register_diag_field('ice_shelf_model', &
+         'dg_art_visc_allow_u', CS%diag%axesCu1, Time, &
+         'Mean-supported surface-jump allowance |ds_bar| of the DG(1) artificial-'//&
+         'viscosity EXCESS_JUMP band on u-faces (max over the 2 face QPs): the surface '//&
+         'jump the two cell means imply at the face-QP bed. Compare with s_jump_face_u '//&
+         'and dg_art_visc_excess_frac_u to separate envelope damping from legitimate-'//&
+         'structure shaving. Only meaningful with DG1_ART_VISC_EXCESS_JUMP=True '//&
+         '(reports 0 otherwise).', 'm', conversion=US%Z_to_m)
+      CS%id_dg_art_visc_allow_v = register_diag_field('ice_shelf_model', &
+         'dg_art_visc_allow_v', CS%diag%axesCv1, Time, &
+         'As dg_art_visc_allow_u but on v-faces.', 'm', conversion=US%Z_to_m)
       CS%id_dg_art_visc_cell_scale = register_diag_field('ice_shelf_model', &
          'dg_art_visc_cell_scale', CS%diag%axesT1, Time, &
          'Per-cell DG(1) artificial-viscosity cap throttle factor (1 = stability cap '//&
@@ -2336,6 +2381,14 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_art_visc_nu_u, CS%dg_art_visc_nu_u, CS%diag)
     if (CS%id_dg_art_visc_nu_v > 0 .and. associated(CS%dg_art_visc_nu_v)) &
         call post_data(CS%id_dg_art_visc_nu_v, CS%dg_art_visc_nu_v, CS%diag)
+    if (CS%id_dg_art_visc_excess_frac_u > 0 .and. associated(CS%dg_art_visc_excess_frac_u)) &
+        call post_data(CS%id_dg_art_visc_excess_frac_u, CS%dg_art_visc_excess_frac_u, CS%diag)
+    if (CS%id_dg_art_visc_excess_frac_v > 0 .and. associated(CS%dg_art_visc_excess_frac_v)) &
+        call post_data(CS%id_dg_art_visc_excess_frac_v, CS%dg_art_visc_excess_frac_v, CS%diag)
+    if (CS%id_dg_art_visc_allow_u > 0 .and. associated(CS%dg_art_visc_allow_u)) &
+        call post_data(CS%id_dg_art_visc_allow_u, CS%dg_art_visc_allow_u, CS%diag)
+    if (CS%id_dg_art_visc_allow_v > 0 .and. associated(CS%dg_art_visc_allow_v)) &
+        call post_data(CS%id_dg_art_visc_allow_v, CS%dg_art_visc_allow_v, CS%diag)
     if (CS%id_dg_art_visc_cell_scale > 0 .and. associated(CS%dg_art_visc_cell_scale)) &
         call post_data(CS%id_dg_art_visc_cell_scale, CS%dg_art_visc_cell_scale, CS%diag)
     if (CS%id_dg_slow_idle_face_u > 0 .and. associated(CS%dg_slow_idle_face_u)) &
@@ -6994,6 +7047,10 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_art_visc_coef_v)) deallocate(CS%dg_art_visc_coef_v)
   if (associated(CS%dg_art_visc_nu_u)) deallocate(CS%dg_art_visc_nu_u)
   if (associated(CS%dg_art_visc_nu_v)) deallocate(CS%dg_art_visc_nu_v)
+  if (associated(CS%dg_art_visc_excess_frac_u)) deallocate(CS%dg_art_visc_excess_frac_u)
+  if (associated(CS%dg_art_visc_excess_frac_v)) deallocate(CS%dg_art_visc_excess_frac_v)
+  if (associated(CS%dg_art_visc_allow_u)) deallocate(CS%dg_art_visc_allow_u)
+  if (associated(CS%dg_art_visc_allow_v)) deallocate(CS%dg_art_visc_allow_v)
   if (associated(CS%dg_art_visc_cell_scale)) deallocate(CS%dg_art_visc_cell_scale)
   if (associated(CS%dg_slow_idle_face_u)) deallocate(CS%dg_slow_idle_face_u)
   if (associated(CS%dg_slow_idle_face_v)) deallocate(CS%dg_slow_idle_face_v)
@@ -10686,6 +10743,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: ds_bar             ! Mean-supported surface jump from the cell means [Z ~> m]
   real :: ds_use             ! Surface jump driving the flux: full or excess [Z ~> m]
   real :: ds_face_max        ! Max |ds_use| over the 2 face QPs [Z ~> m]
+  real :: ds_bar_face_max    ! Max |ds_bar| over the 2 face QPs (allowance diagnostic) [Z ~> m]
+  real :: excess_frac_face   ! Max |ds_use|/|ds_qp| over the 2 face QPs (diagnostic) [nondim]
   real :: rate_face          ! Per-face semi-discrete diffusion rate c*u_eff_avg*ell/dx_perp [T-1]
   real :: scale_AB           ! Min of the two adjacent cells' per-cell CFL scale [nondim]
   real :: dh_eq              ! Well-balanced equivalent thickness jump (surface-jump-derived) [Z ~> m]
@@ -10730,6 +10789,10 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   if (associated(CS%dg_art_visc_coef_v)) CS%dg_art_visc_coef_v(:,:) = 0.0
   if (associated(CS%dg_art_visc_nu_u)) CS%dg_art_visc_nu_u(:,:) = 0.0
   if (associated(CS%dg_art_visc_nu_v)) CS%dg_art_visc_nu_v(:,:) = 0.0
+  if (associated(CS%dg_art_visc_excess_frac_u)) CS%dg_art_visc_excess_frac_u(:,:) = 0.0
+  if (associated(CS%dg_art_visc_excess_frac_v)) CS%dg_art_visc_excess_frac_v(:,:) = 0.0
+  if (associated(CS%dg_art_visc_allow_u)) CS%dg_art_visc_allow_u(:,:) = 0.0
+  if (associated(CS%dg_art_visc_allow_v)) CS%dg_art_visc_allow_v(:,:) = 0.0
   if (associated(CS%dg_slow_idle_face_u)) CS%dg_slow_idle_face_u(:,:) = 0.0
   if (associated(CS%dg_slow_idle_face_v)) CS%dg_slow_idle_face_v(:,:) = 0.0
   ! Reset to 1 (= unthrottled), not 0: a 0 would read as "fully throttled" in cells
@@ -10923,6 +10986,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       u_eff_face_max = 0.0
       amp_face_max = 0.0
       ds_face_max = 0.0
+      ds_bar_face_max = 0.0
+      excess_frac_face = 0.0
       do gp = 1, 2
         if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
         t_co = 1.0 - t_face
@@ -10950,6 +11015,9 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
           ds_use = ds_qp - min(max(ds_qp, -abs(ds_bar)), abs(ds_bar))
           dh_eq = ds_use * dg1_wb_slope_mean(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb, &
                                              CS%dg_art_visc_wb_harmonic)
+          ds_bar_face_max = max(ds_bar_face_max, abs(ds_bar))
+          if (abs(ds_qp) > 0.0) &
+            excess_frac_face = max(excess_frac_face, abs(ds_use) / abs(ds_qp))
         else
           if (CS%dg_art_visc_gate_surface) &
             ds_use = dg1_wb_surface_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
@@ -10970,6 +11038,13 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         u_eff_face_max = max(u_eff_face_max, u_eff_qp)
         u_mag_face_max = max(u_mag_face_max, u_mag_qp)
       enddo
+
+      if (CS%dg_art_visc_excess_jump) then
+        if (associated(CS%dg_art_visc_excess_frac_u)) &
+          CS%dg_art_visc_excess_frac_u(i,j) = excess_frac_face
+        if (associated(CS%dg_art_visc_allow_u)) &
+          CS%dg_art_visc_allow_u(i,j) = ds_bar_face_max
+      endif
 
       if (CS%dg_art_visc_gate_surface) then
         ! Surface-cliff gate: R_LO/R_HI are the cliff heights, as fractions of the
@@ -11119,6 +11194,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       u_eff_face_max = 0.0
       amp_face_max = 0.0
       ds_face_max = 0.0
+      ds_bar_face_max = 0.0
+      excess_frac_face = 0.0
       do gp = 1, 2
         if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
         t_co = 1.0 - t_face
@@ -11142,6 +11219,9 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
           ds_use = ds_qp - min(max(ds_qp, -abs(ds_bar)), abs(ds_bar))
           dh_eq = ds_use * dg1_wb_slope_mean(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb, &
                                              CS%dg_art_visc_wb_harmonic)
+          ds_bar_face_max = max(ds_bar_face_max, abs(ds_bar))
+          if (abs(ds_qp) > 0.0) &
+            excess_frac_face = max(excess_frac_face, abs(ds_use) / abs(ds_qp))
         else
           if (CS%dg_art_visc_gate_surface) &
             ds_use = dg1_wb_surface_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
@@ -11162,6 +11242,13 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         u_eff_face_max = max(u_eff_face_max, u_eff_qp)
         u_mag_face_max = max(u_mag_face_max, u_mag_qp)
       enddo
+
+      if (CS%dg_art_visc_excess_jump) then
+        if (associated(CS%dg_art_visc_excess_frac_v)) &
+          CS%dg_art_visc_excess_frac_v(i,j) = excess_frac_face
+        if (associated(CS%dg_art_visc_allow_v)) &
+          CS%dg_art_visc_allow_v(i,j) = ds_bar_face_max
+      endif
 
       if (CS%dg_art_visc_gate_surface) then
         r_face = ds_face_max / H_ref
