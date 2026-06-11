@@ -8327,10 +8327,13 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
                                            !! (1=SW, 2=SE, 3=NW, 4=NE)
                                            !! [R L3 Z T-2 ~> kg m s-2]
   real, dimension(2) :: xquad
+  real :: d_corner_max, d_corner_min ! Max/min own-h flotation deficit over the 4 cell
+                                     ! corners, for the subgrid dispatch test [Z ~> m]
   integer :: i, j, iq, jq, isc, iec, jsc, jec, m, n
   integer :: i_off, j_off, gisc, giec, gjsc, gjec
   logical :: calc_slope_diag
   logical :: is_grounded
+  logical :: use_subgrid_cell ! True if this cell's volume integral uses subgrid quadrature
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   i_off = G%idg_offset ; j_off = G%jdg_offset
@@ -8373,7 +8376,29 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
     dyCu_W = G%dyCu(I-1,j) ; dyCu_E = G%dyCu(I,j)
 
     ! Volume integral: subgrid dispatch in the GL band, main-grid 2x2 Gauss otherwise.
-    if (CS%GL_regularize .and. CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0) then
+    ! The subgrid quadrature exists to resolve the kink of THIS integrand, whose
+    ! branch tests use the cell's own h_nodal; a bilinear deficit attains its
+    ! extrema at the corners, so the own-h flotation contour intersects the cell
+    ! iff the 4 own corner deficits have mixed signs. Under DG_GL_GATE_CONTINUOUS
+    ! ground_frac is h_flot-based and can mis-dispatch (subgrid on a smooth
+    ! integrand, or 2x2 Gauss on a kinked one), so the corner-sign test is used
+    ! instead there. Without the gate, ground_frac is own-h-based and the frac
+    ! test is kept to preserve answers.
+    if (CS%dg_gl_gate_continuous) then
+      d_corner_max = max( max((rhoi_rhow * max(CS%h_nodal(i,j,1,1), CS%min_h_shelf)) - bed_corners(1,1), &
+                              (rhoi_rhow * max(CS%h_nodal(i,j,2,2), CS%min_h_shelf)) - bed_corners(2,2)), &
+                          max((rhoi_rhow * max(CS%h_nodal(i,j,2,1), CS%min_h_shelf)) - bed_corners(2,1), &
+                              (rhoi_rhow * max(CS%h_nodal(i,j,1,2), CS%min_h_shelf)) - bed_corners(1,2)) )
+      d_corner_min = min( min((rhoi_rhow * max(CS%h_nodal(i,j,1,1), CS%min_h_shelf)) - bed_corners(1,1), &
+                              (rhoi_rhow * max(CS%h_nodal(i,j,2,2), CS%min_h_shelf)) - bed_corners(2,2)), &
+                          min((rhoi_rhow * max(CS%h_nodal(i,j,2,1), CS%min_h_shelf)) - bed_corners(2,1), &
+                              (rhoi_rhow * max(CS%h_nodal(i,j,1,2), CS%min_h_shelf)) - bed_corners(1,2)) )
+      use_subgrid_cell = CS%GL_regularize .and. (d_corner_max > 0.0) .and. (d_corner_min <= 0.0)
+    else
+      use_subgrid_cell = CS%GL_regularize .and. &
+                         (CS%ground_frac(i,j) > 0.0) .and. (CS%ground_frac(i,j) < 1.0)
+    endif
+    if (use_subgrid_cell) then
       call calc_shelf_driving_stress_DG_strong_subgrid(CS, CS%Phisub, &
           CS%h_nodal(i,j,:,:), hgate(i,j,:,:), bed_corners, &
           dxCv_S, dxCv_N, dyCu_W, dyCu_E, &
