@@ -413,6 +413,16 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! exactly 0/1 and defeats the subgrid GL scheme. Force
                                   !! magnitudes (rho*g*h, grad h, face-jump terms) always
                                   !! use the true DG h_nodal. Default false.
+  logical :: dg_gl_gate_driving_stress !< If true (and dg_gl_gate_continuous is true), the
+                                  !! strong-form driving-stress flotation branches (volume,
+                                  !! subgrid, and face Dirac term) also use h_flot. If false
+                                  !! (default), the driving stress keeps per-side own-h
+                                  !! branching, which is equivalent to the continuous
+                                  !! s = max(h - b, (1-r)*h) and hence yields forces that are
+                                  !! continuous in the state. h_flot gating of the face Dirac
+                                  !! term makes [s] switch discontinuously between [h] and
+                                  !! (1-r)*[h] at gate sign flips, creating a strong restoring
+                                  !! force that pins the steady grounding line at cell faces.
   real :: dg_gl_gate_deficit_scale !< Regularization scale s for inverse-flotation-deficit
                                   !! weighting of the h_flot node average [Z ~> m]. <= 0
                                   !! (default 0) gives the plain arithmetic corner mean; > 0
@@ -8339,8 +8349,17 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
 
   calc_slope_diag = (CS%id_sx_shelf > 0 .or. CS%id_sy_shelf > 0 .or. CS%id_surf_slope_mag_shelf > 0)
 
+  ! Driving-stress branch gating. By default the driving stress keeps its own-h
+  ! flotation tests even under DG_GL_GATE_CONTINUOUS: per-side own-h branching is
+  ! algebraically s = max(h - b, (1-r)*h), continuous in h, so the assembled force
+  ! is continuous in the state. Gating the branch with h_flot instead makes s (and
+  ! especially the face Dirac term rho*g*{h}*[s], which switches between [h] and
+  ! (1-r)*[h]) jump discontinuously whenever the gate sign at a face flips while
+  ! the local h is off flotation. That force discontinuity acts as a stiff spring
+  ! pinning the steady grounding line at the configuration where the gate flips
+  ! (node-average deficit = 0, i.e. GL locked at cell faces).
   hgate => CS%h_nodal
-  if (CS%dg_gl_gate_continuous) hgate => CS%h_flot
+  if (CS%dg_gl_gate_continuous .and. CS%dg_gl_gate_driving_stress) hgate => CS%h_flot
 
   do j=jsc-1,jec+1 ; do i=isc-1,iec+1
     if (ISS%hmask(i,j) /= 1 .and. ISS%hmask(i,j) /= 3) cycle
@@ -9370,17 +9389,34 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  units="nondim", default=-1.0, do_not_log=.not.CS%use_DG_thickness)
 
   call get_param(param_file, mdl, "DG_GL_GATE_CONTINUOUS", CS%dg_gl_gate_continuous, &
-                 "If true, evaluate all grounded/floating decisions (basal-friction "//&
-                 "flotation gates, ground_frac, Coulomb effective pressure, and the "//&
-                 "strong-form driving-stress branch selector) on a continuous "//&
-                 "node-averaged thickness field instead of each cell's own DG nodal "//&
-                 "thickness. This prevents the flotation crossing from hiding inside "//&
-                 "an inter-cell thickness jump, which otherwise lets the grounding "//&
-                 "line lock at cell faces (ground_frac exactly 0 or 1) and bypass the "//&
-                 "subgrid grounding-line scheme. Force magnitudes always use the true "//&
-                 "DG thickness. Has no effect on the IBP driving-stress path "//&
-                 "(DG_DRIVING_STRESS_IBP = True) beyond its influence on ground_frac.", &
+                 "If true, evaluate the basal-friction flotation gates, ground_frac, "//&
+                 "and the Coulomb effective pressure on a continuous node-averaged "//&
+                 "thickness field instead of each cell's own DG nodal thickness. This "//&
+                 "prevents the flotation crossing from hiding inside an inter-cell "//&
+                 "thickness jump, which otherwise gives the basal friction a dead band "//&
+                 "(no response to thickness changes while the crossing traverses the "//&
+                 "jump) and lets the grounding line lock at cell faces. Force "//&
+                 "magnitudes always use the true DG thickness, and the driving-stress "//&
+                 "branch selectors keep per-side own-thickness tests unless "//&
+                 "DG_GL_GATE_DRIVING_STRESS is also true. Has no effect on the IBP "//&
+                 "driving-stress path (DG_DRIVING_STRESS_IBP = True) beyond its "//&
+                 "influence on ground_frac.", &
                  default=.false., do_not_log=.not.CS%use_DG_thickness)
+
+  call get_param(param_file, mdl, "DG_GL_GATE_DRIVING_STRESS", CS%dg_gl_gate_driving_stress, &
+                 "If true (with DG_GL_GATE_CONTINUOUS), the strong-form driving-stress "//&
+                 "flotation branches (volume, subgrid, and face Dirac term) also use the "//&
+                 "continuous gate field. If false (default), the driving stress keeps "//&
+                 "per-side own-thickness branching, equivalent to the continuous "//&
+                 "s = max(h - bed, (1-rho_i/rho_w)*h), so the assembled force is "//&
+                 "continuous in the model state. Gating the face Dirac term with the "//&
+                 "continuous field makes its [s] switch discontinuously between [h] and "//&
+                 "(1-rho_i/rho_w)*[h] when the gate sign flips at a face, a force "//&
+                 "discontinuity of order half a cell's driving stress that pins the "//&
+                 "steady grounding line at cell faces (where the node-average deficit "//&
+                 "is zero). Only the basal-friction gates, ground_frac, and Coulomb "//&
+                 "effective pressure should normally use the continuous gate.", &
+                 default=.false., do_not_log=.not.(CS%use_DG_thickness .and. CS%dg_gl_gate_continuous))
 
   call get_param(param_file, mdl, "DG_GL_GATE_DEFICIT_SCALE", CS%dg_gl_gate_deficit_scale, &
                  "Regularization scale s for inverse-flotation-deficit weighting of the "//&
