@@ -374,6 +374,15 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! the part of the face surface jump in excess of the jump
                                   !! supported by the two cells' mean surfaces; if false,
                                   !! the whole jump (legacy).
+  logical :: dg_art_visc_excess_branch_max !< If true, the mean-supported allowance of the
+                                  !! excess-jump scheme is the max |[s]| over the admissible
+                                  !! flotation-branch assignments of each side's cell mean
+                                  !! (admissible = the branch of the mean and the branch of
+                                  !! the face trace, both tested at the face-QP bed). Guards
+                                  !! against under-built allowances where the face bed is a
+                                  !! local extremum unrepresentative of the cell interiors
+                                  !! (e.g. a grounding line on a sill); identical wherever
+                                  !! mean and trace agree on the branch.
   real :: dg_slow_idle_u_tiny     !< Stagnant-jump diagnostic threshold on face-speed
                                   !! magnitude [L T-1]. A face is flagged if |u_face| <
                                   !! this value AND eps_e_face < eps_tiny AND |Delta h_eq|
@@ -1469,7 +1478,9 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          'dg_art_visc_allow_u', CS%diag%axesCu1, Time, &
          'Mean-supported surface-jump allowance |ds_bar| of the DG(1) artificial-'//&
          'viscosity EXCESS_JUMP band on u-faces (max over the 2 face QPs): the surface '//&
-         'jump the two cell means imply at the face-QP bed. Compare with s_jump_face_u '//&
+         'jump the two cell means imply at the face-QP bed (with '//&
+         'DG1_ART_VISC_EXCESS_BRANCH_MAX, the max over admissible flotation-branch '//&
+         'assignments of the means). Compare with s_jump_face_u '//&
          'and dg_art_visc_excess_frac_u to separate envelope damping from legitimate-'//&
          'structure shaving. Only meaningful with DG1_ART_VISC_EXCESS_JUMP=True '//&
          '(reports 0 otherwise).', 'm', conversion=US%Z_to_m)
@@ -9402,6 +9413,25 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "erodes persistent real contrasts at the gated rate.", &
                  default=.false., &
                  do_not_log=(.not.CS%use_DG_thickness .or. CS%dg_art_visc_c_max == 0.0))
+  call get_param(param_file, mdl, "DG1_ART_VISC_EXCESS_BRANCH_MAX", &
+                 CS%dg_art_visc_excess_branch_max, &
+                 "If true, the mean-supported allowance of DG1_ART_VISC_EXCESS_JUMP "//&
+                 "is the maximum |[s]| over the admissible flotation-branch "//&
+                 "assignments of each side's cell mean, where the admissible "//&
+                 "branches per side are the one selected by the cell mean and the "//&
+                 "one selected by the face trace (both tested at the face-QP bed). "//&
+                 "This guards against under-built allowances at faces whose bed is "//&
+                 "a local extremum unrepresentative of the cell interiors (e.g. a "//&
+                 "grounding line sitting on a sill or ridge crest, where a floating "//&
+                 "cell's mean can misread as grounded at the shallow face bed and "//&
+                 "shrink the allowance, so that a legitimate margin surface step is "//&
+                 "chronically damped). The allowance is unchanged wherever each "//&
+                 "side's mean and trace agree on the branch, which is everywhere "//&
+                 "except flotation-ambiguous faces. If false, the allowance uses "//&
+                 "the mean's own branch only (legacy).", &
+                 default=.true., &
+                 do_not_log=(.not.CS%use_DG_thickness .or. CS%dg_art_visc_c_max == 0.0 &
+                             .or. .not.CS%dg_art_visc_excess_jump))
 
   ! NOTE: DG1_ART_VISC_GATE_SURFACE must be read before R_LO/R_HI: their defaults
   ! depend on the gate mode.
@@ -10603,6 +10633,63 @@ pure function dg1_wb_surface_jump(h_A, h_B, bed_qp, rhoi_rhow) result(ds)
   ds = s_B - s_A
 end function dg1_wb_surface_jump
 
+!> Mean-supported surface-jump allowance for the DG(1) excess-jump artificial
+!! viscosity: the largest |s_B - s_A| the two cell means can support at the face-QP
+!! bed over the admissible flotation-branch assignments. A cell mean's branch test
+!! at the face bed can misclassify when the face bed is a local extremum
+!! unrepresentative of the cell interior (e.g. a grounding line on a sill, where a
+!! floating cell's mean reads grounded at the shallow face bed and the allowance
+!! collapses to a plain thickness contrast). The admissible branch set per side is
+!! {branch of the mean, branch of the face trace}, both tested at the face bed, so
+!! the allowance is unchanged wherever mean and trace agree on the branch and only
+!! widens (conservatively, toward under-damping) at flotation-ambiguous faces.
+pure function dg1_wb_mean_allowance(Hbar_A, Hbar_B, h_A, h_B, bed_qp, rhoi_rhow, &
+                                    branch_max) result(ds_allow)
+  real, intent(in) :: Hbar_A    !< Side-A cell-mean thickness [Z ~> m]
+  real, intent(in) :: Hbar_B    !< Side-B cell-mean thickness [Z ~> m]
+  real, intent(in) :: h_A       !< Side-A face-QP trace thickness [Z ~> m]
+  real, intent(in) :: h_B       !< Side-B face-QP trace thickness [Z ~> m]
+  real, intent(in) :: bed_qp    !< Bed elevation at the face QP, single-valued [Z ~> m]
+  real, intent(in) :: rhoi_rhow !< Ice/ocean density ratio [nondim]
+  logical, intent(in) :: branch_max !< If true take the max over admissible branch
+                                !! assignments; if false use the mean's own branch
+                                !! only (legacy)
+  real :: ds_allow              !< Nonnegative mean-supported allowance on |[s]| [Z ~> m]
+  real :: s_A(2), s_B(2)        ! Per-side candidate mean surfaces [Z ~> m]
+  real :: one_m_r               ! 1 - rhoi_rhow [nondim]
+  integer :: nA, nB, ia, ib
+  logical :: gA_mean, gB_mean, gA_trace, gB_trace
+
+  if (.not. branch_max) then
+    ds_allow = abs(dg1_wb_surface_jump(Hbar_A, Hbar_B, bed_qp, rhoi_rhow))
+    return
+  endif
+
+  one_m_r = 1.0 - rhoi_rhow
+  gA_mean  = (rhoi_rhow*Hbar_A - bed_qp > 0.0)
+  gB_mean  = (rhoi_rhow*Hbar_B - bed_qp > 0.0)
+  gA_trace = (rhoi_rhow*h_A - bed_qp > 0.0)
+  gB_trace = (rhoi_rhow*h_B - bed_qp > 0.0)
+
+  if (gA_mean) then ; s_A(1) = Hbar_A - bed_qp ; else ; s_A(1) = one_m_r*Hbar_A ; endif
+  nA = 1
+  if (gA_trace .neqv. gA_mean) then
+    nA = 2
+    if (gA_trace) then ; s_A(2) = Hbar_A - bed_qp ; else ; s_A(2) = one_m_r*Hbar_A ; endif
+  endif
+  if (gB_mean) then ; s_B(1) = Hbar_B - bed_qp ; else ; s_B(1) = one_m_r*Hbar_B ; endif
+  nB = 1
+  if (gB_trace .neqv. gB_mean) then
+    nB = 2
+    if (gB_trace) then ; s_B(2) = Hbar_B - bed_qp ; else ; s_B(2) = one_m_r*Hbar_B ; endif
+  endif
+
+  ds_allow = 0.0
+  do ib = 1, nB ; do ia = 1, nA
+    ds_allow = max(ds_allow, abs(s_B(ib) - s_A(ia)))
+  enddo ; enddo
+end function dg1_wb_mean_allowance
+
 !> Mean inverse flotation slope dh/ds across a face (1 grounded, 1/(1-r) floating per
 !! side), harmonic or arithmetic. Multiplying a surface jump by this mean gives the
 !! equivalent thickness jump. The same-branch shortcut keeps uniform-flotation faces
@@ -10740,7 +10827,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: amp_qp             ! Per-QP jump-mode rate amplification [nondim]
   real :: amp_face_max       ! Max amp_qp over the 2 face QPs [nondim]
   real :: ds_qp              ! Surface-elevation jump s_B - s_A at a face QP [Z ~> m]
-  real :: ds_bar             ! Mean-supported surface jump from the cell means [Z ~> m]
+  real :: ds_bar             ! Nonnegative mean-supported surface-jump allowance from
+                             ! the cell means [Z ~> m]
   real :: ds_use             ! Surface jump driving the flux: full or excess [Z ~> m]
   real :: ds_face_max        ! Max |ds_use| over the 2 face QPs [Z ~> m]
   real :: ds_bar_face_max    ! Max |ds_bar| over the 2 face QPs (allowance diagnostic) [Z ~> m]
@@ -11007,15 +11095,16 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         bed_qp = t_co*CS%bed_node(i,j-1) + t_face*CS%bed_node(i,j)
         if (CS%dg_art_visc_excess_jump) then
           ds_qp  = dg1_wb_surface_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
-          ! Mean-supported jump: per-side surfaces evaluated from the cell means at
-          ! the face-QP bed (same flotation branch logic; an approximation in cells
-          ! straddling the GL, consistent with the face-local comparison).
-          ds_bar = dg1_wb_surface_jump(Hbar_A, Hbar_B, bed_qp, rhoi_rhow_wb)
-          ! Excess over the supported band [-|ds_bar|, +|ds_bar|].
-          ds_use = ds_qp - min(max(ds_qp, -abs(ds_bar)), abs(ds_bar))
+          ! Mean-supported allowance: per-side surfaces evaluated from the cell
+          ! means at the face-QP bed; with BRANCH_MAX, the max over the admissible
+          ! flotation-branch assignments (see dg1_wb_mean_allowance).
+          ds_bar = dg1_wb_mean_allowance(Hbar_A, Hbar_B, h_A_qp, h_B_qp, bed_qp, &
+                                         rhoi_rhow_wb, CS%dg_art_visc_excess_branch_max)
+          ! Excess over the supported band [-ds_bar, +ds_bar].
+          ds_use = ds_qp - min(max(ds_qp, -ds_bar), ds_bar)
           dh_eq = ds_use * dg1_wb_slope_mean(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb, &
                                              CS%dg_art_visc_wb_harmonic)
-          ds_bar_face_max = max(ds_bar_face_max, abs(ds_bar))
+          ds_bar_face_max = max(ds_bar_face_max, ds_bar)
           if (abs(ds_qp) > 0.0) &
             excess_frac_face = max(excess_frac_face, abs(ds_use) / abs(ds_qp))
         else
@@ -11215,11 +11304,12 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         bed_qp = t_co*CS%bed_node(i-1,j) + t_face*CS%bed_node(i,j)
         if (CS%dg_art_visc_excess_jump) then
           ds_qp  = dg1_wb_surface_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
-          ds_bar = dg1_wb_surface_jump(Hbar_A, Hbar_B, bed_qp, rhoi_rhow_wb)
-          ds_use = ds_qp - min(max(ds_qp, -abs(ds_bar)), abs(ds_bar))
+          ds_bar = dg1_wb_mean_allowance(Hbar_A, Hbar_B, h_A_qp, h_B_qp, bed_qp, &
+                                         rhoi_rhow_wb, CS%dg_art_visc_excess_branch_max)
+          ds_use = ds_qp - min(max(ds_qp, -ds_bar), ds_bar)
           dh_eq = ds_use * dg1_wb_slope_mean(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb, &
                                              CS%dg_art_visc_wb_harmonic)
-          ds_bar_face_max = max(ds_bar_face_max, abs(ds_bar))
+          ds_bar_face_max = max(ds_bar_face_max, ds_bar)
           if (abs(ds_qp) > 0.0) &
             excess_frac_face = max(excess_frac_face, abs(ds_use) / abs(ds_qp))
         else
