@@ -6566,6 +6566,9 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
   real :: h_ip, bed_ip   ! Ice thickness and bed elevation at a sub-IP [Z ~> m]
   real :: bed_corners(2,2) ! Bed elevation at the 4 B-grid corners of a cell [Z ~> m]
   real :: H_corners(2,2)   ! Ice thickness at the 4 B-grid corners (non-DG path) [Z ~> m]
+  real :: d_min, d_max   ! Min/max over the 4 corners of the unclamped flotation
+                         ! deficit r*h - bed [Z ~> m]
+  real :: bed_min        ! Min bed elevation over the 4 corners [Z ~> m]
   real, dimension(:,:,:,:), pointer :: hgate ! Thickness field for the flotation
                          ! test: h_flot under DG_GL_GATE_CONTINUOUS, else h_nodal [Z ~> m]
   integer :: i, j, isub, jsub, iq, jq, n_total, n_grounded
@@ -6595,6 +6598,45 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
       bed_corners(:,:) = CS%bed_elev(i,j)
       H_corners(1,1) = H_node(i-1,j-1) ; H_corners(2,1) = H_node(i,j-1)
       H_corners(1,2) = H_node(i-1,j  ) ; H_corners(2,2) = H_node(i,j  )
+    endif
+
+    ! Exact early-out: the sub-IP flotation deficit r*max(h_ip, min_h_shelf) - bed_ip
+    ! is built from bilinear interpolants of the corner values gathered above, and a
+    ! bilinear attains its extrema at the cell corners. If the unclamped corner
+    ! deficits r*h - bed are all positive, the deficit is positive at every sub-IP
+    ! (the min_h_shelf clamp can only raise it) and the sampled fraction is exactly
+    ! 1; if they are all non-positive AND the clamped branch r*min_h_shelf - bed is
+    ! non-positive at every corner, the deficit is non-positive at every sub-IP and
+    ! the fraction is exactly 0. Both results are bitwise identical to sampling, so
+    ! the 4*N^2 sub-sampling is confined to cells whose corner deficits mix signs
+    ! (the grounding-line band).
+    if (CS%use_DG_thickness) then
+      d_min = min((rhoi_rhow*hgate(i,j,1,1)) - bed_corners(1,1), &
+                  (rhoi_rhow*hgate(i,j,2,1)) - bed_corners(2,1), &
+                  (rhoi_rhow*hgate(i,j,1,2)) - bed_corners(1,2), &
+                  (rhoi_rhow*hgate(i,j,2,2)) - bed_corners(2,2))
+      d_max = max((rhoi_rhow*hgate(i,j,1,1)) - bed_corners(1,1), &
+                  (rhoi_rhow*hgate(i,j,2,1)) - bed_corners(2,1), &
+                  (rhoi_rhow*hgate(i,j,1,2)) - bed_corners(1,2), &
+                  (rhoi_rhow*hgate(i,j,2,2)) - bed_corners(2,2))
+    else
+      d_min = min((rhoi_rhow*H_corners(1,1)) - bed_corners(1,1), &
+                  (rhoi_rhow*H_corners(2,1)) - bed_corners(2,1), &
+                  (rhoi_rhow*H_corners(1,2)) - bed_corners(1,2), &
+                  (rhoi_rhow*H_corners(2,2)) - bed_corners(2,2))
+      d_max = max((rhoi_rhow*H_corners(1,1)) - bed_corners(1,1), &
+                  (rhoi_rhow*H_corners(2,1)) - bed_corners(2,1), &
+                  (rhoi_rhow*H_corners(1,2)) - bed_corners(1,2), &
+                  (rhoi_rhow*H_corners(2,2)) - bed_corners(2,2))
+    endif
+    bed_min = min(min(bed_corners(1,1), bed_corners(2,1)), &
+                  min(bed_corners(1,2), bed_corners(2,2)))
+    if (d_min > 0.0) then
+      CS%ground_frac(i,j) = 1.0
+      cycle
+    elseif ((d_max <= 0.0) .and. ((rhoi_rhow*CS%min_h_shelf) - bed_min <= 0.0)) then
+      CS%ground_frac(i,j) = 0.0
+      cycle
     endif
 
     n_grounded = 0
