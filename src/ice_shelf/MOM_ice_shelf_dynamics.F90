@@ -448,6 +448,15 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! flotation crossing far into the lighter cell. Small s
                                   !! approaches pinning straddling faces at flotation (dead
                                   !! band; avoid); large s approaches the arithmetic mean.
+  logical :: dg_gl_gate_cell_mean !< If true (with dg_gl_gate_continuous), each cell touching
+                                  !! a node contributes its DG cell-mean thickness to the
+                                  !! h_flot average instead of its co-located corner trace.
+                                  !! Cell means cannot carry the broken-Q1 slope/jump modes,
+                                  !! so the friction classifier becomes immune to spurious
+                                  !! jump growth dragging node averages across flotation
+                                  !! (Gladstone/PISM-LI-style locator), at the cost of the
+                                  !! gate not seeing in-cell slope information. Identical to
+                                  !! the corner-trace source when the nodal field is flat.
   logical :: calve_to_mask       !< If true, calve off the ice shelf when it passes the edge of a mask.
   real :: min_thickness_simple_calve !< min. ice shelf thickness criteria for calving [Z ~> m].
   real :: T_shelf_missing   !< An ice shelf temperature to use where there is no ice shelf [C ~> degC]
@@ -6322,18 +6331,21 @@ end subroutine update_OD_ffrac_uncoupled
 !! nodal thickness. Each B-grid node value is an average of the h_nodal corner
 !! values of all adjacent ice cells (hmask 1 or 3), written back into every
 !! participating cell's corner slot so that cells sharing a node hold identical
-!! values. With DG_GL_GATE_DEFICIT_SCALE <= 0 the average is arithmetic; with a
-!! positive scale s each corner is weighted by 1/(|d_k| + s), where
-!! d_k = (rho_i/rho_w)*h_k - bed is that corner's flotation deficit, so the side
-!! nearer flotation dominates and a large one-sided jump at the grounding-line
-!! face cannot drag the gate far into the lighter cell. s -> infinity recovers
-!! the arithmetic mean; s -> 0 pins straddling faces exactly at flotation, which
-!! reintroduces a dead band (gate insensitive to thickness changes while the
-!! face straddles) and should be avoided. The gate is a locator, not a mass
-!! field: it commits the flotation crossing to a single position inside any
-!! inter-cell thickness jump, so the grounded/floating gates vary continuously
-!! as the grounding line migrates through faces. Must be called by all PEs
-!! (contains halo exchanges).
+!! values. With DG_GL_GATE_CELL_MEAN each touching cell instead contributes its
+!! DG cell-mean thickness (Dirichlet cells their boundary value), making the
+!! gate immune to the broken-Q1 slope/jump modes. With
+!! DG_GL_GATE_DEFICIT_SCALE <= 0 the average is arithmetic; with a
+!! positive scale s each contribution is weighted by 1/(|d_k| + s), where
+!! d_k = (rho_i/rho_w)*h_k - bed is that contribution's flotation deficit, so
+!! the side nearer flotation dominates and a large one-sided jump at the
+!! grounding-line face cannot drag the gate far into the lighter cell.
+!! s -> infinity recovers the arithmetic mean; s -> 0 pins straddling faces
+!! exactly at flotation, which reintroduces a dead band (gate insensitive to
+!! thickness changes while the face straddles) and should be avoided. The gate
+!! is a locator, not a mass field: it commits the flotation crossing to a
+!! single position inside any inter-cell thickness jump, so the
+!! grounded/floating gates vary continuously as the grounding line migrates
+!! through faces. Must be called by all PEs (contains halo exchanges).
 subroutine compute_h_flot(CS, ISS, G)
   type(ice_shelf_dyn_CS), intent(inout) :: CS  !< The ice shelf dynamics control structure
   type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe
@@ -6373,10 +6385,18 @@ subroutine compute_h_flot(CS, ISS, G)
     vNE = (ISS%hmask(i+1,j+1) == 1.0 .or. ISS%hmask(i+1,j+1) == 3.0)
 
     n_cells = 0
-    if (vSW) then ; n_cells = n_cells + 1 ; h_corner(n_cells) = CS%h_nodal(i  ,j  ,2,2) ; endif
-    if (vSE) then ; n_cells = n_cells + 1 ; h_corner(n_cells) = CS%h_nodal(i+1,j  ,1,2) ; endif
-    if (vNW) then ; n_cells = n_cells + 1 ; h_corner(n_cells) = CS%h_nodal(i  ,j+1,2,1) ; endif
-    if (vNE) then ; n_cells = n_cells + 1 ; h_corner(n_cells) = CS%h_nodal(i+1,j+1,1,1) ; endif
+    if (CS%dg_gl_gate_cell_mean) then
+      ! Cell-mean source: jump-immune Gladstone/PISM-style locator.
+      if (vSW) then ; n_cells = n_cells + 1 ; h_corner(n_cells) = gate_cell_mean(i  ,j  ) ; endif
+      if (vSE) then ; n_cells = n_cells + 1 ; h_corner(n_cells) = gate_cell_mean(i+1,j  ) ; endif
+      if (vNW) then ; n_cells = n_cells + 1 ; h_corner(n_cells) = gate_cell_mean(i  ,j+1) ; endif
+      if (vNE) then ; n_cells = n_cells + 1 ; h_corner(n_cells) = gate_cell_mean(i+1,j+1) ; endif
+    else
+      if (vSW) then ; n_cells = n_cells + 1 ; h_corner(n_cells) = CS%h_nodal(i  ,j  ,2,2) ; endif
+      if (vSE) then ; n_cells = n_cells + 1 ; h_corner(n_cells) = CS%h_nodal(i+1,j  ,1,2) ; endif
+      if (vNW) then ; n_cells = n_cells + 1 ; h_corner(n_cells) = CS%h_nodal(i  ,j+1,2,1) ; endif
+      if (vNE) then ; n_cells = n_cells + 1 ; h_corner(n_cells) = CS%h_nodal(i+1,j+1,1,1) ; endif
+    endif
     if (n_cells == 0) cycle
 
     if (deficit_weighting) then
@@ -6407,6 +6427,22 @@ subroutine compute_h_flot(CS, ISS, G)
 
   ! Fill halo corners that this PE's node loop could not reach.
   call pass_corner_field(CS%h_flot, G)
+
+contains
+
+  !> Cell-mean gate contribution: the DG cell-mean thickness for interior ice
+  !! cells, the boundary thickness for Dirichlet (hmask==3) cells. Mirrors the
+  !! Hbar convention of the artificial-viscosity face passes.
+  function gate_cell_mean(ic, jc) result(hbar)
+    integer, intent(in) :: ic !< i index of the contributing cell
+    integer, intent(in) :: jc !< j index of the contributing cell
+    real :: hbar              !< Cell-mean gate thickness [Z ~> m]
+    if (ISS%hmask(ic,jc) == 3.0) then
+      hbar = max(CS%h_bdry_val(ic,jc), CS%min_h_shelf)
+    else
+      hbar = nodal_cell_mean(CS%h_nodal(ic,jc,:,:), CS%cell_mean_w(ic,jc,:,:))
+    endif
+  end function gate_cell_mean
 
 end subroutine compute_h_flot
 
@@ -9602,6 +9638,22 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "s approaches the arithmetic mean. A few meters is a reasonable "//&
                  "starting value. Meaningful only when DG_GL_GATE_CONTINUOUS is true.", &
                  units="m", default=0.0, scale=US%m_to_Z, &
+                 do_not_log=.not.(CS%use_DG_thickness .and. CS%dg_gl_gate_continuous))
+
+  call get_param(param_file, mdl, "DG_GL_GATE_CELL_MEAN", CS%dg_gl_gate_cell_mean, &
+                 "If true (with DG_GL_GATE_CONTINUOUS), each cell touching a node "//&
+                 "contributes its DG cell-mean thickness to the continuous gate "//&
+                 "average instead of its co-located corner trace. Cell means cannot "//&
+                 "carry the broken-Q1 slope/jump modes, so the friction classifier "//&
+                 "becomes immune to spurious jump growth dragging node averages "//&
+                 "across flotation (a Gladstone/PISM-style cell-mean locator) and "//&
+                 "independent of any slope limiting, at the cost of the gate not "//&
+                 "seeing in-cell slope information. Both sources are second-order "//&
+                 "point estimates of the node thickness on smooth fields, and they "//&
+                 "coincide exactly when the nodal field is flat (DG_FV_ADVECT). "//&
+                 "DG_GL_GATE_DEFICIT_SCALE weighting, if active, then weights the "//&
+                 "cell means by their deficits at the node.", &
+                 default=.false., &
                  do_not_log=.not.(CS%use_DG_thickness .and. CS%dg_gl_gate_continuous))
 
 end subroutine read_nodal_limiter_params
