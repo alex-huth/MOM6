@@ -262,6 +262,13 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! into CS%bed_node and derive CS%bed_elev by bilinear averaging.
                                   !! Skips reconstruct_bed_to_nodes and the BED_TOPO_FILE read in
                                   !! initialize_ice_flow_from_file. Requires USE_DG_THICKNESS.
+  logical :: dg_fv_advect         !< If true (with USE_DG_THICKNESS), transport ISS%h_shelf with
+                                  !! the 2nd-order limited FV advection and slave CS%h_nodal flat
+                                  !! to the cell means: the DG(0) hybrid. All non-advection DG
+                                  !! machinery (strong driving stress, h_flot gate, subgrid GL)
+                                  !! runs unchanged on the flat field, with the in-cell flotation
+                                  !! deficit varying only through the nodal bed. Forces
+                                  !! DG1_ART_VISC_C_MAX = 0 (no slope/jump dofs exist to damp).
   logical :: nodal_positivity     !< If true, apply Liu-style positivity-preserving limiter
                                   !! to the nodal DG(1) thickness corners.
   logical :: dg_hierarchical_lim  !< If true, apply a per-mode hierarchical
@@ -1201,6 +1208,21 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       else
         call reconstruct_bed_to_nodes(CS, G, ISS%hmask)
       endif
+      ! DG(0) hybrid: re-slave the nodal corners flat to the restarted cell means.
+      ! This deliberately flattens any slopes saved by a previous DG(1) run, so a
+      ! DG(1) steady state can be restarted directly into hybrid mode as an A/B.
+      if (CS%dg_fv_advect) then
+        call pass_var(ISS%h_shelf, G%domain)
+        do j=G%jsd,G%jed ; do i=G%isd,G%ied
+          if (ISS%hmask(i,j) == 1.0 .or. ISS%hmask(i,j) == 3.0) then
+            CS%h_nodal(i,j,:,:) = ISS%h_shelf(i,j)
+          else
+            CS%h_nodal(i,j,:,:) = 0.0
+          endif
+        enddo ; enddo
+        call pass_corner_field(CS%h_nodal, G)
+        call enforce_wrap_corner_consistency(CS, ISS, G)
+      endif
     endif
 
     call pass_vector(CS%u_bdry_val, CS%v_bdry_val, G%domain, TO_ALL, BGRID_NE, complete=.false.)
@@ -1314,8 +1336,11 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         call pass_var(ISS%h_shelf, G%domain)
         CS%h_nodal(:,:,:,:) = 0.0
         node_ic_used = .false.
-        call initialize_DG_thickness_from_node_file(ISS%h_shelf, CS%h_nodal, ISS%hmask, &
-                                                    node_ic_used, G, US, param_file)
+        ! DG(0) hybrid: skip the node-file IC (it would introduce slopes); always
+        ! take the flat cell-mean branch below.
+        if (.not. CS%dg_fv_advect) &
+          call initialize_DG_thickness_from_node_file(ISS%h_shelf, CS%h_nodal, ISS%hmask, &
+                                                      node_ic_used, G, US, param_file)
         if (.not. node_ic_used) then
           call initialize_h_nodal_from_cellmean(ISS%h_shelf, CS%h_nodal, ISS%hmask, G)
         endif
@@ -2619,7 +2644,7 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
     ISS%h_shelf(i,j) = CS%h_bdry_val(i,j)
   endif ; enddo ; enddo
 
-  if (CS%use_DG_thickness) then
+  if (CS%use_DG_thickness .and. .not. CS%dg_fv_advect) then
     ! Nodal DG(1) unsplit advection with SSP-RK2 on CS%h_nodal.
     call ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, ISS%hmask, uh_ice, vh_ice)
     ! Publish derived state: ISS%h_shelf as the cell-mean of CS%h_nodal.
@@ -2712,6 +2737,21 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
   call pass_var(ISS%h_shelf, G%domain, complete=.false.)
   call pass_var(ISS%area_shelf_h, G%domain, complete=.false.)
   call pass_var(ISS%hmask, G%domain, complete=.true.)
+
+  ! DG(0) hybrid: ISS%h_shelf (just FV-advected, front/calving applied, halos
+  ! updated) is the authoritative state; slave the DG nodal corners flat to the
+  ! cell means so all downstream DG machinery reads the FV field.
+  if (CS%use_DG_thickness .and. CS%dg_fv_advect) then
+    do j=jsd,jed ; do i=isd,ied
+      if (ISS%hmask(i,j) == 1.0 .or. ISS%hmask(i,j) == 3.0) then
+        CS%h_nodal(i,j,:,:) = ISS%h_shelf(i,j)
+      else
+        CS%h_nodal(i,j,:,:) = 0.0
+      endif
+    enddo ; enddo
+    call pass_corner_field(CS%h_nodal, G)
+    call enforce_wrap_corner_consistency(CS, ISS, G)
+  endif
 
   call update_velocity_masks(CS, G, ISS%hmask, CS%umask, CS%vmask, CS%u_face_mask, CS%v_face_mask)
 
@@ -9184,6 +9224,10 @@ subroutine accumulate_DG_source_rate(CS, i, j, rate)
 
   if (.not. associated(CS)) return
   if (.not. CS%use_DG_thickness) return
+  ! DG(0) hybrid: the FV path's direct h_shelf update is authoritative and the DG
+  ! advect (the only consumer of this buffer) never runs, so accumulating here
+  ! would double-count on restartless diagnostics and grow the buffer unboundedly.
+  if (CS%dg_fv_advect) return
   CS%h_source_rate(i,j) = CS%h_source_rate(i,j) + rate
 end subroutine accumulate_DG_source_rate
 
@@ -9327,6 +9371,18 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  units="nondim", default=1.0, &
                  do_not_log=(.not.CS%use_DG_thickness .or. .not.CS%dg_hierarchical_lim))
 
+  call get_param(param_file, mdl, "DG_FV_ADVECT", CS%dg_fv_advect, &
+                 "If true, transport the ice thickness with the 2nd-order limited "//&
+                 "finite-volume advection of h_shelf and slave the DG nodal "//&
+                 "thickness flat to the cell means (a DG(0) hybrid): the "//&
+                 "strong-form driving stress, continuous flotation gate, and "//&
+                 "subgrid grounding-line machinery all run unchanged on the flat "//&
+                 "field, with the in-cell flotation deficit varying only through "//&
+                 "the nodal bed. The DG(1) artificial viscosity is forced off (no "//&
+                 "slope or jump degrees of freedom exist to damp). Requires "//&
+                 "USE_DG_THICKNESS.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
+
   call get_param(param_file, mdl, "DG1_ART_VISC_C_MAX", CS%dg_art_visc_c_max, &
                  "Peak dimensionless coefficient on the DG(1) artificial-viscosity face "//&
                  "flux at fully-shocky faces. Face coefficient ramps from C_MIN (smooth) "//&
@@ -9340,7 +9396,10 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "(DG1_ART_VISC_KCELL) rescales all faces of any cell whose summed "//&
                  "jump-mode rates would exceed the SSP-RK2 budget.", &
                  units="nondim", default=0.0, &
-                 do_not_log=.not.CS%use_DG_thickness)
+                 do_not_log=(.not.CS%use_DG_thickness .or. CS%dg_fv_advect))
+  ! The DG(0) hybrid has no slope/jump dofs: force the artificial viscosity off so
+  ! all downstream art-visc parameters are suppressed via their c_max==0 conditions.
+  if (CS%dg_fv_advect) CS%dg_art_visc_c_max = 0.0
 
   call get_param(param_file, mdl, "DG1_ART_VISC_ADVECT_COEF", CS%dg_art_visc_advect_coef, &
                  "Dimensionless multiplier on the |u_face| advective contribution to u_eff "//&
