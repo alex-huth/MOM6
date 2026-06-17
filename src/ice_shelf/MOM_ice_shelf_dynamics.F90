@@ -49,6 +49,16 @@ integer, parameter :: INNER_CG = 1       !< Conjugate gradient (default)
 integer, parameter :: INNER_MINRES = 2   !< MINRES
 integer, parameter :: INNER_CR = 3       !< Conjugate residual
 
+! Near-grounding-line basal-traction smoothing modes (DG_BASAL_TR_SCALE)
+integer, parameter :: BASAL_TR_NONE = 0     !< No smoothing (hard Weertman step at flotation)
+integer, parameter :: BASAL_TR_CENTERED = 1 !< Symmetric cosine ramp over [-W,W]; phi(0)=0.5, GL not displaced
+integer, parameter :: BASAL_TR_ONESIDED = 2 !< STREAMICE-style ramp over [0,W]; reduces grounded traction only
+
+! Friction-assembly gate codes stored in CS%basal_gate (real-valued for halo updates)
+real, parameter :: BG_SKIP = 0.0    !< No basal traction in this cell
+real, parameter :: BG_SUBGRID = 1.0 !< Evaluate basal traction per sub-quadrature point
+real, parameter :: BG_FULL = 2.0    !< Full-strength basal traction (fast cell-grounded path)
+
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
 ! consistency testing. These are noted in comments with units like Z, H, L, and T, along with
 ! their mks counterparts with notation like "a velocity [Z T-1 ~> m s-1]".  If the units
@@ -181,6 +191,16 @@ type, public :: ice_shelf_dyn_CS ; private
                                !! is 1, the ice-shelf is grounded
   ! float_cond used to be a persistent CS field; it is now derived inline at use sites
   ! from CS%ground_frac (a GL cell is "0 < ground_frac < 1" under GL_regularize=True).
+  real, pointer, dimension(:,:) :: basal_tr_dfrac => NULL() !< Diagnostic basal-traction smoothing anomaly:
+                               !! (mean of the DG_BASAL_TR_SCALE traction scale phi over the cell sub-IPs)
+                               !! minus the strict grounded fraction. Zero wherever smoothing is inactive;
+                               !! nonzero only in the near-GL band, mapping where/how much the smoothing reweights.
+  real, pointer, dimension(:,:) :: basal_gate => NULL() !< Friction-assembly gate code per cell (BG_SKIP /
+                               !! BG_SUBGRID / BG_FULL), recomputed alongside ground_frac. Decides whether the
+                               !! cell takes the fast full-traction path, the per-sub-qp subgrid path, or none.
+                               !! With DG_BASAL_TR_SCALE active it widens to include cells within the smoothing
+                               !! band of flotation; with no smoothing it mirrors ground_frac exactly. Used only
+                               !! for basal friction, never for the ground_frac diagnostic or the driving stress.
   real, pointer, dimension(:,:,:,:) :: Phi => NULL() !< The gradients of bilinear basis elements at Gaussian
                                                 !! 4 quadrature points surrounding the cell vertices [L-1 ~> m-1].
   real, pointer, dimension(:,:,:) :: PhiC => NULL()  !< The gradients of bilinear basis elements at 1 cell-centered
@@ -250,6 +270,11 @@ type, public :: ice_shelf_dyn_CS ; private
   real :: CF_MinN           !< Minimum Coulomb friction effective pressure [R Z L T-2 ~> Pa]
   real :: CF_PostPeak       !< Coulomb friction post peak exponent [nondim]
   real :: CF_Max            !< Coulomb friction maximum coefficient [nondim]
+  integer :: basal_tr_scale_mode = BASAL_TR_NONE !< Near-GL basal-traction smoothing mode set by
+                            !! DG_BASAL_TR_SCALE ('none'/'centered'/'onesided'). Weertman only; ignored
+                            !! under Coulomb friction (already continuous at flotation).
+  real :: basal_tr_scale_w  !< Smoothing half-width (centered) / width (onesided) in height-above-flotation
+                            !! h - h_flot for DG_BASAL_TR_SCALE [Z ~> m]
   real :: density_ocean_avg !< A typical ocean density [R ~> kg m-3].  This does not affect ocean
                             !! circulation or thermodynamics.  It is used to estimate the
                             !! gravitational driving force at the shelf front (until we think of
@@ -535,7 +560,7 @@ type, public :: ice_shelf_dyn_CS ; private
   !>@{ Diagnostic handles
   integer :: id_u_shelf = -1, id_v_shelf = -1, id_shelf_speed, id_t_shelf = -1, &
              id_taudx_shelf = -1, id_taudy_shelf = -1, id_taud_shelf = -1, id_bed_elev = -1, &
-             id_ground_frac = -1, id_col_thick = -1, id_OD_av = -1, &
+             id_ground_frac = -1, id_basal_tr_dfrac = -1, id_col_thick = -1, id_OD_av = -1, &
              id_u_mask = -1, id_v_mask = -1, id_ufb_mask =-1, id_vfb_mask = -1, id_t_mask = -1, &
              id_sx_shelf = -1, id_sy_shelf = -1, id_surf_slope_mag_shelf, &
              id_duHdx = -1, id_dvHdy = -1, id_fluxdiv = -1, &
@@ -764,6 +789,8 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%fB_elem(isd:ied,jsd:jed), source=0.0)
     allocate(CS%OD_av(isd:ied,jsd:jed), source=0.0)
     allocate(CS%ground_frac(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%basal_gate(isd:ied,jsd:jed), source=BG_SKIP)
+    allocate(CS%basal_tr_dfrac(isd:ied,jsd:jed), source=0.0)
     allocate(CS%taudx_shelf(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%taudy_shelf(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%sx_shelf(isd:ied,jsd:jed), source=0.0)
@@ -890,6 +917,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   character(len=200) :: IS_energyfile  ! The name of the energy file.
   character(len=32) :: filename_appendix = '' ! FMS appendix to filename for ensemble runs
   character(len=16) :: inner_solver_str ! The type of inner solver to use for the SSA
+  character(len=16) :: basal_tr_scale_str ! Near-GL basal-traction smoothing mode string
 
   Isdq = G%isdB ; Iedq = G%iedB ; Jsdq = G%jsdB ; Jedq = G%jedB
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -992,6 +1020,32 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     call get_param(param_file, mdl, "CF_Max", CS%CF_Max, &
                  "Coulomb friction maximum coefficient", &
                  units="none", default=0.5, fail_if_missing=.false.)
+    call get_param(param_file, mdl, "DG_BASAL_TR_SCALE", basal_tr_scale_str, &
+                 "Continuous near-grounding-line scaling of Weertman basal traction. 'none' uses the "//&
+                 "hard flotation step. 'centered' applies a symmetric cosine ramp over [-W,W] in "//&
+                 "height-above-flotation so phi=0.5 at the true grounding line (GL position not "//&
+                 "displaced; some traction is applied to barely-floating integration points). "//&
+                 "'onesided' applies the STREAMICE-style ramp over [0,W], reducing grounded traction "//&
+                 "only (flotation-biased). Ignored under Coulomb friction (already continuous).", &
+                 default="none")
+    select case (trim(basal_tr_scale_str))
+      case ("none")     ; CS%basal_tr_scale_mode = BASAL_TR_NONE
+      case ("centered") ; CS%basal_tr_scale_mode = BASAL_TR_CENTERED
+      case ("onesided") ; CS%basal_tr_scale_mode = BASAL_TR_ONESIDED
+      case default ; call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG_BASAL_TR_SCALE must be "//&
+                       "'none', 'centered', or 'onesided'.")
+    end select
+    if (CS%basal_tr_scale_mode /= BASAL_TR_NONE) then
+      call get_param(param_file, mdl, "DG_BASAL_TR_SCALE_WIDTH", CS%basal_tr_scale_w, &
+                 "Smoothing width for DG_BASAL_TR_SCALE, measured in height above flotation "//&
+                 "(thickness minus flotation thickness). Half-width of the band for 'centered', "//&
+                 "full width for 'onesided'.", &
+                 units="m", default=5.0, scale=US%m_to_Z)
+      if (CS%basal_tr_scale_w <= 0.0) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
+                 "DG_BASAL_TR_SCALE_WIDTH must be positive when DG_BASAL_TR_SCALE is active.")
+      if (CS%CoulombFriction) call MOM_error(WARNING, "MOM_ice_shelf_dynamics: DG_BASAL_TR_SCALE is "//&
+                 "ignored under Coulomb friction (the Coulomb law is already continuous at flotation).")
+    endif
     ! Pre-compute Coulomb prefactor alpha = (q-1)^(q-1)/q^q for q=CF_PostPeak [nondim].
     ! Default is 1.0; only update when Coulomb is active and q /= 1.
     if (CS%CoulombFriction .and. CS%CF_PostPeak /= 1.0) &
@@ -1432,6 +1486,14 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     CS%id_ground_frac = register_diag_field('ice_shelf_model','ice_ground_frac',CS%diag%axesT1, Time, &
        'fraction of cell that is grounded; under GL_regularize this is the fraction of '//&
        'sub-cell quadrature points whose draft sits below the bed', 'none')
+    CS%id_basal_tr_dfrac = register_diag_field('ice_shelf_model','ice_basal_tr_dfrac',CS%diag%axesT1, Time, &
+       'basal-traction smoothing anomaly: the effective traction fraction (mean over a cell '//&
+       'sub-integration points of the DG_BASAL_TR_SCALE near-grounding-line traction scale phi) minus '//&
+       'the strict grounded fraction ice_ground_frac. Zero wherever smoothing is inactive '//&
+       '(DG_BASAL_TR_SCALE=none, Coulomb, or away from the grounding line); in [-1,1]. Negative on the '//&
+       'just-grounded side (traction reduced) and positive on the just-floating side (traction added, '//&
+       'centered mode only), mapping where and how much the near-GL Weertman smoothing reweights traction.', &
+       'none')
     CS%id_col_thick = register_diag_field('ice_shelf_model','col_thick',CS%diag%axesT1, Time, &
        'ocean column thickness passed to ice model', 'm', conversion=US%Z_to_m)
     CS%id_visc_shelf = register_diag_field('ice_shelf_model','ice_visc',CS%diag%axesT1, Time, &
@@ -2039,6 +2101,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       call post_data(CS%id_surf_slope_mag_shelf, surf_slope, CS%diag)
     endif
     if (CS%id_ground_frac > 0) call post_data(CS%id_ground_frac, CS%ground_frac, CS%diag)
+    if (CS%id_basal_tr_dfrac > 0) call post_data(CS%id_basal_tr_dfrac, CS%basal_tr_dfrac, CS%diag)
     if (CS%id_OD_av >0) call post_data(CS%id_OD_av, CS%OD_av,CS%diag)
     if (CS%id_visc_shelf > 0) then
       call ice_visc_diag(CS,G,ice_visc)
@@ -4980,6 +5043,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   real :: rho_ice_g_LtoZ ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
   logical :: do_DG       ! Local flag for DG basal friction mode
   logical :: grounded_qp ! Whether this quadrature point is grounded (for DG per-qp check)
+  logical :: tr_scale_on ! Whether near-GL basal-traction smoothing is active (Weertman only)
   real, dimension(:,:,:,:), pointer :: hgate ! Thickness field for the flotation
                          ! test: h_flot under DG_GL_GATE_CONTINUOUS, else h_nodal [Z ~> m]
   integer :: iq, jq, iphi, jphi, i, j, ilq, jlq, Itgt, Jtgt, qp, qpv
@@ -5006,6 +5070,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   do_newton_visc = use_newton .and. trim(CS%ice_viscosity_compute) == "MODEL"
 
   do_DG = CS%use_DG_thickness .and. present(h_shelf)
+  tr_scale_on = (CS%basal_tr_scale_mode /= BASAL_TR_NONE) .and. (.not. CS%CoulombFriction)
   if (do_DG) then
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
     rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
@@ -5075,7 +5140,8 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
         ! Basal friction and Newton Jacobian evaluated at this quadrature point (fully grounded cells only).
         ! Evaluating at quadrature points rather than cell-averaged ensures the Newton correction is the
         ! exact Jacobian of the Picard residual, enabling quadratic convergence for all friction exponents.
-        grounded_qp = merge(CS%ground_frac(i,j) >= 1.0, CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
+        grounded_qp = merge(merge(CS%basal_gate(i,j) > 1.5, CS%ground_frac(i,j) >= 1.0, tr_scale_on), &
+                            CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
         if (grounded_qp) then
           ! DG mode: per-Gauss-point grounding check and fB computation. h_gp is used
           ! only as a flotation measure (gate + effective pressure), so it is read from
@@ -5189,7 +5255,8 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
       uret_b(I  ,J  ,1) = 0.25*((uret_qp(2,2,1)+uret_qp(2,2,4))+(uret_qp(2,2,2)+uret_qp(2,2,3)))
       vret_b(I  ,J  ,1) = 0.25*((vret_qp(2,2,1)+vret_qp(2,2,4))+(vret_qp(2,2,2)+vret_qp(2,2,3)))
 
-      if (CS%GL_regularize .and. CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0) then
+      if (CS%GL_regularize .and. merge(CS%basal_gate(i,j) > 0.5 .and. CS%basal_gate(i,j) < 1.5, &
+          CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0, tr_scale_on)) then
         ! Subgrid grounding-line: evaluate basal friction at each grounded sub-quadrature point.
         ! Picard and Newton Jacobian are both computed inside CG_action_subgrid_basal.
         Hcell(:,:) = H_node(I-1:I,J-1:J)
@@ -5293,6 +5360,12 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
   real :: rho_ice_g_LtoZ ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
   real :: xi_sub, eta_sub ! DG reference coords at sub-qp ([-0.5,0.5]) [nondim]
   logical :: do_DG       ! Local flag for DG mode
+  logical :: tr_scale_on ! Near-GL basal-traction smoothing active (Weertman only)
+  logical :: tr_onesided ! One-sided ramp form
+  real :: tr_w, x_lo     ! Smoothing width and lower active edge in height-above-flotation [Z ~> m]
+  real :: x_af           ! Height above flotation h - h_flot at sub-qp [Z ~> m]
+  real :: phi_qp         ! Continuous basal-traction scale in [0,1] at sub-qp [nondim]
+  logical :: active_qp   ! Whether this sub-qp contributes basal traction
   integer :: nsub, i, j, qx, qy, m, n
 
   nsub    = size(Phisub, 3)
@@ -5301,6 +5374,11 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
   coef_prefactor = CS%coef_prefactor(i_elem,j_elem)
   min_trac_area  = CS%min_basal_traction * G%areaT(i_elem,j_elem)
   eps_vel2 = CS%eps_glen_min**2 * ((G%dxT(i_elem,j_elem)**2) + (G%dyT(i_elem,j_elem)**2))
+
+  tr_scale_on = (CS%basal_tr_scale_mode /= BASAL_TR_NONE) .and. (.not. CS%CoulombFriction)
+  tr_onesided = (CS%basal_tr_scale_mode == BASAL_TR_ONESIDED)
+  tr_w = CS%basal_tr_scale_w
+  x_lo = merge(0.0, -tr_w, tr_onesided)  ! lower edge of the active band (X > x_lo => phi > 0)
 
   do_DG = .false.
   if (present(use_DG)) do_DG = use_DG
@@ -5331,7 +5409,18 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
         bed_sub = bathyT
       endif
 
-      if (dens_ratio * hloc - bed_sub > 0) then  ! grounded sub-qp
+      ! Grounding test. With smoothing the active band widens to X > x_lo (x_lo = -W centered,
+      ! 0 one-sided) so the cosine ramp phi multiplies the traction; without it this is the plain
+      ! flotation test with phi = 1.
+      if (tr_scale_on) then
+        x_af = hloc - bed_sub / dens_ratio
+        active_qp = (x_af > x_lo)
+      else
+        active_qp = (dens_ratio * hloc - bed_sub > 0)
+      endif
+      if (active_qp) then  ! grounded (or within the smoothing band) sub-qp
+        if (tr_scale_on) then ; phi_qp = basal_tr_scale(x_af, tr_w, tr_onesided)
+        else ; phi_qp = 1.0 ; endif
         u_curr_loc  = (((Phisub(qx,qy,i,j,1,1)*U_curr(1,1))  + (Phisub(qx,qy,i,j,2,2)*U_curr(2,2)))  + &
                        ((Phisub(qx,qy,i,j,1,2)*U_curr(1,2))  + (Phisub(qx,qy,i,j,2,1)*U_curr(2,1))))
         v_curr_loc  = (((Phisub(qx,qy,i,j,1,1)*V_curr(1,1))  + (Phisub(qx,qy,i,j,2,2)*V_curr(2,2)))  + &
@@ -5355,6 +5444,9 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
         call compute_basal_coef(unorm2_loc, coef_prefactor, min_trac_area, fB_local, &
             CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, use_newton, &
             basal_coef_loc, drag_newt_loc)
+        ! Continuous near-GL scaling of the traction (no-op phi=1 without smoothing).
+        basal_coef_loc = phi_qp * basal_coef_loc
+        drag_newt_loc  = phi_qp * drag_newt_loc
         inner_dot_loc = (u_curr_loc * u_delta_loc) + (v_curr_loc * v_delta_loc)
 
         ! Interpolate cell-edge metrics to the sub-cell QP using the bilinear shape function values
@@ -5582,6 +5674,7 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
   real :: rho_ice_g_LtoZ ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
   logical :: do_DG       ! Local flag for DG basal friction mode
   logical :: grounded_qp ! Whether this quadrature point is grounded
+  logical :: tr_scale_on ! Whether near-GL basal-traction smoothing is active (Weertman only)
   real, dimension(:,:,:,:), pointer :: hgate ! Thickness field for the flotation
                          ! test: h_flot under DG_GL_GATE_CONTINUOUS, else h_nodal [Z ~> m]
   real, dimension(2)   :: xquad
@@ -5606,6 +5699,7 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
   do_newton_visc = CS%doing_newton .and. trim(CS%ice_viscosity_compute) == "MODEL"
 
   do_DG = CS%use_DG_thickness .and. present(h_shelf)
+  tr_scale_on = (CS%basal_tr_scale_mode /= BASAL_TR_NONE) .and. (.not. CS%CoulombFriction)
   if (do_DG) then
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
     rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
@@ -5646,7 +5740,8 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
       endif
 
       ! Basal friction coefficients at this quadrature point (fully grounded cells only)
-      grounded_qp = merge(CS%ground_frac(i,j) >= 1.0, CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
+      grounded_qp = merge(merge(CS%basal_gate(i,j) > 1.5, CS%ground_frac(i,j) >= 1.0, tr_scale_on), &
+                          CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
       if (grounded_qp) then
         if (do_DG) then
           ! h_gp is used only as a flotation measure (gate + effective pressure), so it
@@ -5769,7 +5864,8 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
     u_diag_b(I  ,J  ,1) = 0.25*((u_diag_qp(2,2,1)+u_diag_qp(2,2,4))+(u_diag_qp(2,2,2)+u_diag_qp(2,2,3)))
     v_diag_b(I  ,J  ,1) = 0.25*((v_diag_qp(2,2,1)+v_diag_qp(2,2,4))+(v_diag_qp(2,2,2)+v_diag_qp(2,2,3)))
 
-    if (CS%GL_regularize .and. CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0) then
+    if (CS%GL_regularize .and. merge(CS%basal_gate(i,j) > 0.5 .and. CS%basal_gate(i,j) < 1.5, &
+        CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0, tr_scale_on)) then
       ! Subgrid grounding-line: evaluate basal friction diagonal at each grounded sub-quadrature point.
       ! Returns separate u_diag_sub and v_diag_sub (differ in Newton term: u^2 vs v^2).
       ! The sub-qp flotation test handles grounding fraction; no external ground_frac scaling needed.
@@ -5867,6 +5963,12 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
   real :: rho_ice_g_LtoZ ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
   real :: xi_sub, eta_sub ! DG reference coords at sub-qp ([-0.5,0.5]) [nondim]
   logical :: do_DG       ! Local flag for DG mode
+  logical :: tr_scale_on ! Near-GL basal-traction smoothing active (Weertman only)
+  logical :: tr_onesided ! One-sided ramp form
+  real :: tr_w, x_lo     ! Smoothing width and lower active edge in height-above-flotation [Z ~> m]
+  real :: x_af           ! Height above flotation h - h_flot at sub-qp [Z ~> m]
+  real :: phi_qp         ! Continuous basal-traction scale in [0,1] at sub-qp [nondim]
+  logical :: active_qp   ! Whether this sub-qp contributes basal traction
   integer :: nsub, i, j, qx, qy, m, n
 
   nsub    = size(Phisub, 3)
@@ -5875,6 +5977,11 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
   coef_prefactor = CS%coef_prefactor(i_elem,j_elem)
   min_trac_area  = CS%min_basal_traction * G%areaT(i_elem,j_elem)
   eps_vel2 = CS%eps_glen_min**2 * ((G%dxT(i_elem,j_elem)**2) + (G%dyT(i_elem,j_elem)**2))
+
+  tr_scale_on = (CS%basal_tr_scale_mode /= BASAL_TR_NONE) .and. (.not. CS%CoulombFriction)
+  tr_onesided = (CS%basal_tr_scale_mode == BASAL_TR_ONESIDED)
+  tr_w = CS%basal_tr_scale_w
+  x_lo = merge(0.0, -tr_w, tr_onesided)  ! lower edge of the active band (X > x_lo => phi > 0)
 
   do_DG = .false.
   if (present(use_DG)) do_DG = use_DG
@@ -5902,7 +6009,17 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
         bed_sub = bathyT
       endif
 
-      if (dens_ratio * hloc - bed_sub > 0) then  ! grounded sub-qp
+      ! Grounding test, widened to the smoothing band when active (matches CG_action_subgrid_basal
+      ! so the preconditioner diagonal stays consistent with the residual).
+      if (tr_scale_on) then
+        x_af = hloc - bed_sub / dens_ratio
+        active_qp = (x_af > x_lo)
+      else
+        active_qp = (dens_ratio * hloc - bed_sub > 0)
+      endif
+      if (active_qp) then  ! grounded (or within the smoothing band) sub-qp
+        if (tr_scale_on) then ; phi_qp = basal_tr_scale(x_af, tr_w, tr_onesided)
+        else ; phi_qp = 1.0 ; endif
         u_curr_loc = (((Phisub(qx,qy,i,j,1,1)*U_curr(1,1)) + (Phisub(qx,qy,i,j,2,2)*U_curr(2,2))) + &
                       ((Phisub(qx,qy,i,j,1,2)*U_curr(1,2)) + (Phisub(qx,qy,i,j,2,1)*U_curr(2,1))))
         v_curr_loc = (((Phisub(qx,qy,i,j,1,1)*V_curr(1,1)) + (Phisub(qx,qy,i,j,2,2)*V_curr(2,2))) + &
@@ -5922,6 +6039,9 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
         call compute_basal_coef(unorm2_loc, coef_prefactor, min_trac_area, fB_local, &
             CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .true., &
             basal_coef_loc, drag_newt_loc)
+        ! Continuous near-GL scaling of the traction (no-op phi=1 without smoothing).
+        basal_coef_loc = phi_qp * basal_coef_loc
+        drag_newt_loc  = phi_qp * drag_newt_loc
         ! Interpolate cell-edge metrics to the sub-cell QP using the bilinear shape function values
         ! from bilinear_shape_functions_subgrid.  Marginal sums of Phisub give the interpolation
         ! weights: sum over k=1 nodes gives (1-y); k=2 gives y; l=1 gives (1-x); l=2 gives x.
@@ -6572,7 +6692,13 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
   real, dimension(:,:,:,:), pointer :: hgate ! Thickness field for the flotation
                          ! test: h_flot under DG_GL_GATE_CONTINUOUS, else h_nodal [Z ~> m]
   integer :: i, j, isub, jsub, iq, jq, n_total, n_grounded
+  integer :: n_active, n_full ! Sub-IP counts for the basal-traction smoothing gate
   integer :: isc, iec, jsc, jec
+  logical :: gate_scan        ! True when DG_BASAL_TR_SCALE is active (Weertman only)
+  logical :: tr_onesided      ! True for the one-sided ramp
+  real :: g_ip                ! Flotation deficit r*h_ip - bed_ip at a sub-IP [Z ~> m]
+  real :: thr_lo, thr_full    ! g thresholds for the smoothing band edges X=x_lo and X=W [Z ~> m]
+  real :: phi_sum             ! Sum of the traction scale phi over a cell sub-IPs [nondim]
 
   if (.not. CS%GL_regularize) return
 
@@ -6583,6 +6709,18 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
 
   rhoi_rhow = CS%density_ice / CS%density_ocean_avg
   n_total = CS%n_sub_regularize * CS%n_sub_regularize * 4
+
+  ! Basal-traction smoothing gate setup. The gate (CS%basal_gate) decides which friction-assembly
+  ! path each cell takes; it is widened relative to the strict flotation test when smoothing is on,
+  ! but CS%ground_frac itself stays the strict (unsmeared) diagnostic. Smoothing is Weertman only.
+  gate_scan = (CS%basal_tr_scale_mode /= BASAL_TR_NONE) .and. (.not. CS%CoulombFriction)
+  tr_onesided = (CS%basal_tr_scale_mode == BASAL_TR_ONESIDED)
+  ! g = r*h - bed, so X = h - h_flot = g/r. Band edges X=W and X=x_lo map to g thresholds r*W, r*x_lo,
+  ! with x_lo = -W (centered) or 0 (one-sided).
+  thr_full = rhoi_rhow * CS%basal_tr_scale_w
+  thr_lo   = merge(0.0, -rhoi_rhow * CS%basal_tr_scale_w, tr_onesided)
+  CS%basal_gate(:,:) = BG_SKIP
+  CS%basal_tr_dfrac(:,:) = 0.0  ! nonzero only at near-GL band cells under active smoothing
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
 
   do j=jsc,jec ; do i=isc,iec
@@ -6631,15 +6769,30 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
     endif
     bed_min = min(min(bed_corners(1,1), bed_corners(2,1)), &
                   min(bed_corners(1,2), bed_corners(2,2)))
-    if (d_min > 0.0) then
-      CS%ground_frac(i,j) = 1.0
-      cycle
-    elseif ((d_max <= 0.0) .and. ((rhoi_rhow*CS%min_h_shelf) - bed_min <= 0.0)) then
-      CS%ground_frac(i,j) = 0.0
-      cycle
+    ! Exact early-outs (bilinear extrema at the corners). Without smoothing these reproduce the
+    ! strict grounding test; with smoothing the band edges (r*W, r*x_lo) replace 0 so a fully-saturated
+    ! cell (all sub-IP at X>=W) still takes the fast full-traction path and a cell entirely below the
+    ! band takes no traction, while the mixed band cells fall through to the sub-IP scan.
+    ! (basal_tr_dfrac is 0 in every early-out: phi saturates to ground_frac there, so it keeps its reset 0.)
+    if (gate_scan) then
+      if (d_min > thr_full) then
+        CS%ground_frac(i,j) = 1.0 ; CS%basal_gate(i,j) = BG_FULL
+        cycle
+      elseif ((d_max <= thr_lo) .and. ((rhoi_rhow*CS%min_h_shelf) - bed_min <= thr_lo)) then
+        CS%ground_frac(i,j) = 0.0 ; CS%basal_gate(i,j) = BG_SKIP
+        cycle
+      endif
+    else
+      if (d_min > 0.0) then
+        CS%ground_frac(i,j) = 1.0 ; CS%basal_gate(i,j) = BG_FULL
+        cycle
+      elseif ((d_max <= 0.0) .and. ((rhoi_rhow*CS%min_h_shelf) - bed_min <= 0.0)) then
+        CS%ground_frac(i,j) = 0.0 ; CS%basal_gate(i,j) = BG_SKIP
+        cycle
+      endif
     endif
 
-    n_grounded = 0
+    n_grounded = 0 ; n_active = 0 ; n_full = 0 ; phi_sum = 0.0
     do jsub=1,CS%n_sub_regularize ; do isub=1,CS%n_sub_regularize
       do jq=1,2 ; do iq=1,2
         if (CS%use_DG_thickness) then
@@ -6661,14 +6814,37 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
                  ((CS%Phisub(iq,jq,isub,jsub,2,1)*bed_corners(2,1)) + &
                   (CS%Phisub(iq,jq,isub,jsub,1,2)*bed_corners(1,2)))
 
-        if (rhoi_rhow * h_ip - bed_ip > 0.0) n_grounded = n_grounded + 1
+        g_ip = rhoi_rhow * h_ip - bed_ip
+        if (g_ip > 0.0) n_grounded = n_grounded + 1
+        if (gate_scan) then
+          if (g_ip > thr_lo)    n_active = n_active + 1
+          if (g_ip >= thr_full) n_full   = n_full + 1
+          phi_sum = phi_sum + basal_tr_scale(g_ip / rhoi_rhow, CS%basal_tr_scale_w, tr_onesided)
+        endif
       enddo ; enddo
     enddo ; enddo
 
+    ! Strict (unsmeared) grounded fraction for the diagnostic, unchanged by smoothing.
     CS%ground_frac(i,j) = real(n_grounded) / real(n_total)
+    ! Smoothing anomaly diagnostic: effective traction fraction (mean phi) minus the strict grounded
+    ! fraction. Only the active-smoothing scan can make this nonzero; otherwise it keeps its reset 0.
+    if (gate_scan) CS%basal_tr_dfrac(i,j) = phi_sum / real(n_total) - CS%ground_frac(i,j)
+
+    ! Friction-assembly gate. Without smoothing it mirrors the strict fraction exactly; with smoothing
+    ! it keys off the band counts (any sub-IP with phi>0 => active; all sub-IP saturated => full path).
+    if (gate_scan) then
+      if (n_active == 0) then ; CS%basal_gate(i,j) = BG_SKIP
+      elseif (n_full == n_total) then ; CS%basal_gate(i,j) = BG_FULL
+      else ; CS%basal_gate(i,j) = BG_SUBGRID ; endif
+    else
+      if (n_grounded == 0) then ; CS%basal_gate(i,j) = BG_SKIP
+      elseif (n_grounded == n_total) then ; CS%basal_gate(i,j) = BG_FULL
+      else ; CS%basal_gate(i,j) = BG_SUBGRID ; endif
+    endif
   enddo ; enddo
 
-  call pass_var(CS%ground_frac, G%Domain, complete=.true.)
+  call pass_var(CS%ground_frac, G%Domain, complete=.false.)
+  call pass_var(CS%basal_gate, G%Domain, complete=.true.)
 
 end subroutine compute_ground_frac
 
@@ -7291,6 +7467,8 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_lim_phi))        deallocate(CS%dg_lim_phi)
   if (associated(CS%dg_lim_pk_factor))  deallocate(CS%dg_lim_pk_factor)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
+  if (associated(CS%basal_gate)) deallocate(CS%basal_gate)
+  if (associated(CS%basal_tr_dfrac)) deallocate(CS%basal_tr_dfrac)
   if (associated(CS%Jac)) deallocate(CS%Jac)
   if (associated(CS%Phi)) deallocate(CS%Phi)
   if (associated(CS%Phisub)) deallocate(CS%Phisub)
@@ -10883,6 +11061,34 @@ pure function dg1_wb_surface_jump(h_A, h_B, bed_qp, rhoi_rhow) result(ds)
   else ; s_B = one_m_r*h_B ; endif
   ds = s_B - s_A
 end function dg1_wb_surface_jump
+
+!> Continuous near-grounding-line basal-traction scale phi in [0,1] as a function of the
+!! height above flotation X = h - h_flot, used by DG_BASAL_TR_SCALE to turn the hard Weertman
+!! friction step into a smooth ramp (a numerical regularization of the grounding-line friction
+!! discontinuity, after the STREAMICE PHI_GL treatment). The centered form is antisymmetric about
+!! (X=0, phi=0.5) so phi(X)+phi(-X)=1: the traction removed just inside flotation equals that added
+!! just outside, leaving the mean grounding-line position undisplaced. The one-sided form ramps
+!! only over grounded ice [0,W] (phi=0 at and below flotation), reducing grounded traction near the
+!! grounding line without applying any to floating ice (flotation-biased).
+pure function basal_tr_scale(X, W, one_sided) result(phi)
+  real,    intent(in) :: X         !< Height above flotation h - h_flot [Z ~> m]
+  real,    intent(in) :: W         !< Half-width (centered) / width (one-sided) of the ramp [Z ~> m]
+  logical, intent(in) :: one_sided !< If true use the one-sided [0,W] ramp; else the centered [-W,W] ramp
+  real :: phi                      !< Traction scale in [0,1] [nondim]
+  real, parameter :: PI = 4.0*atan(1.0)
+  if (W <= 0.0) then  ! degenerate: hard flotation step
+    phi = merge(1.0, 0.0, X > 0.0) ; return
+  endif
+  if (one_sided) then
+    if (X <= 0.0) then ; phi = 0.0
+    elseif (X >= W) then ; phi = 1.0
+    else ; phi = 0.5*(1.0 - cos(PI*X/W)) ; endif
+  else
+    if (X <= -W) then ; phi = 0.0
+    elseif (X >= W) then ; phi = 1.0
+    else ; phi = 0.5*(1.0 - cos(PI*(X+W)/(2.0*W))) ; endif
+  endif
+end function basal_tr_scale
 
 !> Mean-supported surface-jump allowance for the DG(1) excess-jump artificial
 !! viscosity: the largest |s_B - s_A| the two cell means can support at the face-QP
