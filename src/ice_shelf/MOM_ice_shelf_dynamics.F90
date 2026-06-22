@@ -254,6 +254,11 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! determined by ocean column thickness means update_OD_ffrac
                             !! will be called (note: GL_regularize and GL_couple
                             !! should be exclusive)
+  logical :: FV_GL_one_sided !< If true, use one-sided finite-volume differences to evaluate the
+                            !! driving stress in the cells on either side of the grounding line,
+                            !! following Cornford et al. (2013) eqs 27-29, rather than the
+                            !! centered difference (their eq 25) that would straddle the
+                            !! grounding line. Only used by the FV (non-DG) driving stress.
 
   real    :: CFL_factor     !< A factor used to limit subcycled advective timestep in uncoupled runs
                             !! i.e. dt <= CFL_factor * min(dx / u) [nondim]
@@ -995,6 +1000,12 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     call get_param(param_file, mdl, "MAX_SURFACE_SLOPE", CS%max_surface_slope, &
                  "max. allowed ice-sheet surface slope. To ignore, set to zero.", &
                  units="none", default=0., scale=US%m_to_Z/US%m_to_L)
+    call get_param(param_file, mdl, "FV_GL_ONE_SIDED_TAUD", CS%FV_GL_one_sided, &
+                 "If true, the finite-volume (non-DG) driving stress is evaluated with "//&
+                 "one-sided differences in the grounded and floating cells that border the "//&
+                 "grounding line, following Cornford et al. (2013) eqs 27-29, instead of a "//&
+                 "centered difference that straddles the grounding line.", &
+                 default=.false.)
     call get_param(param_file, mdl, "MIN_ICE_VISC", CS%min_ice_visc, &
                  "min. allowed Glen's law ice viscosity", &
                  units="Pa s", default=0., scale=US%Pa_to_RL2_T2*US%s_to_T)
@@ -4767,8 +4778,17 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
 
   real, dimension(SIZE(OD,1),SIZE(OD,2))  :: S     ! surface elevation [Z ~> m].
   real, dimension(SZDI_(G),SZDJ_(G)) :: sx_e, sy_e !element contributions to driving stress
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: grnd ! True at grounded ice cells, set by the same
+                       ! flotation test that builds S; used by the one-sided grounding-line driving stress.
   real    :: rho, rhow, rhoi_rhow ! Ice and ocean densities [R ~> kg m-3]
   real    :: sx, sy    ! Ice shelf top slopes at tracer points [Z L-1 ~> nondim]
+  real    :: hx, hy    ! Effective ice thickness for the one-sided grounding-line driving stress
+                       ! in the x- and y- directions, averaged across the face used [Z ~> m].
+  logical :: gnd_E, gnd_W, gnd_N, gnd_S ! True if the neighboring cell is grounded ice.
+  logical :: flt_E, flt_W, flt_N, flt_S ! True if the neighboring cell is floating ice.
+  logical :: gnd_EE, gnd_WW, gnd_NN, gnd_SS ! As above, but for the next cell out.
+  logical :: flt_EE, flt_WW, flt_NN, flt_SS ! As above, but for the next cell out.
+  logical :: this_gnd, this_flt ! True if the current cell is grounded / floating ice.
   real    :: neumann_val ! [R Z L2 T-2 ~> kg s-2]
   real    :: grav      ! The gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
   real    :: scale     ! Scaling factor used to ensure surface slope magnitude does not exceed CS%max_surface_slope
@@ -4811,6 +4831,30 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
   endif
 
   call pass_var(S, G%domain)
+
+  ! Flag grounded ice cells for the one-sided grounding-line driving stress, using the same
+  ! cell-center flotation test that builds S (Cornford et al. 2013, Feldmann et al. 2014). The
+  ! mask is built over the full data domain so the +/-2-cell grounding-line stencil can be read
+  ! directly; bed_elev, h_shelf, hmask and ground_frac already carry valid halo values here.
+  if (CS%FV_GL_one_sided) then
+    do j=jsd,jed ; do i=isd,ied
+      if (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3) then
+        if (CS%GL_couple) then
+          grnd(i,j) = (CS%ground_frac(i,j) >= 1.0)
+        else
+          grnd(i,j) = (rhoi_rhow * max(ISS%h_shelf(i,j),CS%min_h_shelf) - CS%bed_elev(i,j) > 0.0)
+        endif
+      else
+        !Non-ice cells for the grounding-line stencil are treated as grounded/floating cells
+        !according to whether they are land/ocean cells
+        if (CS%bed_elev(i,j)>0) then
+          grnd(i,j) = .false.
+        else
+          grnd(i,j) = .true.
+        endif
+      endif
+    enddo ; enddo
+  endif
 
   do j=jsc-1,jec+1
     do i=isc-1,iec+1
@@ -4882,13 +4926,82 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
           endif
         endif
 
+        ! Effective thickness for the driving stress; replaced by a face-averaged value below
+        ! wherever the one-sided grounding-line treatment is applied.
+        hx = max(ISS%h_shelf(i,j),CS%min_h_shelf)
+        hy = max(ISS%h_shelf(i,j),CS%min_h_shelf)
+
+        ! One-sided finite-volume driving stress near the grounding line, following
+        ! Cornford et al. (2013) eqs 27-29 (and Feldmann et al. 2014). Wherever a centered
+        ! slope would straddle the grounding line, it is replaced by a one-sided difference
+        ! that stays on a single side (grounded or floating) of the line, with the thickness
+        ! averaged across the face used. Grounded/floating is the cell-center flotation test
+        ! held in grnd
+        if (CS%FV_GL_one_sided) then
+          ! x-direction. Require the +/-2 stencil to lie within the data domain.
+          if ((i-2 >= isd) .and. (i+2 <= ied)) then
+            this_gnd = grnd(i,j)
+            this_flt = .not. this_gnd
+            gnd_E  = grnd(i+1,j) ; flt_E = valid_E .and. (.not. gnd_E)
+            gnd_W  = grnd(i-1,j) ; flt_W = valid_W .and. (.not. gnd_W)
+            gnd_EE = grnd(i+2,j) ; flt_EE = (.not. gnd_EE)
+            gnd_WW = grnd(i-2,j) ; flt_WW = (.not. gnd_WW)
+
+            if (this_gnd .and. gnd_W .and. flt_E .and. flt_EE) then
+              ! Last grounded cell, grounding line to the east (eqs 27-28): backward difference.
+              sx = (S(i,j) - S(i-1,j)) * G%IdxCu(I-1,j)
+              hx = 0.5*(max(ISS%h_shelf(i,j),CS%min_h_shelf) + max(ISS%h_shelf(i-1,j),CS%min_h_shelf))
+            elseif (this_gnd .and. gnd_E .and. flt_W .and. flt_WW) then
+              ! Last grounded cell, grounding line to the west: forward difference.
+              sx = (S(i+1,j) - S(i,j)) * G%IdxCu(I,j)
+              hx = 0.5*(max(ISS%h_shelf(i+1,j),CS%min_h_shelf) + max(ISS%h_shelf(i,j),CS%min_h_shelf))
+            elseif (this_flt .and. flt_E .and. gnd_W .and. gnd_WW) then
+              ! First floating cell, grounding line to the west (eq 29): forward difference.
+              sx = (S(i+1,j) - S(i,j)) * G%IdxCu(I,j)
+              hx = 0.5*(max(ISS%h_shelf(i+1,j),CS%min_h_shelf) + max(ISS%h_shelf(i,j),CS%min_h_shelf))
+            elseif (this_flt .and. flt_W .and. gnd_E .and. gnd_EE) then
+              ! First floating cell, grounding line to the east: backward difference.
+              sx = (S(i,j) - S(i-1,j)) * G%IdxCu(I-1,j)
+              hx = 0.5*(max(ISS%h_shelf(i,j),CS%min_h_shelf) + max(ISS%h_shelf(i-1,j),CS%min_h_shelf))
+            endif
+          endif
+
+          ! y-direction. Require the +/-2 stencil to lie within the data domain.
+          if ((j-2 >= jsd) .and. (j+2 <= jed)) then
+            this_gnd = grnd(i,j)
+            this_flt = .not. this_gnd
+            gnd_N  = grnd(i,j+1) ; flt_N = valid_N .and. (.not. gnd_N)
+            gnd_S  = grnd(i,j-1) ; flt_S = valid_S .and. (.not. gnd_S)
+            gnd_NN = grnd(i,j+2) ; flt_NN = (.not. gnd_NN)
+            gnd_SS = grnd(i,j-2) ; flt_SS = (.not. gnd_SS)
+
+            if (this_gnd .and. gnd_S .and. flt_N .and. flt_NN) then
+              ! Last grounded cell, grounding line to the north (eqs 27-28): backward difference.
+              sy = (S(i,j) - S(i,j-1)) * G%IdyCv(i,J-1)
+              hy = 0.5*(max(ISS%h_shelf(i,j),CS%min_h_shelf) + max(ISS%h_shelf(i,j-1),CS%min_h_shelf))
+            elseif (this_gnd .and. gnd_N .and. flt_S .and. flt_SS) then
+              ! Last grounded cell, grounding line to the south: forward difference.
+              sy = (S(i,j+1) - S(i,j)) * G%IdyCv(i,J)
+              hy = 0.5*(max(ISS%h_shelf(i,j+1),CS%min_h_shelf) + max(ISS%h_shelf(i,j),CS%min_h_shelf))
+            elseif (this_flt .and. flt_N .and. gnd_S .and. gnd_SS) then
+              ! First floating cell, grounding line to the south (eq 29): forward difference.
+              sy = (S(i,j+1) - S(i,j)) * G%IdyCv(i,J)
+              hy = 0.5*(max(ISS%h_shelf(i,j+1),CS%min_h_shelf) + max(ISS%h_shelf(i,j),CS%min_h_shelf))
+            elseif (this_flt .and. flt_S .and. gnd_N .and. gnd_NN) then
+              ! First floating cell, grounding line to the north: backward difference.
+              sy = (S(i,j) - S(i,j-1)) * G%IdyCv(i,J-1)
+              hy = 0.5*(max(ISS%h_shelf(i,j),CS%min_h_shelf) + max(ISS%h_shelf(i,j-1),CS%min_h_shelf))
+            endif
+          endif
+        endif
+
         if (CS%max_surface_slope>0) then
           scale = CS%max_surface_slope / max( sqrt((sx**2) + (sy**2)), CS%max_surface_slope )
           sx = scale*sx ; sy = scale*sy
         endif
 
-        sx_e(i,j) = (-.25 * G%areaT(i,j)) * ((rho * grav) * (max(ISS%h_shelf(i,j),CS%min_h_shelf) * sx))
-        sy_e(i,j) = (-.25 * G%areaT(i,j)) * ((rho * grav) * (max(ISS%h_shelf(i,j),CS%min_h_shelf) * sy))
+        sx_e(i,j) = (-.25 * G%areaT(i,j)) * ((rho * grav) * (hx * sx))
+        sy_e(i,j) = (-.25 * G%areaT(i,j)) * ((rho * grav) * (hy * sy))
 
         CS%sx_shelf(i,j) = sx ; CS%sy_shelf(i,j) = sy
 
