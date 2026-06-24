@@ -1826,7 +1826,9 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     !Update these variables so that they are nonzero in case
     !IS_dynamics_post_data is called before update_ice_shelf
     if (CS%id_taudx_shelf>0 .or. CS%id_taudy_shelf>0) then
-      if (CS%use_DG_thickness) then
+      ! Match the solver's dispatch: with GL_QUADRANT_TAUD the FV driving stress is used even
+      ! under DG advection, so the diagnostic taud is consistent with what the solver applied.
+      if (CS%use_DG_thickness .and. .not. CS%gl_quad_taud) then
         if (CS%dg_gl_gate_continuous) call compute_h_flot(CS, ISS, G)
         if (CS%dg_driving_stress_IBP) then
           call calc_shelf_driving_stress_DG(CS, ISS, G, US, CS%taudx_shelf, CS%taudy_shelf, CS%OD_av)
@@ -3027,8 +3029,10 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   ! thickness-advection scheme.
   if (CS%gl_quad_friction .or. CS%gl_quad_taud) call compute_gl_quadrant_fractions(CS, ISS, G)
 
-  ! Calculate RHS
-  if (CS%use_DG_thickness) then
+  ! Calculate RHS. With GL_QUADRANT_TAUD, use the FV (non-DG) driving stress even under DG
+  ! thickness advection, so the cell-mean quadrant surface blend (gl_surface_blend) takes effect.
+  ! This feeds the driving stress the cell-mean thickness, discarding the DG sub-cell slope.
+  if (CS%use_DG_thickness .and. .not. CS%gl_quad_taud) then
     if (CS%dg_driving_stress_IBP) then
       call calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, CS%OD_av)
     else
