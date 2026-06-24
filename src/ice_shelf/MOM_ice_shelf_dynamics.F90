@@ -189,6 +189,15 @@ type, public :: ice_shelf_dyn_CS ; private
   real, pointer, dimension(:,:) :: ground_frac => NULL()   !< Fraction of the time a cell is "exposed", i.e. the column
                                !! thickness is below a threshold and interacting with the rock [nondim].  When this
                                !! is 1, the ice-shelf is grounded
+  real, pointer, dimension(:,:) :: f_ground_node => NULL() !< Analytic grounded ice fraction at B-grid
+                               !! nodes (vertices) from the quadrant grounding-line parameterization
+                               !! (Leguy et al. 2021). Multiplies basal friction when GL_QUADRANT_FRICTION
+                               !! is set. 1 = fully grounded, 0 = fully floating [nondim].
+  real, pointer, dimension(:,:) :: f_ground_cell => NULL() !< Analytic grounded ice fraction at cell
+                               !! centers from the same quadrant parameterization (shares the per-cell
+                               !! quadrant areas with f_ground_node, so the two grids carry mutually
+                               !! consistent grounded areas). Used to blend the surface for the FV
+                               !! driving stress when GL_QUADRANT_TAUD is set [nondim].
   ! float_cond used to be a persistent CS field; it is now derived inline at use sites
   ! from CS%ground_frac (a GL cell is "0 < ground_frac < 1" under GL_regularize=True).
   real, pointer, dimension(:,:) :: basal_tr_dfrac => NULL() !< Diagnostic basal-traction smoothing anomaly:
@@ -259,6 +268,15 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! following Cornford et al. (2013) eqs 27-29, rather than the
                             !! centered difference (their eq 25) that would straddle the
                             !! grounding line. Only used by the FV (non-DG) driving stress.
+
+  logical :: gl_quad_friction !< If true, scale basal friction by an analytic nodal grounded
+                            !! fraction (CS%f_ground_node) computed by the quadrant grounding-line
+                            !! parameterization of Leguy et al. (2021), replacing the geometric
+                            !! sub-cell (Phisub) friction integration in grounding-line cells.
+  logical :: gl_quad_taud   !< If true, blend the cell-center surface elevation with the analytic
+                            !! cell grounded fraction (CS%f_ground_cell) before forming the FV
+                            !! (non-DG) driving stress, smoothing the grounding-line surface kink.
+                            !! Mutually exclusive with FV_GL_ONE_SIDED_TAUD.
 
   real    :: CFL_factor     !< A factor used to limit subcycled advective timestep in uncoupled runs
                             !! i.e. dt <= CFL_factor * min(dx / u) [nondim]
@@ -794,6 +812,8 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%fB_elem(isd:ied,jsd:jed), source=0.0)
     allocate(CS%OD_av(isd:ied,jsd:jed), source=0.0)
     allocate(CS%ground_frac(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%f_ground_node(IsdB:IedB,JsdB:JedB), source=0.0)
+    allocate(CS%f_ground_cell(isd:ied,jsd:jed), source=0.0)
     allocate(CS%basal_gate(isd:ied,jsd:jed), source=BG_SKIP)
     allocate(CS%basal_tr_dfrac(isd:ied,jsd:jed), source=0.0)
     allocate(CS%taudx_shelf(IsdB:IedB,JsdB:JedB), source=0.0)
@@ -1006,6 +1026,23 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "grounding line, following Cornford et al. (2013) eqs 27-29, instead of a "//&
                  "centered difference that straddles the grounding line.", &
                  default=.false.)
+    call get_param(param_file, mdl, "GL_QUADRANT_FRICTION", CS%gl_quad_friction, &
+                 "If true, scale basal friction by an analytic nodal grounded fraction from "//&
+                 "the quadrant grounding-line parameterization of Leguy, Lipscomb & Asay-Davis "//&
+                 "(2021, The Cryosphere 15:3229-3253, sec. 2.2), instead of the geometric "//&
+                 "sub-cell (GROUNDING_LINE_INTERP_SUBGRID_N) friction integration. The grounded "//&
+                 "fraction is the analytic bilinear-flotation area integral, so it is rotation- "//&
+                 "consistent and needs no sub-cell sampling.", &
+                 default=.false.)
+    call get_param(param_file, mdl, "GL_QUADRANT_TAUD", CS%gl_quad_taud, &
+                 "If true, blend the cell-center surface elevation with the analytic cell grounded "//&
+                 "fraction from the same quadrant parameterization before forming the FV (non-DG) "//&
+                 "driving stress, smoothing the grounding-line surface kink. Mutually exclusive "//&
+                 "with FV_GL_ONE_SIDED_TAUD.", &
+                 default=.false.)
+    if (CS%gl_quad_taud .and. CS%FV_GL_one_sided) call MOM_error(FATAL, &
+                 "GL_QUADRANT_TAUD and FV_GL_ONE_SIDED_TAUD both regularize the grounding-line "//&
+                 "driving stress and cannot be used together.")
     call get_param(param_file, mdl, "MIN_ICE_VISC", CS%min_ice_visc, &
                  "min. allowed Glen's law ice viscosity", &
                  units="Pa s", default=0., scale=US%Pa_to_RL2_T2*US%s_to_T)
@@ -2985,6 +3022,11 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   if (CS%use_DG_thickness .and. CS%dg_gl_gate_continuous) call compute_h_flot(CS, ISS, G)
   call compute_ground_frac(CS, ISS, G, H_node)
 
+  ! Analytic quadrant grounding-line fractions for friction and/or the driving-stress surface
+  ! blend (Leguy et al. 2021). Uses cell-mean h_shelf/bed_elev, so it is independent of the
+  ! thickness-advection scheme.
+  if (CS%gl_quad_friction .or. CS%gl_quad_taud) call compute_gl_quadrant_fractions(CS, ISS, G)
+
   ! Calculate RHS
   if (CS%use_DG_thickness) then
     if (CS%dg_driving_stress_IBP) then
@@ -4830,6 +4872,10 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
     enddo ; enddo
   endif
 
+  ! Smooth the surface across the grounding line using the analytic cell grounded fraction
+  ! (Leguy et al. 2021). Mutually exclusive with FV_GL_ONE_SIDED_TAUD (enforced at init).
+  if (CS%gl_quad_taud) call gl_surface_blend(CS, ISS, G, S)
+
   call pass_var(S, G%domain)
 
   ! Flag grounded ice cells for the one-sided grounding-line driving stress, using the same
@@ -5142,6 +5188,8 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   real :: u_curr_qp, v_curr_qp  ! Current iterate u^k at quadrature point [L T-1 ~> m s-1]
   real :: unorm2_qp  ! Regularized squared speed of u^k at quadrature point [L2 T-2 ~> m2 s-2]
   real :: basal_coef_qp  ! Picard basal friction coefficient at quadrature point [R L2 Z T-1 ~> kg s-1]
+  real :: gl_w_qp        ! Quadrant-GLP grounded weight at the quadrature point, bilinear-interpolated
+                         ! from CS%f_ground_node; used only when CS%gl_quad_friction [nondim]
   real :: drag_newt_qp   ! Newton basal drag coefficient at quadrature point [R Z T-1 ~> kg m-2 s-1]
   real :: inner_dot_qp   ! u^k_qp · δu_qp inner product for Newton basal drag [L2 T-2 ~> m2 s-2]
   real :: coef_prefactor_e  ! Pre-computed area * C_basal_friction * L_T_to_m_s [R L2 Z T-1 ~> kg s-1]
@@ -5253,8 +5301,14 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
         ! Basal friction and Newton Jacobian evaluated at this quadrature point (fully grounded cells only).
         ! Evaluating at quadrature points rather than cell-averaged ensures the Newton correction is the
         ! exact Jacobian of the Picard residual, enabling quadratic convergence for all friction exponents.
-        grounded_qp = merge(merge(CS%basal_gate(i,j) > 1.5, CS%ground_frac(i,j) >= 1.0, tr_scale_on), &
-                            CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
+        if (CS%gl_quad_friction) then
+          ! Quadrant GLP: the element friction path handles every cell with any grounded area,
+          ! and the per-quadrature-point weight gl_w_qp (below) carries the sub-cell structure.
+          grounded_qp = CS%f_ground_cell(i,j) > 0.0
+        else
+          grounded_qp = merge(merge(CS%basal_gate(i,j) > 1.5, CS%ground_frac(i,j) >= 1.0, tr_scale_on), &
+                              CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
+        endif
         if (grounded_qp) then
           ! DG mode: per-Gauss-point grounding check and fB computation. h_gp is used
           ! only as a flotation measure (gate + effective pressure), so it is read from
@@ -5269,8 +5323,11 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
                       (CS%bed_node(I,J)     * (xquad(iq)   * xquad(jq))))  + &
                      ((CS%bed_node(I,J-1)   * (xquad(iq)   * xquad(3-jq))) + &
                       (CS%bed_node(I-1,J)   * (xquad(3-iq) * xquad(jq))))
-            grounded_qp = (dens_ratio * h_gp - bed_gp > 0)
-            if (grounded_qp .and. CS%CoulombFriction) then
+            ! Under quadrant GLP the smooth nodal weight gl_w_qp sets the grounded contribution,
+            ! so the binary per-quadrature-point test must not gate the friction; it still selects
+            ! a physical (grounded-only) effective pressure for the Coulomb law.
+            if (.not. CS%gl_quad_friction) grounded_qp = (dens_ratio * h_gp - bed_gp > 0)
+            if ((dens_ratio * h_gp - bed_gp > 0) .and. CS%CoulombFriction) then
               fB_local = compute_fB_local(h_gp, bed_gp, rho_oi_ratio, rho_ice_g_LtoZ, &
                   CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
                   CS%CF_PostPeak, CS%n_basal_fric)
@@ -5295,14 +5352,24 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
           call compute_basal_coef(unorm2_qp, coef_prefactor_e, min_trac_e, fB_local, &
               CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, use_newton, &
               basal_coef_qp, drag_newt_qp)
+          ! Quadrant-GLP grounded weight at this quadrature point: bilinear interpolation of the
+          ! nodal grounded fraction (same corner basis as h_gp above). Harmless when the toggle is
+          ! off (f_ground_node is zero and the merge below discards it).
+          gl_w_qp = ((CS%f_ground_node(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
+                     (CS%f_ground_node(I,J)     * (xquad(iq)   * xquad(jq))))  + &
+                    ((CS%f_ground_node(I,J-1)   * (xquad(iq)   * xquad(3-jq))) + &
+                     (CS%f_ground_node(I-1,J)   * (xquad(3-iq) * xquad(jq))))
           ! Apply ground fraction scaling (replaces external scaling of basal_traction).
           ! Under GL_regularize, GL cells (0 < ground_frac < 1) get sub-grid-aware basal
           ! handling via the GL branch below, so the cell-level scaling must collapse to 1.0
           ! there to avoid double-counting (matches pre-refactor behavior when ground_frac
-          ! was forced to 1.0 in GL cells).
-          basal_coef_qp = basal_coef_qp * merge(1.0, CS%ground_frac(i,j), CS%GL_regularize)
+          ! was forced to 1.0 in GL cells). Under quadrant GLP the nodal weight gl_w_qp is used
+          ! at every grounded cell instead.
+          basal_coef_qp = basal_coef_qp * &
+              merge(gl_w_qp, merge(1.0, CS%ground_frac(i,j), CS%GL_regularize), CS%gl_quad_friction)
           if (use_newton) then
-            drag_newt_qp = drag_newt_qp * merge(1.0, CS%ground_frac(i,j), CS%GL_regularize)
+            drag_newt_qp = drag_newt_qp * &
+                merge(gl_w_qp, merge(1.0, CS%ground_frac(i,j), CS%GL_regularize), CS%gl_quad_friction)
             ! Inner product u^k_qp . delta_u_qp for the Newton correction.
             inner_dot_qp = (u_curr_qp * uq) + (v_curr_qp * vq)
           endif
@@ -5368,7 +5435,8 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
       uret_b(I  ,J  ,1) = 0.25*((uret_qp(2,2,1)+uret_qp(2,2,4))+(uret_qp(2,2,2)+uret_qp(2,2,3)))
       vret_b(I  ,J  ,1) = 0.25*((vret_qp(2,2,1)+vret_qp(2,2,4))+(vret_qp(2,2,2)+vret_qp(2,2,3)))
 
-      if (CS%GL_regularize .and. merge(CS%basal_gate(i,j) > 0.5 .and. CS%basal_gate(i,j) < 1.5, &
+      if (CS%GL_regularize .and. .not. CS%gl_quad_friction .and. &
+          merge(CS%basal_gate(i,j) > 0.5 .and. CS%basal_gate(i,j) < 1.5, &
           CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0, tr_scale_on)) then
         ! Subgrid grounding-line: evaluate basal friction at each grounded sub-quadrature point.
         ! Picard and Newton Jacobian are both computed inside CG_action_subgrid_basal.
@@ -5775,6 +5843,8 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
   real :: u_curr_qp, v_curr_qp  ! Current iterate u^k at quadrature point [L T-1 ~> m s-1]
   real :: unorm2_qp  ! Regularized squared speed of u^k at quadrature point [L2 T-2 ~> m2 s-2]
   real :: basal_coef_qp  ! Picard basal friction coefficient at quadrature point [R L2 Z T-1 ~> kg s-1]
+  real :: gl_w_qp        ! Quadrant-GLP grounded weight at the quadrature point, bilinear-interpolated
+                         ! from CS%f_ground_node; used only when CS%gl_quad_friction [nondim]
   real :: drag_newt_qp   ! Newton basal drag coefficient at quadrature point [R Z T-1 ~> kg m-2 s-1]
   real :: coef_prefactor_e  ! Pre-computed area * C_basal_friction * L_T_to_m_s [R L2 Z T-1 ~> kg s-1]
   real :: eps_vel2_e     ! Velocity regularization squared for current element [L2 T-2 ~> m2 s-2]
@@ -5853,8 +5923,14 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
       endif
 
       ! Basal friction coefficients at this quadrature point (fully grounded cells only)
-      grounded_qp = merge(merge(CS%basal_gate(i,j) > 1.5, CS%ground_frac(i,j) >= 1.0, tr_scale_on), &
-                          CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
+      if (CS%gl_quad_friction) then
+        ! Mirror the CG_action operator: element friction path for any grounded cell, weighted
+        ! per quadrature point by gl_w_qp so the preconditioner diagonal matches the operator.
+        grounded_qp = CS%f_ground_cell(i,j) > 0.0
+      else
+        grounded_qp = merge(merge(CS%basal_gate(i,j) > 1.5, CS%ground_frac(i,j) >= 1.0, tr_scale_on), &
+                            CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
+      endif
       if (grounded_qp) then
         if (do_DG) then
           ! h_gp is used only as a flotation measure (gate + effective pressure), so it
@@ -5870,8 +5946,11 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
                     (CS%bed_node(I,J)     * (xquad(iq)   * xquad(jq))))  + &
                    ((CS%bed_node(I,J-1)   * (xquad(iq)   * xquad(3-jq))) + &
                     (CS%bed_node(I-1,J)   * (xquad(3-iq) * xquad(jq))))
-          grounded_qp = (dens_ratio * h_gp - bed_gp > 0)
-          if (grounded_qp .and. CS%CoulombFriction) then
+          ! See CG_action: under quadrant GLP the smooth nodal weight sets the grounded
+          ! contribution, so the binary per-QP test must not gate the diagonal; it still selects
+          ! a physical (grounded-only) effective pressure for the Coulomb law.
+          if (.not. CS%gl_quad_friction) grounded_qp = (dens_ratio * h_gp - bed_gp > 0)
+          if ((dens_ratio * h_gp - bed_gp > 0) .and. CS%CoulombFriction) then
             fB_local = compute_fB_local(h_gp, bed_gp, rho_oi_ratio, rho_ice_g_LtoZ, &
                 CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
                 CS%CF_PostPeak, CS%n_basal_fric)
@@ -5896,8 +5975,15 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
         call compute_basal_coef(unorm2_qp, coef_prefactor_e, min_trac_e, fB_local, &
             CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .true., &
             basal_coef_qp, drag_newt_qp)
-        basal_coef_qp = basal_coef_qp * merge(1.0, CS%ground_frac(i,j), CS%GL_regularize)
-        drag_newt_qp  = drag_newt_qp  * merge(1.0, CS%ground_frac(i,j), CS%GL_regularize)
+        ! Quadrant-GLP grounded weight at this QP (same corner basis as h_gp); matches CG_action.
+        gl_w_qp = ((CS%f_ground_node(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
+                   (CS%f_ground_node(I,J)     * (xquad(iq)   * xquad(jq))))  + &
+                  ((CS%f_ground_node(I,J-1)   * (xquad(iq)   * xquad(3-jq))) + &
+                   (CS%f_ground_node(I-1,J)   * (xquad(3-iq) * xquad(jq))))
+        basal_coef_qp = basal_coef_qp * &
+            merge(gl_w_qp, merge(1.0, CS%ground_frac(i,j), CS%GL_regularize), CS%gl_quad_friction)
+        drag_newt_qp  = drag_newt_qp  * &
+            merge(gl_w_qp, merge(1.0, CS%ground_frac(i,j), CS%GL_regularize), CS%gl_quad_friction)
       endif
 
       do jphi=1,2 ; Jtgt = J-2+jphi ; do iphi=1,2 ; Itgt = I-2+iphi
@@ -5977,7 +6063,8 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
     u_diag_b(I  ,J  ,1) = 0.25*((u_diag_qp(2,2,1)+u_diag_qp(2,2,4))+(u_diag_qp(2,2,2)+u_diag_qp(2,2,3)))
     v_diag_b(I  ,J  ,1) = 0.25*((v_diag_qp(2,2,1)+v_diag_qp(2,2,4))+(v_diag_qp(2,2,2)+v_diag_qp(2,2,3)))
 
-    if (CS%GL_regularize .and. merge(CS%basal_gate(i,j) > 0.5 .and. CS%basal_gate(i,j) < 1.5, &
+    if (CS%GL_regularize .and. .not. CS%gl_quad_friction .and. &
+        merge(CS%basal_gate(i,j) > 0.5 .and. CS%basal_gate(i,j) < 1.5, &
         CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0, tr_scale_on)) then
       ! Subgrid grounding-line: evaluate basal friction diagonal at each grounded sub-quadrature point.
       ! Returns separate u_diag_sub and v_diag_sub (differ in Newton term: u^2 vs v^2).
@@ -6960,6 +7047,233 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
   call pass_var(CS%basal_gate, G%Domain, complete=.true.)
 
 end subroutine compute_ground_frac
+
+!> Grounded-area fraction of a rectangular region from the flotation function at its four
+!! corners, via the analytic bilinear-flotation area integral of the quadrant grounding-line
+!! parameterization. Ported from CISM's glissade_grounding_line.F90::compute_grounded_fraction
+!! (W. Lipscomb, Los Alamos National Laboratory; CISM is LGPL), the scheme documented in
+!! Leguy, Lipscomb & Asay-Davis (2021, The Cryosphere 15:3229-3253, sec. 2.2; orig. Leguy et al.
+!! 2014). Corners are ordered counter-clockwise from the southwest. The flotation function is
+!! positive where floating and non-positive where grounded, with the grounding line at the
+!! contour f = 0; the routine returns the fraction of the region where f <= 0.
+subroutine gl_quadrant_grounded_frac(f_flot, frac)
+  real, dimension(4), intent(in) :: f_flot !< Flotation function at the 4 CCW corners (>0 floating) [Z ~> m]
+  real,               intent(out) :: frac  !< Grounded area fraction of the region [nondim]
+
+  real :: a, b, c, d           ! Coefficients of the bilinear f(x,y) = a + b*x + c*y + d*x*y on the unit square
+  real :: f1, f2, f3, f4       ! Corner values after rotation to a canonical orientation
+  real :: f_corner             ! Area of a single triangular/curved corner region
+  real :: f_corner1, f_corner2 ! Areas of the two corner regions in the diagonal case
+  real :: f_trapezoid          ! Floating-side trapezoid area in the adjacent case
+  real :: var                  ! Sign selector for the diagonal case
+  logical, dimension(4) :: cfloat, logvar
+  logical :: adjacent          ! True if the two like corners are edge-adjacent (vs diagonal)
+  logical :: rotated           ! True if the diagonal case was rotated 90 degrees before integrating
+  integer :: nc, nfloat
+  real, parameter :: eps06 = 1.0e-6 ! Guards the small-curvature (d->0) branches
+
+  nfloat = 0
+  do nc=1,4
+    cfloat(nc) = (f_flot(nc) > 0.0)
+    if (cfloat(nc)) nfloat = nfloat + 1
+  enddo
+
+  if (nfloat == 0) then
+    frac = 1.0 ; return
+  elseif (nfloat == 4 .or. minval(f_flot) == 0.0) then
+    ! All floating, or grounded only where f == 0 exactly: treat as fully floating.
+    frac = 0.0 ; return
+  endif
+
+  if (nfloat == 1 .or. nfloat == 3) then
+    ! One corner is unlike the other three. Rotate it to the southwest (corner 1).
+    if (nfloat == 1) then
+      logvar(:) = cfloat(:)
+    else
+      logvar(:) = .not. cfloat(:)
+    endif
+    if (logvar(1)) then       ! no rotation
+      f1 = f_flot(1) ; f2 = f_flot(2) ; f3 = f_flot(3) ; f4 = f_flot(4)
+    elseif (logvar(2)) then   ! rotate 90 degrees
+      f4 = f_flot(1) ; f1 = f_flot(2) ; f2 = f_flot(3) ; f3 = f_flot(4)
+    elseif (logvar(3)) then   ! rotate 180 degrees
+      f3 = f_flot(1) ; f4 = f_flot(2) ; f1 = f_flot(3) ; f2 = f_flot(4)
+    else                      ! rotate 270 degrees
+      f2 = f_flot(1) ; f3 = f_flot(2) ; f4 = f_flot(3) ; f1 = f_flot(4)
+    endif
+    a = f1 ; b = f2 - f1 ; c = f4 - f1 ; d = (f1 + f3) - (f2 + f4)
+    ! Area of the corner region (floating if nfloat==1, grounded if nfloat==3):
+    !   d /= 0: [(bc - ad) ln|1 - ad/(bc)| + ad] / d^2 ;  d -> 0: a^2 / (2 b c)
+    if (abs((a*d)/(b*c)) > eps06) then
+      f_corner = ((b*c - a*d) * log(abs(1.0 - (a*d)/(b*c))) + a*d) / (d*d)
+    else
+      f_corner = (a*a) / (2.0*b*c)
+    endif
+    if (nfloat == 1) then  ! f_corner is the floating area
+      frac = 1.0 - f_corner
+    else                   ! f_corner is the grounded area
+      frac = f_corner
+    endif
+
+  else  ! nfloat == 2
+    if (cfloat(1) .and. cfloat(2)) then       ! two floating corners adjacent; no rotation
+      adjacent = .true. ; f1 = f_flot(1) ; f2 = f_flot(2) ; f3 = f_flot(3) ; f4 = f_flot(4)
+    elseif (cfloat(2) .and. cfloat(3)) then   ! rotate 90 degrees
+      adjacent = .true. ; f4 = f_flot(1) ; f1 = f_flot(2) ; f2 = f_flot(3) ; f3 = f_flot(4)
+    elseif (cfloat(3) .and. cfloat(4)) then   ! rotate 180 degrees
+      adjacent = .true. ; f3 = f_flot(1) ; f4 = f_flot(2) ; f1 = f_flot(3) ; f2 = f_flot(4)
+    elseif (cfloat(4) .and. cfloat(1)) then   ! rotate 270 degrees
+      adjacent = .true. ; f2 = f_flot(1) ; f3 = f_flot(2) ; f4 = f_flot(3) ; f1 = f_flot(4)
+    else                                      ! two floating corners diagonally opposite
+      adjacent = .false.
+      var = f_flot(2)*f_flot(4) - f_flot(1)*f_flot(3)
+      if (var >= 0.0) then
+        f1 = f_flot(1) ; f2 = f_flot(2) ; f3 = f_flot(3) ; f4 = f_flot(4) ; rotated = .false.
+      else
+        f4 = f_flot(1) ; f1 = f_flot(2) ; f2 = f_flot(3) ; f3 = f_flot(4) ; rotated = .true.
+      endif
+    endif
+    a = f1 ; b = f2 - f1 ; c = f4 - f1 ; d = (f1 + f3) - (f2 + f4)
+    if (adjacent) then
+      ! Floating-side trapezoid area:
+      !   d /= 0: [(bc - ad) ln(1 + d/c) - bd] / d^2 ;  d -> 0: -(2a + b) / (2c)
+      if (abs(d/c) > eps06) then
+        f_trapezoid = ((b*c - a*d) * log(1.0 + d/c) - b*d) / (d*d)
+      else
+        f_trapezoid = -(2.0*a + b) / (2.0*c)
+      endif
+      frac = 1.0 - f_trapezoid
+    else
+      ! Two opposite corner regions; lower-left integral plus upper-right integral.
+      if (abs(b*c - a*d) > eps06) then
+        f_corner1 = ((b*c - a*d) * log(abs(1.0 - (a*d)/(b*c))) + a*d) / (d*d)
+        f_corner2 = ((b*c - a*d) * log(abs((b*c - a*d)/((b+d)*(c+d)))) + d*((a+b)+(c+d))) / (d*d)
+      else
+        f_corner1 = (a*a) / (b*c)
+        f_corner2 = ((a+b)*(a+c)) / (b*c)
+      endif
+      if (f_flot(1) > 0.0) then  ! southwest corner floating
+        if (rotated) then ; frac = f_corner1 + f_corner2
+        else              ; frac = 1.0 - (f_corner1 + f_corner2) ; endif
+      else                       ! southwest corner grounded
+        if (rotated) then ; frac = 1.0 - (f_corner1 + f_corner2)
+        else              ; frac = f_corner1 + f_corner2 ; endif
+      endif
+    endif
+  endif
+
+  ! Guard against small round-off excursions outside the physical range.
+  frac = min(max(frac, 0.0), 1.0)
+
+end subroutine gl_quadrant_grounded_frac
+
+!> Compute the analytic grounded ice fraction at B-grid nodes (CS%f_ground_node, for basal
+!! friction) and at cell centers (CS%f_ground_cell, for the driving-stress surface blend) using
+!! the quadrant grounding-line parameterization of Leguy et al. (2021). Each cell is split into
+!! four quadrants; the grounded area of every quadrant is integrated analytically by
+!! gl_quadrant_grounded_frac and the shared quadrant areas are summed to the surrounding node
+!! (averaged over its 4 quadrants) and to the host cell (averaged over its 4 in-cell quadrants),
+!! so the node and cell grounded areas stay mutually consistent. Cell-mean thickness (h_shelf)
+!! and bed (bed_elev) are used, so this runs identically under FV or DG thickness advection.
+subroutine compute_gl_quadrant_fractions(CS, ISS, G)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS  !< The ice shelf dynamics control structure
+  type(ice_shelf_state),  intent(in)    :: ISS !< A structure describing the ice-shelf state
+  type(ocean_grid_type),  intent(in)    :: G   !< The grid structure used by the ice shelf
+
+  real, dimension(SZDI_(G),SZDJ_(G)) :: f_flot ! Cell-center flotation function (>0 floating) [Z ~> m]
+  real, allocatable, dimension(:,:,:) :: fgq    ! Grounded fraction of the 4 quadrants around each node [nondim]
+  real, dimension(4) :: fv                       ! Flotation at the 4 CCW corners of one quadrant [Z ~> m]
+  real :: rhoi_rhow                              ! Ice/ocean density ratio [nondim]
+  integer :: i, j, isd, ied, jsd, jed, isc, iec, jsc, jec
+
+  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+  isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
+  rhoi_rhow = CS%density_ice / CS%density_ocean_avg
+
+  ! Cell-center flotation function (Leguy 2021 "linear" form = ocean cavity thickness): f > 0 where
+  ! floating, f <= 0 where grounded, with the grounding line at f = 0. Sign matches the existing
+  ! cell-center flotation test rhoi_rhow*h - bed (grounded when positive).
+  do j=jsd,jed ; do i=isd,ied
+    f_flot(i,j) = CS%bed_elev(i,j) - rhoi_rhow * max(ISS%h_shelf(i,j), CS%min_h_shelf)
+  enddo ; enddo
+
+  allocate(fgq(4,isd:ied,jsd:jed), source=0.0)
+  CS%f_ground_node(:,:) = 0.0
+  CS%f_ground_cell(:,:) = 0.0
+
+  ! Per-node quadrant fractions. Node (I,J) is the NE corner of cell (i,j); the four cells around
+  ! it are (i,j), (i+1,j), (i+1,j+1), (i,j+1) (the CISM vertex convention). Each quadrant's corner
+  ! values are the cell-center field interpolated to {cell center, two edge midpoints, node}.
+  do j=jsd,jed-1 ; do i=isd,ied-1
+    ! Quadrant 1: NE quarter of cell (i,j) (southwest of the node)
+    fv(1) =        f_flot(i,j)
+    fv(2) = 0.5 * (f_flot(i,j)   + f_flot(i+1,j))
+    fv(3) = 0.25*((f_flot(i,j)   + f_flot(i+1,j)) + (f_flot(i,j+1) + f_flot(i+1,j+1)))
+    fv(4) = 0.5 * (f_flot(i,j)   + f_flot(i,j+1))
+    call gl_quadrant_grounded_frac(fv, fgq(1,i,j))
+    ! Quadrant 2: NW quarter of cell (i+1,j) (southeast of the node)
+    fv(1) = 0.5 * (f_flot(i+1,j) + f_flot(i,j))
+    fv(2) =        f_flot(i+1,j)
+    fv(3) = 0.5 * (f_flot(i+1,j) + f_flot(i+1,j+1))
+    fv(4) = 0.25*((f_flot(i,j)   + f_flot(i+1,j)) + (f_flot(i,j+1) + f_flot(i+1,j+1)))
+    call gl_quadrant_grounded_frac(fv, fgq(2,i,j))
+    ! Quadrant 3: SW quarter of cell (i+1,j+1) (northeast of the node)
+    fv(1) = 0.25*((f_flot(i,j)   + f_flot(i+1,j)) + (f_flot(i,j+1) + f_flot(i+1,j+1)))
+    fv(2) = 0.5 * (f_flot(i+1,j+1) + f_flot(i+1,j))
+    fv(3) =        f_flot(i+1,j+1)
+    fv(4) = 0.5 * (f_flot(i+1,j+1) + f_flot(i,j+1))
+    call gl_quadrant_grounded_frac(fv, fgq(3,i,j))
+    ! Quadrant 4: SE quarter of cell (i,j+1) (northwest of the node)
+    fv(1) = 0.5 * (f_flot(i,j+1) + f_flot(i,j))
+    fv(2) = 0.25*((f_flot(i,j)   + f_flot(i+1,j)) + (f_flot(i,j+1) + f_flot(i+1,j+1)))
+    fv(3) = 0.5 * (f_flot(i,j+1) + f_flot(i+1,j+1))
+    fv(4) =        f_flot(i,j+1)
+    call gl_quadrant_grounded_frac(fv, fgq(4,i,j))
+
+    CS%f_ground_node(i,j) = 0.25*((fgq(1,i,j) + fgq(2,i,j)) + (fgq(3,i,j) + fgq(4,i,j)))
+  enddo ; enddo
+
+  ! Per-cell grounded fraction = mean of the four in-cell quadrants, taken from the node sums
+  ! above so the cell and node grounded areas are built from the same quadrant areas. Cell (i,j)
+  ! collects quadrant 3 of node (i-1,j-1), quadrant 4 of node (i,j-1), quadrant 1 of node (i,j),
+  ! and quadrant 2 of node (i-1,j).
+  do j=jsd+1,jed-1 ; do i=isd+1,ied-1
+    CS%f_ground_cell(i,j) = 0.25*((fgq(3,i-1,j-1) + fgq(4,i,j-1)) + (fgq(1,i,j) + fgq(2,i-1,j)))
+  enddo ; enddo
+
+  deallocate(fgq)
+  call pass_var(CS%f_ground_cell, G%Domain, complete=.false.)
+  call pass_var(CS%f_ground_node, G%Domain, position=CORNER, complete=.true.)
+
+end subroutine compute_gl_quadrant_fractions
+
+!> Blend the cell-center surface elevation between its grounded and floating forms using the
+!! analytic cell grounded fraction (CS%f_ground_cell) from the quadrant grounding-line
+!! parameterization, smoothing the surface (and hence the driving stress) across the grounding
+!! line. Collapses to the binary grounded/floating surface as f_ground_cell -> {1,0}. Used by the
+!! FV (non-DG) driving stress when GL_QUADRANT_TAUD is set.
+subroutine gl_surface_blend(CS, ISS, G, S)
+  type(ice_shelf_dyn_CS), intent(in)  :: CS  !< The ice shelf dynamics control structure
+  type(ice_shelf_state),  intent(in)  :: ISS !< A structure describing the ice-shelf state
+  type(ocean_grid_type),  intent(in)  :: G   !< The grid structure used by the ice shelf
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(inout) :: S !< Surface elevation to blend in place [Z ~> m]
+
+  real :: rhoi_rhow ! Ice/ocean density ratio [nondim]
+  real :: hh        ! Clamped ice thickness [Z ~> m]
+  real :: fg        ! Grounded fraction in the cell [nondim]
+  integer :: i, j
+
+  rhoi_rhow = CS%density_ice / CS%density_ocean_avg
+  do j=G%jsd+1,G%jed-1 ; do i=G%isd+1,G%ied-1
+    if (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3) then
+      hh = max(ISS%h_shelf(i,j), CS%min_h_shelf)
+      fg = min(max(CS%f_ground_cell(i,j), 0.0), 1.0)
+      ! Grounded surface = h - bed; floating surface = (1 - rhoi_rhow)*h.
+      S(i,j) = fg * (hh - CS%bed_elev(i,j)) + (1.0 - fg) * ((1.0 - rhoi_rhow) * hh)
+    endif
+  enddo ; enddo
+
+end subroutine gl_surface_blend
 
 subroutine change_in_draft(CS, G, h_shelf0, h_shelf1, ddraft)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< A pointer to the ice shelf control structure
