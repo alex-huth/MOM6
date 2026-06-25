@@ -7246,8 +7246,8 @@ subroutine compute_gl_quadrant_fractions(CS, ISS, G)
   enddo ; enddo
 
   deallocate(fgq)
-  call pass_var(CS%f_ground_cell, G%Domain, complete=.false.)
-  call pass_var(CS%f_ground_node, G%Domain, position=CORNER, complete=.true.)
+  call pass_var(CS%f_ground_cell, G%Domain)
+  call pass_var(CS%f_ground_node, G%Domain, position=CORNER)
 
 end subroutine compute_gl_quadrant_fractions
 
