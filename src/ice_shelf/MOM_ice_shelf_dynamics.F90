@@ -282,6 +282,12 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! centers (Lipscomb et al. 2019 eq. 14, "option 3" margins), instead of
                             !! the wider cell-centroid centered difference. Less smeared across the
                             !! grounding line. Mutually exclusive with FV_GL_ONE_SIDED_TAUD.
+  logical :: fv_taud_vertex_lumped !< If true (and FV_TAUD_VERTEX_GRADIENT is on), assemble the nodal
+                            !! driving stress by mass lumping (Lipscomb 2019 A4 "local" method:
+                            !! tau_d at a node uses that node's slope alone). If false (default), use
+                            !! the consistent element-quadrature assembly that matches the basal
+                            !! friction integration. Lumped is more robust for sharp, un-blended
+                            !! surfaces; consistent co-locates the driving-stress and friction GLs.
 
   real    :: CFL_factor     !< A factor used to limit subcycled advective timestep in uncoupled runs
                             !! i.e. dt <= CFL_factor * min(dx / u) [nondim]
@@ -1060,6 +1066,13 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     if (CS%fv_taud_vertex_grad .and. CS%FV_GL_one_sided) call MOM_error(FATAL, &
                  "FV_TAUD_VERTEX_GRADIENT replaces the cell-centroid surface slope with a nodal "//&
                  "gradient, which has no one-sided analog; it cannot be used with FV_GL_ONE_SIDED_TAUD.")
+    call get_param(param_file, mdl, "FV_TAUD_VERTEX_LUMPED", CS%fv_taud_vertex_lumped, &
+                 "If true (only with FV_TAUD_VERTEX_GRADIENT), assemble the nodal driving stress by "//&
+                 "mass lumping -- the driving stress at each node uses the surface slope at that node "//&
+                 "alone (Lipscomb et al. 2019, A4 'local' method), which is more robust for sharp "//&
+                 "surface gradients. If false, use the consistent element-quadrature assembly that "//&
+                 "matches the basal-friction integration and co-locates the two grounding lines.", &
+                 default=.false., do_not_log=.not.CS%fv_taud_vertex_grad)
     call get_param(param_file, mdl, "MIN_ICE_VISC", CS%min_ice_visc, &
                  "min. allowed Glen's law ice viscosity", &
                  units="Pa s", default=0., scale=US%Pa_to_RL2_T2*US%s_to_T)
@@ -5153,9 +5166,13 @@ end subroutine calc_shelf_driving_stress
 !! a gradient is included when both cells are ice-covered, or when an ice-covered cell lies above an
 !! ice-free land neighbor; edges across an ice/ice-free-ocean margin contribute no gradient (the
 !! lateral pressure there is supplied by the Neumann face term, retained verbatim below), and
-!! nunatak edges (ice below ice-free land) likewise contribute nothing. The surface field S is built
-!! exactly as in calc_shelf_driving_stress, so this honors GL_QUADRANT_TAUD (the gl_surface_blend
-!! smoothing) and MAX_SURFACE_SLOPE. Selected by FV_TAUD_VERTEX_GRADIENT; mutually exclusive with
+!! nunatak edges (ice below ice-free land) likewise contribute nothing. The body force is then
+!! assembled by element quadrature (A4, eqs A26-A27): the nodal slope is interpolated to each 2x2
+!! Gauss point with the bilinear basis and distributed to the corner nodes weighted by the basis,
+!! the same consistent integration the basal friction uses in CG_action, so the driving-stress and
+!! friction grounding lines co-locate. The surface field S is built exactly as in
+!! calc_shelf_driving_stress, so this honors GL_QUADRANT_TAUD (the gl_surface_blend smoothing) and
+!! MAX_SURFACE_SLOPE. Selected by FV_TAUD_VERTEX_GRADIENT; mutually exclusive with
 !! FV_GL_ONE_SIDED_TAUD (a centroid-slope construct with no nodal analog).
 subroutine calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
   type(ice_shelf_dyn_CS), intent(in)   :: CS  !< A pointer to the ice shelf control structure
@@ -5177,11 +5194,18 @@ subroutine calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
   real    :: grav      ! The gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
   real    :: gsum_x, gsum_y ! Sum of the valid parallel-edge surface slopes at a node [Z L-1 ~> nondim]
   integer :: nx_e, ny_e     ! Count of valid edges contributing to the x- and y-node slope [nondim]
-  real    :: hA        ! h-weighted node control area, sum of 1/4 areaT max(h,min_h) over ice cells [Z L2 ~> m3]
   real    :: smag      ! Surface slope magnitude at a node [Z L-1 ~> nondim]
   real    :: scale     ! Scaling factor enforcing MAX_SURFACE_SLOPE [nondim]
   real    :: neumann_val ! Lateral-pressure boundary term [R Z L2 T-2 ~> kg s-2]
+  real    :: xquad(2)  ! 2-point Gauss-Legendre quadrature locations on [0,1] [nondim]
+  real    :: He        ! Cell-mean ice thickness used in the driving-stress integral [Z ~> m]
+  real    :: wq        ! Per-quadrature-point area weight, 1/4 areaT [L2 ~> m2]
+  real    :: dsdx_qp, dsdy_qp ! Surface slope interpolated to a quadrature point [Z L-1 ~> nondim]
+  real    :: phim(2,2) ! Bilinear nodal basis values of the 4 cell corners at a quadrature point [nondim]
+  real    :: hA        ! h-weighted node control area for the lumped assembly, sum of 1/4 areaT
+                       ! max(h,min_h) over the ice-covered cells around the node [Z L2 ~> m3]
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed
+  integer :: iq, jq, iphi, jphi, ilq, jlq, Itgt, Jtgt
   integer :: i_off, j_off, gisc, gjsc, giec, gjec
 
   isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
@@ -5191,6 +5215,7 @@ subroutine calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
 
   rho = CS%density_ice ; rhow = CS%density_ocean_avg ; grav = CS%g_Earth
   rhoi_rhow = rho/rhow
+  xquad(1) = .5*(1. - sqrt(1./3.)) ; xquad(2) = .5*(1. + sqrt(1./3.))
 
   ! Surface elevation S -- identical to calc_shelf_driving_stress, including the GL_QUADRANT_TAUD blend.
   if (CS%GL_couple) then
@@ -5216,12 +5241,12 @@ subroutine calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
     land_cell(i,j) = (.not. ice_cell(i,j)) .and. (CS%bed_elev(i,j) <= 0.0)
   enddo ; enddo
 
-  ! Nodal surface gradient (eq. 14), built per parallel edge so margin edges can be dropped.
-  ! Node (I,J) is the NE corner of cell (i,j); its four cells are (i,j),(i+1,j),(i,j+1),(i+1,j+1)
-  ! (uppercase I,J equal lowercase i,j in Fortran). The body force is lumped to the node as
-  ! tau_d = -rho g grad(s) * hA, with hA the h-weighted quarter-area sum over the ice-covered cells.
+  ! Nodal surface gradient (Lipscomb 2019 eq. 14), built per parallel edge so margin edges can be
+  ! dropped (option 3). Node (I,J) is the NE corner of cell (i,j); its four cells are
+  ! (i,j),(i+1,j),(i,j+1),(i+1,j+1) (uppercase I,J equal lowercase i,j in Fortran). Computed over a
+  ! node range wide enough to cover every corner of the element-integration loop below.
   sx_n(:,:) = 0.0 ; sy_n(:,:) = 0.0
-  do j=jsc-1,jec ; do i=isc-1,iec
+  do j=jsc-2,jec+1 ; do i=isc-2,iec+1
     ! x-slope: south edge (i,j)->(i+1,j) and north edge (i,j+1)->(i+1,j+1)
     gsum_x = 0.0 ; nx_e = 0
     if (edge_ok(i,j,  i+1,j  )) then
@@ -5248,15 +5273,54 @@ subroutine calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
       scale = CS%max_surface_slope / max(smag, CS%max_surface_slope)
       sx_n(I,J) = scale*sx_n(I,J) ; sy_n(I,J) = scale*sy_n(I,J)
     endif
-
-    hA = 0.0
-    if (ice_cell(i,  j  )) hA = hA + 0.25*G%areaT(i,  j  )*max(ISS%h_shelf(i,  j  ),CS%min_h_shelf)
-    if (ice_cell(i+1,j  )) hA = hA + 0.25*G%areaT(i+1,j  )*max(ISS%h_shelf(i+1,j  ),CS%min_h_shelf)
-    if (ice_cell(i,  j+1)) hA = hA + 0.25*G%areaT(i,  j+1)*max(ISS%h_shelf(i,  j+1),CS%min_h_shelf)
-    if (ice_cell(i+1,j+1)) hA = hA + 0.25*G%areaT(i+1,j+1)*max(ISS%h_shelf(i+1,j+1),CS%min_h_shelf)
-    taudx(I,J) = taudx(I,J) - (rho*grav) * (hA * sx_n(I,J))
-    taudy(I,J) = taudy(I,J) - (rho*grav) * (hA * sy_n(I,J))
   enddo ; enddo
+
+  if (CS%fv_taud_vertex_lumped) then
+    ! Mass-lumped ("local") assembly: each node's driving stress uses its own slope alone,
+    ! tau_d = -rho g grad(s) * hA, with hA the h-weighted quarter-area sum over the ice-covered
+    ! cells around the node (Lipscomb 2019 A4 local method; more robust for sharp surfaces).
+    do j=jsc-1,jec ; do i=isc-1,iec
+      hA = 0.0
+      if (ice_cell(i,  j  )) hA = hA + 0.25*G%areaT(i,  j  )*max(ISS%h_shelf(i,  j  ),CS%min_h_shelf)
+      if (ice_cell(i+1,j  )) hA = hA + 0.25*G%areaT(i+1,j  )*max(ISS%h_shelf(i+1,j  ),CS%min_h_shelf)
+      if (ice_cell(i,  j+1)) hA = hA + 0.25*G%areaT(i,  j+1)*max(ISS%h_shelf(i,  j+1),CS%min_h_shelf)
+      if (ice_cell(i+1,j+1)) hA = hA + 0.25*G%areaT(i+1,j+1)*max(ISS%h_shelf(i+1,j+1),CS%min_h_shelf)
+      taudx(I,J) = taudx(I,J) - (rho*grav) * (hA * sx_n(I,J))
+      taudy(I,J) = taudy(I,J) - (rho*grav) * (hA * sy_n(I,J))
+    enddo ; enddo
+  else
+    ! Consistent element-quadrature assembly, matching the basal friction integration in CG_action
+    ! (Lipscomb 2019 A4, eqs A26-A27): at each 2x2 Gauss point the nodal slope is interpolated with
+    ! the bilinear basis, multiplied by the cell-mean thickness, and distributed back to the four
+    ! cell-corner nodes weighted by that basis. Matching the friction's quadrature co-locates the
+    ! driving-stress and friction grounding lines. The 1/4 areaT weight matches the centroid routine.
+    do j=jsc-1,jec+1 ; do i=isc-1,iec+1
+      if (ice_cell(i,j)) then
+        He = max(ISS%h_shelf(i,j), CS%min_h_shelf)
+        wq = 0.25 * G%areaT(i,j)
+        do jq=1,2 ; do iq=1,2
+          ! Bilinear basis of the 4 corners at this quadrature point (same convention as CG_action).
+          do jphi=1,2 ; do iphi=1,2
+            ilq = 1 ; if (iq == iphi) ilq = 2
+            jlq = 1 ; if (jq == jphi) jlq = 2
+            phim(iphi,jphi) = xquad(ilq) * xquad(jlq)
+          enddo ; enddo
+          ! Interpolate the nodal slope to the quadrature point.
+          dsdx_qp = 0.0 ; dsdy_qp = 0.0
+          do jphi=1,2 ; do iphi=1,2
+            dsdx_qp = dsdx_qp + (sx_n(i-2+iphi,j-2+jphi) * phim(iphi,jphi))
+            dsdy_qp = dsdy_qp + (sy_n(i-2+iphi,j-2+jphi) * phim(iphi,jphi))
+          enddo ; enddo
+          ! Distribute -rho g H grad(s) to the four corner nodes, weighted by the basis and area.
+          do jphi=1,2 ; do iphi=1,2
+            Itgt = i-2+iphi ; Jtgt = j-2+jphi
+            taudx(Itgt,Jtgt) = taudx(Itgt,Jtgt) - (((rho*grav)*He) * dsdx_qp) * (phim(iphi,jphi)*wq)
+            taudy(Itgt,Jtgt) = taudy(Itgt,Jtgt) - (((rho*grav)*He) * dsdy_qp) * (phim(iphi,jphi)*wq)
+          enddo ; enddo
+        enddo ; enddo
+      endif
+    enddo ; enddo
+  endif
 
   ! Lateral-pressure (Neumann) boundary conditions at calving fronts and stress faces. This block
   ! is identical to calc_shelf_driving_stress; the front forcing is unchanged by the gradient scheme.
