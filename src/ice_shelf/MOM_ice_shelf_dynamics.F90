@@ -584,6 +584,7 @@ type, public :: ice_shelf_dyn_CS ; private
   integer :: id_u_shelf = -1, id_v_shelf = -1, id_shelf_speed, id_t_shelf = -1, &
              id_taudx_shelf = -1, id_taudy_shelf = -1, id_taud_shelf = -1, id_bed_elev = -1, &
              id_ground_frac = -1, id_basal_tr_dfrac = -1, id_col_thick = -1, id_OD_av = -1, &
+             id_f_ground_cell = -1, id_f_ground_node = -1, &
              id_u_mask = -1, id_v_mask = -1, id_ufb_mask =-1, id_vfb_mask = -1, id_t_mask = -1, &
              id_sx_shelf = -1, id_sy_shelf = -1, id_surf_slope_mag_shelf, &
              id_duHdx = -1, id_dvHdy = -1, id_fluxdiv = -1, &
@@ -1542,6 +1543,14 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
        'just-grounded side (traction reduced) and positive on the just-floating side (traction added, '//&
        'centered mode only), mapping where and how much the near-GL Weertman smoothing reweights traction.', &
        'none')
+    CS%id_f_ground_cell = register_diag_field('ice_shelf_model','f_ground_cell',CS%diag%axesT1, Time, &
+       'analytic grounded ice fraction at cell centers from the quadrant grounding-line '//&
+       'parameterization (Leguy et al. 2021); nonzero only when GL_QUADRANT_FRICTION or '//&
+       'GL_QUADRANT_TAUD is set', 'none')
+    CS%id_f_ground_node = register_diag_field('ice_shelf_model','f_ground_node',CS%diag%axesB1, Time, &
+       'analytic grounded ice fraction at B-grid nodes from the quadrant grounding-line '//&
+       'parameterization (Leguy et al. 2021); multiplies basal friction under '//&
+       'GL_QUADRANT_FRICTION', 'none')
     CS%id_col_thick = register_diag_field('ice_shelf_model','col_thick',CS%diag%axesT1, Time, &
        'ocean column thickness passed to ice model', 'm', conversion=US%Z_to_m)
     CS%id_visc_shelf = register_diag_field('ice_shelf_model','ice_visc',CS%diag%axesT1, Time, &
@@ -2151,6 +2160,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       call post_data(CS%id_surf_slope_mag_shelf, surf_slope, CS%diag)
     endif
     if (CS%id_ground_frac > 0) call post_data(CS%id_ground_frac, CS%ground_frac, CS%diag)
+    if (CS%id_f_ground_cell > 0) call post_data(CS%id_f_ground_cell, CS%f_ground_cell, CS%diag)
+    if (CS%id_f_ground_node > 0) call post_data(CS%id_f_ground_node, CS%f_ground_node, CS%diag)
     if (CS%id_basal_tr_dfrac > 0) call post_data(CS%id_basal_tr_dfrac, CS%basal_tr_dfrac, CS%diag)
     if (CS%id_OD_av >0) call post_data(CS%id_OD_av, CS%OD_av,CS%diag)
     if (CS%id_visc_shelf > 0) then
