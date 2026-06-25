@@ -7196,10 +7196,15 @@ subroutine compute_gl_quadrant_fractions(CS, ISS, G)
   type(ocean_grid_type),  intent(in)    :: G   !< The grid structure used by the ice shelf
 
   real, dimension(SZDI_(G),SZDJ_(G)) :: f_flot ! Cell-center flotation function (>0 floating) [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: f_flot_ex ! f_flot with ice-free cells filled by
+                                       ! extrapolation from ice-covered neighbors [Z ~> m]
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: ice_cell ! True where ice is present (grounded or floating)
   real, allocatable, dimension(:,:,:) :: fgq    ! Grounded fraction of the 4 quadrants around each node [nondim]
   real, dimension(4) :: fv                       ! Flotation at the 4 CCW corners of one quadrant [Z ~> m]
   real :: rhoi_rhow                              ! Ice/ocean density ratio [nondim]
-  integer :: i, j, isd, ied, jsd, jed, isc, iec, jsc, jec
+  logical :: filled                              ! True once an ice-free cell has an ice neighbor to copy from
+  logical :: vmask                               ! True if the node has at least one ice-covered neighbor cell
+  integer :: i, j, ii, jj, isd, ied, jsd, jed, isc, iec, jsc, jec
 
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
@@ -7207,10 +7212,52 @@ subroutine compute_gl_quadrant_fractions(CS, ISS, G)
 
   ! Cell-center flotation function (Leguy 2021 "linear" form = ocean cavity thickness): f > 0 where
   ! floating, f <= 0 where grounded, with the grounding line at f = 0. Sign matches the existing
-  ! cell-center flotation test rhoi_rhow*h - bed (grounded when positive).
+  ! cell-center flotation test rhoi_rhow*h - bed (grounded when positive). Following CISM
+  ! (glissade_grounded_fraction), f_flot is meaningful only in ice-covered cells; ice-free cells are
+  ! set to 0 here and filled by extrapolation below, so the quadrant integral never reads bed/thickness
+  ! from ice-free cells. This is essential at the domain edges: the halo across a solid N/S wall has
+  ! bed_elev = 0 (no neighbor PE to fill it), which a raw f_flot would read as spuriously grounded.
   do j=jsd,jed ; do i=isd,ied
-    f_flot(i,j) = CS%bed_elev(i,j) - rhoi_rhow * max(ISS%h_shelf(i,j), CS%min_h_shelf)
+    ice_cell(i,j) = (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3)
+    if (ice_cell(i,j)) then
+      f_flot(i,j) = CS%bed_elev(i,j) - rhoi_rhow * max(ISS%h_shelf(i,j), CS%min_h_shelf)
+    else
+      f_flot(i,j) = 0.0
+    endif
   enddo ; enddo
+
+  ! Extrapolate f_flot into ice-free cells, taking the most-grounded (minimum) value among
+  ! ice-covered neighbors -- edge neighbors first, then corners if there is no ice edge-neighbor.
+  ! This guarantees every node with an ice-covered neighbor is surrounded by four physically
+  ! meaningful corner values for the quadrant interpolation (CISM glissade_grounded_fraction).
+  ! Ice-free cells with no ice neighbor keep 0 and never enter an active grounded fraction (vmask).
+  f_flot_ex(:,:) = f_flot(:,:)
+  do j=jsd+1,jed-1 ; do i=isd+1,ied-1
+    if (.not. ice_cell(i,j)) then
+      filled = .false.
+      do jj=j-1,j+1 ; do ii=i-1,i+1   ! edge neighbors
+        if ((ii == i .or. jj == j) .and. ice_cell(ii,jj)) then
+          if (filled) then
+            f_flot_ex(i,j) = min(f_flot_ex(i,j), f_flot(ii,jj))
+          else
+            f_flot_ex(i,j) = f_flot(ii,jj) ; filled = .true.
+          endif
+        endif
+      enddo ; enddo
+      if (.not. filled) then
+        do jj=j-1,j+1 ; do ii=i-1,i+1   ! corner neighbors
+          if ((abs(ii-i) == 1 .and. abs(jj-j) == 1) .and. ice_cell(ii,jj)) then
+            if (filled) then
+              f_flot_ex(i,j) = min(f_flot_ex(i,j), f_flot(ii,jj))
+            else
+              f_flot_ex(i,j) = f_flot(ii,jj) ; filled = .true.
+            endif
+          endif
+        enddo ; enddo
+      endif
+    endif
+  enddo ; enddo
+  call pass_var(f_flot_ex, G%Domain)
 
   allocate(fgq(4,isd:ied,jsd:jed), source=0.0)
   CS%f_ground_node(:,:) = 0.0
@@ -7218,31 +7265,35 @@ subroutine compute_gl_quadrant_fractions(CS, ISS, G)
 
   ! Per-node quadrant fractions. Node (I,J) is the NE corner of cell (i,j); the four cells around
   ! it are (i,j), (i+1,j), (i+1,j+1), (i,j+1) (the CISM vertex convention). Each quadrant's corner
-  ! values are the cell-center field interpolated to {cell center, two edge midpoints, node}.
+  ! values are the (extrapolated) cell-center field interpolated to {cell center, two edge midpoints,
+  ! node}. Only nodes with at least one ice-covered neighbor (vmask) are computed; nodes surrounded
+  ! entirely by ice-free ocean stay floating (f_ground_node = 0), matching CISM's vmask gate.
   do j=jsd,jed-1 ; do i=isd,ied-1
+    vmask = (ice_cell(i,j) .or. ice_cell(i+1,j)) .or. (ice_cell(i,j+1) .or. ice_cell(i+1,j+1))
+    if (.not. vmask) cycle
     ! Quadrant 1: NE quarter of cell (i,j) (southwest of the node)
-    fv(1) =        f_flot(i,j)
-    fv(2) = 0.5 * (f_flot(i,j)   + f_flot(i+1,j))
-    fv(3) = 0.25*((f_flot(i,j)   + f_flot(i+1,j)) + (f_flot(i,j+1) + f_flot(i+1,j+1)))
-    fv(4) = 0.5 * (f_flot(i,j)   + f_flot(i,j+1))
+    fv(1) =        f_flot_ex(i,j)
+    fv(2) = 0.5 * (f_flot_ex(i,j)   + f_flot_ex(i+1,j))
+    fv(3) = 0.25*((f_flot_ex(i,j)   + f_flot_ex(i+1,j)) + (f_flot_ex(i,j+1) + f_flot_ex(i+1,j+1)))
+    fv(4) = 0.5 * (f_flot_ex(i,j)   + f_flot_ex(i,j+1))
     call gl_quadrant_grounded_frac(fv, fgq(1,i,j))
     ! Quadrant 2: NW quarter of cell (i+1,j) (southeast of the node)
-    fv(1) = 0.5 * (f_flot(i+1,j) + f_flot(i,j))
-    fv(2) =        f_flot(i+1,j)
-    fv(3) = 0.5 * (f_flot(i+1,j) + f_flot(i+1,j+1))
-    fv(4) = 0.25*((f_flot(i,j)   + f_flot(i+1,j)) + (f_flot(i,j+1) + f_flot(i+1,j+1)))
+    fv(1) = 0.5 * (f_flot_ex(i+1,j) + f_flot_ex(i,j))
+    fv(2) =        f_flot_ex(i+1,j)
+    fv(3) = 0.5 * (f_flot_ex(i+1,j) + f_flot_ex(i+1,j+1))
+    fv(4) = 0.25*((f_flot_ex(i,j)   + f_flot_ex(i+1,j)) + (f_flot_ex(i,j+1) + f_flot_ex(i+1,j+1)))
     call gl_quadrant_grounded_frac(fv, fgq(2,i,j))
     ! Quadrant 3: SW quarter of cell (i+1,j+1) (northeast of the node)
-    fv(1) = 0.25*((f_flot(i,j)   + f_flot(i+1,j)) + (f_flot(i,j+1) + f_flot(i+1,j+1)))
-    fv(2) = 0.5 * (f_flot(i+1,j+1) + f_flot(i+1,j))
-    fv(3) =        f_flot(i+1,j+1)
-    fv(4) = 0.5 * (f_flot(i+1,j+1) + f_flot(i,j+1))
+    fv(1) = 0.25*((f_flot_ex(i,j)   + f_flot_ex(i+1,j)) + (f_flot_ex(i,j+1) + f_flot_ex(i+1,j+1)))
+    fv(2) = 0.5 * (f_flot_ex(i+1,j+1) + f_flot_ex(i+1,j))
+    fv(3) =        f_flot_ex(i+1,j+1)
+    fv(4) = 0.5 * (f_flot_ex(i+1,j+1) + f_flot_ex(i,j+1))
     call gl_quadrant_grounded_frac(fv, fgq(3,i,j))
     ! Quadrant 4: SE quarter of cell (i,j+1) (northwest of the node)
-    fv(1) = 0.5 * (f_flot(i,j+1) + f_flot(i,j))
-    fv(2) = 0.25*((f_flot(i,j)   + f_flot(i+1,j)) + (f_flot(i,j+1) + f_flot(i+1,j+1)))
-    fv(3) = 0.5 * (f_flot(i,j+1) + f_flot(i+1,j+1))
-    fv(4) =        f_flot(i,j+1)
+    fv(1) = 0.5 * (f_flot_ex(i,j+1) + f_flot_ex(i,j))
+    fv(2) = 0.25*((f_flot_ex(i,j)   + f_flot_ex(i+1,j)) + (f_flot_ex(i,j+1) + f_flot_ex(i+1,j+1)))
+    fv(3) = 0.5 * (f_flot_ex(i,j+1) + f_flot_ex(i+1,j+1))
+    fv(4) =        f_flot_ex(i,j+1)
     call gl_quadrant_grounded_frac(fv, fgq(4,i,j))
 
     CS%f_ground_node(i,j) = 0.25*((fgq(1,i,j) + fgq(2,i,j)) + (fgq(3,i,j) + fgq(4,i,j)))
