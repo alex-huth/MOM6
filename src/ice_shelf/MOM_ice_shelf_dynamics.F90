@@ -277,6 +277,11 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! cell grounded fraction (CS%f_ground_cell) before forming the FV
                             !! (non-DG) driving stress, smoothing the grounding-line surface kink.
                             !! Mutually exclusive with FV_GL_ONE_SIDED_TAUD.
+  logical :: fv_taud_vertex_grad !< If true, the FV (non-DG) driving stress evaluates the surface
+                            !! gradient directly at B-grid nodes from the four surrounding cell
+                            !! centers (Lipscomb et al. 2019 eq. 14, "option 3" margins), instead of
+                            !! the wider cell-centroid centered difference. Less smeared across the
+                            !! grounding line. Mutually exclusive with FV_GL_ONE_SIDED_TAUD.
 
   real    :: CFL_factor     !< A factor used to limit subcycled advective timestep in uncoupled runs
                             !! i.e. dt <= CFL_factor * min(dx / u) [nondim]
@@ -1044,6 +1049,17 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     if (CS%gl_quad_taud .and. CS%FV_GL_one_sided) call MOM_error(FATAL, &
                  "GL_QUADRANT_TAUD and FV_GL_ONE_SIDED_TAUD both regularize the grounding-line "//&
                  "driving stress and cannot be used together.")
+    call get_param(param_file, mdl, "FV_TAUD_VERTEX_GRADIENT", CS%fv_taud_vertex_grad, &
+                 "If true, the finite-volume (non-DG) driving stress evaluates the surface gradient "//&
+                 "directly at B-grid nodes from the four surrounding cell centers (Lipscomb et al. "//&
+                 "2019, Geosci. Model Dev. 12:387-424, eq. 14, with their 'option 3' ice-margin "//&
+                 "treatment), instead of the wider cell-centroid centered difference. The compact "//&
+                 "stencil is less smeared across the grounding line. Honors GL_QUADRANT_TAUD and "//&
+                 "MAX_SURFACE_SLOPE; mutually exclusive with FV_GL_ONE_SIDED_TAUD.", &
+                 default=.false.)
+    if (CS%fv_taud_vertex_grad .and. CS%FV_GL_one_sided) call MOM_error(FATAL, &
+                 "FV_TAUD_VERTEX_GRADIENT replaces the cell-centroid surface slope with a nodal "//&
+                 "gradient, which has no one-sided analog; it cannot be used with FV_GL_ONE_SIDED_TAUD.")
     call get_param(param_file, mdl, "MIN_ICE_VISC", CS%min_ice_visc, &
                  "min. allowed Glen's law ice viscosity", &
                  units="Pa s", default=0., scale=US%Pa_to_RL2_T2*US%s_to_T)
@@ -4866,6 +4882,13 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
   i_off = G%idg_offset ; j_off = G%jdg_offset
 
 
+  ! Compact nodal surface-gradient driving stress (Lipscomb et al. 2019 eq. 14) is a drop-in
+  ! alternative for the FV path; hand off and return so every caller routes through it.
+  if (CS%fv_taud_vertex_grad) then
+    call calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
+    return
+  endif
+
   rho =  CS%density_ice
   rhow = CS%density_ocean_avg
   grav = CS%g_Earth
@@ -5121,6 +5144,184 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
     taudy(I,J) = taudy(I,J) + ((sy_e(i,j)+sy_e(i+1,j+1)) + (sy_e(i+1,j)+sy_e(i,j+1)))
   enddo ; enddo
 end subroutine calc_shelf_driving_stress
+
+!> Finite-volume (non-DG) driving stress with the surface gradient evaluated directly at B-grid
+!! nodes from the four surrounding cell-center surface elevations, following Lipscomb et al. (2019,
+!! Geosci. Model Dev. 12:387-424) eq. 14 and their "option 3" ice-margin treatment. This compact
+!! 4-cell stencil replaces the wider cell-centroid centered difference used by
+!! calc_shelf_driving_stress, and so is less smeared across the grounding line. Per parallel edge,
+!! a gradient is included when both cells are ice-covered, or when an ice-covered cell lies above an
+!! ice-free land neighbor; edges across an ice/ice-free-ocean margin contribute no gradient (the
+!! lateral pressure there is supplied by the Neumann face term, retained verbatim below), and
+!! nunatak edges (ice below ice-free land) likewise contribute nothing. The surface field S is built
+!! exactly as in calc_shelf_driving_stress, so this honors GL_QUADRANT_TAUD (the gl_surface_blend
+!! smoothing) and MAX_SURFACE_SLOPE. Selected by FV_TAUD_VERTEX_GRADIENT; mutually exclusive with
+!! FV_GL_ONE_SIDED_TAUD (a centroid-slope construct with no nodal analog).
+subroutine calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
+  type(ice_shelf_dyn_CS), intent(in)   :: CS  !< A pointer to the ice shelf control structure
+  type(ice_shelf_state), intent(in)    :: ISS !< A structure describing the ice-shelf state
+  type(ocean_grid_type), intent(inout) :: G   !< The grid structure used by the ice shelf.
+  type(unit_scale_type), intent(in)    :: US  !< A structure containing unit conversion factors
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                         intent(in)    :: OD  !< ocean floor depth at tracer points [Z ~> m].
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                         intent(inout) :: taudx  !< X-direction driving stress at q-points [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                         intent(inout) :: taudy  !< Y-direction driving stress at q-points [R L3 Z T-2 ~> kg m s-2]
+
+  real, dimension(SZDI_(G),SZDJ_(G))   :: S     ! surface elevation [Z ~> m].
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: sx_n, sy_n ! Nodal surface slopes [Z L-1 ~> nondim]
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: ice_cell  ! True at ice-covered cells (grounded or floating)
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: land_cell ! True at ice-free cells at/above sea level (bed_elev<=0)
+  real    :: rho, rhow, rhoi_rhow ! Ice and ocean densities [R ~> kg m-3] and their ratio [nondim]
+  real    :: grav      ! The gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
+  real    :: gsum_x, gsum_y ! Sum of the valid parallel-edge surface slopes at a node [Z L-1 ~> nondim]
+  integer :: nx_e, ny_e     ! Count of valid edges contributing to the x- and y-node slope [nondim]
+  real    :: hA        ! h-weighted node control area, sum of 1/4 areaT max(h,min_h) over ice cells [Z L2 ~> m3]
+  real    :: smag      ! Surface slope magnitude at a node [Z L-1 ~> nondim]
+  real    :: scale     ! Scaling factor enforcing MAX_SURFACE_SLOPE [nondim]
+  real    :: neumann_val ! Lateral-pressure boundary term [R Z L2 T-2 ~> kg s-2]
+  integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed
+  integer :: i_off, j_off, gisc, gjsc, giec, gjec
+
+  isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
+  isd = G%isd ; jsd = G%jsd ; ied = G%ied ; jed = G%jed
+  i_off = G%idg_offset ; j_off = G%jdg_offset
+  gisc = 1 ; gjsc = 1 ; giec = G%domain%niglobal ; gjec = G%domain%njglobal
+
+  rho = CS%density_ice ; rhow = CS%density_ocean_avg ; grav = CS%g_Earth
+  rhoi_rhow = rho/rhow
+
+  ! Surface elevation S -- identical to calc_shelf_driving_stress, including the GL_QUADRANT_TAUD blend.
+  if (CS%GL_couple) then
+    do j=jsc-2,jec+2 ; do i=isc-2,iec+2
+      S(i,j) = -CS%bed_elev(i,j) + (OD(i,j) + max(ISS%h_shelf(i,j),CS%min_h_shelf))
+    enddo ; enddo
+  else
+    do j=jsc-2,jec+2 ; do i=isc-2,iec+2
+      if (rhoi_rhow * max(ISS%h_shelf(i,j),CS%min_h_shelf) - CS%bed_elev(i,j) <= 0) then
+        S(i,j) = (1 - rhoi_rhow)*max(ISS%h_shelf(i,j),CS%min_h_shelf)
+      else
+        S(i,j) = max(ISS%h_shelf(i,j),CS%min_h_shelf)-CS%bed_elev(i,j)
+      endif
+    enddo ; enddo
+  endif
+  if (CS%gl_quad_taud) call gl_surface_blend(CS, ISS, G, S)
+  call pass_var(S, G%domain)
+
+  ! Cell classification for the option-3 margin rule: ice-covered (hmask 1 or 3), ice-free land
+  ! (no ice and bed at/above sea level, bed_elev<=0), else ice-free ocean.
+  do j=jsd,jed ; do i=isd,ied
+    ice_cell(i,j)  = (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3)
+    land_cell(i,j) = (.not. ice_cell(i,j)) .and. (CS%bed_elev(i,j) <= 0.0)
+  enddo ; enddo
+
+  ! Nodal surface gradient (eq. 14), built per parallel edge so margin edges can be dropped.
+  ! Node (I,J) is the NE corner of cell (i,j); its four cells are (i,j),(i+1,j),(i,j+1),(i+1,j+1)
+  ! (uppercase I,J equal lowercase i,j in Fortran). The body force is lumped to the node as
+  ! tau_d = -rho g grad(s) * hA, with hA the h-weighted quarter-area sum over the ice-covered cells.
+  sx_n(:,:) = 0.0 ; sy_n(:,:) = 0.0
+  do j=jsc-1,jec ; do i=isc-1,iec
+    ! x-slope: south edge (i,j)->(i+1,j) and north edge (i,j+1)->(i+1,j+1)
+    gsum_x = 0.0 ; nx_e = 0
+    if (edge_ok(i,j,  i+1,j  )) then
+      gsum_x = gsum_x + (S(i+1,j)   - S(i,j)  ) * G%IdxCu(I,j)   ; nx_e = nx_e + 1
+    endif
+    if (edge_ok(i,j+1,i+1,j+1)) then
+      gsum_x = gsum_x + (S(i+1,j+1) - S(i,j+1)) * G%IdxCu(I,j+1) ; nx_e = nx_e + 1
+    endif
+    if (nx_e > 0) sx_n(I,J) = gsum_x / real(nx_e)
+
+    ! y-slope: west edge (i,j)->(i,j+1) and east edge (i+1,j)->(i+1,j+1)
+    gsum_y = 0.0 ; ny_e = 0
+    if (edge_ok(i,j,  i,  j+1)) then
+      gsum_y = gsum_y + (S(i,j+1)   - S(i,j)  ) * G%IdyCv(i,J)   ; ny_e = ny_e + 1
+    endif
+    if (edge_ok(i+1,j,i+1,j+1)) then
+      gsum_y = gsum_y + (S(i+1,j+1) - S(i+1,j)) * G%IdyCv(i+1,J) ; ny_e = ny_e + 1
+    endif
+    if (ny_e > 0) sy_n(I,J) = gsum_y / real(ny_e)
+
+    ! Cap the surface slope magnitude (MAX_SURFACE_SLOPE), as in calc_shelf_driving_stress.
+    if (CS%max_surface_slope > 0) then
+      smag = sqrt((sx_n(I,J)**2) + (sy_n(I,J)**2))
+      scale = CS%max_surface_slope / max(smag, CS%max_surface_slope)
+      sx_n(I,J) = scale*sx_n(I,J) ; sy_n(I,J) = scale*sy_n(I,J)
+    endif
+
+    hA = 0.0
+    if (ice_cell(i,  j  )) hA = hA + 0.25*G%areaT(i,  j  )*max(ISS%h_shelf(i,  j  ),CS%min_h_shelf)
+    if (ice_cell(i+1,j  )) hA = hA + 0.25*G%areaT(i+1,j  )*max(ISS%h_shelf(i+1,j  ),CS%min_h_shelf)
+    if (ice_cell(i,  j+1)) hA = hA + 0.25*G%areaT(i,  j+1)*max(ISS%h_shelf(i,  j+1),CS%min_h_shelf)
+    if (ice_cell(i+1,j+1)) hA = hA + 0.25*G%areaT(i+1,j+1)*max(ISS%h_shelf(i+1,j+1),CS%min_h_shelf)
+    taudx(I,J) = taudx(I,J) - (rho*grav) * (hA * sx_n(I,J))
+    taudy(I,J) = taudy(I,J) - (rho*grav) * (hA * sy_n(I,J))
+  enddo ; enddo
+
+  ! Lateral-pressure (Neumann) boundary conditions at calving fronts and stress faces. This block
+  ! is identical to calc_shelf_driving_stress; the front forcing is unchanged by the gradient scheme.
+  do j=jsc-1,jec+1 ; do i=isc-1,iec+1
+    if (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3) then
+      if (CS%ground_frac(i,j) == 1) then
+        neumann_val = ((.5 * grav) * (rho * max(ISS%h_shelf(i,j),CS%min_h_shelf)**2 - &
+                                      rhow * max(0.0, CS%bed_elev(i,j))**2))
+      else
+        neumann_val = (.5 * grav) * ((1-rho/rhow) * (rho * max(ISS%h_shelf(i,j),CS%min_h_shelf)**2))
+      endif
+      if ((CS%u_face_mask_bdry(I-1,j) == 2) .OR. &
+        ((ISS%hmask(i-1,j) == 0 .OR. ISS%hmask(i-1,j) == 2) .AND. (CS%reentrant_x .OR. (i+i_off /= gisc)))) then
+        taudx(I-1,J-1) = taudx(I-1,J-1) - .5 * G%dyCu(I-1,j) * neumann_val
+        taudx(I-1,J) = taudx(I-1,J) - .5 * G%dyCu(I-1,j) * neumann_val
+      endif
+      if ((CS%u_face_mask_bdry(I,j) == 2) .OR. &
+        ((ISS%hmask(i+1,j) == 0 .OR. ISS%hmask(i+1,j) == 2) .and. (CS%reentrant_x .OR. (i+i_off /= giec)))) then
+        taudx(I,J-1) = taudx(I,J-1) + .5 * G%dyCu(I,j) * neumann_val
+        taudx(I,J) = taudx(I,J) + .5 * G%dyCu(I,j) * neumann_val
+      endif
+      if ((CS%v_face_mask_bdry(i,J-1) == 2) .OR. &
+        ((ISS%hmask(i,j-1) == 0 .OR. ISS%hmask(i,j-1) == 2) .and. (CS%reentrant_y .OR. (j+j_off /= gjsc)))) then
+        taudy(I-1,J-1) = taudy(I-1,J-1) - .5 * G%dxCv(i,J-1) * neumann_val
+        taudy(I,J-1) = taudy(I,J-1) - .5 * G%dxCv(i,J-1) * neumann_val
+      endif
+      if ((CS%v_face_mask_bdry(i,J) == 2) .OR. &
+        ((ISS%hmask(i,j+1) == 0 .OR. ISS%hmask(i,j+1) == 2) .and. (CS%reentrant_y .OR. (j+j_off /= gjec)))) then
+        taudy(I-1,J) = taudy(I-1,J) + .5 * G%dxCv(i,J) * neumann_val
+        taudy(I,J) = taudy(I,J) + .5 * G%dxCv(i,J) * neumann_val
+      endif
+    endif
+  enddo ; enddo
+
+  ! Surface-slope diagnostic at cell centers: average the four corner-node slopes.
+  if (CS%id_sx_shelf > 0 .or. CS%id_sy_shelf > 0 .or. CS%id_surf_slope_mag_shelf > 0) then
+    do j=jsc,jec ; do i=isc,iec
+      if (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3) then
+        CS%sx_shelf(i,j) = 0.25*((sx_n(I-1,J-1) + sx_n(I,J)) + (sx_n(I,J-1) + sx_n(I-1,J)))
+        CS%sy_shelf(i,j) = 0.25*((sy_n(I-1,J-1) + sy_n(I,J)) + (sy_n(I,J-1) + sy_n(I-1,J)))
+      else
+        CS%sx_shelf(i,j) = 0.0 ; CS%sy_shelf(i,j) = 0.0
+      endif
+    enddo ; enddo
+  endif
+
+contains
+
+  !> Option-3 (Lipscomb 2019) test for whether the edge between cells A=(ia,ja) and B=(ib,jb)
+  !! contributes a surface-slope estimate: yes if both are ice-covered, or if an ice-covered cell
+  !! lies higher in surface elevation than an ice-free land neighbor; no across ice/ice-free-ocean
+  !! margins or where ice lies below ice-free land (a nunatak).
+  logical function edge_ok(ia, ja, ib, jb)
+    integer, intent(in) :: ia, ja, ib, jb
+    edge_ok = .false.
+    if (ice_cell(ia,ja) .and. ice_cell(ib,jb)) then
+      edge_ok = .true.
+    elseif (ice_cell(ia,ja) .and. land_cell(ib,jb)) then
+      edge_ok = (S(ia,ja) > S(ib,jb))
+    elseif (ice_cell(ib,jb) .and. land_cell(ia,ja)) then
+      edge_ok = (S(ib,jb) > S(ia,ja))
+    endif
+  end function edge_ok
+
+end subroutine calc_shelf_driving_stress_vertex
 
 subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, hmask, H_node, &
                      ice_visc, bathyT, u_curr, v_curr, G, US, is, ie, js, je, dens_ratio, &
