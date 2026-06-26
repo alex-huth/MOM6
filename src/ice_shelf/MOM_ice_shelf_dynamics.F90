@@ -5204,8 +5204,14 @@ subroutine calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
   real    :: phim(2,2) ! Bilinear nodal basis values of the 4 cell corners at a quadrature point [nondim]
   real    :: hA        ! h-weighted node control area for the lumped assembly, sum of 1/4 areaT
                        ! max(h,min_h) over the ice-covered cells around the node [Z L2 ~> m3]
+  real    :: hA_sw, hA_se, hA_nw, hA_ne ! Per-cell quarter-area thickness weights at the four cells
+                       ! around a node, summed in diagonal pairs for rotation invariance [Z L2 ~> m3]
+  real    :: txqp(2,2,4), tyqp(2,2,4) ! Per-quadrature-point nodal driving-stress contributions within
+                       ! one element, pair-summed over quadrature points [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(SZDIB_(G),SZDJB_(G),4) :: taudx_b, taudy_b ! Per-element corner contributions to the
+                       ! nodal driving stress, diagonal-pair-summed for rotation invariance [R L3 Z T-2 ~> kg m s-2]
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed
-  integer :: iq, jq, iphi, jphi, ilq, jlq, Itgt, Jtgt
+  integer :: iq, jq, iphi, jphi, ilq, jlq, Itgt, Jtgt, qp
   integer :: i_off, j_off, gisc, gjsc, giec, gjec
 
   isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
@@ -5280,11 +5286,13 @@ subroutine calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
     ! tau_d = -rho g grad(s) * hA, with hA the h-weighted quarter-area sum over the ice-covered
     ! cells around the node (Lipscomb 2019 A4 local method; more robust for sharp surfaces).
     do j=jsc-1,jec ; do i=isc-1,iec
-      hA = 0.0
-      if (ice_cell(i,  j  )) hA = hA + 0.25*G%areaT(i,  j  )*max(ISS%h_shelf(i,  j  ),CS%min_h_shelf)
-      if (ice_cell(i+1,j  )) hA = hA + 0.25*G%areaT(i+1,j  )*max(ISS%h_shelf(i+1,j  ),CS%min_h_shelf)
-      if (ice_cell(i,  j+1)) hA = hA + 0.25*G%areaT(i,  j+1)*max(ISS%h_shelf(i,  j+1),CS%min_h_shelf)
-      if (ice_cell(i+1,j+1)) hA = hA + 0.25*G%areaT(i+1,j+1)*max(ISS%h_shelf(i+1,j+1),CS%min_h_shelf)
+      ! Quarter-area thickness weight of each of the four cells around node (I,J), summed in
+      ! diagonal pairs (SW+NE)+(SE+NW) so the lumped mass is bitwise invariant under 90 deg rotation.
+      hA_sw = 0.0 ; if (ice_cell(i,  j  )) hA_sw = 0.25*G%areaT(i,  j  )*max(ISS%h_shelf(i,  j  ),CS%min_h_shelf)
+      hA_se = 0.0 ; if (ice_cell(i+1,j  )) hA_se = 0.25*G%areaT(i+1,j  )*max(ISS%h_shelf(i+1,j  ),CS%min_h_shelf)
+      hA_nw = 0.0 ; if (ice_cell(i,  j+1)) hA_nw = 0.25*G%areaT(i,  j+1)*max(ISS%h_shelf(i,  j+1),CS%min_h_shelf)
+      hA_ne = 0.0 ; if (ice_cell(i+1,j+1)) hA_ne = 0.25*G%areaT(i+1,j+1)*max(ISS%h_shelf(i+1,j+1),CS%min_h_shelf)
+      hA = (hA_sw + hA_ne) + (hA_se + hA_nw)
       taudx(I,J) = taudx(I,J) - (rho*grav) * (hA * sx_n(I,J))
       taudy(I,J) = taudy(I,J) - (rho*grav) * (hA * sy_n(I,J))
     enddo ; enddo
@@ -5294,31 +5302,48 @@ subroutine calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
     ! the bilinear basis, multiplied by the cell-mean thickness, and distributed back to the four
     ! cell-corner nodes weighted by that basis. Matching the friction's quadrature co-locates the
     ! driving-stress and friction grounding lines. The 1/4 areaT weight matches the centroid routine.
+    ! Each element writes its four corner contributions into its own slot of taudx_b/taudy_b; the
+    ! quadrature-point and four-element sums are then accumulated in diagonal pairs (exactly as
+    ! CG_action assembles uret_b) so the load vector is bitwise invariant under 90 deg rotation.
+    taudx_b(:,:,:) = 0.0 ; taudy_b(:,:,:) = 0.0
     do j=jsc-1,jec+1 ; do i=isc-1,iec+1
       if (ice_cell(i,j)) then
         He = max(ISS%h_shelf(i,j), CS%min_h_shelf)
         wq = 0.25 * G%areaT(i,j)
         do jq=1,2 ; do iq=1,2
+          qp = 2*(jq-1)+iq
           ! Bilinear basis of the 4 corners at this quadrature point (same convention as CG_action).
           do jphi=1,2 ; do iphi=1,2
             ilq = 1 ; if (iq == iphi) ilq = 2
             jlq = 1 ; if (jq == jphi) jlq = 2
             phim(iphi,jphi) = xquad(ilq) * xquad(jlq)
           enddo ; enddo
-          ! Interpolate the nodal slope to the quadrature point.
-          dsdx_qp = 0.0 ; dsdy_qp = 0.0
+          ! Interpolate the nodal slope to the quadrature point, summing corners in diagonal pairs.
+          dsdx_qp = ((sx_n(i-1,j-1)*phim(1,1) + sx_n(i,j)*phim(2,2)) + &
+                     (sx_n(i,j-1)*phim(2,1) + sx_n(i-1,j)*phim(1,2)))
+          dsdy_qp = ((sy_n(i-1,j-1)*phim(1,1) + sy_n(i,j)*phim(2,2)) + &
+                     (sy_n(i,j-1)*phim(2,1) + sy_n(i-1,j)*phim(1,2)))
+          ! Per-corner contribution -rho g H grad(s) phi_m |J| w_q at this quadrature point.
           do jphi=1,2 ; do iphi=1,2
-            dsdx_qp = dsdx_qp + (sx_n(i-2+iphi,j-2+jphi) * phim(iphi,jphi))
-            dsdy_qp = dsdy_qp + (sy_n(i-2+iphi,j-2+jphi) * phim(iphi,jphi))
-          enddo ; enddo
-          ! Distribute -rho g H grad(s) to the four corner nodes, weighted by the basis and area.
-          do jphi=1,2 ; do iphi=1,2
-            Itgt = i-2+iphi ; Jtgt = j-2+jphi
-            taudx(Itgt,Jtgt) = taudx(Itgt,Jtgt) - (((rho*grav)*He) * dsdx_qp) * (phim(iphi,jphi)*wq)
-            taudy(Itgt,Jtgt) = taudy(Itgt,Jtgt) - (((rho*grav)*He) * dsdy_qp) * (phim(iphi,jphi)*wq)
+            txqp(iphi,jphi,qp) = -(((rho*grav)*He) * dsdx_qp) * (phim(iphi,jphi)*wq)
+            tyqp(iphi,jphi,qp) = -(((rho*grav)*He) * dsdy_qp) * (phim(iphi,jphi)*wq)
           enddo ; enddo
         enddo ; enddo
+        ! Sum the four quadrature points in diagonal pairs (qp 1+4, 2+3) into each corner's element slot.
+        taudx_b(I-1,J-1,4) = (txqp(1,1,1)+txqp(1,1,4)) + (txqp(1,1,2)+txqp(1,1,3))
+        taudx_b(I-1,J  ,2) = (txqp(1,2,1)+txqp(1,2,4)) + (txqp(1,2,2)+txqp(1,2,3))
+        taudx_b(I  ,J-1,3) = (txqp(2,1,1)+txqp(2,1,4)) + (txqp(2,1,2)+txqp(2,1,3))
+        taudx_b(I  ,J  ,1) = (txqp(2,2,1)+txqp(2,2,4)) + (txqp(2,2,2)+txqp(2,2,3))
+        taudy_b(I-1,J-1,4) = (tyqp(1,1,1)+tyqp(1,1,4)) + (tyqp(1,1,2)+tyqp(1,1,3))
+        taudy_b(I-1,J  ,2) = (tyqp(1,2,1)+tyqp(1,2,4)) + (tyqp(1,2,2)+tyqp(1,2,3))
+        taudy_b(I  ,J-1,3) = (tyqp(2,1,1)+tyqp(2,1,4)) + (tyqp(2,1,2)+tyqp(2,1,3))
+        taudy_b(I  ,J  ,1) = (tyqp(2,2,1)+tyqp(2,2,4)) + (tyqp(2,2,2)+tyqp(2,2,3))
       endif
+    enddo ; enddo
+    ! Assemble the four surrounding-element slots at each node in diagonal pairs (slots 1+4, 2+3).
+    do J=jsc-1,jec ; do I=isc-1,iec
+      taudx(I,J) = taudx(I,J) + ((taudx_b(I,J,1)+taudx_b(I,J,4)) + (taudx_b(I,J,2)+taudx_b(I,J,3)))
+      taudy(I,J) = taudy(I,J) + ((taudy_b(I,J,1)+taudy_b(I,J,4)) + (taudy_b(I,J,2)+taudy_b(I,J,3)))
     enddo ; enddo
   endif
 
@@ -5372,10 +5397,23 @@ contains
   !> Option-3 (Lipscomb 2019) test for whether the edge between cells A=(ia,ja) and B=(ib,jb)
   !! contributes a surface-slope estimate: yes if both are ice-covered, or if an ice-covered cell
   !! lies higher in surface elevation than an ice-free land neighbor; no across ice/ice-free-ocean
-  !! margins or where ice lies below ice-free land (a nunatak).
+  !! margins or where ice lies below ice-free land (a nunatak). An edge is also rejected if either
+  !! cell lies outside a non-reentrant computational boundary, so the nodal gradient never differences
+  !! across a solid wall into the (unphysical) across-wall halo. Without this guard the N/S (and E/W)
+  !! wall nodes pick up a spurious cross-wall slope, breaking the meridional symmetry of channel
+  !! configurations like MISMIP3D, matching the boundary handling in calc_shelf_driving_stress.
   logical function edge_ok(ia, ja, ib, jb)
     integer, intent(in) :: ia, ja, ib, jb
     edge_ok = .false.
+    ! Both cells must be inside the global computational domain unless the domain is reentrant.
+    if (.not. CS%reentrant_x) then
+      if ((ia+i_off < gisc) .or. (ia+i_off > giec) .or. &
+          (ib+i_off < gisc) .or. (ib+i_off > giec)) return
+    endif
+    if (.not. CS%reentrant_y) then
+      if ((ja+j_off < gjsc) .or. (ja+j_off > gjec) .or. &
+          (jb+j_off < gjsc) .or. (jb+j_off > gjec)) return
+    endif
     if (ice_cell(ia,ja) .and. ice_cell(ib,jb)) then
       edge_ok = .true.
     elseif (ice_cell(ia,ja) .and. land_cell(ib,jb)) then
