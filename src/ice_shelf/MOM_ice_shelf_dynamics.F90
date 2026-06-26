@@ -182,6 +182,11 @@ type, public :: ice_shelf_dyn_CS ; private
   real, pointer, dimension(:,:) :: fB_elem => NULL()        !< Pre-computed element-level Coulomb fB parameter
                                !! [(T L-1)^CF_PostPeak]; 0 for Weertman.
                                !! Updated each outer iteration by calc_shelf_basal_prefactors.
+  real, pointer, dimension(:,:) :: coef_prefactor_node => NULL() !< Pre-computed areaBu*C_node*L_T_to_m_s at
+                               !! B-grid nodes for the local (LOCAL_BASAL_FRICTION) diagonal drag,
+                               !! C_node an area-weighted 4-cell average [R L2 Z T-1 ~> kg s-1].
+  real, pointer, dimension(:,:) :: fB_node => NULL()        !< Pre-computed nodal Coulomb fB parameter at B-grid
+                               !! nodes for LOCAL_BASAL_FRICTION [(T L-1)^CF_PostPeak]; 0 for Weertman.
   real :: alpha_coulomb = 1.0  !< Coulomb prefactor (CF_PostPeak-1)^(CF_PostPeak-1)/CF_PostPeak^CF_PostPeak [nondim]
   real, pointer, dimension(:,:) :: OD_rt => NULL()         !< A running total for calculating OD_av [Z ~> m].
   real, pointer, dimension(:,:) :: ground_frac_rt => NULL() !< A running total for calculating ground_frac.
@@ -282,12 +287,18 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! centers (Lipscomb et al. 2019 eq. 14, "option 3" margins), instead of
                             !! the wider cell-centroid centered difference. Less smeared across the
                             !! grounding line. Mutually exclusive with FV_GL_ONE_SIDED_TAUD.
-  logical :: fv_taud_vertex_lumped !< If true (and FV_TAUD_VERTEX_GRADIENT is on), assemble the nodal
-                            !! driving stress by mass lumping (Lipscomb 2019 A4 "local" method:
-                            !! tau_d at a node uses that node's slope alone). If false (default), use
-                            !! the consistent element-quadrature assembly that matches the basal
-                            !! friction integration. Lumped is more robust for sharp, un-blended
-                            !! surfaces; consistent co-locates the driving-stress and friction GLs.
+  logical :: local_fv_taud_vertex !< If true (default; only with FV_TAUD_VERTEX_GRADIENT), assemble the
+                            !! nodal driving stress by the local/lumped method (Lipscomb 2019 A4; CISM
+                            !! HO_ASSEMBLE_TAUD_LOCAL): tau_d at a node uses that node's slope alone over
+                            !! its nodal control mass. If false, use the consistent element-quadrature
+                            !! assembly. Local is the CISM-faithful default (co-locates with a local
+                            !! basal friction); consistent matches a consistent-mass friction.
+  logical :: local_basal_friction !< If true, assemble basal drag with a local/nodal diagonal (CISM
+                            !! HO_ASSEMBLE_BETA_LOCAL): drag at a node = beta(node)*areaBu*u(node),
+                            !! beta from a nodal C, nodal velocity, and the nodal grounded fraction
+                            !! f_ground_node, with no element integration or neighbor coupling. Requires
+                            !! GL_QUADRANT_FRICTION (for f_ground_node). Pairs with LOCAL_FV_TAUD_VERTEX
+                            !! to reproduce the all-local CISM/Leguy-2021 grounding-line setup.
 
   real    :: CFL_factor     !< A factor used to limit subcycled advective timestep in uncoupled runs
                             !! i.e. dt <= CFL_factor * min(dx / u) [nondim]
@@ -822,6 +833,8 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
              ! Units of [R L Z T-2 (s m-1)^n_sliding ~> Pa (s m-1)^n_sliding]
     allocate(CS%coef_prefactor(isd:ied,jsd:jed), source=0.0)
     allocate(CS%fB_elem(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%coef_prefactor_node(IsdB:IedB,JsdB:JedB), source=0.0)
+    allocate(CS%fB_node(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%OD_av(isd:ied,jsd:jed), source=0.0)
     allocate(CS%ground_frac(isd:ied,jsd:jed), source=0.0)
     allocate(CS%f_ground_node(IsdB:IedB,JsdB:JedB), source=0.0)
@@ -1066,13 +1079,24 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     if (CS%fv_taud_vertex_grad .and. CS%FV_GL_one_sided) call MOM_error(FATAL, &
                  "FV_TAUD_VERTEX_GRADIENT replaces the cell-centroid surface slope with a nodal "//&
                  "gradient, which has no one-sided analog; it cannot be used with FV_GL_ONE_SIDED_TAUD.")
-    call get_param(param_file, mdl, "FV_TAUD_VERTEX_LUMPED", CS%fv_taud_vertex_lumped, &
-                 "If true (only with FV_TAUD_VERTEX_GRADIENT), assemble the nodal driving stress by "//&
-                 "mass lumping -- the driving stress at each node uses the surface slope at that node "//&
-                 "alone (Lipscomb et al. 2019, A4 'local' method), which is more robust for sharp "//&
-                 "surface gradients. If false, use the consistent element-quadrature assembly that "//&
-                 "matches the basal-friction integration and co-locates the two grounding lines.", &
-                 default=.false., do_not_log=.not.CS%fv_taud_vertex_grad)
+    call get_param(param_file, mdl, "LOCAL_FV_TAUD_VERTEX", CS%local_fv_taud_vertex, &
+                 "If true (default; only with FV_TAUD_VERTEX_GRADIENT), assemble the nodal driving "//&
+                 "stress by the local/lumped method -- the driving stress at each node uses the surface "//&
+                 "slope at that node alone over its nodal control mass (Lipscomb et al. 2019, A4 'local' "//&
+                 "method; CISM HO_ASSEMBLE_TAUD_LOCAL). If false, use the consistent element-quadrature "//&
+                 "assembly. Local is the CISM-faithful choice and co-locates with a local basal friction.", &
+                 default=.true., do_not_log=.not.CS%fv_taud_vertex_grad)
+    call get_param(param_file, mdl, "LOCAL_BASAL_FRICTION", CS%local_basal_friction, &
+                 "If true, assemble basal drag with a local/nodal diagonal instead of the consistent "//&
+                 "element-quadrature mass (CISM HO_ASSEMBLE_BETA_LOCAL): the drag at each node is "//&
+                 "beta(node)*areaBu*u(node), with beta from an area-weighted nodal C_basal_friction, the "//&
+                 "nodal velocity, and the nodal grounded fraction f_ground_node -- no element integration "//&
+                 "or neighbor coupling. Reproduces the CISM/Leguy-2021 local friction; pair with "//&
+                 "LOCAL_FV_TAUD_VERTEX for the all-local setup.", &
+                 default=.false.)
+    if (CS%local_basal_friction .and. .not. CS%gl_quad_friction) call MOM_error(FATAL, &
+                 "LOCAL_BASAL_FRICTION needs the nodal grounded fraction f_ground_node; set "//&
+                 "GL_QUADRANT_FRICTION=True.")
     call get_param(param_file, mdl, "MIN_ICE_VISC", CS%min_ice_visc, &
                  "min. allowed Glen's law ice viscosity", &
                  units="Pa s", default=0., scale=US%Pa_to_RL2_T2*US%s_to_T)
@@ -3085,6 +3109,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
   ! Calculate basal drag constants and initial velocity
   call calc_shelf_basal_prefactors(CS, ISS, G, US)
+  if (CS%local_basal_friction) call calc_shelf_basal_prefactors_node(CS, ISS, G, US)
   call calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
   if (CS%doing_newton) then
     call pass_var(CS%ice_visc, G%domain, complete=.false.)
@@ -5290,7 +5315,7 @@ subroutine calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
     endif
   enddo ; enddo
 
-  if (CS%fv_taud_vertex_lumped) then
+  if (CS%local_fv_taud_vertex) then
     ! Mass-lumped ("local") assembly: each node's driving stress uses its own slope alone,
     ! tau_d = -rho g grad(s) * hA, with hA the h-weighted lumped nodal mass over the ice-covered
     ! cells around the node (Lipscomb 2019 A4 local method; more robust for sharp surfaces).
@@ -5553,6 +5578,9 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
                          ! from CS%f_ground_node; used only when CS%gl_quad_friction [nondim]
   real :: drag_newt_qp   ! Newton basal drag coefficient at quadrature point [R Z T-1 ~> kg m-2 s-1]
   real :: inner_dot_qp   ! u^k_qp · δu_qp inner product for Newton basal drag [L2 T-2 ~> m2 s-2]
+  real :: bcoef_loc, dnewt_loc ! Local (nodal-diagonal) basal Picard drag [R L2 Z T-1 ~> kg s-1] and
+                         ! Newton tangent factor [R Z T ~> kg m-2 s] at a node (LOCAL_BASAL_FRICTION)
+  real :: idot_loc       ! u^k_node · δu_node inner product for the local Newton drag [L2 T-2 ~> m2 s-2]
   real :: coef_prefactor_e  ! Pre-computed area * C_basal_friction * L_T_to_m_s [R L2 Z T-1 ~> kg s-1]
   real :: eps_vel2_e     ! Velocity regularization squared for current element [L2 T-2 ~> m2 s-2]
   real :: min_trac_e     ! min_basal_traction * areaT for current element [R L2 Z T-1 ~> kg s-1]
@@ -5760,7 +5788,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
                ((2.*stry_n + strx_n) * Phi(2*(2*(jphi-1)+iphi),qp,i,j)))
           endif
 
-          if (grounded_qp) then
+          if (grounded_qp .and. .not. CS%local_basal_friction) then
             ilq = 1 ; if (iq == iphi) ilq = 2
             jlq = 1 ; if (jq == jphi) jlq = 2
             ! Picard basal drag: C*|u^k|^(m-1) * δu evaluated at quadrature point, weighted by φ_m
@@ -5796,7 +5824,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
       uret_b(I  ,J  ,1) = 0.25*((uret_qp(2,2,1)+uret_qp(2,2,4))+(uret_qp(2,2,2)+uret_qp(2,2,3)))
       vret_b(I  ,J  ,1) = 0.25*((vret_qp(2,2,1)+vret_qp(2,2,4))+(vret_qp(2,2,2)+vret_qp(2,2,3)))
 
-      if (CS%GL_regularize .and. .not. CS%gl_quad_friction .and. &
+      if (CS%GL_regularize .and. .not. CS%gl_quad_friction .and. .not. CS%local_basal_friction .and. &
           merge(CS%basal_gate(i,j) > 0.5 .and. CS%basal_gate(i,j) < 1.5, &
           CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0, tr_scale_on)) then
         ! Subgrid grounding-line: evaluate basal friction at each grounded sub-quadrature point.
@@ -5836,6 +5864,23 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
     uret(I,J) = (uret_b(I,J,1)+uret_b(I,J,4)) + (uret_b(I,J,2)+uret_b(I,J,3))
     vret(I,J) = (vret_b(I,J,1)+vret_b(I,J,4)) + (vret_b(I,J,2)+vret_b(I,J,3))
   enddo ; enddo
+
+  ! Local (nodal-diagonal) basal friction (CISM HO_ASSEMBLE_BETA_LOCAL): each node's drag uses only
+  ! its own velocity, beta, and grounded fraction f_ground_node -- no element integration or neighbor
+  ! coupling. Replaces the per-quadrature-point friction gated off above.
+  if (CS%local_basal_friction) then
+    do J=js-1,je ; do I=is-1,ie
+      if (CS%f_ground_node(I,J) > 0.0) then
+        call compute_basal_coef_node(CS, G, US, I, J, u_curr(I,J), v_curr(I,J), use_newton, &
+                                     bcoef_loc, dnewt_loc)
+        idot_loc = (u_curr(I,J)*u_shlf(I,J)) + (v_curr(I,J)*v_shlf(I,J))
+        if (umask(I,J) == 1) uret(I,J) = uret(I,J) + &
+            ((bcoef_loc * u_shlf(I,J)) + (dnewt_loc * u_curr(I,J) * idot_loc))
+        if (vmask(I,J) == 1) vret(I,J) = vret(I,J) + &
+            ((bcoef_loc * v_shlf(I,J)) + (dnewt_loc * v_curr(I,J) * idot_loc))
+      endif
+    enddo ; enddo
+  endif
 
 end subroutine CG_action
 
@@ -6092,6 +6137,33 @@ subroutine compute_basal_coef(unorm2_qp, coef_prefactor, min_trac_area, fB_e, &
 
 end subroutine compute_basal_coef
 
+!> Local (nodal) basal drag coefficient and Newton tangent factor at B-grid node (I,J) for
+!! LOCAL_BASAL_FRICTION (CISM HO_ASSEMBLE_BETA_LOCAL). beta is built from the pre-computed nodal
+!! prefactor (areaBu*C_node) and nodal Coulomb fB, the nodal velocity magnitude, then scaled by the
+!! nodal grounded fraction f_ground_node. The drag is purely diagonal: tau_b at the node = bcoef*u.
+subroutine compute_basal_coef_node(CS, G, US, I, J, u_c, v_c, use_newton, bcoef, dnewt)
+  type(ice_shelf_dyn_CS), intent(in) :: CS  !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in) :: G   !< The grid structure
+  type(unit_scale_type),  intent(in) :: US  !< Unit conversion factors
+  integer, intent(in) :: I, J               !< B-grid node indices
+  real,    intent(in) :: u_c, v_c           !< Current nodal velocity components [L T-1 ~> m s-1]
+  logical, intent(in) :: use_newton         !< If true, evaluate the Newton tangent factor
+  real,    intent(out) :: bcoef             !< Picard diagonal drag at the node [R L2 Z T-1 ~> kg s-1]
+  real,    intent(out) :: dnewt             !< Newton drag tangent factor [R Z T ~> kg m-2 s]; 0 without Newton
+
+  real :: eps2     ! Velocity regularization squared at the node [L2 T-2 ~> m2 s-2]
+  real :: mintrac  ! min_basal_traction * areaBu floor at the node [R L2 Z T-1 ~> kg s-1]
+  real :: unorm2   ! Regularized |u|^2 at the node [L2 T-2 ~> m2 s-2]
+
+  eps2    = CS%eps_glen_min**2 * G%areaBu(I,J)
+  mintrac = CS%min_basal_traction * G%areaBu(I,J)
+  unorm2  = ((u_c**2) + (v_c**2)) + eps2
+  call compute_basal_coef(unorm2, CS%coef_prefactor_node(I,J), mintrac, CS%fB_node(I,J), &
+      CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, use_newton, bcoef, dnewt)
+  bcoef = bcoef * CS%f_ground_node(I,J)
+  dnewt = dnewt * CS%f_ground_node(I,J)
+end subroutine compute_basal_coef_node
+
 !> Compute the Coulomb fB parameter at a single quadrature point from local (subgrid) ice
 !! thickness and bed elevation. This replaces the cell-averaged fB_elem when use_DG_thickness
 !! is active, allowing the effective pressure to vary within the cell.
@@ -6221,6 +6293,8 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
   logical :: tr_scale_on ! Whether near-GL basal-traction smoothing is active (Weertman only)
   real, dimension(:,:,:,:), pointer :: hgate ! Thickness field for the flotation
                          ! test: h_flot under DG_GL_GATE_CONTINUOUS, else h_nodal [Z ~> m]
+  real :: bcoef_loc, dnewt_loc ! Local (nodal-diagonal) basal Picard drag [R L2 Z T-1 ~> kg s-1] and
+                         ! Newton tangent factor [R Z T ~> kg m-2 s] at a node (LOCAL_BASAL_FRICTION)
   real, dimension(2)   :: xquad
   real, dimension(2,2) :: Hcell, u_diag_sub, v_diag_sub  ! Subgrid diagonal contributions [R L2 Z T-1 ~> kg s-1]
   real, dimension(2,2,4) :: u_diag_qp, v_diag_qp
@@ -6373,7 +6447,7 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
               jac_wt * CS%newton_visc_factor(i,j,qpv) * dstrain_diag_u**2
           endif
 
-          if (grounded_qp) then
+          if (grounded_qp .and. .not. CS%local_basal_friction) then
             u_diag_qp(iphi,jphi,qp) = u_diag_qp(iphi,jphi,qp) + jac_wt * basal_coef_qp * phi_m_sq
             if (CS%doing_newton) &
               u_diag_qp(iphi,jphi,qp) = u_diag_qp(iphi,jphi,qp) + jac_wt * drag_newt_qp * u_curr_qp**2 * phi_m_sq
@@ -6399,7 +6473,7 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
               jac_wt * CS%newton_visc_factor(i,j,qpv) * dstrain_diag_v**2
           endif
 
-          if (grounded_qp) then
+          if (grounded_qp .and. .not. CS%local_basal_friction) then
             v_diag_qp(iphi,jphi,qp) = v_diag_qp(iphi,jphi,qp) + jac_wt * basal_coef_qp * phi_m_sq
             if (CS%doing_newton) &
               v_diag_qp(iphi,jphi,qp) = v_diag_qp(iphi,jphi,qp) + jac_wt * drag_newt_qp * v_curr_qp**2 * phi_m_sq
@@ -6424,7 +6498,7 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
     u_diag_b(I  ,J  ,1) = 0.25*((u_diag_qp(2,2,1)+u_diag_qp(2,2,4))+(u_diag_qp(2,2,2)+u_diag_qp(2,2,3)))
     v_diag_b(I  ,J  ,1) = 0.25*((v_diag_qp(2,2,1)+v_diag_qp(2,2,4))+(v_diag_qp(2,2,2)+v_diag_qp(2,2,3)))
 
-    if (CS%GL_regularize .and. .not. CS%gl_quad_friction .and. &
+    if (CS%GL_regularize .and. .not. CS%gl_quad_friction .and. .not. CS%local_basal_friction .and. &
         merge(CS%basal_gate(i,j) > 0.5 .and. CS%basal_gate(i,j) < 1.5, &
         CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0, tr_scale_on)) then
       ! Subgrid grounding-line: evaluate basal friction diagonal at each grounded sub-quadrature point.
@@ -6463,6 +6537,19 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
     u_diagonal(I,J) = (u_diag_b(I,J,1)+u_diag_b(I,J,4)) + (u_diag_b(I,J,2)+u_diag_b(I,J,3))
     v_diagonal(I,J) = (v_diag_b(I,J,1)+v_diag_b(I,J,4)) + (v_diag_b(I,J,2)+v_diag_b(I,J,3))
   enddo ; enddo
+
+  ! Local (nodal-diagonal) basal friction (CISM HO_ASSEMBLE_BETA_LOCAL): the diagonal of the nodal
+  ! drag bcoef*u (+ Newton tangent dnewt*u^2), matching the term added in CG_action.
+  if (CS%local_basal_friction) then
+    do J=jsc-2,jec+1 ; do I=isc-2,iec+1
+      if (CS%f_ground_node(I,J) > 0.0) then
+        call compute_basal_coef_node(CS, G, US, I, J, u_curr(I,J), v_curr(I,J), CS%doing_newton, &
+                                     bcoef_loc, dnewt_loc)
+        if (CS%umask(I,J) == 1) u_diagonal(I,J) = u_diagonal(I,J) + (bcoef_loc + (dnewt_loc * u_curr(I,J)**2))
+        if (CS%vmask(I,J) == 1) v_diagonal(I,J) = v_diagonal(I,J) + (bcoef_loc + (dnewt_loc * v_curr(I,J)**2))
+      endif
+    enddo ; enddo
+  endif
 
 end subroutine matrix_diagonal
 
@@ -6973,6 +7060,68 @@ subroutine calc_shelf_basal_prefactors(CS, ISS, G, US)
   enddo ; enddo
 
 end subroutine calc_shelf_basal_prefactors
+
+!> Pre-compute the nodal basal-friction prefactors for LOCAL_BASAL_FRICTION. C_basal_friction is a
+!! static bed property defined under grounded, floating, and ice-free cells alike, so the nodal C is
+!! an area-weighted average over all four cells around the node -- the nodal C does not change as the
+!! (grounded) ice front moves across the node. The Coulomb fB instead uses thickness and bed averaged
+!! over only the ice-covered cells, since the effective pressure is an ice-state quantity. These are
+!! velocity-independent, so they are computed once per solve alongside calc_shelf_basal_prefactors.
+!! Node (I,J) is the NE corner of cell (i,j); its four surrounding cells are
+!! (I,J),(I+1,J),(I,J+1),(I+1,J+1).
+subroutine calc_shelf_basal_prefactors_node(CS, ISS, G, US)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS  !< Ice shelf dynamics control structure
+  type(ice_shelf_state),  intent(in)    :: ISS !< Ice shelf state (hmask, h_shelf)
+  type(ocean_grid_type),  intent(in)    :: G   !< The grid structure
+  type(unit_scale_type),  intent(in)    :: US  !< Unit conversion factors
+
+  real :: rho_oi_ratio   ! density_ocean_avg / density_ice [nondim]
+  real :: rho_ice_g_LtoZ ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
+  real :: asum_all       ! Sum of all four cell areas at the node [L2 ~> m2]
+  real :: asum_ice       ! Sum of the ice-covered cell areas at the node [L2 ~> m2]
+  real :: w              ! Area weight of one cell [L2 ~> m2]
+  real :: Cw             ! Area-weighted sum of C_basal_friction over all four cells [R L Z T-2 (s m-1)^n L2]
+  real :: hw             ! Area-weighted sum of ice thickness over ice cells [Z L2 ~> m3]
+  real :: bw             ! Area-weighted sum of bed elevation over ice cells [Z L2 ~> m3]
+  real :: C_n            ! Nodal area-weighted C_basal_friction [R L Z T-2 (s m-1)^n]
+  real :: h_n            ! Nodal area-weighted ice thickness [Z ~> m]
+  real :: bed_n          ! Nodal area-weighted bed elevation [Z ~> m]
+  integer :: i, j, ii, jj, ic, jc
+
+  rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
+  rho_ice_g_LtoZ = US%L_to_Z * (CS%density_ice * CS%g_Earth)
+
+  do J=G%jsd,G%jed-1 ; do I=G%isd,G%ied-1
+    asum_all = 0.0 ; asum_ice = 0.0 ; Cw = 0.0 ; hw = 0.0 ; bw = 0.0 ; C_n = 0.0
+    do jj=0,1 ; jc = J+jj ; do ii=0,1 ; ic = I+ii
+      w = G%areaT(ic,jc)
+      ! C is a static bed property under floating and ice-free ice alike: average over all four cells
+      ! so the nodal C is fixed by geometry, not by where the ice front happens to be.
+      asum_all = asum_all + w
+      Cw = Cw + w*CS%C_basal_friction(ic,jc)
+      ! Thickness/bed for the Coulomb effective pressure are only meaningful under ice.
+      if (ISS%hmask(ic,jc) == 1 .or. ISS%hmask(ic,jc) == 3) then
+        asum_ice = asum_ice + w
+        hw = hw + w*max(ISS%h_shelf(ic,jc), CS%min_h_shelf)
+        bw = bw + w*CS%bed_elev(ic,jc)
+      endif
+    enddo ; enddo
+    if (asum_all > 0.0) then
+      C_n = Cw/asum_all
+      CS%coef_prefactor_node(I,J) = (G%areaBu(I,J) * C_n) * US%L_T_to_m_s
+    else
+      CS%coef_prefactor_node(I,J) = 0.0
+    endif
+    if (CS%CoulombFriction .and. asum_ice > 0.0) then
+      h_n = hw/asum_ice ; bed_n = bw/asum_ice
+      CS%fB_node(I,J) = compute_fB_local(h_n, bed_n, rho_oi_ratio, rho_ice_g_LtoZ, &
+          C_n, CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, CS%CF_PostPeak, CS%n_basal_fric)
+    else
+      CS%fB_node(I,J) = 0.0
+    endif
+  enddo ; enddo
+
+end subroutine calc_shelf_basal_prefactors_node
 
 !> Compute area-averaged basal shear stress [R L T-1 ~> Pa s m-1] and return it in basal_tr.
 !! Uses CS%u_shelf and CS%v_shelf for velocities and G%US for unit conversions.
