@@ -5192,19 +5192,20 @@ subroutine calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
   logical, dimension(SZDI_(G),SZDJ_(G)) :: land_cell ! True at ice-free cells at/above sea level (bed_elev<=0)
   real    :: rho, rhow, rhoi_rhow ! Ice and ocean densities [R ~> kg m-3] and their ratio [nondim]
   real    :: grav      ! The gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
-  real    :: gsum_x, gsum_y ! Sum of the valid parallel-edge surface slopes at a node [Z L-1 ~> nondim]
-  integer :: nx_e, ny_e     ! Count of valid edges contributing to the x- and y-node slope [nondim]
+  real    :: num_x, num_y ! Sum of the valid parallel-edge surface differences at a node [Z ~> m]
+  real    :: den_x, den_y ! Sum of the valid parallel-edge lengths at a node [L ~> m]
   real    :: smag      ! Surface slope magnitude at a node [Z L-1 ~> nondim]
   real    :: scale     ! Scaling factor enforcing MAX_SURFACE_SLOPE [nondim]
   real    :: neumann_val ! Lateral-pressure boundary term [R Z L2 T-2 ~> kg s-2]
   real    :: xquad(2)  ! 2-point Gauss-Legendre quadrature locations on [0,1] [nondim]
   real    :: He        ! Cell-mean ice thickness used in the driving-stress integral [Z ~> m]
-  real    :: wq        ! Per-quadrature-point area weight, 1/4 areaT [L2 ~> m2]
+  real    :: wq        ! Per-quadrature-point area weight, 1/4 |J_q| (= 1/4 areaT for rectangular cells) [L2 ~> m2]
   real    :: dsdx_qp, dsdy_qp ! Surface slope interpolated to a quadrature point [Z L-1 ~> nondim]
   real    :: phim(2,2) ! Bilinear nodal basis values of the 4 cell corners at a quadrature point [nondim]
-  real    :: hA        ! h-weighted node control area for the lumped assembly, sum of 1/4 areaT
-                       ! max(h,min_h) over the ice-covered cells around the node [Z L2 ~> m3]
-  real    :: hA_sw, hA_se, hA_nw, hA_ne ! Per-cell quarter-area thickness weights at the four cells
+  real    :: hA        ! h-weighted node control mass for the lumped assembly, sum of the metric
+                       ! lumped corner masses (1/4 |J_q|-integrated basis) over the ice-covered
+                       ! cells around the node [Z L2 ~> m3]
+  real    :: hA_sw, hA_se, hA_nw, hA_ne ! Per-cell metric-lumped corner-mass weights at the four cells
                        ! around a node, summed in diagonal pairs for rotation invariance [Z L2 ~> m3]
   real    :: txqp(2,2,4), tyqp(2,2,4) ! Per-quadrature-point nodal driving-stress contributions within
                        ! one element, pair-summed over quadrature points [R L3 Z T-2 ~> kg m s-2]
@@ -5247,31 +5248,39 @@ subroutine calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
     land_cell(i,j) = (.not. ice_cell(i,j)) .and. (CS%bed_elev(i,j) <= 0.0)
   enddo ; enddo
 
-  ! Nodal surface gradient (Lipscomb 2019 eq. 14), built per parallel edge so margin edges can be
-  ! dropped (option 3). Node (I,J) is the NE corner of cell (i,j); its four cells are
+  ! Nodal surface gradient (generalized Lipscomb 2019 eq. 14), built per parallel edge so margin
+  ! edges can be dropped (option 3). Node (I,J) is the NE corner of cell (i,j); its four cells are
   ! (i,j),(i+1,j),(i,j+1),(i+1,j+1) (uppercase I,J equal lowercase i,j in Fortran). Computed over a
   ! node range wide enough to cover every corner of the element-integration loop below.
+  !
+  ! The two parallel edges are combined as a ratio of summed surface differences over summed edge
+  ! lengths -- num/den -- which is the isoparametric bilinear gradient CG_action forms for nodal
+  ! fields (metric-interpolated numerator over metric-interpolated denominator), not an average of
+  ! the two per-edge ratios. The two are bitwise identical on a uniform grid but differ where the
+  ! parallel edges have unequal length (e.g. lat/lon, where dxCu varies with latitude), so this
+  ! matches CG_action's metric treatment. A single valid edge (option 3) reduces to num/den =
+  ! that edge's one-sided slope, exactly as before.
   sx_n(:,:) = 0.0 ; sy_n(:,:) = 0.0
   do j=jsc-2,jec+1 ; do i=isc-2,iec+1
     ! x-slope: south edge (i,j)->(i+1,j) and north edge (i,j+1)->(i+1,j+1)
-    gsum_x = 0.0 ; nx_e = 0
+    num_x = 0.0 ; den_x = 0.0
     if (edge_ok(i,j,  i+1,j  )) then
-      gsum_x = gsum_x + (S(i+1,j)   - S(i,j)  ) * G%IdxCu(I,j)   ; nx_e = nx_e + 1
+      num_x = num_x + (S(i+1,j)   - S(i,j)  ) ; den_x = den_x + G%dxCu(I,j)
     endif
     if (edge_ok(i,j+1,i+1,j+1)) then
-      gsum_x = gsum_x + (S(i+1,j+1) - S(i,j+1)) * G%IdxCu(I,j+1) ; nx_e = nx_e + 1
+      num_x = num_x + (S(i+1,j+1) - S(i,j+1)) ; den_x = den_x + G%dxCu(I,j+1)
     endif
-    if (nx_e > 0) sx_n(I,J) = gsum_x / real(nx_e)
+    if (den_x > 0.0) sx_n(I,J) = num_x / den_x
 
     ! y-slope: west edge (i,j)->(i,j+1) and east edge (i+1,j)->(i+1,j+1)
-    gsum_y = 0.0 ; ny_e = 0
+    num_y = 0.0 ; den_y = 0.0
     if (edge_ok(i,j,  i,  j+1)) then
-      gsum_y = gsum_y + (S(i,j+1)   - S(i,j)  ) * G%IdyCv(i,J)   ; ny_e = ny_e + 1
+      num_y = num_y + (S(i,j+1)   - S(i,j)  ) ; den_y = den_y + G%dyCv(i,J)
     endif
     if (edge_ok(i+1,j,i+1,j+1)) then
-      gsum_y = gsum_y + (S(i+1,j+1) - S(i+1,j)) * G%IdyCv(i+1,J) ; ny_e = ny_e + 1
+      num_y = num_y + (S(i+1,j+1) - S(i+1,j)) ; den_y = den_y + G%dyCv(i+1,J)
     endif
-    if (ny_e > 0) sy_n(I,J) = gsum_y / real(ny_e)
+    if (den_y > 0.0) sy_n(I,J) = num_y / den_y
 
     ! Cap the surface slope magnitude (MAX_SURFACE_SLOPE), as in calc_shelf_driving_stress.
     if (CS%max_surface_slope > 0) then
@@ -5283,15 +5292,21 @@ subroutine calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
 
   if (CS%fv_taud_vertex_lumped) then
     ! Mass-lumped ("local") assembly: each node's driving stress uses its own slope alone,
-    ! tau_d = -rho g grad(s) * hA, with hA the h-weighted quarter-area sum over the ice-covered
+    ! tau_d = -rho g grad(s) * hA, with hA the h-weighted lumped nodal mass over the ice-covered
     ! cells around the node (Lipscomb 2019 A4 local method; more robust for sharp surfaces).
     do j=jsc-1,jec ; do i=isc-1,iec
-      ! Quarter-area thickness weight of each of the four cells around node (I,J), summed in
-      ! diagonal pairs (SW+NE)+(SE+NW) so the lumped mass is bitwise invariant under 90 deg rotation.
-      hA_sw = 0.0 ; if (ice_cell(i,  j  )) hA_sw = 0.25*G%areaT(i,  j  )*max(ISS%h_shelf(i,  j  ),CS%min_h_shelf)
-      hA_se = 0.0 ; if (ice_cell(i+1,j  )) hA_se = 0.25*G%areaT(i+1,j  )*max(ISS%h_shelf(i+1,j  ),CS%min_h_shelf)
-      hA_nw = 0.0 ; if (ice_cell(i,  j+1)) hA_nw = 0.25*G%areaT(i,  j+1)*max(ISS%h_shelf(i,  j+1),CS%min_h_shelf)
-      hA_ne = 0.0 ; if (ice_cell(i+1,j+1)) hA_ne = 0.25*G%areaT(i+1,j+1)*max(ISS%h_shelf(i+1,j+1),CS%min_h_shelf)
+      ! Metric-exact lumped (row-sum) mass contribution of each of the four cells around node (I,J):
+      ! h * integral of that cell's node-corner bilinear basis against the element Jacobian,
+      ! (h/4) sum_qp phi_corner(qp) Jac(qp) (lumped_corner_mass below; 2-pt Gauss is exact for the
+      ! bilinear-orthogonal map, so this carries the lat/lon metric exactly and reduces to
+      ! 0.25*areaT*h on rectangular cells). The corner passed is the cell's corner that coincides
+      ! with the node: cell (i,j) -> NE, (i+1,j) -> NW, (i,j+1) -> SE, (i+1,j+1) -> SW. Cells are
+      ! summed in diagonal pairs (SW+NE)+(SE+NW) so the lumped mass is bitwise invariant under
+      ! 90 deg rotation, matching CG_action.
+      hA_sw = 0.0 ; if (ice_cell(i,  j  )) hA_sw = lumped_corner_mass(i,  j,   2, 2)
+      hA_se = 0.0 ; if (ice_cell(i+1,j  )) hA_se = lumped_corner_mass(i+1,j,   1, 2)
+      hA_nw = 0.0 ; if (ice_cell(i,  j+1)) hA_nw = lumped_corner_mass(i,  j+1, 2, 1)
+      hA_ne = 0.0 ; if (ice_cell(i+1,j+1)) hA_ne = lumped_corner_mass(i+1,j+1, 1, 1)
       hA = (hA_sw + hA_ne) + (hA_se + hA_nw)
       taudx(I,J) = taudx(I,J) - (rho*grav) * (hA * sx_n(I,J))
       taudy(I,J) = taudy(I,J) - (rho*grav) * (hA * sy_n(I,J))
@@ -5301,7 +5316,9 @@ subroutine calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
     ! (Lipscomb 2019 A4, eqs A26-A27): at each 2x2 Gauss point the nodal slope is interpolated with
     ! the bilinear basis, multiplied by the cell-mean thickness, and distributed back to the four
     ! cell-corner nodes weighted by that basis. Matching the friction's quadrature co-locates the
-    ! driving-stress and friction grounding lines. The 1/4 areaT weight matches the centroid routine.
+    ! driving-stress and friction grounding lines. The per-quadrature-point weight 1/4 |J_q| (CS%Jac)
+    ! carries the element metric, exactly as CG_action's jac_wt = |J_q|/areaT does for friction; it
+    ! reduces to 1/4 areaT on rectangular cells where |J_q| == areaT.
     ! Each element writes its four corner contributions into its own slot of taudx_b/taudy_b; the
     ! quadrature-point and four-element sums are then accumulated in diagonal pairs (exactly as
     ! CG_action assembles uret_b) so the load vector is bitwise invariant under 90 deg rotation.
@@ -5309,9 +5326,12 @@ subroutine calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
     do j=jsc-1,jec+1 ; do i=isc-1,iec+1
       if (ice_cell(i,j)) then
         He = max(ISS%h_shelf(i,j), CS%min_h_shelf)
-        wq = 0.25 * G%areaT(i,j)
         do jq=1,2 ; do iq=1,2
           qp = 2*(jq-1)+iq
+          ! Per-quadrature-point area weight |J_q|/4, the same element-map metric CG_action applies
+          ! to the friction integral (via jac_wt). On non-rectangular (e.g. lat/lon) cells this keeps
+          ! the driving-stress and friction integrals on an identical metric; = 0.25*areaT when |J_q|==areaT.
+          wq = 0.25 * CS%Jac(qp,i,j)
           ! Bilinear basis of the 4 corners at this quadrature point (same convention as CG_action).
           do jphi=1,2 ; do iphi=1,2
             ilq = 1 ; if (iq == iphi) ilq = 2
@@ -5422,6 +5442,29 @@ contains
       edge_ok = (S(ib,jb) > S(ia,ja))
     endif
   end function edge_ok
+
+  !> Metric-exact lumped (row-sum) nodal mass contribution of cell (ic,jc) to the node at its
+  !! (icorner,jcorner) corner: h * integral of that corner's bilinear basis against the element
+  !! Jacobian, (h/4) * sum_qp phi_corner(qp) * Jac(qp). Two-point Gauss is exact for this integrand
+  !! on the bilinear locally-orthogonal map (phi*Jac is at most quadratic per direction), so the
+  !! result carries the lat/lon metric exactly, matching the per-quadrature-point |J_q| weighting
+  !! CG_action uses. Reduces to 0.25*areaT*h on rectangular cells where Jac(qp) == areaT.
+  real function lumped_corner_mass(ic, jc, icorner, jcorner)
+    integer, intent(in) :: ic, jc        !< Cell indices of the contributing cell
+    integer, intent(in) :: icorner, jcorner !< The cell corner (1=W/S, 2=E/N) that is the node
+    real :: pj(4)  ! phi_corner(qp) * Jac(qp) at the four quadrature points [L2 ~> m2]
+    integer :: iq2, jq2, qq, il, jl
+    do jq2=1,2 ; do iq2=1,2
+      qq = 2*(jq2-1)+iq2
+      il = 1 ; if (iq2 == icorner) il = 2
+      jl = 1 ; if (jq2 == jcorner) jl = 2
+      pj(qq) = (xquad(il)*xquad(jl)) * CS%Jac(qq,ic,jc)
+    enddo ; enddo
+    ! Gauss weight 1/4 per QP, summed in diagonal pairs (1+4)+(2+3) to match CG_action's
+    ! rotation-invariant quadrature; times the cell-mean thickness.
+    lumped_corner_mass = (0.25 * ((pj(1)+pj(4)) + (pj(2)+pj(3)))) * &
+                         max(ISS%h_shelf(ic,jc), CS%min_h_shelf)
+  end function lumped_corner_mass
 
 end subroutine calc_shelf_driving_stress_vertex
 
