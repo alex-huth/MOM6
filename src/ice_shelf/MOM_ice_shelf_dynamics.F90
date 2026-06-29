@@ -182,11 +182,19 @@ type, public :: ice_shelf_dyn_CS ; private
   real, pointer, dimension(:,:) :: fB_elem => NULL()        !< Pre-computed element-level Coulomb fB parameter
                                !! [(T L-1)^CF_PostPeak]; 0 for Weertman.
                                !! Updated each outer iteration by calc_shelf_basal_prefactors.
-  real, pointer, dimension(:,:) :: coef_prefactor_node => NULL() !< Pre-computed areaBu*C_node*L_T_to_m_s at
+  real, pointer, dimension(:,:) :: coef_prefactor_node => NULL() !< Pre-computed area_node*C_node*L_T_to_m_s at
                                !! B-grid nodes for the local (LOCAL_BASAL_FRICTION) diagonal drag,
-                               !! C_node an area-weighted 4-cell average [R L2 Z T-1 ~> kg s-1].
+                               !! C_node an area-weighted 4-cell average and area_node the ice-restricted
+                               !! nodal control volume [R L2 Z T-1 ~> kg s-1].
   real, pointer, dimension(:,:) :: fB_node => NULL()        !< Pre-computed nodal Coulomb fB parameter at B-grid
                                !! nodes for LOCAL_BASAL_FRICTION [(T L-1)^CF_PostPeak]; 0 for Weertman.
+  real, pointer, dimension(:,:) :: area_node => NULL()      !< Nodal control-volume area for the local
+                               !! (LOCAL_BASAL_FRICTION) drag: the sum of the ice-covered surrounding cells'
+                               !! lumped corner areas (0.25*areaT each), i.e. the same control volume the
+                               !! lumped driving stress and the CG_action element assembly integrate over.
+                               !! Equals areaBu at all-ice interior nodes but halves/quarters at domain-edge
+                               !! and margin nodes, so the local taud and friction share one control volume
+                               !! and the wall-node x-force balance stays meridionally symmetric [L2 ~> m2].
   real :: alpha_coulomb = 1.0  !< Coulomb prefactor (CF_PostPeak-1)^(CF_PostPeak-1)/CF_PostPeak^CF_PostPeak [nondim]
   real, pointer, dimension(:,:) :: OD_rt => NULL()         !< A running total for calculating OD_av [Z ~> m].
   real, pointer, dimension(:,:) :: ground_frac_rt => NULL() !< A running total for calculating ground_frac.
@@ -835,6 +843,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%fB_elem(isd:ied,jsd:jed), source=0.0)
     allocate(CS%coef_prefactor_node(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%fB_node(IsdB:IedB,JsdB:JedB), source=0.0)
+    allocate(CS%area_node(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%OD_av(isd:ied,jsd:jed), source=0.0)
     allocate(CS%ground_frac(isd:ied,jsd:jed), source=0.0)
     allocate(CS%f_ground_node(IsdB:IedB,JsdB:JedB), source=0.0)
@@ -6152,11 +6161,14 @@ subroutine compute_basal_coef_node(CS, G, US, I, J, u_c, v_c, use_newton, bcoef,
   real,    intent(out) :: dnewt             !< Newton drag tangent factor [R Z T ~> kg m-2 s]; 0 without Newton
 
   real :: eps2     ! Velocity regularization squared at the node [L2 T-2 ~> m2 s-2]
-  real :: mintrac  ! min_basal_traction * areaBu floor at the node [R L2 Z T-1 ~> kg s-1]
+  real :: mintrac  ! min_basal_traction * area_node floor at the node [R L2 Z T-1 ~> kg s-1]
   real :: unorm2   ! Regularized |u|^2 at the node [L2 T-2 ~> m2 s-2]
 
-  eps2    = CS%eps_glen_min**2 * G%areaBu(I,J)
-  mintrac = CS%min_basal_traction * G%areaBu(I,J)
+  ! Scale the regularization and traction floor by the same ice-restricted nodal control volume
+  ! (CS%area_node) the drag prefactor uses, not areaBu, so every term in the local node balance shares
+  ! one control volume and the domain-edge nodes stay consistent with the interior (meridional symmetry).
+  eps2    = CS%eps_glen_min**2 * CS%area_node(I,J)
+  mintrac = CS%min_basal_traction * CS%area_node(I,J)
   unorm2  = ((u_c**2) + (v_c**2)) + eps2
   call compute_basal_coef(unorm2, CS%coef_prefactor_node(I,J), mintrac, CS%fB_node(I,J), &
       CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, use_newton, bcoef, dnewt)
@@ -7106,9 +7118,18 @@ subroutine calc_shelf_basal_prefactors_node(CS, ISS, G, US)
         bw = bw + w*CS%bed_elev(ic,jc)
       endif
     enddo ; enddo
-    if (asum_all > 0.0) then
+    ! Nodal control volume for the local drag: the lumped corner areas of the ICE-COVERED surrounding
+    ! cells only (0.25*areaT each), matching both the lumped driving stress (sum of lumped_corner_mass
+    ! over ice cells) and the CG_action element assembly (which loops over ice cells). This is NOT
+    ! areaBu: at a domain-edge node areaBu is the full dual-cell area but the across-wall halo cells
+    ! carry no ice, so areaBu would give the boundary node a full-strength drag while its driving stress
+    ! and viscous terms are integrated over only the interior (half) control volume. That mismatch
+    ! slows the wall-node along-flow velocity relative to the interior, breaking the meridional symmetry
+    ! of channel configs (MISMIP3D) -- spurious y-velocity and y-surface-slope near the y walls.
+    CS%area_node(I,J) = 0.25 * asum_ice
+    if (CS%area_node(I,J) > 0.0) then
       C_n = Cw/asum_all
-      CS%coef_prefactor_node(I,J) = (G%areaBu(I,J) * C_n) * US%L_T_to_m_s
+      CS%coef_prefactor_node(I,J) = (CS%area_node(I,J) * C_n) * US%L_T_to_m_s
     else
       CS%coef_prefactor_node(I,J) = 0.0
     endif
@@ -8423,6 +8444,9 @@ subroutine ice_shelf_dyn_end(CS)
   deallocate(CS%newton_umid, CS%newton_vmid, CS%newton_drag_coef)
   deallocate(CS%C_basal_friction)
   deallocate(CS%coef_prefactor, CS%fB_elem)
+  if (associated(CS%coef_prefactor_node)) deallocate(CS%coef_prefactor_node)
+  if (associated(CS%fB_node)) deallocate(CS%fB_node)
+  if (associated(CS%area_node)) deallocate(CS%area_node)
   deallocate(CS%OD_rt, CS%OD_av)
   deallocate(CS%t_bdry_val, CS%bed_elev, CS%bed_node)
   if (associated(CS%h_nodal)) deallocate(CS%h_nodal)
