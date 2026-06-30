@@ -7099,16 +7099,29 @@ subroutine calc_shelf_basal_prefactors_node(CS, ISS, G, US)
   real :: h_n            ! Nodal area-weighted ice thickness [Z ~> m]
   real :: bed_n          ! Nodal area-weighted bed elevation [Z ~> m]
   integer :: i, j, ii, jj, ic, jc
+  integer :: i_off, j_off, gisc, gjsc, giec, gjec
 
   rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
   rho_ice_g_LtoZ = US%L_to_Z * (CS%density_ice * CS%g_Earth)
+  i_off = G%idg_offset ; j_off = G%jdg_offset
+  gisc = 1 ; gjsc = 1 ; giec = G%domain%niglobal ; gjec = G%domain%njglobal
 
   do J=G%jsd,G%jed-1 ; do I=G%isd,G%ied-1
     asum_all = 0.0 ; asum_ice = 0.0 ; Cw = 0.0 ; hw = 0.0 ; bw = 0.0 ; C_n = 0.0
     do jj=0,1 ; jc = J+jj ; do ii=0,1 ; ic = I+ii
+      ! Skip across-wall halo cells: beyond a non-reentrant wall C_basal_friction is not read from
+      ! file and pass_var does not fill it, so it keeps the (large) allocate default and would poison
+      ! the nodal C average at wall nodes, inflating the wall-node drag and breaking meridional
+      ! symmetry (MISMIP3D y-velocity/y-slope). In-domain ice-free land cells are kept (valid C).
+      if (.not. CS%reentrant_x) then
+        if ((ic+i_off < gisc) .or. (ic+i_off > giec)) cycle
+      endif
+      if (.not. CS%reentrant_y) then
+        if ((jc+j_off < gjsc) .or. (jc+j_off > gjec)) cycle
+      endif
       w = G%areaT(ic,jc)
-      ! C is a static bed property under floating and ice-free ice alike: average over all four cells
-      ! so the nodal C is fixed by geometry, not by where the ice front happens to be.
+      ! C is a static bed property under floating and ice-free ice alike: average over all in-domain
+      ! cells so the nodal C is fixed by geometry, not by where the ice front happens to be.
       asum_all = asum_all + w
       Cw = Cw + w*CS%C_basal_friction(ic,jc)
       ! Thickness/bed for the Coulomb effective pressure are only meaningful under ice.
