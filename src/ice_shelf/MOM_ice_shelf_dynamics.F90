@@ -54,6 +54,12 @@ integer, parameter :: BASAL_TR_NONE = 0     !< No smoothing (hard Weertman step 
 integer, parameter :: BASAL_TR_CENTERED = 1 !< Symmetric cosine ramp over [-W,W]; phi(0)=0.5, GL not displaced
 integer, parameter :: BASAL_TR_ONESIDED = 2 !< STREAMICE-style ramp over [0,W]; reduces grounded traction only
 
+! TVD slope limiters for thickness advection (ICE_SHELF_ADVECT_LIMITER)
+integer, parameter :: LIMITER_VANLEER = 0   !< Van Leer limiter (original scheme)
+integer, parameter :: LIMITER_SUPERBEE = 1  !< Superbee limiter (least diffusive; STREAMICE default)
+integer, parameter :: LIMITER_MINMOD = 2    !< Minmod limiter (most diffusive)
+integer, parameter :: LIMITER_MC = 3        !< Monotonized-central limiter (between Van Leer and superbee)
+
 ! Friction-assembly gate codes stored in CS%basal_gate (real-valued for halo updates)
 real, parameter :: BG_SKIP = 0.0    !< No basal traction in this cell
 real, parameter :: BG_SUBGRID = 1.0 !< Evaluate basal traction per sub-quadrature point
@@ -307,6 +313,12 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! f_ground_node, with no element integration or neighbor coupling. Requires
                             !! GL_QUADRANT_FRICTION (for f_ground_node). Pairs with LOCAL_FV_TAUD_VERTEX
                             !! to reproduce the all-local CISM/Leguy-2021 grounding-line setup.
+  integer :: adv_thickness_limiter = LIMITER_VANLEER !< TVD slope limiter used for thickness
+                            !! advection in ice_shelf_advect_thickness_x/y (LIMITER_VANLEER,
+                            !! LIMITER_SUPERBEE, LIMITER_MINMOD, or LIMITER_MC).
+  logical :: adv_cfl_weight = .false. !< If true, weight the thickness-advection slope reconstruction by the
+                            !! Lax-Wendroff (1-CFL) factor (as in STREAMICE), for a time-accurate
+                            !! 2nd-order flux. If false, use the full spatial slope (original behavior).
 
   real    :: CFL_factor     !< A factor used to limit subcycled advective timestep in uncoupled runs
                             !! i.e. dt <= CFL_factor * min(dx / u) [nondim]
@@ -728,19 +740,33 @@ contains
 
 !> used for flux limiting in advective subroutines Van Leer limiter (source: Wikipedia)
 !! The return value is between 0 and 2 [nondim].
-function slope_limiter(num, denom)
-  real, intent(in)    :: num   !< The numerator of the ratio used in the Van Leer slope limiter
-  real, intent(in)    :: denom !< The denominator of the ratio used in the Van Leer slope limiter
+function slope_limiter(num, denom, limiter)
+  real, intent(in)    :: num   !< The numerator of the ratio used in the slope limiter
+  real, intent(in)    :: denom !< The denominator of the ratio used in the slope limiter
+  integer, optional, intent(in) :: limiter !< The TVD limiter to use (LIMITER_VANLEER (default),
+                                           !! LIMITER_SUPERBEE, LIMITER_MINMOD, or LIMITER_MC)
   real :: slope_limiter ! The slope limiter value, between 0 and 2 [nondim].
   real :: r  ! The ratio of num/denom [nondim]
+  integer :: lim ! The selected limiter
+
+  lim = LIMITER_VANLEER ; if (present(limiter)) lim = limiter
 
   if (denom == 0) then
     slope_limiter = 0
-  elseif (num*denom <= 0) then
+  elseif (num*denom <= 0) then  ! r <= 0: all TVD limiters return 0 at an extremum
     slope_limiter = 0
   else
     r = num/denom
-    slope_limiter = (r+abs(r))/(1+abs(r))
+    select case (lim)
+      case (LIMITER_SUPERBEE)
+        slope_limiter = max(min(2.0*r, 1.0), min(r, 2.0))
+      case (LIMITER_MINMOD)
+        slope_limiter = min(r, 1.0)
+      case (LIMITER_MC)
+        slope_limiter = min(min(2.0*r, 0.5*(1.0+r)), 2.0)
+      case default  ! LIMITER_VANLEER
+        slope_limiter = (r+abs(r))/(1+abs(r))
+    end select
   endif
 
 end function slope_limiter
@@ -977,6 +1003,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   character(len=32) :: filename_appendix = '' ! FMS appendix to filename for ensemble runs
   character(len=16) :: inner_solver_str ! The type of inner solver to use for the SSA
   character(len=16) :: basal_tr_scale_str ! Near-GL basal-traction smoothing mode string
+  character(len=16) :: adv_limiter_str ! Thickness-advection TVD slope-limiter choice string
 
   Isdq = G%isdB ; Iedq = G%iedB ; Jsdq = G%jsdB ; Jedq = G%jedB
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -1106,6 +1133,24 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     if (CS%local_basal_friction .and. .not. CS%gl_quad_friction) call MOM_error(FATAL, &
                  "LOCAL_BASAL_FRICTION needs the nodal grounded fraction f_ground_node; set "//&
                  "GL_QUADRANT_FRICTION=True.")
+    call get_param(param_file, mdl, "ICE_SHELF_ADVECT_LIMITER", adv_limiter_str, &
+                 "The TVD slope limiter used for the finite-volume ice thickness advection in "//&
+                 "ice_shelf_advect_thickness_x/y. VAN_LEER is the original scheme; SUPERBEE is "//&
+                 "the least diffusive (matches the STREAMICE default) but compressive; MINMOD is "//&
+                 "the most diffusive; MC is intermediate.", default="VAN_LEER")
+    select case (trim(adv_limiter_str))
+      case ("VAN_LEER") ; CS%adv_thickness_limiter = LIMITER_VANLEER
+      case ("SUPERBEE") ; CS%adv_thickness_limiter = LIMITER_SUPERBEE
+      case ("MINMOD")   ; CS%adv_thickness_limiter = LIMITER_MINMOD
+      case ("MC")       ; CS%adv_thickness_limiter = LIMITER_MC
+      case default ; call MOM_error(FATAL, "ICE_SHELF_ADVECT_LIMITER = "//trim(adv_limiter_str)//&
+                 " is invalid; use VAN_LEER, SUPERBEE, MINMOD, or MC.")
+    end select
+    call get_param(param_file, mdl, "ICE_SHELF_ADVECT_CFL_WEIGHT", CS%adv_cfl_weight, &
+                 "If true, weight the ice thickness-advection slope reconstruction by the "//&
+                 "Lax-Wendroff (1-CFL) factor, as in STREAMICE and standard flux-form TVD "//&
+                 "schemes, giving a time-accurate 2nd-order flux. If false, the slope uses the "//&
+                 "full spatial reconstruction (the original behavior).", default=.false.)
     call get_param(param_file, mdl, "MIN_ICE_VISC", CS%min_ice_visc, &
                  "min. allowed Glen's law ice viscosity", &
                  units="Pa s", default=0., scale=US%Pa_to_RL2_T2*US%s_to_T)
@@ -4337,6 +4382,7 @@ subroutine ice_shelf_advect_thickness_x(CS, G, LB, time_step, hmask, h0, h_after
   real :: u_face     ! Zonal velocity at a face [L T-1 ~> m s-1]
   real :: h_face     ! Thickness at a face for transport [Z ~> m]
   real :: slope_lim  ! The value of the slope limiter, in the range of 0 to 2 [nondim]
+  real :: cfl_wt     ! The Lax-Wendroff (1-CFL) reconstruction weight, or 1 if disabled [nondim]
 
 !  is = G%isc-2 ; ie = G%iec+2 ; js = G%jsc ; je = G%jec
 !  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -4359,9 +4405,12 @@ subroutine ice_shelf_advect_thickness_x(CS, G, LB, time_step, hmask, h0, h_after
         elseif (hmask(i,j) == 1) then ! There can be eastward flow through this face.
           if ((hmask(i-1,j) == 1 .or. hmask(i-1,j) == 3) .and. &
             (hmask(i+1,j) == 1 .or. hmask(i+1,j) == 3)) then
-            slope_lim = slope_limiter(h0(i,j)-h0(i-1,j), h0(i+1,j)-h0(i,j))
-            ! This is a 2nd-order centered scheme with a slope limiter.  We could try PPM here.
-            h_face = h0(i,j) - slope_lim * (0.5 * (h0(i,j)-h0(i+1,j)))
+            slope_lim = slope_limiter(h0(i,j)-h0(i-1,j), h0(i+1,j)-h0(i,j), CS%adv_thickness_limiter)
+            ! This is a 2nd-order scheme with a TVD slope limiter, optionally Lax-Wendroff (1-CFL)
+            ! weighted for time accuracy.  We could try PPM here.
+            cfl_wt = 1.0
+            if (CS%adv_cfl_weight) cfl_wt = max(0.0, 1.0 - u_face*time_step*G%IdxT(i,j))
+            h_face = h0(i,j) - slope_lim * (0.5 * cfl_wt * (h0(i,j)-h0(i+1,j)))
             if (associated(CS%phi_x_FV)) CS%phi_x_FV(I,j) = slope_lim
           else
             h_face = h0(i,j)
@@ -4373,8 +4422,10 @@ subroutine ice_shelf_advect_thickness_x(CS, G, LB, time_step, hmask, h0, h_after
         elseif (hmask(i+1,j) == 1) then
           if ((hmask(i,j) == 1 .or. hmask(i,j) == 3) .and. &
             (hmask(i+2,j) == 1 .or. hmask(i+2,j) == 3)) then
-            slope_lim = slope_limiter(h0(i+1,j)-h0(i,j), h0(i+2,j)-h0(i+1,j))
-            h_face = h0(i+1,j) - slope_lim * (0.5 * (h0(i+2,j)-h0(i+1,j)))
+            slope_lim = slope_limiter(h0(i+1,j)-h0(i,j), h0(i+2,j)-h0(i+1,j), CS%adv_thickness_limiter)
+            cfl_wt = 1.0
+            if (CS%adv_cfl_weight) cfl_wt = max(0.0, 1.0 + u_face*time_step*G%IdxT(i+1,j))
+            h_face = h0(i+1,j) - slope_lim * (0.5 * cfl_wt * (h0(i+2,j)-h0(i+1,j)))
             if (associated(CS%phi_x_FV)) CS%phi_x_FV(I,j) = slope_lim
           else
             h_face = h0(i+1,j)
@@ -4423,6 +4474,7 @@ subroutine ice_shelf_advect_thickness_y(CS, G, LB, time_step, hmask, h0, h_after
   real :: v_face     ! Pseudo-meridional velocity at a face [L T-1 ~> m s-1]
   real :: h_face     ! Thickness at a face for transport [Z ~> m]
   real :: slope_lim  ! The value of the slope limiter, in the range of 0 to 2 [nondim]
+  real :: cfl_wt     ! The Lax-Wendroff (1-CFL) reconstruction weight, or 1 if disabled [nondim]
 
   ish = LB%ish ; ieh = LB%ieh ; jsh = LB%jsh ; jeh = LB%jeh
 
@@ -4442,9 +4494,12 @@ subroutine ice_shelf_advect_thickness_y(CS, G, LB, time_step, hmask, h0, h_after
         elseif (hmask(i,j) == 1) then ! There can be northward flow through this face.
           if ((hmask(i,j-1) == 1 .or. hmask(i,j-1) == 3) .and. &
             (hmask(i,j+1) == 1 .or. hmask(i,j+1) == 3)) then
-            slope_lim = slope_limiter(h0(i,j)-h0(i,j-1), h0(i,j+1)-h0(i,j))
-            ! This is a 2nd-order centered scheme with a slope limiter.  We could try PPM here.
-            h_face = h0(i,j) - slope_lim * (0.5 * (h0(i,j)-h0(i,j+1)))
+            slope_lim = slope_limiter(h0(i,j)-h0(i,j-1), h0(i,j+1)-h0(i,j), CS%adv_thickness_limiter)
+            ! This is a 2nd-order scheme with a TVD slope limiter, optionally Lax-Wendroff (1-CFL)
+            ! weighted for time accuracy.  We could try PPM here.
+            cfl_wt = 1.0
+            if (CS%adv_cfl_weight) cfl_wt = max(0.0, 1.0 - v_face*time_step*G%IdyT(i,j))
+            h_face = h0(i,j) - slope_lim * (0.5 * cfl_wt * (h0(i,j)-h0(i,j+1)))
             if (associated(CS%phi_y_FV)) CS%phi_y_FV(i,J) = slope_lim
           else
             h_face = h0(i,j)
@@ -4456,8 +4511,10 @@ subroutine ice_shelf_advect_thickness_y(CS, G, LB, time_step, hmask, h0, h_after
         elseif (hmask(i,j+1) == 1) then
           if ((hmask(i,j) == 1 .or. hmask(i,j) == 3) .and. &
             (hmask(i,j+2) == 1 .or. hmask(i,j+2) == 3)) then
-            slope_lim = slope_limiter(h0(i,j+1)-h0(i,j), h0(i,j+2)-h0(i,j+1))
-            h_face = h0(i,j+1) - slope_lim * (0.5 * (h0(i,j+2)-h0(i,j+1)))
+            slope_lim = slope_limiter(h0(i,j+1)-h0(i,j), h0(i,j+2)-h0(i,j+1), CS%adv_thickness_limiter)
+            cfl_wt = 1.0
+            if (CS%adv_cfl_weight) cfl_wt = max(0.0, 1.0 + v_face*time_step*G%IdyT(i,j+1))
+            h_face = h0(i,j+1) - slope_lim * (0.5 * cfl_wt * (h0(i,j+2)-h0(i,j+1)))
             if (associated(CS%phi_y_FV)) CS%phi_y_FV(i,J) = slope_lim
           else
             h_face = h0(i,j+1)
