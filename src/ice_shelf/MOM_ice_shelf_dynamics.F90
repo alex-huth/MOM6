@@ -54,6 +54,16 @@ integer, parameter :: BASAL_TR_NONE = 0     !< No smoothing (hard Weertman step 
 integer, parameter :: BASAL_TR_CENTERED = 1 !< Symmetric cosine ramp over [-W,W]; phi(0)=0.5, GL not displaced
 integer, parameter :: BASAL_TR_ONESIDED = 2 !< STREAMICE-style ramp over [0,W]; reduces grounded traction only
 
+! SEP2 sub-element quadrature constants (GROUNDING_LINE_SUBGRID_SCHEME="SEP2").
+real, parameter :: SEP2_W23 = 2.0/3.0    !< Heavy vertex weight of the interior 3-pt triangle rule [nondim]
+real, parameter :: SEP2_W16 = 1.0/6.0    !< Light vertex weight of the interior 3-pt triangle rule [nondim]
+real, parameter :: SEP2_TRI3 = 0.25/3.0  !< Per-QP reference measure of a whole parent triangle [nondim]
+real, parameter, dimension(2) :: SEP2_GP = (/ 0.21132486540518712, 0.78867513459481288 /)
+                                         !< 2-pt Gauss abscissae on [0,1] [nondim]
+real, parameter, dimension(2) :: SEP2_GC = (/ 0.78867513459481288, 0.21132486540518712 /)
+                                         !< Complementary Gauss factors (1-abscissa), stored as the
+                                         !! same literals swapped so reflection orbits are exact [nondim]
+
 ! TVD slope limiters for thickness advection (ICE_SHELF_ADVECT_LIMITER)
 integer, parameter :: LIMITER_VANLEER = 0   !< Van Leer limiter (original scheme)
 integer, parameter :: LIMITER_SUPERBEE = 1  !< Superbee limiter (least diffusive; STREAMICE default)
@@ -292,6 +302,11 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! fraction (CS%f_ground_node) computed by the quadrant grounding-line
                             !! parameterization of Leguy et al. (2021), replacing the geometric
                             !! sub-cell (Phisub) friction integration in grounding-line cells.
+  logical :: use_sep2       !< If true (GROUNDING_LINE_SUBGRID_SCHEME="SEP2"), grounding-line cells
+                            !! are split geometrically into grounded/floating sub-elements
+                            !! (Seroussi et al. 2014 SEP2, extended to quadrilaterals) for the basal
+                            !! friction, driving stress, and grounded fraction, instead of the
+                            !! uniform Phisub sub-sampling ("SEP3").
   logical :: gl_quad_taud   !< If true, blend the cell-center surface elevation with the analytic
                             !! cell grounded fraction (CS%f_ground_cell) before forming the FV
                             !! (non-DG) driving stress, smoothing the grounding-line surface kink.
@@ -1003,6 +1018,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   character(len=32) :: filename_appendix = '' ! FMS appendix to filename for ensemble runs
   character(len=16) :: inner_solver_str ! The type of inner solver to use for the SSA
   character(len=16) :: basal_tr_scale_str ! Near-GL basal-traction smoothing mode string
+  character(len=16) :: gl_subgrid_scheme_str ! Grounding-line subgrid quadrature scheme string
   character(len=16) :: adv_limiter_str ! Thickness-advection TVD slope-limiter choice string
 
   Isdq = G%isdB ; Iedq = G%iedB ; Jsdq = G%jsdB ; Jedq = G%jedB
@@ -1046,6 +1062,22 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "is divided into NxN equally-sized rectangles, over which the "//&
                  "basal contribution is integrated by iterative quadrature.", &
                  default=0)
+    call get_param(param_file, mdl, "GROUNDING_LINE_SUBGRID_SCHEME", gl_subgrid_scheme_str, &
+                 "Quadrature scheme for the sub-cell grounding-line integration when "//&
+                 "GROUNDING_LINE_INTERPOLATE is true. 'SEP3' samples each cell with a uniform "//&
+                 "NxN sub-grid (GROUNDING_LINE_INTERP_SUBGRID_N) and a per-point flotation "//&
+                 "test. 'SEP2' splits each grounding-line cell geometrically into grounded and "//&
+                 "floating sub-elements and integrates each side exactly on its own quadrature "//&
+                 "(Seroussi et al. 2014, extended to quadrilateral elements); it applies to the "//&
+                 "basal friction, the DG driving stress, and the grounded fraction, and ignores "//&
+                 "GROUNDING_LINE_INTERP_SUBGRID_N.", &
+                 default="SEP3", do_not_log=.not.CS%GL_regularize)
+    select case (trim(gl_subgrid_scheme_str))
+      case ("SEP3") ; CS%use_sep2 = .false.
+      case ("SEP2") ; CS%use_sep2 = .true.
+      case default  ; call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
+                        "GROUNDING_LINE_SUBGRID_SCHEME must be 'SEP3' or 'SEP2'.")
+    end select
     call get_param(param_file, mdl, "GROUNDING_LINE_COUPLE", CS%GL_couple, &
                  "If true, let the floatation condition be determined by "//&
                  "ocean column thickness. This means that update_OD_ffrac "//&
@@ -1055,8 +1087,15 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     if (present(solo_ice_sheet_in)) then
       if (solo_ice_sheet_in) CS%GL_couple = .false.
     endif
-    if (CS%GL_regularize .and. (CS%n_sub_regularize == 0)) call MOM_error (FATAL, &
-      "GROUNDING_LINE_INTERP_SUBGRID_N must be a positive integer if GL regularization is used")
+    if (CS%GL_regularize .and. (CS%n_sub_regularize == 0)) then
+      if (CS%use_sep2) then
+        ! SEP2 does not use the uniform sub-grid; keep Phisub minimally allocated.
+        CS%n_sub_regularize = 1
+      else
+        call MOM_error (FATAL, &
+          "GROUNDING_LINE_INTERP_SUBGRID_N must be a positive integer if GL regularization is used")
+      endif
+    endif
     call get_param(param_file, mdl, "ICE_SHELF_CFL_FACTOR", CS%CFL_factor, &
                  "A factor used to limit timestep as CFL_FACTOR * min (\Delta x / u). "//&
                  "This is only used with an ice-only model.", units="nondim", default=0.25)
@@ -1201,6 +1240,9 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "DG_BASAL_TR_SCALE_WIDTH must be positive when DG_BASAL_TR_SCALE is active.")
       if (CS%CoulombFriction) call MOM_error(WARNING, "MOM_ice_shelf_dynamics: DG_BASAL_TR_SCALE is "//&
                  "ignored under Coulomb friction (the Coulomb law is already continuous at flotation).")
+      if (CS%use_sep2) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG_BASAL_TR_SCALE requires "//&
+                 "GROUNDING_LINE_SUBGRID_SCHEME='SEP3'; the continuous traction ramp contradicts "//&
+                 "the sharp SEP2 sub-element partition.")
     endif
     ! Pre-compute Coulomb prefactor alpha = (q-1)^(q-1)/q^q for q=CF_PostPeak [nondim].
     ! Default is 1.0; only update when Coulomb is active and q /= 1.
@@ -5896,7 +5938,23 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
         ! Subgrid grounding-line: evaluate basal friction at each grounded sub-quadrature point.
         ! Picard and Newton Jacobian are both computed inside CG_action_subgrid_basal.
         Hcell(:,:) = H_node(I-1:I,J-1:J)
-        if (do_DG) then
+        if (CS%use_sep2) then
+          if (do_DG) then
+            call CG_action_sep2_basal(CS, G, US, Hcell, &
+                u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+                u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
+                bathyT(i,j), dens_ratio, i, j, fB_e, use_newton, Usub, Vsub, &
+                G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
+                use_DG=.true., h_nodal_cell=hgate(i,j,:,:), &
+                bed_corners=CS%bed_node(I-1:I,J-1:J))
+          else
+            call CG_action_sep2_basal(CS, G, US, Hcell, &
+                u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+                u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
+                bathyT(i,j), dens_ratio, i, j, fB_e, use_newton, Usub, Vsub, &
+                G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j))
+          endif
+        elseif (do_DG) then
           ! h_nodal_cell is used inside only as a flotation measure (sub-qp gate +
           ! effective pressure), so the gate field is passed (h_flot under
           ! DG_GL_GATE_CONTINUOUS).
@@ -6574,7 +6632,21 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
       ! Returns separate u_diag_sub and v_diag_sub (differ in Newton term: u^2 vs v^2).
       ! The sub-qp flotation test handles grounding fraction; no external ground_frac scaling needed.
       Hcell(:,:) = H_node(I-1:I,J-1:J)
-      if (do_DG) then
+      if (CS%use_sep2) then
+        if (do_DG) then
+          call CG_diagonal_sep2_basal(CS, G, US, Hcell, &
+              u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+              CS%bed_elev(i,j), dens_ratio, i, j, fB_e, u_diag_sub, v_diag_sub, &
+              G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
+              use_DG=.true., h_nodal_cell=hgate(i,j,:,:), &
+              bed_corners=CS%bed_node(I-1:I,J-1:J))
+        else
+          call CG_diagonal_sep2_basal(CS, G, US, Hcell, &
+              u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+              CS%bed_elev(i,j), dens_ratio, i, j, fB_e, u_diag_sub, v_diag_sub, &
+              G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j))
+        endif
+      elseif (do_DG) then
         ! h_nodal_cell is used inside only as a flotation measure (sub-qp gate +
         ! effective pressure), so the gate field is passed (h_flot under
         ! DG_GL_GATE_CONTINUOUS).
@@ -6797,6 +6869,451 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
   enddo ; enddo
 
 end subroutine CG_diagonal_subgrid_basal
+
+!> Build the SEP2 sub-element quadrature of one grounding-line cell (Seroussi et al. 2014
+!! SEP2, extended to quadrilaterals). The cell is fanned into 4 triangles at its center;
+!! the bilinear flotation deficit f is linear on each, so the grounding line is a straight
+!! cut separating the unique minority-sign vertex (triangle piece) from the other two
+!! (quad piece, collapsed exactly when the cut passes through a vertex). QPs carry parent
+!! Q1 corner-basis weights (beta) and reference-space measures (wref); no physical metric
+!! enters here. All formulas are keyed to vertex roles and grouped in symmetry orbits so
+!! outputs are bitwise-covariant under grid rotations and reflections.
+subroutine sep2_cell_qps(f, nqp, beta, wref, qp_grounded)
+  real, dimension(4),     intent(in)  :: f    !< Flotation deficit r*h - bed at the cell corners,
+                                              !! ordered SW, SE, NW, NE [Z ~> m]
+  integer, dimension(4),  intent(out) :: nqp  !< Number of QPs per parent triangle (3 or 7)
+  real, dimension(4,7,4), intent(out) :: beta !< Corner-basis weights per (corner, QP, triangle),
+                                              !! triangles ordered S, E, N, W [nondim]
+  real, dimension(7,4),   intent(out) :: wref !< Reference-space measure per (QP, triangle) [nondim]
+  logical, dimension(7,4), intent(out) :: qp_grounded !< True where the QP lies in a grounded piece
+
+  ! Base-corner ids (A,B) of triangles S,E,N,W in counterclockwise order.
+  integer, dimension(4), parameter :: iA = (/ 1, 2, 4, 3 /) ! First (CCW) base corner per triangle
+  integer, dimension(4), parameter :: iB = (/ 2, 4, 3, 1 /) ! Second (CCW) base corner per triangle
+  real, dimension(4) :: bC, bA, bB ! Corner-basis weights of the role vertices [nondim]
+  real :: fC              ! Deficit at the cell center (bilinear value = corner mean) [Z ~> m]
+  logical :: gC, gA, gB   ! Tie-broken grounded states (f > 0) of the role vertices
+  integer :: k
+
+  ! Diagonal-pair grouping: the two diagonals map to each other under any rotation/reflection.
+  fC = 0.5 * ((0.5 * (f(1) + f(4))) + (0.5 * (f(2) + f(3))))
+  gC = (fC > 0.0)
+  bC(:) = 0.25
+
+  do k=1,4
+    gA = (f(iA(k)) > 0.0) ; gB = (f(iB(k)) > 0.0)
+    if ((gA .eqv. gC) .and. (gB .eqv. gC)) then
+      ! Uncut triangle: interior 3-pt rule on (C, A, B); QPs (2,3) are a reflection orbit.
+      bA(:) = 0.0 ; bA(iA(k)) = 1.0
+      bB(:) = 0.0 ; bB(iB(k)) = 1.0
+      beta(:,1,k) = (SEP2_W23 * bC(:)) + ((SEP2_W16 * bA(:)) + (SEP2_W16 * bB(:)))
+      beta(:,2,k) = (SEP2_W16 * bC(:)) + ((SEP2_W23 * bA(:)) + (SEP2_W16 * bB(:)))
+      beta(:,3,k) = (SEP2_W16 * bC(:)) + ((SEP2_W16 * bA(:)) + (SEP2_W23 * bB(:)))
+      wref(1:3,k) = SEP2_TRI3
+      qp_grounded(1:3,k) = gC
+      nqp(k) = 3
+    elseif (gA .eqv. gB) then
+      ! Center vertex separated; cyclic role binding (C, A, B).
+      bA(:) = 0.0 ; bA(iA(k)) = 1.0
+      bB(:) = 0.0 ; bB(iB(k)) = 1.0
+      call sep2_cut_tri(fC, f(iA(k)), f(iB(k)), bC, bA, bB, gC, beta(:,:,k), wref(:,k), qp_grounded(:,k))
+      nqp(k) = 7
+    elseif (gB .eqv. gC) then
+      ! Corner A separated; cyclic role binding (A, B, C).
+      bA(:) = 0.0 ; bA(iA(k)) = 1.0
+      bB(:) = 0.0 ; bB(iB(k)) = 1.0
+      call sep2_cut_tri(f(iA(k)), f(iB(k)), fC, bA, bB, bC, gA, beta(:,:,k), wref(:,k), qp_grounded(:,k))
+      nqp(k) = 7
+    else
+      ! Corner B separated; cyclic role binding (B, C, A).
+      bA(:) = 0.0 ; bA(iA(k)) = 1.0
+      bB(:) = 0.0 ; bB(iB(k)) = 1.0
+      call sep2_cut_tri(f(iB(k)), fC, f(iA(k)), bB, bC, bA, gB, beta(:,:,k), wref(:,k), qp_grounded(:,k))
+      nqp(k) = 7
+    endif
+  enddo
+
+end subroutine sep2_cell_qps
+
+!> Quadrature of one cut parent triangle: minority vertex X separated from (Y, Z) by the
+!! straight zero contour of the linear deficit. QPs 1-3 sample the X-side triangle piece
+!! (interior 3-pt rule, X-heavy first; 2 and 3 are a reflection orbit); QPs 4-7 sample the
+!! (Y,Z)-side quad piece (2x2 tensor rule on the bilinear sub-map; pairs (4,5) and (6,7)
+!! are reflection orbits). A cut through a vertex collapses the quad exactly (zero-area
+!! side), so degenerate configurations need no special case.
+subroutine sep2_cut_tri(fX, fY, fZ, bX, bY, bZ, gX, betaT, wrefT, gT)
+  real,               intent(in)  :: fX     !< Deficit at the minority vertex [Z ~> m]
+  real,               intent(in)  :: fY     !< Deficit at the first (CCW) majority vertex [Z ~> m]
+  real,               intent(in)  :: fZ     !< Deficit at the second majority vertex [Z ~> m]
+  real, dimension(4), intent(in)  :: bX     !< Corner-basis weights of vertex X [nondim]
+  real, dimension(4), intent(in)  :: bY     !< Corner-basis weights of vertex Y [nondim]
+  real, dimension(4), intent(in)  :: bZ     !< Corner-basis weights of vertex Z [nondim]
+  logical,            intent(in)  :: gX     !< Grounded state of the minority vertex
+  real, dimension(4,7), intent(out) :: betaT !< Corner-basis weights per (corner, QP) [nondim]
+  real, dimension(7),   intent(out) :: wrefT !< Reference-space measure per QP [nondim]
+  logical, dimension(7), intent(out) :: gT   !< Grounded state per QP
+
+  real :: cY1, cX1  ! Crossing weights on edge X-Y: v1 = cX1*X + cY1*Y [nondim]
+  real :: cZ2, cX2  ! Crossing weights on edge Z-X: v4 = cX2*X + cZ2*Z [nondim]
+  real, dimension(4) :: b1, b4 ! Corner-basis weights of the crossings [nondim]
+  real :: t1, t2, t3, t4 ! Tensor-product factors at a quad QP [nondim]
+  real :: wtri      ! Per-QP measure of the triangle piece [nondim]
+  integer :: k, ir, is
+
+  ! Exact edge crossings; both complements have their own role-anchored formula so a
+  ! (Y,Z) swap permutes them bitwise (denominators are exact negations of each other).
+  cY1 = fX / (fX - fY) ; cX1 = fY / (fY - fX)
+  cZ2 = fX / (fX - fZ) ; cX2 = fZ / (fZ - fX)
+  b1(:) = (cX1 * bX(:)) + (cY1 * bY(:))
+  b4(:) = (cX2 * bX(:)) + (cZ2 * bZ(:))
+
+  ! Triangle piece (X, v1, v4); ref area = cY1*cZ2 * (1/4), the parent-triangle area.
+  wtri = (cY1 * cZ2) * SEP2_TRI3
+  betaT(:,1) = (SEP2_W23 * bX(:)) + ((SEP2_W16 * b1(:)) + (SEP2_W16 * b4(:)))
+  betaT(:,2) = (SEP2_W16 * bX(:)) + ((SEP2_W23 * b1(:)) + (SEP2_W16 * b4(:)))
+  betaT(:,3) = (SEP2_W16 * bX(:)) + ((SEP2_W16 * b1(:)) + (SEP2_W23 * b4(:)))
+  wrefT(1:3) = wtri
+  gT(1:3) = gX
+
+  ! Quad piece (v1, Y, Z, v4) on the bilinear sub-map Q(r,s): r along v1->Y and v4->Z,
+  ! s along v1->v4. Sub-map Jacobian (linear in r and s, derived analytically so a (Y,Z)
+  ! swap maps it to J(r,1-s) bitwise; 0.5 = cross(Y-X, Z-X), twice the parent-tri area):
+  !   J_sub = 0.5 * [ (1-s)*cX1*((1-r)*cZ2 + r) + s*cX2*((1-r)*cY1 + r) ]
+  ! QP weight = (1/4 Gauss) * J_sub; 0.125 = 0.25 * 0.5.
+  k = 3
+  do ir=1,2 ; do is=1,2
+    k = k + 1
+    t1 = SEP2_GC(ir) * SEP2_GC(is) ; t2 = SEP2_GP(ir) * SEP2_GC(is)
+    t3 = SEP2_GP(ir) * SEP2_GP(is) ; t4 = SEP2_GC(ir) * SEP2_GP(is)
+    betaT(:,k) = ((t1 * b1(:)) + (t4 * b4(:))) + ((t2 * bY(:)) + (t3 * bZ(:)))
+    wrefT(k) = 0.125 * ( ((SEP2_GC(is) * cX1) * ((SEP2_GC(ir) * cZ2) + SEP2_GP(ir))) + &
+                         ((SEP2_GP(is) * cX2) * ((SEP2_GC(ir) * cY1) + SEP2_GP(ir))) )
+    gT(k) = .not. gX
+  enddo ; enddo
+
+end subroutine sep2_cut_tri
+
+!> SEP2 subgrid basal traction for a CG action: Picard and Newton friction integrated over
+!! the grounded sub-elements of the sep2_cell_qps partition. QPs inherit their piece's
+!! flotation state; floating QPs contribute nothing.
+subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, &
+                                bathyT, dens_ratio, i_elem, j_elem, fB_e, use_newton, &
+                                Ucontr, Vcontr, dxCv_S, dxCv_N, dyCu_W, dyCu_E, IareaT, &
+                                use_DG, h_nodal_cell, bed_corners)
+  type(ice_shelf_dyn_CS), intent(in) :: CS      !< Ice shelf control structure
+  type(ocean_grid_type),  intent(in) :: G       !< The grid structure
+  type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
+  real, dimension(2,2),   intent(in) :: H       !< Ice thickness at element corners [Z ~> m]
+  real, dimension(2,2),   intent(in) :: U_curr  !< Frozen u^k at element corners [L T-1 ~> m s-1]
+  real, dimension(2,2),   intent(in) :: V_curr  !< Frozen v^k at element corners [L T-1 ~> m s-1]
+  real, dimension(2,2),   intent(in) :: U_delta !< Search direction du at element corners [L T-1 ~> m s-1]
+  real, dimension(2,2),   intent(in) :: V_delta !< Search direction dv at element corners [L T-1 ~> m s-1]
+  real,                   intent(in) :: bathyT  !< Ocean bathymetry depth at tracer point [Z ~> m]
+  real,                   intent(in) :: dens_ratio !< Ice density / water density [nondim]
+  integer,                intent(in) :: i_elem  !< Tracer-grid i-index of the element
+  integer,                intent(in) :: j_elem  !< Tracer-grid j-index of the element
+  real,                   intent(in) :: fB_e    !< Element Coulomb parameter fB; 0 for Weertman [(T L-1)^CF_PostPeak]
+  logical,                intent(in) :: use_newton !< If true, include Newton basal drag correction
+  real, dimension(2,2),   intent(out) :: Ucontr !< Nodal u-contributions with friction applied [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(2,2),   intent(out) :: Vcontr !< Nodal v-contributions with friction applied [R L3 Z T-2 ~> kg m s-2]
+  real,                   intent(in) :: dxCv_S  !< The cell width at the southern (v-point) edge [L ~> m]
+  real,                   intent(in) :: dxCv_N  !< The cell width at the northern (v-point) edge [L ~> m]
+  real,                   intent(in) :: dyCu_W  !< The cell height at the western (u-point) edge [L ~> m]
+  real,                   intent(in) :: dyCu_E  !< The cell height at the eastern (u-point) edge [L ~> m]
+  real,                   intent(in) :: IareaT  !< The inverse of the cell area at the tracer point [L-2 ~> m-2]
+  logical,       optional, intent(in) :: use_DG !< If true, use DG nodal thickness and bed corners
+  real, dimension(2,2), optional, intent(in) :: h_nodal_cell !< Q1 thickness at the 4 cell corners [Z ~> m]
+  real, dimension(2,2), optional, intent(in) :: bed_corners  !< Bed elevation at element corners [Z ~> m]
+
+  real, dimension(4)     :: hc, bedc  ! Corner thickness and bed, flattened SW,SE,NW,NE [Z ~> m]
+  real, dimension(4)     :: uc, vc    ! Corner frozen velocities [L T-1 ~> m s-1]
+  real, dimension(4)     :: duc, dvc  ! Corner search directions [L T-1 ~> m s-1]
+  real, dimension(4)     :: fls       ! Corner flotation deficit r*h - bed [Z ~> m]
+  integer, dimension(4)  :: nqp       ! QPs per parent triangle
+  real, dimension(4,7,4) :: beta      ! Corner-basis weights per (corner, QP, triangle) [nondim]
+  real, dimension(7,4)   :: wref      ! Reference measure per (QP, triangle) [nondim]
+  logical, dimension(7,4) :: qpg      ! Grounded state per (QP, triangle)
+  real, dimension(4,7)   :: valu, valv ! Per-QP nodal contributions [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(4,4)   :: pu, pv    ! Per-(corner, triangle) partial sums [R L3 Z T-2 ~> kg m s-2]
+  real :: b1, b2, b3, b4    ! Corner-basis weights at the QP [nondim]
+  real :: mS, mN, mW, mE    ! Marginal sums: interpolation weights of the 4 cell edges [nondim]
+  real :: a, d              ! Interpolated cell-edge spacings at the QP [L ~> m]
+  real :: jac               ! Quadrature weight wref * (a*d) * IareaT [nondim]
+  real :: hloc              ! Ice thickness at the QP [Z ~> m]
+  real :: bed_sub           ! Bed elevation at the QP [Z ~> m]
+  real :: u_curr_loc, v_curr_loc   ! Frozen velocity at the QP [L T-1 ~> m s-1]
+  real :: u_delta_loc, v_delta_loc ! Search direction at the QP [L T-1 ~> m s-1]
+  real :: unorm2_loc        ! Regularized |u^k|^2 at the QP [L2 T-2 ~> m2 s-2]
+  real :: basal_coef_loc    ! Picard friction coefficient at the QP [R L2 Z T-1 ~> kg s-1]
+  real :: drag_newt_loc     ! Newton drag coefficient at the QP [R Z T ~> kg m-2 s]
+  real :: inner_dot_loc     ! u^k . du inner product at the QP [L2 T-2 ~> m2 s-2]
+  real :: contrib           ! Per-corner quadrature contribution [nondim]
+  real :: coef_prefactor    ! Pre-computed area * C_basal_friction * L_T_to_m_s [R L2 Z T-1 ~> kg s-1]
+  real :: min_trac_area     ! Minimum area-integrated traction floor [R L2 Z T-1 ~> kg s-1]
+  real :: eps_vel2          ! Velocity regularization squared [L2 T-2 ~> m2 s-2]
+  real :: fB_local          ! Coulomb fB at the QP (DG mode) [(T L-1)^CF_PostPeak]
+  real :: rho_oi_ratio      ! density_ocean / density_ice [nondim]
+  real :: rho_ice_g_LtoZ    ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
+  logical :: do_DG          ! Local flag for DG mode
+  integer :: t, k, c
+
+  coef_prefactor = CS%coef_prefactor(i_elem,j_elem)
+  min_trac_area  = CS%min_basal_traction * G%areaT(i_elem,j_elem)
+  eps_vel2 = CS%eps_glen_min**2 * ((G%dxT(i_elem,j_elem)**2) + (G%dyT(i_elem,j_elem)**2))
+
+  do_DG = .false.
+  if (present(use_DG)) do_DG = use_DG
+  if (do_DG) then
+    rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
+    rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
+    hc(1) = h_nodal_cell(1,1) ; hc(2) = h_nodal_cell(2,1)
+    hc(3) = h_nodal_cell(1,2) ; hc(4) = h_nodal_cell(2,2)
+    bedc(1) = bed_corners(1,1) ; bedc(2) = bed_corners(2,1)
+    bedc(3) = bed_corners(1,2) ; bedc(4) = bed_corners(2,2)
+  else
+    hc(1) = H(1,1) ; hc(2) = H(2,1) ; hc(3) = H(1,2) ; hc(4) = H(2,2)
+    bedc(:) = bathyT
+  endif
+  uc(1)  = U_curr(1,1)  ; uc(2)  = U_curr(2,1)  ; uc(3)  = U_curr(1,2)  ; uc(4)  = U_curr(2,2)
+  vc(1)  = V_curr(1,1)  ; vc(2)  = V_curr(2,1)  ; vc(3)  = V_curr(1,2)  ; vc(4)  = V_curr(2,2)
+  duc(1) = U_delta(1,1) ; duc(2) = U_delta(2,1) ; duc(3) = U_delta(1,2) ; duc(4) = U_delta(2,2)
+  dvc(1) = V_delta(1,1) ; dvc(2) = V_delta(2,1) ; dvc(3) = V_delta(1,2) ; dvc(4) = V_delta(2,2)
+
+  ! Unclamped bilinear deficit defines the partition; magnitudes keep the min_h clamp below.
+  fls(:) = (dens_ratio * hc(:)) - bedc(:)
+  call sep2_cell_qps(fls, nqp, beta, wref, qpg)
+
+  do t=1,4
+    valu(:,1:nqp(t)) = 0.0 ; valv(:,1:nqp(t)) = 0.0
+    do k=1,nqp(t)
+      if (.not. qpg(k,t)) cycle ! floating piece: no basal traction
+      b1 = beta(1,k,t) ; b2 = beta(2,k,t) ; b3 = beta(3,k,t) ; b4 = beta(4,k,t)
+      mS = b1 + b2 ; mN = b3 + b4 ; mW = b1 + b3 ; mE = b2 + b4
+      a = (dxCv_S * mS) + (dxCv_N * mN)
+      d = (dyCu_W * mW) + (dyCu_E * mE)
+      jac = (wref(k,t) * (a * d)) * IareaT
+
+      hloc = ((b1 * hc(1)) + (b4 * hc(4))) + ((b2 * hc(2)) + (b3 * hc(3)))
+      if (do_DG) then
+        hloc = max(hloc, CS%min_h_shelf)
+        bed_sub = ((b1 * bedc(1)) + (b4 * bedc(4))) + ((b2 * bedc(2)) + (b3 * bedc(3)))
+      else
+        bed_sub = bathyT
+      endif
+      u_curr_loc  = ((b1 * uc(1))  + (b4 * uc(4)))  + ((b2 * uc(2))  + (b3 * uc(3)))
+      v_curr_loc  = ((b1 * vc(1))  + (b4 * vc(4)))  + ((b2 * vc(2))  + (b3 * vc(3)))
+      u_delta_loc = ((b1 * duc(1)) + (b4 * duc(4))) + ((b2 * duc(2)) + (b3 * duc(3)))
+      v_delta_loc = ((b1 * dvc(1)) + (b4 * dvc(4))) + ((b2 * dvc(2)) + (b3 * dvc(3)))
+
+      unorm2_loc = ((u_curr_loc**2) + (v_curr_loc**2)) + eps_vel2
+
+      if (do_DG .and. CS%CoulombFriction) then
+        fB_local = compute_fB_local(hloc, bed_sub, rho_oi_ratio, rho_ice_g_LtoZ, &
+            CS%C_basal_friction(i_elem,j_elem), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
+            CS%CF_PostPeak, CS%n_basal_fric)
+      else
+        fB_local = fB_e
+      endif
+
+      call compute_basal_coef(unorm2_loc, coef_prefactor, min_trac_area, fB_local, &
+          CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, use_newton, &
+          basal_coef_loc, drag_newt_loc)
+      inner_dot_loc = (u_curr_loc * u_delta_loc) + (v_curr_loc * v_delta_loc)
+
+      do c=1,4
+        contrib = jac * beta(c,k,t)
+        valu(c,k) = contrib * (basal_coef_loc * u_delta_loc)
+        valv(c,k) = contrib * (basal_coef_loc * v_delta_loc)
+        if (use_newton) then
+          valu(c,k) = valu(c,k) + (contrib * (drag_newt_loc * u_curr_loc * inner_dot_loc))
+          valv(c,k) = valv(c,k) + (contrib * (drag_newt_loc * v_curr_loc * inner_dot_loc))
+        endif
+      enddo
+    enddo
+
+    ! Orbit-grouped QP sums: (2,3), (4,5) and (6,7) are reflection pairs.
+    if (nqp(t) == 3) then
+      do c=1,4
+        pu(c,t) = valu(c,1) + (valu(c,2) + valu(c,3))
+        pv(c,t) = valv(c,1) + (valv(c,2) + valv(c,3))
+      enddo
+    else
+      do c=1,4
+        pu(c,t) = (valu(c,1) + (valu(c,2) + valu(c,3))) + &
+                  ((valu(c,4) + valu(c,5)) + (valu(c,6) + valu(c,7)))
+        pv(c,t) = (valv(c,1) + (valv(c,2) + valv(c,3))) + &
+                  ((valv(c,4) + valv(c,5)) + (valv(c,6) + valv(c,7)))
+      enddo
+    endif
+  enddo
+
+  ! Role-grouped cross-triangle reduction: each corner takes each of the roles
+  ! (A, B, farA, farB) exactly once over the 4 triangles (S=1, E=2, N=3, W=4).
+  Ucontr(1,1) = (pu(1,1) + pu(1,4)) + (pu(1,2) + pu(1,3)) ! SW: (S+W)+(E+N)
+  Ucontr(2,1) = (pu(2,2) + pu(2,1)) + (pu(2,3) + pu(2,4)) ! SE: (E+S)+(N+W)
+  Ucontr(1,2) = (pu(3,4) + pu(3,3)) + (pu(3,1) + pu(3,2)) ! NW: (W+N)+(S+E)
+  Ucontr(2,2) = (pu(4,3) + pu(4,2)) + (pu(4,4) + pu(4,1)) ! NE: (N+E)+(W+S)
+  Vcontr(1,1) = (pv(1,1) + pv(1,4)) + (pv(1,2) + pv(1,3))
+  Vcontr(2,1) = (pv(2,2) + pv(2,1)) + (pv(2,3) + pv(2,4))
+  Vcontr(1,2) = (pv(3,4) + pv(3,3)) + (pv(3,1) + pv(3,2))
+  Vcontr(2,2) = (pv(4,3) + pv(4,2)) + (pv(4,4) + pv(4,1))
+
+end subroutine CG_action_sep2_basal
+
+!> SEP2 subgrid basal traction for the preconditioner diagonal: same partition and
+!! quadrature as CG_action_sep2_basal, with squared basis weights and per-block
+!! Newton terms (u^2 for the u-block, v^2 for the v-block).
+subroutine CG_diagonal_sep2_basal(CS, G, US, H, U_curr, V_curr, &
+                                  bathyT, dens_ratio, i_elem, j_elem, fB_e, u_diag, v_diag, &
+                                  dxCv_S, dxCv_N, dyCu_W, dyCu_E, IareaT, &
+                                  use_DG, h_nodal_cell, bed_corners)
+  type(ice_shelf_dyn_CS), intent(in) :: CS      !< Ice shelf control structure
+  type(ocean_grid_type),  intent(in) :: G       !< The grid structure
+  type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
+  real, dimension(2,2),   intent(in) :: H       !< Ice thickness at element corners [Z ~> m]
+  real, dimension(2,2),   intent(in) :: U_curr  !< Frozen u^k at element corners [L T-1 ~> m s-1]
+  real, dimension(2,2),   intent(in) :: V_curr  !< Frozen v^k at element corners [L T-1 ~> m s-1]
+  real,                   intent(in) :: bathyT  !< Ocean bathymetry depth at tracer point [Z ~> m]
+  real,                   intent(in) :: dens_ratio !< Ice density / water density [nondim]
+  integer,                intent(in) :: i_elem  !< Tracer-grid i-index of the element
+  integer,                intent(in) :: j_elem  !< Tracer-grid j-index of the element
+  real,                   intent(in) :: fB_e    !< Element Coulomb parameter fB; 0 for Weertman [(T L-1)^CF_PostPeak]
+  real, dimension(2,2),   intent(out) :: u_diag !< Nodal u-diagonal entries [R L2 Z T-1 ~> kg s-1]
+  real, dimension(2,2),   intent(out) :: v_diag !< Nodal v-diagonal entries [R L2 Z T-1 ~> kg s-1]
+  real,                   intent(in) :: dxCv_S  !< The cell width at the southern (v-point) edge [L ~> m]
+  real,                   intent(in) :: dxCv_N  !< The cell width at the northern (v-point) edge [L ~> m]
+  real,                   intent(in) :: dyCu_W  !< The cell height at the western (u-point) edge [L ~> m]
+  real,                   intent(in) :: dyCu_E  !< The cell height at the eastern (u-point) edge [L ~> m]
+  real,                   intent(in) :: IareaT  !< The inverse of the cell area at the tracer point [L-2 ~> m-2]
+  logical,       optional, intent(in) :: use_DG !< If true, use DG nodal thickness and bed corners
+  real, dimension(2,2), optional, intent(in) :: h_nodal_cell !< Q1 thickness at the 4 cell corners [Z ~> m]
+  real, dimension(2,2), optional, intent(in) :: bed_corners  !< Bed elevation at element corners [Z ~> m]
+
+  real, dimension(4)     :: hc, bedc  ! Corner thickness and bed, flattened SW,SE,NW,NE [Z ~> m]
+  real, dimension(4)     :: uc, vc    ! Corner frozen velocities [L T-1 ~> m s-1]
+  real, dimension(4)     :: fls       ! Corner flotation deficit r*h - bed [Z ~> m]
+  integer, dimension(4)  :: nqp       ! QPs per parent triangle
+  real, dimension(4,7,4) :: beta      ! Corner-basis weights per (corner, QP, triangle) [nondim]
+  real, dimension(7,4)   :: wref      ! Reference measure per (QP, triangle) [nondim]
+  logical, dimension(7,4) :: qpg      ! Grounded state per (QP, triangle)
+  real, dimension(4,7)   :: valu, valv ! Per-QP nodal diagonal contributions [R L2 Z T-1 ~> kg s-1]
+  real, dimension(4,4)   :: pu, pv    ! Per-(corner, triangle) partial sums [R L2 Z T-1 ~> kg s-1]
+  real :: b1, b2, b3, b4    ! Corner-basis weights at the QP [nondim]
+  real :: mS, mN, mW, mE    ! Marginal sums: interpolation weights of the 4 cell edges [nondim]
+  real :: a, d              ! Interpolated cell-edge spacings at the QP [L ~> m]
+  real :: jac               ! Quadrature weight wref * (a*d) * IareaT [nondim]
+  real :: hloc              ! Ice thickness at the QP [Z ~> m]
+  real :: bed_sub           ! Bed elevation at the QP [Z ~> m]
+  real :: u_curr_loc, v_curr_loc ! Frozen velocity at the QP [L T-1 ~> m s-1]
+  real :: unorm2_loc        ! Regularized |u^k|^2 at the QP [L2 T-2 ~> m2 s-2]
+  real :: basal_coef_loc    ! Picard friction coefficient at the QP [R L2 Z T-1 ~> kg s-1]
+  real :: drag_newt_loc     ! Newton drag coefficient at the QP [R Z T ~> kg m-2 s]
+  real :: contrib           ! Per-corner quadrature contribution [nondim]
+  real :: coef_prefactor    ! Pre-computed area * C_basal_friction * L_T_to_m_s [R L2 Z T-1 ~> kg s-1]
+  real :: min_trac_area     ! Minimum area-integrated traction floor [R L2 Z T-1 ~> kg s-1]
+  real :: eps_vel2          ! Velocity regularization squared [L2 T-2 ~> m2 s-2]
+  real :: fB_local          ! Coulomb fB at the QP (DG mode) [(T L-1)^CF_PostPeak]
+  real :: rho_oi_ratio      ! density_ocean / density_ice [nondim]
+  real :: rho_ice_g_LtoZ    ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
+  logical :: do_DG          ! Local flag for DG mode
+  integer :: t, k, c
+
+  coef_prefactor = CS%coef_prefactor(i_elem,j_elem)
+  min_trac_area  = CS%min_basal_traction * G%areaT(i_elem,j_elem)
+  eps_vel2 = CS%eps_glen_min**2 * ((G%dxT(i_elem,j_elem)**2) + (G%dyT(i_elem,j_elem)**2))
+
+  do_DG = .false.
+  if (present(use_DG)) do_DG = use_DG
+  if (do_DG) then
+    rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
+    rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
+    hc(1) = h_nodal_cell(1,1) ; hc(2) = h_nodal_cell(2,1)
+    hc(3) = h_nodal_cell(1,2) ; hc(4) = h_nodal_cell(2,2)
+    bedc(1) = bed_corners(1,1) ; bedc(2) = bed_corners(2,1)
+    bedc(3) = bed_corners(1,2) ; bedc(4) = bed_corners(2,2)
+  else
+    hc(1) = H(1,1) ; hc(2) = H(2,1) ; hc(3) = H(1,2) ; hc(4) = H(2,2)
+    bedc(:) = bathyT
+  endif
+  uc(1) = U_curr(1,1) ; uc(2) = U_curr(2,1) ; uc(3) = U_curr(1,2) ; uc(4) = U_curr(2,2)
+  vc(1) = V_curr(1,1) ; vc(2) = V_curr(2,1) ; vc(3) = V_curr(1,2) ; vc(4) = V_curr(2,2)
+
+  fls(:) = (dens_ratio * hc(:)) - bedc(:)
+  call sep2_cell_qps(fls, nqp, beta, wref, qpg)
+
+  do t=1,4
+    valu(:,1:nqp(t)) = 0.0 ; valv(:,1:nqp(t)) = 0.0
+    do k=1,nqp(t)
+      if (.not. qpg(k,t)) cycle ! floating piece: no basal traction
+      b1 = beta(1,k,t) ; b2 = beta(2,k,t) ; b3 = beta(3,k,t) ; b4 = beta(4,k,t)
+      mS = b1 + b2 ; mN = b3 + b4 ; mW = b1 + b3 ; mE = b2 + b4
+      a = (dxCv_S * mS) + (dxCv_N * mN)
+      d = (dyCu_W * mW) + (dyCu_E * mE)
+      jac = (wref(k,t) * (a * d)) * IareaT
+
+      hloc = ((b1 * hc(1)) + (b4 * hc(4))) + ((b2 * hc(2)) + (b3 * hc(3)))
+      if (do_DG) then
+        hloc = max(hloc, CS%min_h_shelf)
+        bed_sub = ((b1 * bedc(1)) + (b4 * bedc(4))) + ((b2 * bedc(2)) + (b3 * bedc(3)))
+      else
+        bed_sub = bathyT
+      endif
+      u_curr_loc = ((b1 * uc(1)) + (b4 * uc(4))) + ((b2 * uc(2)) + (b3 * uc(3)))
+      v_curr_loc = ((b1 * vc(1)) + (b4 * vc(4))) + ((b2 * vc(2)) + (b3 * vc(3)))
+
+      unorm2_loc = ((u_curr_loc**2) + (v_curr_loc**2)) + eps_vel2
+
+      if (do_DG .and. CS%CoulombFriction) then
+        fB_local = compute_fB_local(hloc, bed_sub, rho_oi_ratio, rho_ice_g_LtoZ, &
+            CS%C_basal_friction(i_elem,j_elem), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
+            CS%CF_PostPeak, CS%n_basal_fric)
+      else
+        fB_local = fB_e
+      endif
+
+      call compute_basal_coef(unorm2_loc, coef_prefactor, min_trac_area, fB_local, &
+          CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .true., &
+          basal_coef_loc, drag_newt_loc)
+
+      do c=1,4
+        contrib = jac * (beta(c,k,t)**2)
+        if (CS%doing_newton) then
+          valu(c,k) = contrib * (basal_coef_loc + (drag_newt_loc * u_curr_loc**2))
+          valv(c,k) = contrib * (basal_coef_loc + (drag_newt_loc * v_curr_loc**2))
+        else
+          valu(c,k) = contrib * basal_coef_loc
+          valv(c,k) = contrib * basal_coef_loc
+        endif
+      enddo
+    enddo
+
+    ! Orbit-grouped QP sums: (2,3), (4,5) and (6,7) are reflection pairs.
+    if (nqp(t) == 3) then
+      do c=1,4
+        pu(c,t) = valu(c,1) + (valu(c,2) + valu(c,3))
+        pv(c,t) = valv(c,1) + (valv(c,2) + valv(c,3))
+      enddo
+    else
+      do c=1,4
+        pu(c,t) = (valu(c,1) + (valu(c,2) + valu(c,3))) + &
+                  ((valu(c,4) + valu(c,5)) + (valu(c,6) + valu(c,7)))
+        pv(c,t) = (valv(c,1) + (valv(c,2) + valv(c,3))) + &
+                  ((valv(c,4) + valv(c,5)) + (valv(c,6) + valv(c,7)))
+      enddo
+    endif
+  enddo
+
+  ! Role-grouped cross-triangle reduction (see CG_action_sep2_basal).
+  u_diag(1,1) = (pu(1,1) + pu(1,4)) + (pu(1,2) + pu(1,3)) ! SW: (S+W)+(E+N)
+  u_diag(2,1) = (pu(2,2) + pu(2,1)) + (pu(2,3) + pu(2,4)) ! SE: (E+S)+(N+W)
+  u_diag(1,2) = (pu(3,4) + pu(3,3)) + (pu(3,1) + pu(3,2)) ! NW: (W+N)+(S+E)
+  u_diag(2,2) = (pu(4,3) + pu(4,2)) + (pu(4,4) + pu(4,1)) ! NE: (N+E)+(W+S)
+  v_diag(1,1) = (pv(1,1) + pv(1,4)) + (pv(1,2) + pv(1,3))
+  v_diag(2,1) = (pv(2,2) + pv(2,1)) + (pv(2,3) + pv(2,4))
+  v_diag(1,2) = (pv(3,4) + pv(3,3)) + (pv(3,1) + pv(3,2))
+  v_diag(2,2) = (pv(4,3) + pv(4,2)) + (pv(4,4) + pv(4,1))
+
+end subroutine CG_diagonal_sep2_basal
 
 !> Post_data calls related to ice-sheet flux divergence, strain-rate, and deviatoric stress
 subroutine IS_dynamics_post_data_2(CS, ISS, G)
@@ -7500,6 +8017,18 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
   real :: g_ip                ! Flotation deficit r*h_ip - bed_ip at a sub-IP [Z ~> m]
   real :: thr_lo, thr_full    ! g thresholds for the smoothing band edges X=x_lo and X=W [Z ~> m]
   real :: phi_sum             ! Sum of the traction scale phi over a cell sub-IPs [nondim]
+  real, dimension(4)     :: fls_gf   ! Corner flotation deficit, flattened SW,SE,NW,NE [Z ~> m]
+  integer, dimension(4)  :: nqp_gf   ! SEP2 QPs per parent triangle
+  real, dimension(4,7,4) :: beta_gf  ! SEP2 corner-basis weights per (corner, QP, triangle) [nondim]
+  real, dimension(7,4)   :: wref_gf  ! SEP2 reference measure per (QP, triangle) [nondim]
+  logical, dimension(7,4) :: qpg_gf  ! SEP2 grounded state per (QP, triangle)
+  real, dimension(7) :: vg_gf, vt_gf ! Per-QP grounded and total Jacobian weights [L2 ~> m2]
+  real, dimension(4) :: pg_gf, pt_gf ! Per-triangle grounded and total weight sums [L2 ~> m2]
+  real :: b1_gf, b2_gf, b3_gf, b4_gf ! Corner-basis weights at a SEP2 QP [nondim]
+  real :: mS_gf, mN_gf, mW_gf, mE_gf ! Marginal edge-interpolation weights [nondim]
+  real :: a_gf, d_gf                 ! Interpolated cell-edge spacings at the QP [L ~> m]
+  real :: w_ground, w_total          ! Grounded and total Jacobian weights of the cell [L2 ~> m2]
+  integer :: tq, kq
 
   if (.not. CS%GL_regularize) return
 
@@ -7591,6 +8120,54 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
         CS%ground_frac(i,j) = 0.0 ; CS%basal_gate(i,j) = BG_SKIP
         cycle
       endif
+    endif
+
+    if (CS%use_sep2) then
+      ! SEP2: exact Jacobian-weighted grounded area fraction of the sub-element
+      ! partition, so the diagnostic and gate agree with the friction geometry.
+      ! (DG_BASAL_TR_SCALE is FATAL with SEP2, so gate_scan is never active here.)
+      if (CS%use_DG_thickness) then
+        fls_gf(1) = (rhoi_rhow * hgate(i,j,1,1)) - bed_corners(1,1)
+        fls_gf(2) = (rhoi_rhow * hgate(i,j,2,1)) - bed_corners(2,1)
+        fls_gf(3) = (rhoi_rhow * hgate(i,j,1,2)) - bed_corners(1,2)
+        fls_gf(4) = (rhoi_rhow * hgate(i,j,2,2)) - bed_corners(2,2)
+      else
+        fls_gf(1) = (rhoi_rhow * H_corners(1,1)) - bed_corners(1,1)
+        fls_gf(2) = (rhoi_rhow * H_corners(2,1)) - bed_corners(2,1)
+        fls_gf(3) = (rhoi_rhow * H_corners(1,2)) - bed_corners(1,2)
+        fls_gf(4) = (rhoi_rhow * H_corners(2,2)) - bed_corners(2,2)
+      endif
+      call sep2_cell_qps(fls_gf, nqp_gf, beta_gf, wref_gf, qpg_gf)
+      do tq=1,4
+        do kq=1,nqp_gf(tq)
+          b1_gf = beta_gf(1,kq,tq) ; b2_gf = beta_gf(2,kq,tq)
+          b3_gf = beta_gf(3,kq,tq) ; b4_gf = beta_gf(4,kq,tq)
+          mS_gf = b1_gf + b2_gf ; mN_gf = b3_gf + b4_gf
+          mW_gf = b1_gf + b3_gf ; mE_gf = b2_gf + b4_gf
+          a_gf = (G%dxCv(i,j-1) * mS_gf) + (G%dxCv(i,j) * mN_gf)
+          d_gf = (G%dyCu(i-1,j) * mW_gf) + (G%dyCu(i,j) * mE_gf)
+          vt_gf(kq) = wref_gf(kq,tq) * (a_gf * d_gf)
+          vg_gf(kq) = merge(vt_gf(kq), 0.0, qpg_gf(kq,tq))
+        enddo
+        ! Orbit-grouped QP sums: (2,3), (4,5) and (6,7) are reflection pairs.
+        if (nqp_gf(tq) == 3) then
+          pg_gf(tq) = vg_gf(1) + (vg_gf(2) + vg_gf(3))
+          pt_gf(tq) = vt_gf(1) + (vt_gf(2) + vt_gf(3))
+        else
+          pg_gf(tq) = (vg_gf(1) + (vg_gf(2) + vg_gf(3))) + &
+                      ((vg_gf(4) + vg_gf(5)) + (vg_gf(6) + vg_gf(7)))
+          pt_gf(tq) = (vt_gf(1) + (vt_gf(2) + vt_gf(3))) + &
+                      ((vt_gf(4) + vt_gf(5)) + (vt_gf(6) + vt_gf(7)))
+        endif
+      enddo
+      ! Opposite-pair grouping is invariant under any rotation/reflection (S=1,E=2,N=3,W=4).
+      w_ground = (pg_gf(1) + pg_gf(3)) + (pg_gf(2) + pg_gf(4))
+      w_total  = (pt_gf(1) + pt_gf(3)) + (pt_gf(2) + pt_gf(4))
+      CS%ground_frac(i,j) = w_ground / w_total
+      if (CS%ground_frac(i,j) <= 0.0) then ; CS%basal_gate(i,j) = BG_SKIP
+      elseif (CS%ground_frac(i,j) >= 1.0) then ; CS%basal_gate(i,j) = BG_FULL
+      else ; CS%basal_gate(i,j) = BG_SUBGRID ; endif
+      cycle
     endif
 
     n_grounded = 0 ; n_active = 0 ; n_full = 0 ; phi_sum = 0.0
@@ -9943,11 +10520,17 @@ subroutine calc_shelf_driving_stress_DG_strong(CS, ISS, G, US, taudx, taudy, OD)
                          (CS%ground_frac(i,j) > 0.0) .and. (CS%ground_frac(i,j) < 1.0)
     endif
     if (use_subgrid_cell) then
-      call calc_shelf_driving_stress_DG_strong_subgrid(CS, CS%Phisub, &
-          CS%h_nodal(i,j,:,:), hgate(i,j,:,:), bed_corners, &
-          dxCv_S, dxCv_N, dyCu_W, dyCu_E, &
-          rho, rhow, rhoi_rhow, grav, vol_dx, vol_dy, &
-          CS%sx_shelf(i,j), CS%sy_shelf(i,j), calc_slope_diag)
+      if (CS%use_sep2) then
+        call calc_shelf_driving_stress_DG_strong_sep2(CS, CS%h_nodal(i,j,:,:), bed_corners, &
+            dxCv_S, dxCv_N, dyCu_W, dyCu_E, rho, rhoi_rhow, grav, vol_dx, vol_dy, &
+            CS%sx_shelf(i,j), CS%sy_shelf(i,j), calc_slope_diag)
+      else
+        call calc_shelf_driving_stress_DG_strong_subgrid(CS, CS%Phisub, &
+            CS%h_nodal(i,j,:,:), hgate(i,j,:,:), bed_corners, &
+            dxCv_S, dxCv_N, dyCu_W, dyCu_E, &
+            rho, rhow, rhoi_rhow, grav, vol_dx, vol_dy, &
+            CS%sx_shelf(i,j), CS%sy_shelf(i,j), calc_slope_diag)
+      endif
     else
       qp_dx(:,:,:,:) = 0.0 ; qp_dy(:,:,:,:) = 0.0
       do jq=1,2 ; do iq=1,2
@@ -10304,6 +10887,145 @@ subroutine calc_shelf_driving_stress_DG_strong_subgrid(CS, Phisub, &
   endif
 
 end subroutine calc_shelf_driving_stress_DG_strong_subgrid
+
+!> SEP2 driving-stress volume integral for a grounding-line cell in the DG strong path.
+!! Integrates -rho*g*h*grad(s) on the sep2_cell_qps partition: every QP lies strictly on
+!! one side of the sub-element grounding line and takes that side's grad(s) branch, so no
+!! QP straddles the surface-slope kink. Surface-slope diagnostics use the same QPs.
+subroutine calc_shelf_driving_stress_DG_strong_sep2(CS, h_nodal_cell, bed_corners, &
+    dxCv_S, dxCv_N, dyCu_W, dyCu_E, rho, rhoi_rhow, grav, vol_dx, vol_dy, &
+    sx_shelf, sy_shelf, calc_slope_diag)
+  type(ice_shelf_dyn_CS), intent(in) :: CS    !< Ice shelf control structure
+  real, dimension(2,2), intent(in) :: h_nodal_cell !< Q1 nodal thickness at the 4 corners [Z ~> m]
+  real, dimension(2,2), intent(in) :: bed_corners  !< Bed depth at the 4 cell corners [Z ~> m]
+  real, intent(in) :: dxCv_S         !< Cell x-length on south face [L ~> m]
+  real, intent(in) :: dxCv_N         !< Cell x-length on north face [L ~> m]
+  real, intent(in) :: dyCu_W         !< Cell y-length on west face [L ~> m]
+  real, intent(in) :: dyCu_E         !< Cell y-length on east face [L ~> m]
+  real, intent(in) :: rho            !< Ice density [R ~> kg m-3]
+  real, intent(in) :: rhoi_rhow      !< rho/rhow [nondim]
+  real, intent(in) :: grav           !< Gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
+  real, dimension(2,2), intent(out) :: vol_dx !< Per-corner x volume integral [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(2,2), intent(out) :: vol_dy !< Per-corner y volume integral [R L3 Z T-2 ~> kg m s-2]
+  real, intent(inout) :: sx_shelf    !< Cell-average x surface slope [Z L-1 ~> nondim]
+  real, intent(inout) :: sy_shelf    !< Cell-average y surface slope [Z L-1 ~> nondim]
+  logical, intent(in) :: calc_slope_diag !< True if slope diagnostics will be calculated
+
+  real, dimension(4)     :: hc, bedc  ! Corner thickness and bed, flattened SW,SE,NW,NE [Z ~> m]
+  real, dimension(4)     :: fls       ! Corner flotation deficit r*h - bed [Z ~> m]
+  integer, dimension(4)  :: nqp       ! QPs per parent triangle
+  real, dimension(4,7,4) :: beta      ! Corner-basis weights per (corner, QP, triangle) [nondim]
+  real, dimension(7,4)   :: wref      ! Reference measure per (QP, triangle) [nondim]
+  logical, dimension(7,4) :: qpg      ! Grounded state per (QP, triangle)
+  real, dimension(4,7)   :: valx, valy ! Per-QP nodal contributions [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(4,4)   :: px, py    ! Per-(corner, triangle) partial sums [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(7) :: vsx, vsy      ! Per-QP Jacobian-weighted slopes [Z L ~> m2 m-1]
+  real, dimension(7) :: vw            ! Per-QP Jacobian weights [L2 ~> m2]
+  real, dimension(4) :: psx, psy      ! Per-triangle weighted-slope sums [Z L ~> m2 m-1]
+  real, dimension(4) :: pw            ! Per-triangle weight sums [L2 ~> m2]
+  real :: b1, b2, b3, b4    ! Corner-basis weights at the QP [nondim]
+  real :: mS, mN, mW, mE    ! Marginal sums: interpolation weights of the 4 cell edges [nondim]
+  real :: a, d              ! Interpolated cell-edge spacings at the QP [L ~> m]
+  real :: weight            ! Quadrature weight wref * (a*d) [L2 ~> m2]
+  real :: hloc              ! Ice thickness at the QP [Z ~> m]
+  real :: dhdx_gp, dhdy_gp  ! Thickness gradients at the QP [Z L-1 ~> nondim]
+  real :: dbdx_gp, dbdy_gp  ! Bed gradients at the QP [Z L-1 ~> nondim]
+  real :: dsdx_gp, dsdy_gp  ! Surface gradients at the QP [Z L-1 ~> nondim]
+  real :: fx_gp, fy_gp      ! Driving-stress integrand at the QP [R L Z T-2 ~> kg m-1 s-2]
+  real :: w_total           ! Total Jacobian weight over the cell [L2 ~> m2]
+  integer :: t, k, c
+
+  hc(1) = h_nodal_cell(1,1) ; hc(2) = h_nodal_cell(2,1)
+  hc(3) = h_nodal_cell(1,2) ; hc(4) = h_nodal_cell(2,2)
+  bedc(1) = bed_corners(1,1) ; bedc(2) = bed_corners(2,1)
+  bedc(3) = bed_corners(1,2) ; bedc(4) = bed_corners(2,2)
+
+  fls(:) = (rhoi_rhow * hc(:)) - bedc(:)
+  call sep2_cell_qps(fls, nqp, beta, wref, qpg)
+
+  do t=1,4
+    do k=1,nqp(t)
+      b1 = beta(1,k,t) ; b2 = beta(2,k,t) ; b3 = beta(3,k,t) ; b4 = beta(4,k,t)
+      mS = b1 + b2 ; mN = b3 + b4 ; mW = b1 + b3 ; mE = b2 + b4
+      a = (dxCv_S * mS) + (dxCv_N * mN)
+      d = (dyCu_W * mW) + (dyCu_E * mE)
+      weight = wref(k,t) * (a * d)
+
+      hloc = ((b1 * hc(1)) + (b4 * hc(4))) + ((b2 * hc(2)) + (b3 * hc(3)))
+      hloc = max(hloc, CS%min_h_shelf)
+      dhdx_gp = ( (((-mS) * hc(1)) + (mN * hc(4))) + ((mS * hc(2)) + ((-mN) * hc(3))) ) / a
+      dhdy_gp = ( (((-mW) * hc(1)) + (mE * hc(4))) + (((-mE) * hc(2)) + (mW * hc(3))) ) / d
+      dbdx_gp = ( (((-mS) * bedc(1)) + (mN * bedc(4))) + ((mS * bedc(2)) + ((-mN) * bedc(3))) ) / a
+      dbdy_gp = ( (((-mW) * bedc(1)) + (mE * bedc(4))) + (((-mE) * bedc(2)) + (mW * bedc(3))) ) / d
+
+      ! The QP inherits its piece's flotation state; friction and taud branch identically.
+      if (qpg(k,t)) then
+        dsdx_gp = dhdx_gp - dbdx_gp
+        dsdy_gp = dhdy_gp - dbdy_gp
+      else
+        dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp
+        dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
+      endif
+
+      fx_gp = -rho * grav * hloc * dsdx_gp
+      fy_gp = -rho * grav * hloc * dsdy_gp
+
+      do c=1,4
+        valx(c,k) = (weight * beta(c,k,t)) * fx_gp
+        valy(c,k) = (weight * beta(c,k,t)) * fy_gp
+      enddo
+      if (calc_slope_diag) then
+        vw(k) = weight
+        vsx(k) = dsdx_gp * weight
+        vsy(k) = dsdy_gp * weight
+      endif
+    enddo
+
+    ! Orbit-grouped QP sums: (2,3), (4,5) and (6,7) are reflection pairs.
+    if (nqp(t) == 3) then
+      do c=1,4
+        px(c,t) = valx(c,1) + (valx(c,2) + valx(c,3))
+        py(c,t) = valy(c,1) + (valy(c,2) + valy(c,3))
+      enddo
+      if (calc_slope_diag) then
+        psx(t) = vsx(1) + (vsx(2) + vsx(3))
+        psy(t) = vsy(1) + (vsy(2) + vsy(3))
+        pw(t)  = vw(1) + (vw(2) + vw(3))
+      endif
+    else
+      do c=1,4
+        px(c,t) = (valx(c,1) + (valx(c,2) + valx(c,3))) + &
+                  ((valx(c,4) + valx(c,5)) + (valx(c,6) + valx(c,7)))
+        py(c,t) = (valy(c,1) + (valy(c,2) + valy(c,3))) + &
+                  ((valy(c,4) + valy(c,5)) + (valy(c,6) + valy(c,7)))
+      enddo
+      if (calc_slope_diag) then
+        psx(t) = (vsx(1) + (vsx(2) + vsx(3))) + ((vsx(4) + vsx(5)) + (vsx(6) + vsx(7)))
+        psy(t) = (vsy(1) + (vsy(2) + vsy(3))) + ((vsy(4) + vsy(5)) + (vsy(6) + vsy(7)))
+        pw(t)  = (vw(1) + (vw(2) + vw(3))) + ((vw(4) + vw(5)) + (vw(6) + vw(7)))
+      endif
+    endif
+  enddo
+
+  ! Role-grouped cross-triangle reduction (see CG_action_sep2_basal).
+  vol_dx(1,1) = (px(1,1) + px(1,4)) + (px(1,2) + px(1,3)) ! SW: (S+W)+(E+N)
+  vol_dx(2,1) = (px(2,2) + px(2,1)) + (px(2,3) + px(2,4)) ! SE: (E+S)+(N+W)
+  vol_dx(1,2) = (px(3,4) + px(3,3)) + (px(3,1) + px(3,2)) ! NW: (W+N)+(S+E)
+  vol_dx(2,2) = (px(4,3) + px(4,2)) + (px(4,4) + px(4,1)) ! NE: (N+E)+(W+S)
+  vol_dy(1,1) = (py(1,1) + py(1,4)) + (py(1,2) + py(1,3))
+  vol_dy(2,1) = (py(2,2) + py(2,1)) + (py(2,3) + py(2,4))
+  vol_dy(1,2) = (py(3,4) + py(3,3)) + (py(3,1) + py(3,2))
+  vol_dy(2,2) = (py(4,3) + py(4,2)) + (py(4,4) + py(4,1))
+
+  if (calc_slope_diag) then
+    ! Opposite-pair grouping is invariant under the triangle permutations of any
+    ! rotation or reflection (S=1, E=2, N=3, W=4).
+    w_total  = (pw(1) + pw(3)) + (pw(2) + pw(4))
+    sx_shelf = ((psx(1) + psx(3)) + (psx(2) + psx(4))) / w_total
+    sy_shelf = ((psy(1) + psy(3)) + (psy(2) + psy(4))) / w_total
+  endif
+
+end subroutine calc_shelf_driving_stress_DG_strong_sep2
 
 !> Subgrid GL-band volume integral of the driving stress for the DG path.
 !! Evaluates the unified integration-by-parts weak form over nsub x nsub sub-cells.
