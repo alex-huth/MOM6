@@ -328,6 +328,29 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! f_ground_node, with no element integration or neighbor coupling. Requires
                             !! GL_QUADRANT_FRICTION (for f_ground_node). Pairs with LOCAL_FV_TAUD_VERTEX
                             !! to reproduce the all-local CISM/Leguy-2021 grounding-line setup.
+  logical :: fv_subgrid_gl_friction !< If true, the FV (non-DG) basal friction and the Coulomb
+                            !! effective pressure are integrated over the sub-element grounding-line
+                            !! partition selected by GROUNDING_LINE_SUBGRID_SCHEME, using the corner
+                            !! thickness and flotation fields CS%H_corner and CS%fls_corner instead of
+                            !! corner H with a cell-constant bed. Requires GROUNDING_LINE_INTERPOLATE.
+  logical :: fv_subgrid_gl_taud !< If true, the FV (non-DG) driving stress is integrated over the same
+                            !! sub-element partition used by FV_SUBGRID_GL_FRICTION, with the surface
+                            !! elevation reconstructed as S = (1-r)*H + max(fls,0) so that its slope
+                            !! kink lies exactly on the partition's grounding line. Requires
+                            !! GROUNDING_LINE_INTERPOLATE.
+  real, pointer, dimension(:,:) :: H_corner => NULL() !< Ice thickness interpolated to B-grid corners
+                            !! with dual-cell Lagrange weights over the included cells only
+                            !! (FV_SUBGRID_GL_* paths) [Z ~> m].
+  real, pointer, dimension(:,:) :: fls_corner => NULL() !< Flotation deficit r*h - bed interpolated to
+                            !! B-grid corners with the same weights and cell set as CS%H_corner, so
+                            !! that fls = r*H - bed holds pointwise at every corner [Z ~> m].
+  logical, pointer, dimension(:,:) :: corner_valid => NULL() !< True where CS%H_corner and
+                            !! CS%fls_corner have at least one contributing cell.
+  real, pointer, dimension(:,:,:) :: corner_wt => NULL() !< Dual-cell Q1 (Lagrange) interpolation
+                            !! weights of the 4 cells surrounding each B-grid node, ordered
+                            !! SW, SE, NW, NE; each cell is weighted by the opposite cell's spacing,
+                            !! so a linear field is reproduced exactly at the node. Equal to 1/4 on a
+                            !! uniform Cartesian grid [nondim].
   integer :: adv_thickness_limiter = LIMITER_VANLEER !< TVD slope limiter used for thickness
                             !! advection in ice_shelf_advect_thickness_x/y (LIMITER_VANLEER,
                             !! LIMITER_SUPERBEE, LIMITER_MINMOD, or LIMITER_MC).
@@ -889,6 +912,10 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%ground_frac(isd:ied,jsd:jed), source=0.0)
     allocate(CS%f_ground_node(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%f_ground_cell(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%H_corner(IsdB:IedB,JsdB:JedB), source=0.0)
+    allocate(CS%fls_corner(IsdB:IedB,JsdB:JedB), source=0.0)
+    allocate(CS%corner_valid(IsdB:IedB,JsdB:JedB), source=.false.)
+    allocate(CS%corner_wt(4,IsdB:IedB,JsdB:JedB), source=0.25)
     allocate(CS%basal_gate(isd:ied,jsd:jed), source=BG_SKIP)
     allocate(CS%basal_tr_dfrac(isd:ied,jsd:jed), source=0.0)
     allocate(CS%taudx_shelf(IsdB:IedB,JsdB:JedB), source=0.0)
@@ -1172,6 +1199,55 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     if (CS%local_basal_friction .and. .not. CS%gl_quad_friction) call MOM_error(FATAL, &
                  "LOCAL_BASAL_FRICTION needs the nodal grounded fraction f_ground_node; set "//&
                  "GL_QUADRANT_FRICTION=True.")
+
+    ! Sub-element grounding line for the FV (non-DG) path: one flotation field (CS%fls_corner) on one
+    ! partition drives the grounding-line location, the basal friction, the Coulomb effective pressure,
+    ! and the driving stress. Both parameters require GROUNDING_LINE_INTERPOLATE, which is what
+    ! allocates Phisub and enables compute_ground_frac and the sub-element quadrature dispatch; without
+    ! it there is no sub-cell partition for either term to integrate over.
+    call get_param(param_file, mdl, "FV_SUBGRID_GL_FRICTION", CS%fv_subgrid_gl_friction, &
+                 "If true, integrate the finite-volume (non-DG) basal friction and the Coulomb "//&
+                 "effective pressure over the sub-element grounding-line partition selected by "//&
+                 "GROUNDING_LINE_SUBGRID_SCHEME, using the corner thickness and flotation deficit "//&
+                 "obtained by interpolating the cell-centered fields with dual-cell Lagrange weights "//&
+                 "over ice-covered cells (plus ice-free land lying below the ice). This replaces the "//&
+                 "corner-thickness-with-cell-constant-bed flotation field, so the grounding line seen "//&
+                 "by the friction is the same one seen by FV_SUBGRID_GL_TAUD. The effective pressure "//&
+                 "is evaluated at each grounded quadrature point as rho_ocean*g*min(fls, r*H). "//&
+                 "Requires GROUNDING_LINE_INTERPOLATE=True.", &
+                 default=.false.)
+    call get_param(param_file, mdl, "FV_SUBGRID_GL_TAUD", CS%fv_subgrid_gl_taud, &
+                 "If true, integrate the finite-volume (non-DG) driving stress over the same "//&
+                 "sub-element grounding-line partition used by FV_SUBGRID_GL_FRICTION. The surface "//&
+                 "elevation is reconstructed as S = (1-r)*H + max(fls,0) from the same two corner "//&
+                 "fields, so the slope kink lies exactly on the partition's grounding line and every "//&
+                 "quadrature point takes one side of it; the cell-mean thickness multiplies the "//&
+                 "resulting slope. Requires GROUNDING_LINE_INTERPOLATE=True.", &
+                 default=.false.)
+    if ((CS%fv_subgrid_gl_friction .or. CS%fv_subgrid_gl_taud) .and. .not. CS%GL_regularize) &
+      call MOM_error(FATAL, "MOM_ice_shelf_dynamics: FV_SUBGRID_GL_FRICTION and FV_SUBGRID_GL_TAUD "//&
+                 "integrate over the sub-cell grounding-line partition and require "//&
+                 "GROUNDING_LINE_INTERPOLATE=True.")
+    if ((CS%fv_subgrid_gl_friction .or. CS%fv_subgrid_gl_taud) .and. CS%local_basal_friction) &
+      call MOM_error(FATAL, "MOM_ice_shelf_dynamics: FV_SUBGRID_GL_FRICTION and FV_SUBGRID_GL_TAUD "//&
+                 "assemble over the primal element with Q1 weighting, while LOCAL_BASAL_FRICTION is a "//&
+                 "nodal diagonal on the dual cell; mixing them mismatches the control volumes at the "//&
+                 "grounding line.")
+    if (CS%fv_subgrid_gl_friction .and. CS%gl_quad_friction) call MOM_error(FATAL, &
+                 "MOM_ice_shelf_dynamics: FV_SUBGRID_GL_FRICTION and GL_QUADRANT_FRICTION are two "//&
+                 "different sources of the grounded fraction and cannot both be used.")
+    if (CS%fv_subgrid_gl_taud .and. CS%gl_quad_taud) call MOM_error(FATAL, &
+                 "MOM_ice_shelf_dynamics: FV_SUBGRID_GL_TAUD and GL_QUADRANT_TAUD both regularize "//&
+                 "the grounding-line driving stress and cannot be used together.")
+    if (CS%fv_subgrid_gl_taud .and. .not. CS%use_sep2) call MOM_error(FATAL, &
+                 "MOM_ice_shelf_dynamics: FV_SUBGRID_GL_TAUD integrates the surface-slope kink on "//&
+                 "the geometric sub-element partition and currently requires "//&
+                 "GROUNDING_LINE_SUBGRID_SCHEME='SEP2'. FV_SUBGRID_GL_FRICTION supports both "//&
+                 "schemes.")
+    if (CS%fv_subgrid_gl_taud .and. CS%FV_GL_one_sided) call MOM_error(FATAL, &
+                 "MOM_ice_shelf_dynamics: FV_SUBGRID_GL_TAUD replaces the cell-centroid surface slope "//&
+                 "with a sub-element reconstruction, which has no one-sided analog; it cannot be used "//&
+                 "with FV_GL_ONE_SIDED_TAUD.")
     call get_param(param_file, mdl, "ICE_SHELF_ADVECT_LIMITER", adv_limiter_str, &
                  "The TVD slope limiter used for the finite-volume ice thickness advection in "//&
                  "ice_shelf_advect_thickness_x/y. VAN_LEER is the original scheme; SUPERBEE is "//&
@@ -1471,6 +1547,10 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       allocate(CS%Phisub(2,2,CS%n_sub_regularize,CS%n_sub_regularize,2,2), source=0.0)
       call bilinear_shape_functions_subgrid(CS%Phisub, CS%n_sub_regularize)
     endif
+
+    ! Dual-cell Lagrange weights for the FV sub-element corner fields; grid-only, so once at init.
+    if (CS%fv_subgrid_gl_friction .or. CS%fv_subgrid_gl_taud) &
+      call build_corner_lagrange_weights(CS, G)
 
     if ((trim(CS%ice_viscosity_compute) == "MODEL") .and. CS%visc_qps==1) then
       !for calculating viscosity and 1 cell-centered quadrature point per cell
@@ -3182,6 +3262,11 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   ! Refresh the continuous flotation-gate field before any grounded/floating
   ! decisions are made for this outer solve (h is frozen for its duration).
   if (CS%use_DG_thickness .and. CS%dg_gl_gate_continuous) call compute_h_flot(CS, ISS, G)
+  ! Corner thickness and flotation deficit for the FV sub-element paths. Built before
+  ! compute_ground_frac so the grounded fraction is measured on the same flotation field the
+  ! friction and driving stress integrate over.
+  if (CS%fv_subgrid_gl_friction .or. CS%fv_subgrid_gl_taud) &
+    call build_corner_flotation_fields(CS, ISS, G)
   call compute_ground_frac(CS, ISS, G, H_node)
 
   ! Analytic quadrant grounding-line fractions for friction and/or the driving-stress surface
@@ -5028,6 +5113,13 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
   i_off = G%idg_offset ; j_off = G%jdg_offset
 
 
+  ! Sub-element driving stress on the same grounding-line partition the friction integrates over;
+  ! hand off and return so every caller routes through it.
+  if (CS%fv_subgrid_gl_taud) then
+    call calc_shelf_driving_stress_fv_subgrid(CS, ISS, G, US, taudx, taudy)
+    return
+  endif
+
   ! Compact nodal surface-gradient driving stress (Lipscomb et al. 2019 eq. 14) is a drop-in
   ! alternative for the FV path; hand off and return so every caller routes through it.
   if (CS%fv_taud_vertex_grad) then
@@ -5700,6 +5792,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   real :: rho_oi_ratio   ! density_ocean / density_ice [nondim]
   real :: rho_ice_g_LtoZ ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
   logical :: do_DG       ! Local flag for DG basal friction mode
+  logical :: fv_sub_fric ! Local flag for FV_SUBGRID_GL_FRICTION (corner H and fls fields)
   logical :: grounded_qp ! Whether this quadrature point is grounded (for DG per-qp check)
   logical :: tr_scale_on ! Whether near-GL basal-traction smoothing is active (Weertman only)
   real, dimension(:,:,:,:), pointer :: hgate ! Thickness field for the flotation
@@ -5728,6 +5821,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   do_newton_visc = use_newton .and. trim(CS%ice_viscosity_compute) == "MODEL"
 
   do_DG = CS%use_DG_thickness .and. present(h_shelf)
+  fv_sub_fric = CS%fv_subgrid_gl_friction .and. (.not. CS%use_DG_thickness)
   tr_scale_on = (CS%basal_tr_scale_mode /= BASAL_TR_NONE) .and. (.not. CS%CoulombFriction)
   if (do_DG) then
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
@@ -5939,7 +6033,15 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
         ! Picard and Newton Jacobian are both computed inside CG_action_subgrid_basal.
         Hcell(:,:) = H_node(I-1:I,J-1:J)
         if (CS%use_sep2) then
-          if (do_DG) then
+          if (fv_sub_fric) then
+            call CG_action_sep2_basal(CS, G, US, Hcell, &
+                u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+                u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
+                bathyT(i,j), dens_ratio, i, j, fB_e, use_newton, Usub, Vsub, &
+                G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
+                h_nodal_cell=CS%H_corner(I-1:I,J-1:J), &
+                fls_cell=CS%fls_corner(I-1:I,J-1:J))
+          elseif (do_DG) then
             call CG_action_sep2_basal(CS, G, US, Hcell, &
                 u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
                 u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
@@ -5954,6 +6056,14 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
                 bathyT(i,j), dens_ratio, i, j, fB_e, use_newton, Usub, Vsub, &
                 G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j))
           endif
+        elseif (fv_sub_fric) then
+          call CG_action_subgrid_basal(CS, G, US, Phisub, Hcell, &
+              u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+              u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
+              bathyT(i,j), dens_ratio, i, j, fB_e, use_newton, Usub, Vsub, &
+              G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
+              h_nodal_cell=CS%H_corner(I-1:I,J-1:J), &
+              fls_cell=CS%fls_corner(I-1:I,J-1:J))
         elseif (do_DG) then
           ! h_nodal_cell is used inside only as a flotation measure (sub-qp gate +
           ! effective pressure), so the gate field is passed (h_flot under
@@ -6014,7 +6124,7 @@ end subroutine CG_action
 subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta, V_delta, &
                                    bathyT, dens_ratio, i_elem, j_elem, fB_e, use_newton, Ucontr, Vcontr, &
                                    dxCv_S, dxCv_N, dyCu_W, dyCu_E, IareaT, &
-                                   use_DG, h_shelf_cell, h_nodal_cell, bed_corners)
+                                   use_DG, h_shelf_cell, h_nodal_cell, bed_corners, fls_cell)
   type(ice_shelf_dyn_CS), intent(in) :: CS      !< Ice shelf control structure
   type(ocean_grid_type),  intent(in) :: G       !< The grid structure
   type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
@@ -6044,6 +6154,11 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
                                           !! pressure); the caller passes h_flot here under
                                           !! DG_GL_GATE_CONTINUOUS [Z ~> m]
   real, dimension(2,2), optional, intent(in) :: bed_corners !< Bed elevation at element corners [Z ~> m]
+  real, dimension(2,2), optional, intent(in) :: fls_cell !< Flotation deficit r*h - bed at the 4 cell
+                                              !! corners (FV_SUBGRID_GL_FRICTION). When present the
+                                              !! sub-point flotation test and the effective pressure
+                                              !! are taken from this field and h_nodal_cell supplies
+                                              !! the matching corner thickness [Z ~> m]
 
   real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: Ucontr_sub, Vcontr_sub
   real, dimension(2,2,2,2) :: U_qp_nd, V_qp_nd  ! Per-qp nodal contributions (qx,qy,m,n)
@@ -6077,6 +6192,9 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
   real :: x_af           ! Height above flotation h - h_flot at sub-qp [Z ~> m]
   real :: phi_qp         ! Continuous basal-traction scale in [0,1] at sub-qp [nondim]
   logical :: active_qp   ! Whether this sub-qp contributes basal traction
+  logical :: do_fvsub    ! Local flag for the FV sub-element mode (fls_cell supplied)
+  real :: fls_loc        ! Flotation deficit r*h - bed at sub-qp [Z ~> m]
+  real :: rho_ocean_g_LtoZ ! US%L_to_Z * density_ocean_avg * g_Earth [R L Z-1 T-2]
   integer :: nsub, i, j, qx, qy, m, n
 
   nsub    = size(Phisub, 3)
@@ -6093,7 +6211,10 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
 
   do_DG = .false.
   if (present(use_DG)) do_DG = use_DG
-  if (do_DG) then
+  do_fvsub = present(fls_cell)
+  if (do_fvsub) then
+    rho_ocean_g_LtoZ = US%L_to_Z * CS%density_ocean_avg * CS%g_Earth
+  elseif (do_DG) then
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
     rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
   endif
@@ -6103,7 +6224,16 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
   do j=1,nsub ; do i=1,nsub
     U_qp_nd(:,:,:,:) = 0.0 ; V_qp_nd(:,:,:,:) = 0.0
     do qy=1,2 ; do qx=1,2
-      if (do_DG) then
+      if (do_fvsub) then
+        ! FV sub-element mode: thickness and flotation deficit share one interpolant (the same
+        ! bilinear Phisub weights that the SEP3 sub-point flotation test uses), so the grounding
+        ! line, the effective pressure and the surface kink all key off one field.
+        hloc = ((Phisub(qx,qy,i,j,1,1)*h_nodal_cell(1,1)) + (Phisub(qx,qy,i,j,2,2)*h_nodal_cell(2,2))) + &
+               ((Phisub(qx,qy,i,j,1,2)*h_nodal_cell(1,2)) + (Phisub(qx,qy,i,j,2,1)*h_nodal_cell(2,1)))
+        fls_loc = ((Phisub(qx,qy,i,j,1,1)*fls_cell(1,1)) + (Phisub(qx,qy,i,j,2,2)*fls_cell(2,2))) + &
+                  ((Phisub(qx,qy,i,j,1,2)*fls_cell(1,2)) + (Phisub(qx,qy,i,j,2,1)*fls_cell(2,1)))
+        bed_sub = bathyT  ! unused; the bed is implicit in fls
+      elseif (do_DG) then
         ! xi_sub = a_right(qx,i) - 0.5; marginal sum of Phisub over the l index gives a_right(qx,i).
         xi_sub  = (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)) - 0.5
         eta_sub = (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2)) - 0.5
@@ -6124,8 +6254,12 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
       ! 0 one-sided) so the cosine ramp phi multiplies the traction; without it this is the plain
       ! flotation test with phi = 1.
       if (tr_scale_on) then
-        x_af = hloc - bed_sub / dens_ratio
+        ! X = h - h_flot = (r*h - bed)/r, so the FV sub-element form is just fls/r.
+        if (do_fvsub) then ; x_af = fls_loc / dens_ratio
+        else ; x_af = hloc - bed_sub / dens_ratio ; endif
         active_qp = (x_af > x_lo)
+      elseif (do_fvsub) then
+        active_qp = (fls_loc > 0)
       else
         active_qp = (dens_ratio * hloc - bed_sub > 0)
       endif
@@ -6143,8 +6277,13 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
 
         unorm2_loc = ((u_curr_loc**2) + (v_curr_loc**2)) + eps_vel2
 
-        ! Compute Coulomb fB at this sub-qp when in DG mode
-        if (do_DG .and. CS%CoulombFriction) then
+        ! Compute Coulomb fB at this sub-qp when the effective pressure varies within the cell
+        if (do_fvsub .and. CS%CoulombFriction) then
+          fB_local = compute_fB_from_N( &
+              subgrid_effective_pressure(fls_loc, hloc, dens_ratio, rho_ocean_g_LtoZ), &
+              CS%C_basal_friction(i_elem,j_elem), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
+              CS%CF_PostPeak, CS%n_basal_fric)
+        elseif (do_DG .and. CS%CoulombFriction) then
           fB_local = compute_fB_local(hloc, bed_sub, rho_oi_ratio, rho_ice_g_LtoZ, &
               CS%C_basal_friction(i_elem,j_elem), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
               CS%CF_PostPeak, CS%n_basal_fric)
@@ -6416,6 +6555,7 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
   real :: rho_oi_ratio   ! density_ocean / density_ice [nondim]
   real :: rho_ice_g_LtoZ ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
   logical :: do_DG       ! Local flag for DG basal friction mode
+  logical :: fv_sub_fric ! Local flag for FV_SUBGRID_GL_FRICTION (corner H and fls fields)
   logical :: grounded_qp ! Whether this quadrature point is grounded
   logical :: tr_scale_on ! Whether near-GL basal-traction smoothing is active (Weertman only)
   real, dimension(:,:,:,:), pointer :: hgate ! Thickness field for the flotation
@@ -6444,6 +6584,7 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
   do_newton_visc = CS%doing_newton .and. trim(CS%ice_viscosity_compute) == "MODEL"
 
   do_DG = CS%use_DG_thickness .and. present(h_shelf)
+  fv_sub_fric = CS%fv_subgrid_gl_friction .and. (.not. CS%use_DG_thickness)
   tr_scale_on = (CS%basal_tr_scale_mode /= BASAL_TR_NONE) .and. (.not. CS%CoulombFriction)
   if (do_DG) then
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
@@ -6633,7 +6774,14 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
       ! The sub-qp flotation test handles grounding fraction; no external ground_frac scaling needed.
       Hcell(:,:) = H_node(I-1:I,J-1:J)
       if (CS%use_sep2) then
-        if (do_DG) then
+        if (fv_sub_fric) then
+          call CG_diagonal_sep2_basal(CS, G, US, Hcell, &
+              u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+              CS%bed_elev(i,j), dens_ratio, i, j, fB_e, u_diag_sub, v_diag_sub, &
+              G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
+              h_nodal_cell=CS%H_corner(I-1:I,J-1:J), &
+              fls_cell=CS%fls_corner(I-1:I,J-1:J))
+        elseif (do_DG) then
           call CG_diagonal_sep2_basal(CS, G, US, Hcell, &
               u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
               CS%bed_elev(i,j), dens_ratio, i, j, fB_e, u_diag_sub, v_diag_sub, &
@@ -6646,6 +6794,13 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
               CS%bed_elev(i,j), dens_ratio, i, j, fB_e, u_diag_sub, v_diag_sub, &
               G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j))
         endif
+      elseif (fv_sub_fric) then
+        call CG_diagonal_subgrid_basal(CS, G, US, Phisub, Hcell, &
+            u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+            CS%bed_elev(i,j), dens_ratio, i, j, fB_e, u_diag_sub, v_diag_sub, &
+            G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
+            h_nodal_cell=CS%H_corner(I-1:I,J-1:J), &
+            fls_cell=CS%fls_corner(I-1:I,J-1:J))
       elseif (do_DG) then
         ! h_nodal_cell is used inside only as a flotation measure (sub-qp gate +
         ! effective pressure), so the gate field is passed (h_flot under
@@ -6701,7 +6856,7 @@ end subroutine matrix_diagonal
 subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, &
                                      bathyT, dens_ratio, i_elem, j_elem, fB_e, u_diag, v_diag, &
                                      dxCv_S, dxCv_N, dyCu_W, dyCu_E, IareaT, &
-                                     use_DG, h_shelf_cell, h_nodal_cell, bed_corners)
+                                     use_DG, h_shelf_cell, h_nodal_cell, bed_corners, fls_cell)
   type(ice_shelf_dyn_CS), intent(in) :: CS      !< Ice shelf control structure
   type(ocean_grid_type),  intent(in) :: G       !< The grid structure
   type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
@@ -6728,6 +6883,11 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
                                           !! pressure); the caller passes h_flot here under
                                           !! DG_GL_GATE_CONTINUOUS [Z ~> m]
   real, dimension(2,2), optional, intent(in) :: bed_corners !< Bed elevation at element corners [Z ~> m]
+  real, dimension(2,2), optional, intent(in) :: fls_cell !< Flotation deficit r*h - bed at the 4 cell
+                                              !! corners (FV_SUBGRID_GL_FRICTION). When present the
+                                              !! sub-point flotation test and the effective pressure
+                                              !! are taken from this field and h_nodal_cell supplies
+                                              !! the matching corner thickness [Z ~> m]
 
   real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: u_diag_sub, v_diag_sub
   real, dimension(2,2,2,2) :: u_diag_qp_nd, v_diag_qp_nd  ! Per-qp nodal diagonal entries (qx,qy,m,n),
@@ -6758,6 +6918,9 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
   real :: x_af           ! Height above flotation h - h_flot at sub-qp [Z ~> m]
   real :: phi_qp         ! Continuous basal-traction scale in [0,1] at sub-qp [nondim]
   logical :: active_qp   ! Whether this sub-qp contributes basal traction
+  logical :: do_fvsub    ! Local flag for the FV sub-element mode (fls_cell supplied)
+  real :: fls_loc        ! Flotation deficit r*h - bed at sub-qp [Z ~> m]
+  real :: rho_ocean_g_LtoZ ! US%L_to_Z * density_ocean_avg * g_Earth [R L Z-1 T-2]
   integer :: nsub, i, j, qx, qy, m, n
 
   nsub    = size(Phisub, 3)
@@ -6774,7 +6937,10 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
 
   do_DG = .false.
   if (present(use_DG)) do_DG = use_DG
-  if (do_DG) then
+  do_fvsub = present(fls_cell)
+  if (do_fvsub) then
+    rho_ocean_g_LtoZ = US%L_to_Z * CS%density_ocean_avg * CS%g_Earth
+  elseif (do_DG) then
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
     rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
   endif
@@ -6801,8 +6967,12 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
       ! Grounding test, widened to the smoothing band when active (matches CG_action_subgrid_basal
       ! so the preconditioner diagonal stays consistent with the residual).
       if (tr_scale_on) then
-        x_af = hloc - bed_sub / dens_ratio
+        ! X = h - h_flot = (r*h - bed)/r, so the FV sub-element form is just fls/r.
+        if (do_fvsub) then ; x_af = fls_loc / dens_ratio
+        else ; x_af = hloc - bed_sub / dens_ratio ; endif
         active_qp = (x_af > x_lo)
+      elseif (do_fvsub) then
+        active_qp = (fls_loc > 0)
       else
         active_qp = (dens_ratio * hloc - bed_sub > 0)
       endif
@@ -6816,8 +6986,13 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
 
         unorm2_loc = ((u_curr_loc**2) + (v_curr_loc**2)) + eps_vel2
 
-        ! Compute Coulomb fB at this sub-qp when in DG mode
-        if (do_DG .and. CS%CoulombFriction) then
+        ! Compute Coulomb fB at this sub-qp when the effective pressure varies within the cell
+        if (do_fvsub .and. CS%CoulombFriction) then
+          fB_local = compute_fB_from_N( &
+              subgrid_effective_pressure(fls_loc, hloc, dens_ratio, rho_ocean_g_LtoZ), &
+              CS%C_basal_friction(i_elem,j_elem), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
+              CS%CF_PostPeak, CS%n_basal_fric)
+        elseif (do_DG .and. CS%CoulombFriction) then
           fB_local = compute_fB_local(hloc, bed_sub, rho_oi_ratio, rho_ice_g_LtoZ, &
               CS%C_basal_friction(i_elem,j_elem), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
               CS%CF_PostPeak, CS%n_basal_fric)
@@ -6999,7 +7174,7 @@ end subroutine sep2_cut_tri
 subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, &
                                 bathyT, dens_ratio, i_elem, j_elem, fB_e, use_newton, &
                                 Ucontr, Vcontr, dxCv_S, dxCv_N, dyCu_W, dyCu_E, IareaT, &
-                                use_DG, h_nodal_cell, bed_corners)
+                                use_DG, h_nodal_cell, bed_corners, fls_cell)
   type(ice_shelf_dyn_CS), intent(in) :: CS      !< Ice shelf control structure
   type(ocean_grid_type),  intent(in) :: G       !< The grid structure
   type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
@@ -7024,6 +7199,11 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
   logical,       optional, intent(in) :: use_DG !< If true, use DG nodal thickness and bed corners
   real, dimension(2,2), optional, intent(in) :: h_nodal_cell !< Q1 thickness at the 4 cell corners [Z ~> m]
   real, dimension(2,2), optional, intent(in) :: bed_corners  !< Bed elevation at element corners [Z ~> m]
+  real, dimension(2,2), optional, intent(in) :: fls_cell !< Flotation deficit r*h - bed at the 4 cell
+                                              !! corners (FV_SUBGRID_GL_FRICTION). When present the
+                                              !! partition and the effective pressure are both taken
+                                              !! from this field and h_nodal_cell supplies the
+                                              !! matching corner thickness [Z ~> m]
 
   real, dimension(4)     :: hc, bedc  ! Corner thickness and bed, flattened SW,SE,NW,NE [Z ~> m]
   real, dimension(4)     :: uc, vc    ! Corner frozen velocities [L T-1 ~> m s-1]
@@ -7054,7 +7234,10 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
   real :: fB_local          ! Coulomb fB at the QP (DG mode) [(T L-1)^CF_PostPeak]
   real :: rho_oi_ratio      ! density_ocean / density_ice [nondim]
   real :: rho_ice_g_LtoZ    ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
+  real :: rho_ocean_g_LtoZ  ! US%L_to_Z * density_ocean_avg * g_Earth [R L Z-1 T-2]
+  real :: fls_loc           ! Flotation deficit at the QP [Z ~> m]
   logical :: do_DG          ! Local flag for DG mode
+  logical :: do_fvsub       ! Local flag for the FV sub-element mode (fls_cell supplied)
   integer :: t, k, c
 
   coef_prefactor = CS%coef_prefactor(i_elem,j_elem)
@@ -7063,7 +7246,16 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
 
   do_DG = .false.
   if (present(use_DG)) do_DG = use_DG
-  if (do_DG) then
+  do_fvsub = present(fls_cell)
+  if (do_fvsub) then
+    ! FV sub-element mode: the partition, the sub-element thickness and the effective pressure all
+    ! come from the two corner fields built by build_corner_flotation_fields, so the grounding line
+    ! the friction sees is the same one the driving stress sees. The bed is implicit in fls.
+    rho_ocean_g_LtoZ = US%L_to_Z * CS%density_ocean_avg * CS%g_Earth
+    hc(1) = h_nodal_cell(1,1) ; hc(2) = h_nodal_cell(2,1)
+    hc(3) = h_nodal_cell(1,2) ; hc(4) = h_nodal_cell(2,2)
+    bedc(:) = bathyT
+  elseif (do_DG) then
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
     rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
     hc(1) = h_nodal_cell(1,1) ; hc(2) = h_nodal_cell(2,1)
@@ -7079,8 +7271,15 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
   duc(1) = U_delta(1,1) ; duc(2) = U_delta(2,1) ; duc(3) = U_delta(1,2) ; duc(4) = U_delta(2,2)
   dvc(1) = V_delta(1,1) ; dvc(2) = V_delta(2,1) ; dvc(3) = V_delta(1,2) ; dvc(4) = V_delta(2,2)
 
-  ! Unclamped bilinear deficit defines the partition; magnitudes keep the min_h clamp below.
-  fls(:) = (dens_ratio * hc(:)) - bedc(:)
+  if (do_fvsub) then
+    ! The corner deficit is already consistent with hc (both carried by one weight set over one cell
+    ! set), and MIN_H_SHELF was applied at the cell centers, so no clamp is reapplied here.
+    fls(1) = fls_cell(1,1) ; fls(2) = fls_cell(2,1)
+    fls(3) = fls_cell(1,2) ; fls(4) = fls_cell(2,2)
+  else
+    ! Unclamped bilinear deficit defines the partition; magnitudes keep the min_h clamp below.
+    fls(:) = (dens_ratio * hc(:)) - bedc(:)
+  endif
   call sep2_cell_qps(fls, nqp, beta, wref, qpg)
 
   do t=1,4
@@ -7094,7 +7293,15 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
       jac = (wref(k,t) * (a * d)) * IareaT
 
       hloc = ((b1 * hc(1)) + (b4 * hc(4))) + ((b2 * hc(2)) + (b3 * hc(3)))
-      if (do_DG) then
+      if (do_fvsub) then
+        ! The corner-basis weights beta are the barycentric coordinates of the QP in its parent
+        ! triangle (the center weights bC are 1/4 each, so they reproduce the cell-center value), so
+        ! this sum is the P1-on-the-fan interpolant -- the very field whose zero contour sep2_cut_tri
+        ! cut. Hence fls_loc >= 0 at every grounded QP by construction, and the effective pressure
+        ! below can never see a negative argument.
+        fls_loc = ((b1 * fls(1)) + (b4 * fls(4))) + ((b2 * fls(2)) + (b3 * fls(3)))
+        bed_sub = bathyT
+      elseif (do_DG) then
         hloc = max(hloc, CS%min_h_shelf)
         bed_sub = ((b1 * bedc(1)) + (b4 * bedc(4))) + ((b2 * bedc(2)) + (b3 * bedc(3)))
       else
@@ -7107,7 +7314,12 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
 
       unorm2_loc = ((u_curr_loc**2) + (v_curr_loc**2)) + eps_vel2
 
-      if (do_DG .and. CS%CoulombFriction) then
+      if (do_fvsub .and. CS%CoulombFriction) then
+        fB_local = compute_fB_from_N( &
+            subgrid_effective_pressure(fls_loc, hloc, dens_ratio, rho_ocean_g_LtoZ), &
+            CS%C_basal_friction(i_elem,j_elem), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
+            CS%CF_PostPeak, CS%n_basal_fric)
+      elseif (do_DG .and. CS%CoulombFriction) then
         fB_local = compute_fB_local(hloc, bed_sub, rho_oi_ratio, rho_ice_g_LtoZ, &
             CS%C_basal_friction(i_elem,j_elem), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
             CS%CF_PostPeak, CS%n_basal_fric)
@@ -7166,7 +7378,7 @@ end subroutine CG_action_sep2_basal
 subroutine CG_diagonal_sep2_basal(CS, G, US, H, U_curr, V_curr, &
                                   bathyT, dens_ratio, i_elem, j_elem, fB_e, u_diag, v_diag, &
                                   dxCv_S, dxCv_N, dyCu_W, dyCu_E, IareaT, &
-                                  use_DG, h_nodal_cell, bed_corners)
+                                  use_DG, h_nodal_cell, bed_corners, fls_cell)
   type(ice_shelf_dyn_CS), intent(in) :: CS      !< Ice shelf control structure
   type(ocean_grid_type),  intent(in) :: G       !< The grid structure
   type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
@@ -7188,6 +7400,9 @@ subroutine CG_diagonal_sep2_basal(CS, G, US, H, U_curr, V_curr, &
   logical,       optional, intent(in) :: use_DG !< If true, use DG nodal thickness and bed corners
   real, dimension(2,2), optional, intent(in) :: h_nodal_cell !< Q1 thickness at the 4 cell corners [Z ~> m]
   real, dimension(2,2), optional, intent(in) :: bed_corners  !< Bed elevation at element corners [Z ~> m]
+  real, dimension(2,2), optional, intent(in) :: fls_cell !< Flotation deficit r*h - bed at the 4 cell
+                                              !! corners (FV_SUBGRID_GL_FRICTION); see
+                                              !! CG_action_sep2_basal [Z ~> m]
 
   real, dimension(4)     :: hc, bedc  ! Corner thickness and bed, flattened SW,SE,NW,NE [Z ~> m]
   real, dimension(4)     :: uc, vc    ! Corner frozen velocities [L T-1 ~> m s-1]
@@ -7215,7 +7430,10 @@ subroutine CG_diagonal_sep2_basal(CS, G, US, H, U_curr, V_curr, &
   real :: fB_local          ! Coulomb fB at the QP (DG mode) [(T L-1)^CF_PostPeak]
   real :: rho_oi_ratio      ! density_ocean / density_ice [nondim]
   real :: rho_ice_g_LtoZ    ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
+  real :: rho_ocean_g_LtoZ  ! US%L_to_Z * density_ocean_avg * g_Earth [R L Z-1 T-2]
+  real :: fls_loc           ! Flotation deficit at the QP [Z ~> m]
   logical :: do_DG          ! Local flag for DG mode
+  logical :: do_fvsub       ! Local flag for the FV sub-element mode (fls_cell supplied)
   integer :: t, k, c
 
   coef_prefactor = CS%coef_prefactor(i_elem,j_elem)
@@ -7224,7 +7442,16 @@ subroutine CG_diagonal_sep2_basal(CS, G, US, H, U_curr, V_curr, &
 
   do_DG = .false.
   if (present(use_DG)) do_DG = use_DG
-  if (do_DG) then
+  do_fvsub = present(fls_cell)
+  if (do_fvsub) then
+    ! FV sub-element mode: the partition, the sub-element thickness and the effective pressure all
+    ! come from the two corner fields built by build_corner_flotation_fields, so the grounding line
+    ! the friction sees is the same one the driving stress sees. The bed is implicit in fls.
+    rho_ocean_g_LtoZ = US%L_to_Z * CS%density_ocean_avg * CS%g_Earth
+    hc(1) = h_nodal_cell(1,1) ; hc(2) = h_nodal_cell(2,1)
+    hc(3) = h_nodal_cell(1,2) ; hc(4) = h_nodal_cell(2,2)
+    bedc(:) = bathyT
+  elseif (do_DG) then
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
     rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
     hc(1) = h_nodal_cell(1,1) ; hc(2) = h_nodal_cell(2,1)
@@ -7252,7 +7479,15 @@ subroutine CG_diagonal_sep2_basal(CS, G, US, H, U_curr, V_curr, &
       jac = (wref(k,t) * (a * d)) * IareaT
 
       hloc = ((b1 * hc(1)) + (b4 * hc(4))) + ((b2 * hc(2)) + (b3 * hc(3)))
-      if (do_DG) then
+      if (do_fvsub) then
+        ! The corner-basis weights beta are the barycentric coordinates of the QP in its parent
+        ! triangle (the center weights bC are 1/4 each, so they reproduce the cell-center value), so
+        ! this sum is the P1-on-the-fan interpolant -- the very field whose zero contour sep2_cut_tri
+        ! cut. Hence fls_loc >= 0 at every grounded QP by construction, and the effective pressure
+        ! below can never see a negative argument.
+        fls_loc = ((b1 * fls(1)) + (b4 * fls(4))) + ((b2 * fls(2)) + (b3 * fls(3)))
+        bed_sub = bathyT
+      elseif (do_DG) then
         hloc = max(hloc, CS%min_h_shelf)
         bed_sub = ((b1 * bedc(1)) + (b4 * bedc(4))) + ((b2 * bedc(2)) + (b3 * bedc(3)))
       else
@@ -7263,7 +7498,12 @@ subroutine CG_diagonal_sep2_basal(CS, G, US, H, U_curr, V_curr, &
 
       unorm2_loc = ((u_curr_loc**2) + (v_curr_loc**2)) + eps_vel2
 
-      if (do_DG .and. CS%CoulombFriction) then
+      if (do_fvsub .and. CS%CoulombFriction) then
+        fB_local = compute_fB_from_N( &
+            subgrid_effective_pressure(fls_loc, hloc, dens_ratio, rho_ocean_g_LtoZ), &
+            CS%C_basal_friction(i_elem,j_elem), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
+            CS%CF_PostPeak, CS%n_basal_fric)
+      elseif (do_DG .and. CS%CoulombFriction) then
         fB_local = compute_fB_local(hloc, bed_sub, rho_oi_ratio, rho_ice_g_LtoZ, &
             CS%C_basal_friction(i_elem,j_elem), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
             CS%CF_PostPeak, CS%n_basal_fric)
@@ -8004,6 +8244,8 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
   real :: h_ip, bed_ip   ! Ice thickness and bed elevation at a sub-IP [Z ~> m]
   real :: bed_corners(2,2) ! Bed elevation at the 4 B-grid corners of a cell [Z ~> m]
   real :: H_corners(2,2)   ! Ice thickness at the 4 B-grid corners (non-DG path) [Z ~> m]
+  real :: fls_corners(2,2) ! Flotation deficit r*h - bed at the 4 B-grid corners [Z ~> m]
+  logical :: fv_sub        ! True on the FV sub-element path (CS%fv_subgrid_gl_friction)
   real :: d_min, d_max   ! Min/max over the 4 corners of the unclamped flotation
                          ! deficit r*h - bed [Z ~> m]
   real :: bed_min        ! Min bed elevation over the 4 corners [Z ~> m]
@@ -8039,6 +8281,7 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
 
   rhoi_rhow = CS%density_ice / CS%density_ocean_avg
   n_total = CS%n_sub_regularize * CS%n_sub_regularize * 4
+  fv_sub = CS%fv_subgrid_gl_friction .and. (.not. CS%use_DG_thickness)
 
   ! Basal-traction smoothing gate setup. The gate (CS%basal_gate) decides which friction-assembly
   ! path each cell takes; it is widened relative to the strict flotation test when smoothing is on,
@@ -8056,16 +8299,34 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
   do j=jsc,jec ; do i=isc,iec
     if (ISS%hmask(i,j) /= 1 .and. ISS%hmask(i,j) /= 3) cycle
 
-    ! Gather corner values for bed (and H if non-DG) at this cell.
+    ! Gather corner values for bed (and H if non-DG) at this cell, and the flotation deficit that
+    ! every grounding test below keys off.
     if (CS%use_DG_thickness) then
       bed_corners(1,1) = CS%bed_node(i-1,j-1) ; bed_corners(2,1) = CS%bed_node(i,j-1)
       bed_corners(1,2) = CS%bed_node(i-1,j  ) ; bed_corners(2,2) = CS%bed_node(i,j  )
+      fls_corners(1,1) = (rhoi_rhow*hgate(i,j,1,1)) - bed_corners(1,1)
+      fls_corners(2,1) = (rhoi_rhow*hgate(i,j,2,1)) - bed_corners(2,1)
+      fls_corners(1,2) = (rhoi_rhow*hgate(i,j,1,2)) - bed_corners(1,2)
+      fls_corners(2,2) = (rhoi_rhow*hgate(i,j,2,2)) - bed_corners(2,2)
+    elseif (fv_sub) then
+      ! FV sub-element path: both corner fields come from build_corner_flotation_fields, which
+      ! carried h and r*h-bed to the corners with one weight set, so fls = r*H - bed holds here and
+      ! the bed never has to be reconstructed.
+      H_corners(1,1) = CS%H_corner(i-1,j-1) ; H_corners(2,1) = CS%H_corner(i,j-1)
+      H_corners(1,2) = CS%H_corner(i-1,j  ) ; H_corners(2,2) = CS%H_corner(i,j  )
+      fls_corners(1,1) = CS%fls_corner(i-1,j-1) ; fls_corners(2,1) = CS%fls_corner(i,j-1)
+      fls_corners(1,2) = CS%fls_corner(i-1,j  ) ; fls_corners(2,2) = CS%fls_corner(i,j  )
+      bed_corners(:,:) = CS%bed_elev(i,j)  ! only reached by the min_h early-out, skipped when fv_sub
     else
       ! Non-DG: bed is cell-constant in the existing GL detection logic; mirror that
       ! by setting all 4 corner values to bed_elev(i,j).
       bed_corners(:,:) = CS%bed_elev(i,j)
       H_corners(1,1) = H_node(i-1,j-1) ; H_corners(2,1) = H_node(i,j-1)
       H_corners(1,2) = H_node(i-1,j  ) ; H_corners(2,2) = H_node(i,j  )
+      fls_corners(1,1) = (rhoi_rhow*H_corners(1,1)) - bed_corners(1,1)
+      fls_corners(2,1) = (rhoi_rhow*H_corners(2,1)) - bed_corners(2,1)
+      fls_corners(1,2) = (rhoi_rhow*H_corners(1,2)) - bed_corners(1,2)
+      fls_corners(2,2) = (rhoi_rhow*H_corners(2,2)) - bed_corners(2,2)
     endif
 
     ! Exact early-out: the sub-IP flotation deficit r*max(h_ip, min_h_shelf) - bed_ip
@@ -8078,33 +8339,29 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
     ! the fraction is exactly 0. Both results are bitwise identical to sampling, so
     ! the 4*N^2 sub-sampling is confined to cells whose corner deficits mix signs
     ! (the grounding-line band).
-    if (CS%use_DG_thickness) then
-      d_min = min((rhoi_rhow*hgate(i,j,1,1)) - bed_corners(1,1), &
-                  (rhoi_rhow*hgate(i,j,2,1)) - bed_corners(2,1), &
-                  (rhoi_rhow*hgate(i,j,1,2)) - bed_corners(1,2), &
-                  (rhoi_rhow*hgate(i,j,2,2)) - bed_corners(2,2))
-      d_max = max((rhoi_rhow*hgate(i,j,1,1)) - bed_corners(1,1), &
-                  (rhoi_rhow*hgate(i,j,2,1)) - bed_corners(2,1), &
-                  (rhoi_rhow*hgate(i,j,1,2)) - bed_corners(1,2), &
-                  (rhoi_rhow*hgate(i,j,2,2)) - bed_corners(2,2))
-    else
-      d_min = min((rhoi_rhow*H_corners(1,1)) - bed_corners(1,1), &
-                  (rhoi_rhow*H_corners(2,1)) - bed_corners(2,1), &
-                  (rhoi_rhow*H_corners(1,2)) - bed_corners(1,2), &
-                  (rhoi_rhow*H_corners(2,2)) - bed_corners(2,2))
-      d_max = max((rhoi_rhow*H_corners(1,1)) - bed_corners(1,1), &
-                  (rhoi_rhow*H_corners(2,1)) - bed_corners(2,1), &
-                  (rhoi_rhow*H_corners(1,2)) - bed_corners(1,2), &
-                  (rhoi_rhow*H_corners(2,2)) - bed_corners(2,2))
-    endif
+    d_min = min(min(fls_corners(1,1), fls_corners(2,1)), &
+                min(fls_corners(1,2), fls_corners(2,2)))
+    d_max = max(max(fls_corners(1,1), fls_corners(2,1)), &
+                max(fls_corners(1,2), fls_corners(2,2)))
     bed_min = min(min(bed_corners(1,1), bed_corners(2,1)), &
                   min(bed_corners(1,2), bed_corners(2,2)))
+    ! On the FV sub-element path the MIN_H_SHELF clamp is applied at cell centers before the
+    ! interpolation, so there is no post-interpolation clamp that could raise a sub-point deficit and
+    ! the plain sign test on the corner deficits is exact on its own.
+    if (fv_sub) then
+      if (d_min > 0.0) then
+        CS%ground_frac(i,j) = 1.0 ; CS%basal_gate(i,j) = BG_FULL
+        cycle
+      elseif (d_max <= 0.0) then
+        CS%ground_frac(i,j) = 0.0 ; CS%basal_gate(i,j) = BG_SKIP
+        cycle
+      endif
     ! Exact early-outs (bilinear extrema at the corners). Without smoothing these reproduce the
     ! strict grounding test; with smoothing the band edges (r*W, r*x_lo) replace 0 so a fully-saturated
     ! cell (all sub-IP at X>=W) still takes the fast full-traction path and a cell entirely below the
     ! band takes no traction, while the mixed band cells fall through to the sub-IP scan.
     ! (basal_tr_dfrac is 0 in every early-out: phi saturates to ground_frac there, so it keeps its reset 0.)
-    if (gate_scan) then
+    elseif (gate_scan) then
       if (d_min > thr_full) then
         CS%ground_frac(i,j) = 1.0 ; CS%basal_gate(i,j) = BG_FULL
         cycle
@@ -8126,17 +8383,8 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
       ! SEP2: exact Jacobian-weighted grounded area fraction of the sub-element
       ! partition, so the diagnostic and gate agree with the friction geometry.
       ! (DG_BASAL_TR_SCALE is FATAL with SEP2, so gate_scan is never active here.)
-      if (CS%use_DG_thickness) then
-        fls_gf(1) = (rhoi_rhow * hgate(i,j,1,1)) - bed_corners(1,1)
-        fls_gf(2) = (rhoi_rhow * hgate(i,j,2,1)) - bed_corners(2,1)
-        fls_gf(3) = (rhoi_rhow * hgate(i,j,1,2)) - bed_corners(1,2)
-        fls_gf(4) = (rhoi_rhow * hgate(i,j,2,2)) - bed_corners(2,2)
-      else
-        fls_gf(1) = (rhoi_rhow * H_corners(1,1)) - bed_corners(1,1)
-        fls_gf(2) = (rhoi_rhow * H_corners(2,1)) - bed_corners(2,1)
-        fls_gf(3) = (rhoi_rhow * H_corners(1,2)) - bed_corners(1,2)
-        fls_gf(4) = (rhoi_rhow * H_corners(2,2)) - bed_corners(2,2)
-      endif
+      fls_gf(1) = fls_corners(1,1) ; fls_gf(2) = fls_corners(2,1)
+      fls_gf(3) = fls_corners(1,2) ; fls_gf(4) = fls_corners(2,2)
       call sep2_cell_qps(fls_gf, nqp_gf, beta_gf, wref_gf, qpg_gf)
       do tq=1,4
         do kq=1,nqp_gf(tq)
@@ -8173,26 +8421,36 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
     n_grounded = 0 ; n_active = 0 ; n_full = 0 ; phi_sum = 0.0
     do jsub=1,CS%n_sub_regularize ; do isub=1,CS%n_sub_regularize
       do jq=1,2 ; do iq=1,2
-        if (CS%use_DG_thickness) then
-          h_ip = ((CS%Phisub(iq,jq,isub,jsub,1,1)*hgate(i,j,1,1)) + &
-                  (CS%Phisub(iq,jq,isub,jsub,2,2)*hgate(i,j,2,2))) + &
-                 ((CS%Phisub(iq,jq,isub,jsub,2,1)*hgate(i,j,2,1)) + &
-                  (CS%Phisub(iq,jq,isub,jsub,1,2)*hgate(i,j,1,2)))
-          h_ip = max(h_ip, CS%min_h_shelf)
+        if (fv_sub) then
+          ! Interpolate the deficit itself, with the same bilinear interpolant the SEP3 sub-point
+          ! test uses, so the grounded fraction, the friction, and the surface kink all key off one
+          ! field. No post-interpolation clamp: MIN_H_SHELF was applied at the cell centers.
+          g_ip = ((CS%Phisub(iq,jq,isub,jsub,1,1)*fls_corners(1,1)) + &
+                  (CS%Phisub(iq,jq,isub,jsub,2,2)*fls_corners(2,2))) + &
+                 ((CS%Phisub(iq,jq,isub,jsub,2,1)*fls_corners(2,1)) + &
+                  (CS%Phisub(iq,jq,isub,jsub,1,2)*fls_corners(1,2)))
         else
-          h_ip = ((CS%Phisub(iq,jq,isub,jsub,1,1)*H_corners(1,1)) + &
-                  (CS%Phisub(iq,jq,isub,jsub,2,2)*H_corners(2,2))) + &
-                 ((CS%Phisub(iq,jq,isub,jsub,2,1)*H_corners(2,1)) + &
-                  (CS%Phisub(iq,jq,isub,jsub,1,2)*H_corners(1,2)))
-          h_ip = max(h_ip, CS%min_h_shelf)
+          if (CS%use_DG_thickness) then
+            h_ip = ((CS%Phisub(iq,jq,isub,jsub,1,1)*hgate(i,j,1,1)) + &
+                    (CS%Phisub(iq,jq,isub,jsub,2,2)*hgate(i,j,2,2))) + &
+                   ((CS%Phisub(iq,jq,isub,jsub,2,1)*hgate(i,j,2,1)) + &
+                    (CS%Phisub(iq,jq,isub,jsub,1,2)*hgate(i,j,1,2)))
+            h_ip = max(h_ip, CS%min_h_shelf)
+          else
+            h_ip = ((CS%Phisub(iq,jq,isub,jsub,1,1)*H_corners(1,1)) + &
+                    (CS%Phisub(iq,jq,isub,jsub,2,2)*H_corners(2,2))) + &
+                   ((CS%Phisub(iq,jq,isub,jsub,2,1)*H_corners(2,1)) + &
+                    (CS%Phisub(iq,jq,isub,jsub,1,2)*H_corners(1,2)))
+            h_ip = max(h_ip, CS%min_h_shelf)
+          endif
+
+          bed_ip = ((CS%Phisub(iq,jq,isub,jsub,1,1)*bed_corners(1,1)) + &
+                    (CS%Phisub(iq,jq,isub,jsub,2,2)*bed_corners(2,2))) + &
+                   ((CS%Phisub(iq,jq,isub,jsub,2,1)*bed_corners(2,1)) + &
+                    (CS%Phisub(iq,jq,isub,jsub,1,2)*bed_corners(1,2)))
+
+          g_ip = rhoi_rhow * h_ip - bed_ip
         endif
-
-        bed_ip = ((CS%Phisub(iq,jq,isub,jsub,1,1)*bed_corners(1,1)) + &
-                  (CS%Phisub(iq,jq,isub,jsub,2,2)*bed_corners(2,2))) + &
-                 ((CS%Phisub(iq,jq,isub,jsub,2,1)*bed_corners(2,1)) + &
-                  (CS%Phisub(iq,jq,isub,jsub,1,2)*bed_corners(1,2)))
-
-        g_ip = rhoi_rhow * h_ip - bed_ip
         if (g_ip > 0.0) n_grounded = n_grounded + 1
         if (gate_scan) then
           if (g_ip > thr_lo)    n_active = n_active + 1
@@ -8954,6 +9212,482 @@ subroutine update_velocity_masks(CS, G, hmask, umask, vmask, u_face_mask, v_face
   call pass_vector(umask, vmask, G%domain, TO_ALL, BGRID_NE)
 
 end subroutine update_velocity_masks
+
+!> Finite-volume driving stress integrated over the sub-element grounding-line partition
+!! (FV_SUBGRID_GL_TAUD). Every quadrature point lies strictly on one side of the sub-element
+!! grounding line and takes that side's surface-slope branch, so no point straddles the kink.
+!!
+!! The surface is reconstructed from the same two corner fields the friction uses:
+!!
+!!   S      = (1-r)*H + max(fls, 0)
+!!   grad S = (1-r)*grad H  +  { grad fls   grounded
+!!                             { 0          floating
+!!
+!! which reproduces grad H - grad bed where grounded and (1-r)*grad H where floating, while placing
+!! the kink exactly on the fls = 0 contour that the partition cut on. The bed never appears.
+!!
+!! The thickness multiplying the slope is the cell mean, not an interpolant, so rho*g*H is constant
+!! over the cell. That is also what makes the strong form used here identical to a surface-form
+!! integration by parts: with H constant, rho*g*H*grad(S) = grad(rho*g*H*S) and the integrand
+!! rho*g*H*S is continuous across the grounding line (S_grounded - S_floating = fls = 0 there), so
+!! that IBP carries no internal grounding-line contour integral. The *pressure*-form IBP used by the
+!! DG path does, because 1/2*rho*g*h^2 step-jumps by r/2*rho*g*h^2 at flotation; that is why the
+!! calving-front Neumann term below, which is exactly that pressure, is kept as a separate face term
+!! rather than folded into the volume integral.
+!!
+!! Under SEP2 the kinked term uses the P1-on-the-fan gradient, constant on each parent triangle,
+!! because the SEP2 cut is the zero contour of that same P1 interpolant; using the bilinear gradient
+!! there would put the kink on a slightly different curve and make S jump across the cut. Under SEP3
+!! the sub-point flotation test is bilinear, so the bilinear gradient is the consistent choice. The
+!! smooth term (1-r)*grad H is bilinear in both cases -- it carries no kink.
+subroutine calc_shelf_driving_stress_fv_subgrid(CS, ISS, G, US, taudx, taudy)
+  type(ice_shelf_dyn_CS), intent(in)   :: CS  !< A pointer to the ice shelf control structure
+  type(ice_shelf_state), intent(in)    :: ISS !< A structure describing the ice-shelf state
+  type(ocean_grid_type), intent(inout) :: G   !< The grid structure used by the ice shelf.
+  type(unit_scale_type), intent(in)    :: US  !< A structure containing unit conversion factors
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                         intent(inout) :: taudx !< X-direction driving stress at q-points [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                         intent(inout) :: taudy !< Y-direction driving stress at q-points [R L3 Z T-2 ~> kg m s-2]
+
+  ! Reference-space coordinates of the 4 cell corners, ordered SW, SE, NW, NE.
+  real, dimension(4), parameter :: xref = (/ 0.0, 1.0, 0.0, 1.0 /) !< Corner xi [nondim]
+  real, dimension(4), parameter :: yref = (/ 0.0, 0.0, 1.0, 1.0 /) !< Corner eta [nondim]
+  ! Base-corner ids (A,B) of the parent triangles S, E, N, W, matching sep2_cell_qps.
+  integer, dimension(4), parameter :: iA = (/ 1, 2, 4, 3 /) !< First (CCW) base corner per triangle
+  integer, dimension(4), parameter :: iB = (/ 2, 4, 3, 1 /) !< Second (CCW) base corner per triangle
+
+  real, dimension(SZDIB_(G),SZDJB_(G),4) :: taudx_b, taudy_b ! Per-element corner contributions,
+                       ! diagonal-pair summed for rotation invariance [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(4)     :: hc     ! Corner thickness, flattened SW,SE,NW,NE [Z ~> m]
+  real, dimension(4)     :: fls    ! Corner flotation deficit, flattened SW,SE,NW,NE [Z ~> m]
+  integer, dimension(4)  :: nqp    ! SEP2 QPs per parent triangle
+  real, dimension(4,7,4) :: beta   ! SEP2 corner-basis weights per (corner, QP, triangle) [nondim]
+  real, dimension(7,4)   :: wref   ! SEP2 reference measure per (QP, triangle) [nondim]
+  logical, dimension(7,4) :: qpg   ! SEP2 grounded state per (QP, triangle)
+  real, dimension(4,7)   :: valx, valy ! Per-QP nodal contributions [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(4,4)   :: px, py ! Per-(corner, triangle) partial sums [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(4)     :: dfxi, dfeta ! Per-triangle P1 gradient of fls in reference space [Z ~> m]
+  real, dimension(7) :: vsx, vsy ! Per-QP weight-scaled surface slopes [Z L ~> m2 m-1]
+  real, dimension(7) :: vw       ! Per-QP quadrature weights [L2 ~> m2]
+  real, dimension(4) :: psx, psy ! Per-triangle weighted-slope sums [Z L ~> m2 m-1]
+  real, dimension(4) :: pw       ! Per-triangle weight sums [L2 ~> m2]
+  real :: w_total           ! Total quadrature weight over the cell [L2 ~> m2]
+  logical :: calc_slope_diag ! True if the surface-slope diagnostics are registered
+  real :: fC                ! Flotation deficit at the cell center (corner mean) [Z ~> m]
+  real :: det               ! Reference-space area factor of a parent triangle [nondim]
+  real :: b1, b2, b3, b4    ! Corner-basis weights at the QP [nondim]
+  real :: mS, mN, mW, mE    ! Marginal sums: interpolation weights of the 4 cell edges [nondim]
+  real :: a, d              ! Interpolated cell-edge spacings at the QP [L ~> m]
+  real :: weight            ! Quadrature weight [L2 ~> m2]
+  real :: dhdx_gp, dhdy_gp  ! Corner-field thickness gradients at the QP [Z L-1 ~> nondim]
+  real :: dfdx_gp, dfdy_gp  ! Flotation-deficit gradients at the QP [Z L-1 ~> nondim]
+  real :: dsdx_gp, dsdy_gp  ! Surface gradients at the QP [Z L-1 ~> nondim]
+  real :: fx_gp, fy_gp      ! Driving-stress integrand at the QP [R L Z T-2 ~> kg m-1 s-2]
+  real :: rho, rhow, rhoi_rhow ! Ice and ocean densities [R ~> kg m-3] and their ratio [nondim]
+  real :: grav              ! The gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
+  real :: He                ! Cell-mean ice thickness in the driving-stress prefactor [Z ~> m]
+  real :: rgHe              ! rho*g*He, constant over the cell [R L2 Z T-2 ~> kg m-1 s-2]
+  real :: smag, scale       ! Slope magnitude and MAX_SURFACE_SLOPE scaling [nondim]
+  real :: neumann_val       ! Lateral-pressure boundary term [R Z L2 T-2 ~> kg s-2]
+  real :: dxS, dxN, dyW, dyE ! Cell edge spacings [L ~> m]
+  integer :: i, j, isc, iec, jsc, jec, t, k, c
+  integer :: i_off, j_off, gisc, gjsc, giec, gjec
+
+  isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
+  i_off = G%idg_offset ; j_off = G%jdg_offset
+  gisc = 1 ; gjsc = 1 ; giec = G%domain%niglobal ; gjec = G%domain%njglobal
+  rho = CS%density_ice ; rhow = CS%density_ocean_avg ; grav = CS%g_Earth
+  rhoi_rhow = rho/rhow
+
+  taudx_b(:,:,:) = 0.0 ; taudy_b(:,:,:) = 0.0
+
+  ! Surface-slope diagnostics: the quadrature-weighted cell mean of the same per-QP slope that is
+  ! integrated above, so the diagnostic reports the branch-resolved slope the driving stress used
+  ! rather than a separate reconstruction. Cells with no ice, or with an incomplete corner stencil,
+  ! keep zero.
+  calc_slope_diag = (CS%id_sx_shelf > 0 .or. CS%id_sy_shelf > 0 .or. CS%id_surf_slope_mag_shelf > 0)
+  if (calc_slope_diag) then
+    do j=jsc,jec ; do i=isc,iec
+      CS%sx_shelf(i,j) = 0.0 ; CS%sy_shelf(i,j) = 0.0
+    enddo ; enddo
+  endif
+
+  do j=jsc-1,jec+1 ; do i=isc-1,iec+1
+    if (ISS%hmask(i,j) /= 1 .and. ISS%hmask(i,j) /= 3) cycle
+    if (.not. (CS%corner_valid(I-1,J-1) .and. CS%corner_valid(I,J-1) .and. &
+               CS%corner_valid(I-1,J  ) .and. CS%corner_valid(I,J  ))) cycle
+
+    hc(1) = CS%H_corner(I-1,J-1) ; hc(2) = CS%H_corner(I,J-1)
+    hc(3) = CS%H_corner(I-1,J  ) ; hc(4) = CS%H_corner(I,J  )
+    fls(1) = CS%fls_corner(I-1,J-1) ; fls(2) = CS%fls_corner(I,J-1)
+    fls(3) = CS%fls_corner(I-1,J  ) ; fls(4) = CS%fls_corner(I,J  )
+
+    He = max(ISS%h_shelf(i,j), CS%min_h_shelf)
+    rgHe = (rho*grav) * He
+    dxS = G%dxCv(i,j-1) ; dxN = G%dxCv(i,j)
+    dyW = G%dyCu(i-1,j) ; dyE = G%dyCu(i,j)
+
+    call sep2_cell_qps(fls, nqp, beta, wref, qpg)
+
+    ! Per-triangle P1 gradient of the flotation deficit in reference space. The triangle is
+    ! (C, A, B) with C the cell center, whose value is the corner mean -- exactly the value
+    ! sep2_cell_qps uses -- so this is the gradient of the field whose zero contour was cut.
+    fC = 0.5 * ((0.5 * (fls(1) + fls(4))) + (0.5 * (fls(2) + fls(3))))
+    do t=1,4
+      det = ((xref(iB(t)) - xref(iA(t))) * (0.5 - yref(iA(t)))) - &
+            ((0.5 - xref(iA(t))) * (yref(iB(t)) - yref(iA(t))))
+      dfxi(t)  = (((fls(iB(t)) - fls(iA(t))) * (0.5 - yref(iA(t)))) - &
+                  ((fC - fls(iA(t))) * (yref(iB(t)) - yref(iA(t))))) / det
+      dfeta(t) = (((fC - fls(iA(t))) * (xref(iB(t)) - xref(iA(t)))) - &
+                  ((fls(iB(t)) - fls(iA(t))) * (0.5 - xref(iA(t))))) / det
+    enddo
+
+    do t=1,4
+      do k=1,nqp(t)
+        b1 = beta(1,k,t) ; b2 = beta(2,k,t) ; b3 = beta(3,k,t) ; b4 = beta(4,k,t)
+        mS = b1 + b2 ; mN = b3 + b4 ; mW = b1 + b3 ; mE = b2 + b4
+        a = (dxS * mS) + (dxN * mN)
+        d = (dyW * mW) + (dyE * mE)
+        weight = wref(k,t) * (a * d)
+
+        ! Smooth part: bilinear gradient of the corner thickness (no kink).
+        dhdx_gp = ( (((-mS) * hc(1)) + (mN * hc(4))) + ((mS * hc(2)) + ((-mN) * hc(3))) ) / a
+        dhdy_gp = ( (((-mW) * hc(1)) + (mE * hc(4))) + (((-mE) * hc(2)) + (mW * hc(3))) ) / d
+        ! Kinked part: P1 gradient on this triangle, zero on the floating side.
+        if (qpg(k,t)) then
+          dfdx_gp = dfxi(t) / a ; dfdy_gp = dfeta(t) / d
+        else
+          dfdx_gp = 0.0 ; dfdy_gp = 0.0
+        endif
+        dsdx_gp = ((1.0 - rhoi_rhow) * dhdx_gp) + dfdx_gp
+        dsdy_gp = ((1.0 - rhoi_rhow) * dhdy_gp) + dfdy_gp
+
+        if (CS%max_surface_slope > 0) then
+          smag = sqrt((dsdx_gp**2) + (dsdy_gp**2))
+          scale = CS%max_surface_slope / max(smag, CS%max_surface_slope)
+          dsdx_gp = scale*dsdx_gp ; dsdy_gp = scale*dsdy_gp
+        endif
+
+        fx_gp = -rgHe * dsdx_gp
+        fy_gp = -rgHe * dsdy_gp
+        do c=1,4
+          valx(c,k) = (weight * beta(c,k,t)) * fx_gp
+          valy(c,k) = (weight * beta(c,k,t)) * fy_gp
+        enddo
+        if (calc_slope_diag) then
+          vw(k) = weight
+          vsx(k) = dsdx_gp * weight
+          vsy(k) = dsdy_gp * weight
+        endif
+      enddo
+
+      ! Orbit-grouped QP sums: (2,3), (4,5) and (6,7) are reflection pairs.
+      if (nqp(t) == 3) then
+        do c=1,4
+          px(c,t) = valx(c,1) + (valx(c,2) + valx(c,3))
+          py(c,t) = valy(c,1) + (valy(c,2) + valy(c,3))
+        enddo
+        if (calc_slope_diag) then
+          psx(t) = vsx(1) + (vsx(2) + vsx(3))
+          psy(t) = vsy(1) + (vsy(2) + vsy(3))
+          pw(t)  = vw(1) + (vw(2) + vw(3))
+        endif
+      else
+        do c=1,4
+          px(c,t) = (valx(c,1) + (valx(c,2) + valx(c,3))) + &
+                    ((valx(c,4) + valx(c,5)) + (valx(c,6) + valx(c,7)))
+          py(c,t) = (valy(c,1) + (valy(c,2) + valy(c,3))) + &
+                    ((valy(c,4) + valy(c,5)) + (valy(c,6) + valy(c,7)))
+        enddo
+        if (calc_slope_diag) then
+          psx(t) = (vsx(1) + (vsx(2) + vsx(3))) + ((vsx(4) + vsx(5)) + (vsx(6) + vsx(7)))
+          psy(t) = (vsy(1) + (vsy(2) + vsy(3))) + ((vsy(4) + vsy(5)) + (vsy(6) + vsy(7)))
+          pw(t)  = (vw(1) + (vw(2) + vw(3))) + ((vw(4) + vw(5)) + (vw(6) + vw(7)))
+        endif
+      endif
+    enddo
+
+    if (calc_slope_diag) then
+      if ((i >= isc) .and. (i <= iec) .and. (j >= jsc) .and. (j <= jec)) then
+        ! Opposite-pair grouping (S,N) and (E,W) is invariant under the triangle permutations of
+        ! any rotation or reflection (S=1, E=2, N=3, W=4).
+        w_total = (pw(1) + pw(3)) + (pw(2) + pw(4))
+        if (w_total > 0.0) then
+          CS%sx_shelf(i,j) = ((psx(1) + psx(3)) + (psx(2) + psx(4))) / w_total
+          CS%sy_shelf(i,j) = ((psy(1) + psy(3)) + (psy(2) + psy(4))) / w_total
+        endif
+      endif
+    endif
+
+    ! Role-grouped cross-triangle reduction (see CG_action_sep2_basal).
+    taudx_b(I-1,J-1,4) = (px(1,1) + px(1,4)) + (px(1,2) + px(1,3))
+    taudx_b(I  ,J-1,3) = (px(2,2) + px(2,1)) + (px(2,3) + px(2,4))
+    taudx_b(I-1,J  ,2) = (px(3,4) + px(3,3)) + (px(3,1) + px(3,2))
+    taudx_b(I  ,J  ,1) = (px(4,3) + px(4,2)) + (px(4,4) + px(4,1))
+    taudy_b(I-1,J-1,4) = (py(1,1) + py(1,4)) + (py(1,2) + py(1,3))
+    taudy_b(I  ,J-1,3) = (py(2,2) + py(2,1)) + (py(2,3) + py(2,4))
+    taudy_b(I-1,J  ,2) = (py(3,4) + py(3,3)) + (py(3,1) + py(3,2))
+    taudy_b(I  ,J  ,1) = (py(4,3) + py(4,2)) + (py(4,4) + py(4,1))
+  enddo ; enddo
+
+  do J=jsc-1,jec ; do I=isc-1,iec
+    taudx(I,J) = taudx(I,J) + ((taudx_b(I,J,1)+taudx_b(I,J,4)) + (taudx_b(I,J,2)+taudx_b(I,J,3)))
+    taudy(I,J) = taudy(I,J) + ((taudy_b(I,J,1)+taudy_b(I,J,4)) + (taudy_b(I,J,2)+taudy_b(I,J,3)))
+  enddo ; enddo
+
+  ! Lateral-pressure (Neumann) boundary conditions at calving fronts and stress faces, identical to
+  ! calc_shelf_driving_stress. This is the pressure-form face term and is deliberately kept separate
+  ! from the volume integral above (see the header note on the two integrations by parts).
+  do j=jsc-1,jec+1 ; do i=isc-1,iec+1
+    if (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3) then
+      if (CS%ground_frac(i,j) == 1) then
+        neumann_val = ((.5 * grav) * (rho * max(ISS%h_shelf(i,j),CS%min_h_shelf)**2 - &
+                                      rhow * max(0.0, CS%bed_elev(i,j))**2))
+      else
+        neumann_val = (.5 * grav) * ((1-rho/rhow) * (rho * max(ISS%h_shelf(i,j),CS%min_h_shelf)**2))
+      endif
+      if ((CS%u_face_mask_bdry(I-1,j) == 2) .OR. &
+        ((ISS%hmask(i-1,j) == 0 .OR. ISS%hmask(i-1,j) == 2) .AND. (CS%reentrant_x .OR. (i+i_off /= gisc)))) then
+        taudx(I-1,J-1) = taudx(I-1,J-1) - .5 * G%dyCu(I-1,j) * neumann_val
+        taudx(I-1,J) = taudx(I-1,J) - .5 * G%dyCu(I-1,j) * neumann_val
+      endif
+      if ((CS%u_face_mask_bdry(I,j) == 2) .OR. &
+        ((ISS%hmask(i+1,j) == 0 .OR. ISS%hmask(i+1,j) == 2) .and. (CS%reentrant_x .OR. (i+i_off /= giec)))) then
+        taudx(I,J-1) = taudx(I,J-1) + .5 * G%dyCu(I,j) * neumann_val
+        taudx(I,J) = taudx(I,J) + .5 * G%dyCu(I,j) * neumann_val
+      endif
+      if ((CS%v_face_mask_bdry(i,J-1) == 2) .OR. &
+        ((ISS%hmask(i,j-1) == 0 .OR. ISS%hmask(i,j-1) == 2) .and. (CS%reentrant_y .OR. (j+j_off /= gjsc)))) then
+        taudy(I-1,J-1) = taudy(I-1,J-1) - .5 * G%dxCv(i,J-1) * neumann_val
+        taudy(I,J-1) = taudy(I,J-1) - .5 * G%dxCv(i,J-1) * neumann_val
+      endif
+      if ((CS%v_face_mask_bdry(i,J) == 2) .OR. &
+        ((ISS%hmask(i,j+1) == 0 .OR. ISS%hmask(i,j+1) == 2) .and. (CS%reentrant_y .OR. (j+j_off /= gjec)))) then
+        taudy(I-1,J) = taudy(I-1,J) + .5 * G%dxCv(i,J) * neumann_val
+        taudy(I,J) = taudy(I,J) + .5 * G%dxCv(i,J) * neumann_val
+      endif
+    endif
+  enddo ; enddo
+
+end subroutine calc_shelf_driving_stress_fv_subgrid
+
+!> Pre-compute the dual-cell Q1 (Lagrange) interpolation weights used to carry the cell-centered
+!! thickness and flotation deficit to B-grid corners for the FV_SUBGRID_GL_* paths. Node (I,J) is
+!! the NE corner of cell (i,j); its four cells are (i,j), (i+1,j), (i,j+1), (i+1,j+1), stored in
+!! CS%corner_wt in the order SW, SE, NW, NE.
+!!
+!! Each cell is weighted by the *opposite* cell's spacing -- that is, by the proximity of its
+!! centroid to the node -- which is the separable Q1 interpolant on the dual cell (the box whose
+!! four corners are the surrounding cell centers) and reproduces a linear field exactly at the node.
+!! An area-weighted mean does not: it weights toward the larger cell, whose centroid is farther from
+!! the node, and for a linear field on cells of width h1 and h2 it is in error by (h2-h1)/2. That
+!! also rules out the lumped-mass conservative projection (Huth et al. 2021, JAMES,
+!! 10.1029/2020MS002277, eq. 29) reduced to one point per cell: a Q1 corner basis evaluated at its
+!! own element centroid is 1/4 for every corner, so the basis factor cancels and only the area
+!! weight is left. That form is correct for its purpose -- many scattered particles, where A_p is the
+!! material a particle represents -- but here nothing downstream conserves the corner fields (the
+!! total driving force is conserved by the Q1 partition of unity in the assembly and by the cell-mean
+!! thickness in the prefactor), so the interpolatory weights are the right ones. Control-volume
+!! averages elsewhere (CS%area_node, the nodal C, lumped_corner_mass) correctly stay area-weighted.
+!!
+!! On a uniform Cartesian grid every weight is exactly 0.25, so this reduces bitwise to a plain
+!! four-cell mean and only differs where the grid is stretched.
+subroutine build_corner_lagrange_weights(CS, G)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf
+
+  real :: dxW, dxE  ! Mean cell width of the west and east columns at a node [L ~> m]
+  real :: dyS, dyN  ! Mean cell height of the south and north rows at a node [L ~> m]
+  real :: wxW, wxE  ! Lagrange weights of the west and east columns [nondim]
+  real :: wyS, wyN  ! Lagrange weights of the south and north rows [nondim]
+  integer :: i, j, isd, ied, jsd, jed
+
+  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+
+  CS%corner_wt(:,:,:) = 0.25
+  do j=jsd,jed-1 ; do i=isd,ied-1
+    dxW = 0.5 * (G%dxT(i,  j) + G%dxT(i,  j+1))
+    dxE = 0.5 * (G%dxT(i+1,j) + G%dxT(i+1,j+1))
+    dyS = 0.5 * (G%dyT(i,j  ) + G%dyT(i+1,j  ))
+    dyN = 0.5 * (G%dyT(i,j+1) + G%dyT(i+1,j+1))
+    if ((dxW + dxE) <= 0.0 .or. (dyS + dyN) <= 0.0) cycle
+    ! Weight each column/row by the opposite one's spacing (proximity of the centroid to the node).
+    wxW = dxE / (dxW + dxE) ; wxE = dxW / (dxW + dxE)
+    wyS = dyN / (dyS + dyN) ; wyN = dyS / (dyS + dyN)
+    CS%corner_wt(1,I,J) = wxW * wyS  ! SW cell (i,j)
+    CS%corner_wt(2,I,J) = wxE * wyS  ! SE cell (i+1,j)
+    CS%corner_wt(3,I,J) = wxW * wyN  ! NW cell (i,j+1)
+    CS%corner_wt(4,I,J) = wxE * wyN  ! NE cell (i+1,j+1)
+  enddo ; enddo
+
+end subroutine build_corner_lagrange_weights
+
+!> Build the two corner fields that drive every sub-element grounding-line decision in the FV
+!! (non-DG) path: the ice thickness CS%H_corner and the flotation deficit CS%fls_corner = r*h - bed.
+!!
+!! Both are carried from cell centers with the same weights (CS%corner_wt) over the same cell set, so
+!! the identity fls = r*H - bed survives the interpolation. That is what lets the surface be written
+!! as S = (1-r)*H + max(fls,0), whose slope kink is the zero contour of fls -- the same contour the
+!! sub-element partition cuts on, and the same one the friction tests -- so the driving stress, the
+!! basal friction, the effective pressure, and the grounded fraction cannot disagree about where the
+!! grounding line is. The bed does not appear again after this routine; where it is needed (the
+!! effective pressure cap) it is recovered as bed = r*H - fls.
+!!
+!! Cell inclusion follows the "option 3" ice-margin rule of Lipscomb et al. (2019), transplanted from
+!! edges (edge_ok, in calc_shelf_driving_stress_vertex) to cell inclusion, because this interpolation
+!! replaces the eq.-14 nodal gradient that used to host it:
+!!   - ice-covered cells: always included, with h clamped at MIN_H_SHELF *before* the interpolation
+!!     so that the clamped h and the fls built from it stay mutually consistent;
+!!   - ice-free land lying below the ice (a real terrestrial margin): included with h = 0 exactly,
+!!     for which S = max(-bed,0) is the bare-ground elevation and the effective pressure is zero, so
+!!     no special case is needed anywhere downstream;
+!!   - ice-free land standing above the ice (a nunatak): excluded. Including it would give the
+!!     adjacent ice a surface sloping off the rock and a spurious driving stress; a nunatak is a
+!!     lateral boundary that drags on the ice, not a source of driving stress;
+!!   - ice-free ocean: excluded. Including it at any positive thickness drives the corner flotation
+!!     deficit strongly negative, which floats a *grounded* marine terminus -- the lateral load at a
+!!     calving front is already supplied by the Neumann face term;
+!!   - cells outside a non-reentrant computational boundary: excluded. The halo across a solid wall
+!!     has bed_elev = 0 with no neighbor PE to fill it, which is not a bed of zero but an undefined
+!!     one. Excluding it from both the numerator and the weight sum drops it cleanly, unlike setting
+!!     an ice-free flotation function to 0, which instead places the cell exactly on the flotation
+!!     contour and reads as grounded.
+!! Because ice-free cells are excluded rather than filled, no extrapolation pass into ice-free cells
+!! is needed.
+subroutine build_corner_flotation_fields(CS, ISS, G)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS  !< The ice shelf dynamics control structure
+  type(ice_shelf_state),  intent(in)    :: ISS !< A structure describing the ice-shelf state
+  type(ocean_grid_type),  intent(in)    :: G   !< The grid structure used by the ice shelf
+
+  integer, parameter :: KIND_SKIP = 0 !< Cell contributes to no corner
+  integer, parameter :: KIND_ICE  = 1 !< Ice-covered cell
+  integer, parameter :: KIND_LAND = 2 !< Ice-free land, included only where it lies below the ice
+  integer, dimension(SZDI_(G),SZDJ_(G)) :: ckind ! Per-cell classification, one of KIND_*
+  real, dimension(SZDI_(G),SZDJ_(G)) :: h_c   ! Cell thickness entering the interpolation [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: fls_c ! Cell flotation deficit r*h_c - bed [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: S_c   ! Cell surface elevation (1-r)*h_c + max(fls_c,0) [Z ~> m]
+  real    :: rhoi_rhow    ! Ice/ocean density ratio r [nondim]
+  real    :: S_ice_max    ! Largest surface elevation among the ice cells at a node [Z ~> m]
+  real    :: wsum         ! Sum of the weights of the included cells [nondim]
+  real    :: whs(4), wfs(4), wws(4) ! Weighted thickness, deficit and weight of the 4 cells,
+                          ! zero where the cell is excluded [Z ~> m], [Z ~> m], [nondim]
+  integer :: kc(4)        ! Classification of the 4 cells around a node
+  real    :: sc4(4)       ! Surface elevation of the 4 cells around a node [Z ~> m]
+  logical :: have_ice     ! True if at least one of the 4 cells is ice-covered
+  integer :: i, j, n, isd, ied, jsd, jed
+  integer :: ii(4), jj(4) ! Tracer indices of the 4 cells around a node, ordered SW, SE, NW, NE
+  integer :: i_off, j_off, gisc, gjsc, giec, gjec
+
+  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+  i_off = G%idg_offset ; j_off = G%jdg_offset
+  gisc = 1 ; gjsc = 1 ; giec = G%domain%niglobal ; gjec = G%domain%njglobal
+  rhoi_rhow = CS%density_ice / CS%density_ocean_avg
+
+  ! Cell-centered preparation. The MIN_H_SHELF clamp is applied here, before the interpolation, so
+  ! that fls_c = r*h_c - bed holds for the clamped thickness and therefore survives to the corners.
+  ckind(:,:) = KIND_SKIP ; h_c(:,:) = 0.0 ; fls_c(:,:) = 0.0 ; S_c(:,:) = 0.0
+  do j=jsd,jed ; do i=isd,ied
+    ! Cells outside a non-reentrant computational boundary have no meaningful bed and are skipped.
+    if (.not. CS%reentrant_x) then
+      if ((i+i_off < gisc) .or. (i+i_off > giec)) cycle
+    endif
+    if (.not. CS%reentrant_y) then
+      if ((j+j_off < gjsc) .or. (j+j_off > gjec)) cycle
+    endif
+    if (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3) then
+      ckind(i,j) = KIND_ICE
+      h_c(i,j) = max(ISS%h_shelf(i,j), CS%min_h_shelf)
+    elseif (CS%bed_elev(i,j) <= 0.0) then
+      ckind(i,j) = KIND_LAND
+      h_c(i,j) = 0.0
+    else
+      cycle  ! ice-free ocean
+    endif
+    fls_c(i,j) = (rhoi_rhow * h_c(i,j)) - CS%bed_elev(i,j)
+    S_c(i,j) = ((1.0 - rhoi_rhow) * h_c(i,j)) + max(fls_c(i,j), 0.0)
+  enddo ; enddo
+
+  CS%H_corner(:,:) = 0.0 ; CS%fls_corner(:,:) = 0.0 ; CS%corner_valid(:,:) = .false.
+
+  do j=jsd,jed-1 ; do i=isd,ied-1
+    ii(1) = i   ; jj(1) = j     ! SW
+    ii(2) = i+1 ; jj(2) = j     ! SE
+    ii(3) = i   ; jj(3) = j+1   ! NW
+    ii(4) = i+1 ; jj(4) = j+1   ! NE
+    do n=1,4
+      kc(n) = ckind(ii(n),jj(n)) ; sc4(n) = S_c(ii(n),jj(n))
+    enddo
+
+    ! The ice-free-land test is against the highest ice surface among the cells sharing this node:
+    ! "this ground stands above the ice" is the conservative reading of the option-3 nunatak rule.
+    have_ice = .false. ; S_ice_max = 0.0
+    do n=1,4
+      if (kc(n) == KIND_ICE) then
+        if (have_ice) then ; S_ice_max = max(S_ice_max, sc4(n))
+        else ; S_ice_max = sc4(n) ; have_ice = .true. ; endif
+      endif
+    enddo
+    if (.not. have_ice) cycle  ! no ice touches this node; its value is never used
+
+    do n=1,4
+      if ((kc(n) == KIND_ICE) .or. ((kc(n) == KIND_LAND) .and. (sc4(n) < S_ice_max))) then
+        wws(n) = CS%corner_wt(n,I,J)
+        whs(n) = wws(n) * h_c(ii(n),jj(n))
+        wfs(n) = wws(n) * fls_c(ii(n),jj(n))
+      else
+        wws(n) = 0.0 ; whs(n) = 0.0 ; wfs(n) = 0.0
+      endif
+    enddo
+
+    ! Diagonal-pair sums (SW+NE)+(SE+NW), so the corner fields are bitwise invariant under a
+    ! 90-degree grid rotation, matching CG_action and lumped_corner_mass.
+    wsum = (wws(1) + wws(4)) + (wws(2) + wws(3))
+    if (wsum <= 0.0) cycle
+    CS%H_corner(I,J)   = ((whs(1) + whs(4)) + (whs(2) + whs(3))) / wsum
+    CS%fls_corner(I,J) = ((wfs(1) + wfs(4)) + (wfs(2) + wfs(3))) / wsum
+    CS%corner_valid(I,J) = .true.
+  enddo ; enddo
+
+  call pass_var(CS%H_corner, G%domain, position=CORNER, complete=.false.)
+  call pass_var(CS%fls_corner, G%domain, position=CORNER, complete=.true.)
+
+end subroutine build_corner_flotation_fields
+
+!> Coulomb fB parameter at a quadrature point from the effective pressure directly, for the
+!! FV_SUBGRID_GL_* paths where N is formed from the corner flotation field rather than from a
+!! thickness and a bed. Identical in form to compute_fB_local once N is in hand.
+pure real function compute_fB_from_N(N_eff, C_basal, alpha_coulomb, CF_Max, CF_MinN, &
+    CF_PostPeak, n_basal_fric)
+  real, intent(in) :: N_eff         !< Effective pressure at the quadrature point [R Z L T-2 ~> Pa]
+  real, intent(in) :: C_basal       !< Basal friction coefficient for this cell [R L Z T-2 (s m-1)^n]
+  real, intent(in) :: alpha_coulomb !< Coulomb prefactor [nondim]
+  real, intent(in) :: CF_Max        !< Coulomb friction maximum coefficient [nondim]
+  real, intent(in) :: CF_MinN       !< Minimum Coulomb effective pressure [R Z L T-2 ~> Pa]
+  real, intent(in) :: CF_PostPeak   !< Coulomb post-peak exponent q [nondim]
+  real, intent(in) :: n_basal_fric  !< Friction sliding exponent m [nondim]
+
+  real :: fN  ! Floored effective pressure [R Z L T-2 ~> Pa]
+
+  fN = max(N_eff, CF_MinN)
+  compute_fB_from_N = alpha_coulomb * (C_basal / (CF_Max * fN))**(CF_PostPeak / n_basal_fric)
+end function compute_fB_from_N
+
+!> Effective pressure at a quadrature point from the sub-element flotation field:
+!! N = rho_ocean*g*min(fls, r*H). Where the bed is below sea level this is the usual
+!! rho_ice*g*(H - H_f); where it is above, min selects r*H and N reduces to the pure overburden
+!! rho_ice*g*H, with no spurious water column over dry land. This is the same cap CISM applies by
+!! clamping f_pattyn to [0,1], written without a branch, and it needs no bed field: the bed is
+!! implicit in fls. Taking fls from the same interpolant that decided the quadrature point's
+!! flotation state guarantees N >= 0 at every grounded point.
+pure real function subgrid_effective_pressure(fls_qp, h_qp, rhoi_rhow, rho_ocean_g_LtoZ)
+  real, intent(in) :: fls_qp    !< Flotation deficit r*h - bed at the quadrature point [Z ~> m]
+  real, intent(in) :: h_qp      !< Ice thickness at the quadrature point [Z ~> m]
+  real, intent(in) :: rhoi_rhow !< Ice/ocean density ratio r [nondim]
+  real, intent(in) :: rho_ocean_g_LtoZ !< US%L_to_Z * density_ocean_avg * g_Earth [R L Z-1 T-2]
+
+  subgrid_effective_pressure = rho_ocean_g_LtoZ * min(fls_qp, rhoi_rhow * h_qp)
+end function subgrid_effective_pressure
 
 !> Interpolate the ice shelf thickness from tracer point to nodal points,
 !! subject to a mask.
