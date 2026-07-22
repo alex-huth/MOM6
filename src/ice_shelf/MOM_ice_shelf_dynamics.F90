@@ -7168,6 +7168,57 @@ subroutine sep2_cut_tri(fX, fY, fZ, bX, bY, bZ, gX, betaT, wrefT, gT)
 
 end subroutine sep2_cut_tri
 
+!> Reference-space gradient of the P1 (linear) interpolant of a corner field on each of the four
+!! parent triangles of the sep2_cell_qps fan. Triangle t is (C, A, B) with C the cell center, whose
+!! value is the corner mean -- formed here with the same diagonal-pair grouping sep2_cell_qps uses,
+!! so it is bitwise the value the partition was built on. The gradient is constant on each triangle.
+!!
+!! Every field that enters a quantity which branches on the SEP2 flotation state must be
+!! differentiated with THIS operator, not with the bilinear (Q1) gradient. The two agree at the
+!! corners, at the center, and along the cell edges, but differ inside the cell by eta times the
+!! twist term (f_SW + f_NE) - (f_SE + f_NW): the bilinear x-gradient blends the north and south edge
+!! differences, while the P1 gradient on the southern triangle freezes the south edge value.
+!! Mixing them breaks the surface reconstruction in two ways. It stops the grounded branch
+!! telescoping -- (1-r)*B[h] + P[r*h - b] is a blend (1-r)*B + r*P applied to h against a pure P
+!! applied to b, which is no consistent surface at all -- and it moves the kink off the cut, since
+!! S_grounded - S_floating = r*h - b identically, so a branch taken on the P1 contour while the
+!! slopes come from the bilinear field makes S jump across the cut by the bilinear r*h - b evaluated
+!! there. Using P1 throughout gives grad S = P[h] - P[b] grounded and (1-r)*P[h] floating, both
+!! exact, with the jump identically zero. It also matches the friction, which evaluates fields at a
+!! QP as sum(beta*f) -- the beta are barycentric coordinates on the parent triangle, so that sum is
+!! already the P1 interpolant.
+subroutine sep2_fan_gradient(f, gxi, geta)
+  real, dimension(4), intent(in)  :: f    !< Corner values, ordered SW, SE, NW, NE [Z ~> m]
+  real, dimension(4), intent(out) :: gxi  !< d/dxi of the P1 interpolant per triangle, ordered
+                                          !! S, E, N, W as in sep2_cell_qps [Z ~> m]
+  real, dimension(4), intent(out) :: geta !< d/deta of the P1 interpolant per triangle [Z ~> m]
+
+  ! Base-corner ids (A,B) and reference coordinates of triangles S, E, N, W; these must match
+  ! sep2_cell_qps exactly or the gradient will not belong to the interpolant that was cut.
+  integer, dimension(4), parameter :: iA = (/ 1, 2, 4, 3 /) ! First (CCW) base corner per triangle
+  integer, dimension(4), parameter :: iB = (/ 2, 4, 3, 1 /) ! Second (CCW) base corner per triangle
+  real, dimension(4), parameter :: xref = (/ 0.0, 1.0, 0.0, 1.0 /) ! Corner xi [nondim]
+  real, dimension(4), parameter :: yref = (/ 0.0, 0.0, 1.0, 1.0 /) ! Corner eta [nondim]
+  real :: fC          ! Field value at the cell center, the corner mean [Z ~> m]
+  real :: abx, aby    ! Reference-space edge vector A->B [nondim]
+  real :: acx, acy    ! Reference-space edge vector A->C [nondim]
+  real :: u, v        ! Field increments along A->B and A->C [Z ~> m]
+  real :: Idet        ! Inverse reference-space determinant of (AB, AC) [nondim]
+  integer :: t
+
+  fC = 0.5 * ((0.5 * (f(1) + f(4))) + (0.5 * (f(2) + f(3))))
+  do t=1,4
+    abx = xref(iB(t)) - xref(iA(t)) ; aby = yref(iB(t)) - yref(iA(t))
+    acx = 0.5 - xref(iA(t))         ; acy = 0.5 - yref(iA(t))
+    u = f(iB(t)) - f(iA(t))         ; v = fC - f(iA(t))
+    ! Cramer solve of g.AB = u, g.AC = v for the constant gradient g on this triangle.
+    Idet = 1.0 / ((abx * acy) - (acx * aby))
+    gxi(t)  = ((u * acy) - (v * aby)) * Idet
+    geta(t) = ((v * abx) - (u * acx)) * Idet
+  enddo
+
+end subroutine sep2_fan_gradient
+
 !> SEP2 subgrid basal traction for a CG action: Picard and Newton friction integrated over
 !! the grounded sub-elements of the sep2_cell_qps partition. QPs inherit their piece's
 !! flotation state; floating QPs contribute nothing.
@@ -9250,13 +9301,6 @@ subroutine calc_shelf_driving_stress_fv_subgrid(CS, ISS, G, US, taudx, taudy)
   real, dimension(SZDIB_(G),SZDJB_(G)), &
                          intent(inout) :: taudy !< Y-direction driving stress at q-points [R L3 Z T-2 ~> kg m s-2]
 
-  ! Reference-space coordinates of the 4 cell corners, ordered SW, SE, NW, NE.
-  real, dimension(4), parameter :: xref = (/ 0.0, 1.0, 0.0, 1.0 /) !< Corner xi [nondim]
-  real, dimension(4), parameter :: yref = (/ 0.0, 0.0, 1.0, 1.0 /) !< Corner eta [nondim]
-  ! Base-corner ids (A,B) of the parent triangles S, E, N, W, matching sep2_cell_qps.
-  integer, dimension(4), parameter :: iA = (/ 1, 2, 4, 3 /) !< First (CCW) base corner per triangle
-  integer, dimension(4), parameter :: iB = (/ 2, 4, 3, 1 /) !< Second (CCW) base corner per triangle
-
   real, dimension(SZDIB_(G),SZDJB_(G),4) :: taudx_b, taudy_b ! Per-element corner contributions,
                        ! diagonal-pair summed for rotation invariance [R L3 Z T-2 ~> kg m s-2]
   real, dimension(4)     :: hc     ! Corner thickness, flattened SW,SE,NW,NE [Z ~> m]
@@ -9268,14 +9312,13 @@ subroutine calc_shelf_driving_stress_fv_subgrid(CS, ISS, G, US, taudx, taudy)
   real, dimension(4,7)   :: valx, valy ! Per-QP nodal contributions [R L3 Z T-2 ~> kg m s-2]
   real, dimension(4,4)   :: px, py ! Per-(corner, triangle) partial sums [R L3 Z T-2 ~> kg m s-2]
   real, dimension(4)     :: dfxi, dfeta ! Per-triangle P1 gradient of fls in reference space [Z ~> m]
+  real, dimension(4)     :: dhxi, dheta ! Per-triangle P1 gradient of H in reference space [Z ~> m]
   real, dimension(7) :: vsx, vsy ! Per-QP weight-scaled surface slopes [Z L ~> m2 m-1]
   real, dimension(7) :: vw       ! Per-QP quadrature weights [L2 ~> m2]
   real, dimension(4) :: psx, psy ! Per-triangle weighted-slope sums [Z L ~> m2 m-1]
   real, dimension(4) :: pw       ! Per-triangle weight sums [L2 ~> m2]
   real :: w_total           ! Total quadrature weight over the cell [L2 ~> m2]
   logical :: calc_slope_diag ! True if the surface-slope diagnostics are registered
-  real :: fC                ! Flotation deficit at the cell center (corner mean) [Z ~> m]
-  real :: det               ! Reference-space area factor of a parent triangle [nondim]
   real :: b1, b2, b3, b4    ! Corner-basis weights at the QP [nondim]
   real :: mS, mN, mW, mE    ! Marginal sums: interpolation weights of the 4 cell edges [nondim]
   real :: a, d              ! Interpolated cell-edge spacings at the QP [L ~> m]
@@ -9330,18 +9373,10 @@ subroutine calc_shelf_driving_stress_fv_subgrid(CS, ISS, G, US, taudx, taudy)
 
     call sep2_cell_qps(fls, nqp, beta, wref, qpg)
 
-    ! Per-triangle P1 gradient of the flotation deficit in reference space. The triangle is
-    ! (C, A, B) with C the cell center, whose value is the corner mean -- exactly the value
-    ! sep2_cell_qps uses -- so this is the gradient of the field whose zero contour was cut.
-    fC = 0.5 * ((0.5 * (fls(1) + fls(4))) + (0.5 * (fls(2) + fls(3))))
-    do t=1,4
-      det = ((xref(iB(t)) - xref(iA(t))) * (0.5 - yref(iA(t)))) - &
-            ((0.5 - xref(iA(t))) * (yref(iB(t)) - yref(iA(t))))
-      dfxi(t)  = (((fls(iB(t)) - fls(iA(t))) * (0.5 - yref(iA(t)))) - &
-                  ((fC - fls(iA(t))) * (yref(iB(t)) - yref(iA(t))))) / det
-      dfeta(t) = (((fC - fls(iA(t))) * (xref(iB(t)) - xref(iA(t)))) - &
-                  ((fls(iB(t)) - fls(iA(t))) * (0.5 - xref(iA(t))))) / det
-    enddo
+    ! Per-triangle P1 gradients of BOTH corner fields. Both terms of S must use the same operator
+    ! or the grounded branch does not telescope to grad(h) - grad(bed); see sep2_fan_gradient.
+    call sep2_fan_gradient(fls, dfxi, dfeta)
+    call sep2_fan_gradient(hc,  dhxi, dheta)
 
     do t=1,4
       do k=1,nqp(t)
@@ -9351,10 +9386,10 @@ subroutine calc_shelf_driving_stress_fv_subgrid(CS, ISS, G, US, taudx, taudy)
         d = (dyW * mW) + (dyE * mE)
         weight = wref(k,t) * (a * d)
 
-        ! Smooth part: bilinear gradient of the corner thickness (no kink).
-        dhdx_gp = ( (((-mS) * hc(1)) + (mN * hc(4))) + ((mS * hc(2)) + ((-mN) * hc(3))) ) / a
-        dhdy_gp = ( (((-mW) * hc(1)) + (mE * hc(4))) + (((-mE) * hc(2)) + (mW * hc(3))) ) / d
-        ! Kinked part: P1 gradient on this triangle, zero on the floating side.
+        ! S = (1-r)*H + max(fls,0). Smooth part, no kink; P1 to match the kinked part below.
+        dhdx_gp = dhxi(t) / a ; dhdy_gp = dheta(t) / d
+        ! Kinked part: zero on the floating side, so grad S telescopes to P[h] - P[bed] where
+        ! grounded and (1-r)*P[h] where floating, with the kink exactly on the cut.
         if (qpg(k,t)) then
           dfdx_gp = dfxi(t) / a ; dfdy_gp = dfeta(t) / d
         else
@@ -11657,6 +11692,8 @@ subroutine calc_shelf_driving_stress_DG_strong_sep2(CS, h_nodal_cell, bed_corner
   real, dimension(7) :: vw            ! Per-QP Jacobian weights [L2 ~> m2]
   real, dimension(4) :: psx, psy      ! Per-triangle weighted-slope sums [Z L ~> m2 m-1]
   real, dimension(4) :: pw            ! Per-triangle weight sums [L2 ~> m2]
+  real, dimension(4) :: dhxi, dheta   ! Per-triangle P1 gradient of h in reference space [Z ~> m]
+  real, dimension(4) :: dbxi, dbeta   ! Per-triangle P1 gradient of bed in reference space [Z ~> m]
   real :: b1, b2, b3, b4    ! Corner-basis weights at the QP [nondim]
   real :: mS, mN, mW, mE    ! Marginal sums: interpolation weights of the 4 cell edges [nondim]
   real :: a, d              ! Interpolated cell-edge spacings at the QP [L ~> m]
@@ -11677,6 +11714,12 @@ subroutine calc_shelf_driving_stress_DG_strong_sep2(CS, h_nodal_cell, bed_corner
   fls(:) = (rhoi_rhow * hc(:)) - bedc(:)
   call sep2_cell_qps(fls, nqp, beta, wref, qpg)
 
+  ! Per-triangle P1 gradients of the two corner fields. These must use the same interpolant that
+  ! sep2_cell_qps cut on, or the branch below is taken on one contour while the slopes come from
+  ! another and the surface jumps across the cut; see sep2_fan_gradient.
+  call sep2_fan_gradient(hc,   dhxi, dheta)
+  call sep2_fan_gradient(bedc, dbxi, dbeta)
+
   do t=1,4
     do k=1,nqp(t)
       b1 = beta(1,k,t) ; b2 = beta(2,k,t) ; b3 = beta(3,k,t) ; b4 = beta(4,k,t)
@@ -11687,10 +11730,8 @@ subroutine calc_shelf_driving_stress_DG_strong_sep2(CS, h_nodal_cell, bed_corner
 
       hloc = ((b1 * hc(1)) + (b4 * hc(4))) + ((b2 * hc(2)) + (b3 * hc(3)))
       hloc = max(hloc, CS%min_h_shelf)
-      dhdx_gp = ( (((-mS) * hc(1)) + (mN * hc(4))) + ((mS * hc(2)) + ((-mN) * hc(3))) ) / a
-      dhdy_gp = ( (((-mW) * hc(1)) + (mE * hc(4))) + (((-mE) * hc(2)) + (mW * hc(3))) ) / d
-      dbdx_gp = ( (((-mS) * bedc(1)) + (mN * bedc(4))) + ((mS * bedc(2)) + ((-mN) * bedc(3))) ) / a
-      dbdy_gp = ( (((-mW) * bedc(1)) + (mE * bedc(4))) + (((-mE) * bedc(2)) + (mW * bedc(3))) ) / d
+      dhdx_gp = dhxi(t) / a ; dhdy_gp = dheta(t) / d
+      dbdx_gp = dbxi(t) / a ; dbdy_gp = dbeta(t) / d
 
       ! The QP inherits its piece's flotation state; friction and taud branch identically.
       if (qpg(k,t)) then
