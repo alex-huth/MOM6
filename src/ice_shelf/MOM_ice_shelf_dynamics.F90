@@ -437,7 +437,8 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! integral of tau_d*psi) and feed the static-condensation RHS correction
                             !! -K_aU^T Kaa^-1 F_a back to the nodal driving stress, so the grounded
                             !! surface-slope kink no longer leaks onto floating corners. Requires
-                            !! CUTFEM_GL_FRICTION and FV_SUBGRID_GL_TAUD (FV path only). Experimental.
+                            !! CUTFEM_GL_FRICTION and either FV_SUBGRID_GL_TAUD (FV path) or the strong-form
+                            !! SEP2 DG driving stress (USE_DG_THICKNESS path). Experimental.
   real :: cutfem_ridge_reg  !< Relative Tikhonov floor on the 2x2 ridge self-stiffness before it is
                             !! inverted for static condensation, as a fraction of its trace [nondim].
   real, pointer, dimension(:,:) :: H_corner => NULL() !< Ice thickness interpolated to B-grid corners
@@ -1534,7 +1535,9 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "sub-element driving stress onto the same ridge mode and feed the static-condensation "//&
                  "RHS correction back to the nodal driving stress, so the grounded surface-slope kink "//&
                  "no longer leaks onto floating velocity corners. Requires CUTFEM_GL_FRICTION and "//&
-                 "FV_SUBGRID_GL_TAUD (FV path only). Experimental.", &
+                 "either FV_SUBGRID_GL_TAUD (FV path) or the strong-form SEP2 DG driving stress "//&
+                 "(USE_DG_THICKNESS with DG_DRIVING_STRESS_IBP=False, SEP2, no GL_QUADRANT_TAUD, no "//&
+                 "DG_GL_GATE_CONTINUOUS). Experimental.", &
                  default=.false., do_not_log=.not.CS%cutfem_gl_friction)
 
     call get_param(param_file, mdl, "ICE_SHELF_ADVECT_LIMITER", adv_limiter_str, &
@@ -1730,11 +1733,25 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       if (.not. CS%cutfem_gl_friction) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
                  "CUTFEM_GL_TAUD reuses the CUTFEM_GL_FRICTION ridge (K_aU, Kaa) and requires "//&
                  "CUTFEM_GL_FRICTION=True.")
-      if (.not. CS%fv_subgrid_gl_taud) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
+      if (CS%use_DG_thickness) then
+        ! DG path: F_a mirrors calc_shelf_driving_stress_DG_strong_sep2 (h_nodal, bed_node).
+        if (.not. CS%use_sep2) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: CUTFEM_GL_TAUD with "//&
+                 "USE_DG_THICKNESS projects the SEP2 DG driving stress and requires "//&
+                 "GROUNDING_LINE_SUBGRID_SCHEME='SEP2'.")
+        if (CS%gl_quad_taud) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: CUTFEM_GL_TAUD is "//&
+                 "inconsistent with GL_QUADRANT_TAUD (which replaces the DG driving stress).")
+        if (CS%dg_driving_stress_IBP) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: CUTFEM_GL_TAUD "//&
+                 "mirrors the strong-form SEP2 DG driving stress and requires "//&
+                 "DG_DRIVING_STRESS_IBP=False.")
+        if (CS%dg_gl_gate_continuous) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: CUTFEM_GL_TAUD "//&
+                 "with DG is not supported under DG_GL_GATE_CONTINUOUS: the DG driving stress uses "//&
+                 "h_nodal while the friction ridge uses h_flot, so their sub-element partitions "//&
+                 "differ.")
+      else
+        if (.not. CS%fv_subgrid_gl_taud) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
                  "CUTFEM_GL_TAUD projects the FV sub-element driving stress onto the ridge and "//&
                  "requires FV_SUBGRID_GL_TAUD=True (the FV path).")
-      if (CS%use_DG_thickness) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: CUTFEM_GL_TAUD is "//&
-                 "implemented for the FV_SUBGRID driving stress only, not the DG driving stress.")
+      endif
     endif
     call get_param(param_file, mdl, "USE_NODAL_BED_FILE", CS%use_nodal_bed_file, &
                  "If true, read bed elevation directly at B-grid nodes from "//&
@@ -8322,14 +8339,17 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
 
 end subroutine cutfem_diag_ground_fraction
 
-!> Driving-stress half of the CutFEM ridge (FV_SUBGRID path). For each cut cell it assembles the
-!! same ridge stiffness K_aU, Kaa as cutfem_condense_sep2 (membrane + grounded drag at the current
-!! iterate), projects the one-sided sub-element driving stress onto the ridge mode
-!!   F_a = sum_QP weight * psi * (-rho g He grad S)          (weight = wref*a*d, as the nodal taud),
+!> Driving-stress half of the CutFEM ridge. For each cut cell it assembles the same ridge stiffness
+!! K_aU, Kaa as cutfem_condense_sep2 (membrane + grounded drag at the current iterate), projects the
+!! one-sided sub-element driving stress onto the ridge mode
+!!   F_a = sum_QP weight * psi * (-rho g H grad S)           (weight = wref*a*d, as the nodal taud),
 !! and adds the static-condensation RHS correction  G = -K_aU^T Kaa^-1 F_a  to the nodal driving
 !! stress RHSu/RHSv. This is the RHS analog of the friction ridge: the grounded surface-slope kink
 !! drives the enrichment instead of leaking onto floating corners. Called once per outer iteration
-!! (K_aU, Kaa depend on the current viscosity/friction). FV path only.
+!! (K_aU, Kaa depend on the current viscosity/friction). The FV path mirrors the per-QP surface
+!! slope of calc_shelf_driving_stress_fv_subgrid (cell-mean thickness in the prefactor,
+!! MAX_SURFACE_SLOPE clamp); the DG path mirrors calc_shelf_driving_stress_DG_strong_sep2
+!! (h_nodal/bed_node fields, per-QP thickness in the prefactor, no clamp).
 subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, dens_ratio)
   type(ice_shelf_dyn_CS), intent(in) :: CS   !< Ice shelf control structure
   type(ice_shelf_state),  intent(in) :: ISS  !< Ice-shelf state (for h_shelf)
@@ -8341,7 +8361,7 @@ subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, den
   real, dimension(SZDIB_(G),SZDJB_(G)), intent(inout) :: RHSv !< Nodal driving-stress RHS, y [R L3 Z T-2]
   real,                   intent(in) :: dens_ratio !< Ice/water density ratio [nondim]
 
-  real, dimension(4) :: fls, hc            ! Corner deficit and thickness SW,SE,NW,NE [Z ~> m]
+  real, dimension(4) :: fls, hc, bedc      ! Corner deficit, thickness, bed SW,SE,NW,NE [Z ~> m]
   real, dimension(4) :: absfls             ! |fls| at corners [Z ~> m]
   real, dimension(4) :: uc, vc             ! Corner current velocities [L T-1 ~> m s-1]
   integer, dimension(4) :: nqp             ! QPs per parent triangle
@@ -8350,6 +8370,7 @@ subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, den
   logical, dimension(7,4) :: qpg           ! Grounded state per (QP, triangle)
   real, dimension(4)     :: dfxi, dfeta, daxi, daeta ! P1 gradients of fls and |fls| per triangle [Z]
   real, dimension(4)     :: dhxi, dheta    ! P1 gradient of corner thickness per triangle [Z ~> m]
+  real, dimension(4)     :: dbxi, dbeta    ! P1 gradient of corner bed per triangle (DG) [Z ~> m]
   real, dimension(4,4)   :: dNxi, dNeta    ! P1 gradient of corner basis per triangle [nondim]
   real, dimension(2,8)   :: KaU            ! Ridge-to-std stiffness [R L3 Z T-1]
   real, dimension(2,2)   :: Kaa, Kaa_inv   ! Ridge self-stiffness and its inverse
@@ -8359,22 +8380,43 @@ subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, den
   real :: visc_qp, fls_loc, psi_qp, gx, gy, dNx, dNy, sgn, bcw
   real :: coef_prefactor, min_trac_area, eps_vel2, fB_e
   real :: u_curr_loc, v_curr_loc, unorm2_loc, basal_coef_loc, drag_newt_loc
-  real :: dhdx_gp, dhdy_gp, dfdx_gp, dfdy_gp, dsdx_gp, dsdy_gp, fx_gp, fy_gp
+  real :: dhdx_gp, dhdy_gp, dfdx_gp, dfdy_gp, dbdx_gp, dbdy_gp, dsdx_gp, dsdy_gp, fx_gp, fy_gp
+  real :: hloc, bed_sub, fB_local          ! QP thickness, bed, Coulomb fB
+  real :: rho_ocean_g_LtoZ, rho_oi_ratio, rho_ice_g_LtoZ ! Coulomb effective-pressure constants
   real :: rho, grav, He, rgHe, smag, scale, det, reg_diag
+  logical :: do_DG, do_coulomb
   integer :: i, j, is, ie, js, je, t, k, c
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
   rho = CS%density_ice ; grav = CS%g_Earth
+  do_DG = CS%use_DG_thickness
+  do_coulomb = CS%CoulombFriction
+  if (do_coulomb) then
+    rho_ocean_g_LtoZ = US%L_to_Z * CS%density_ocean_avg * CS%g_Earth
+    rho_oi_ratio     = CS%density_ocean_avg / CS%density_ice
+    rho_ice_g_LtoZ   = US%L_to_Z * CS%density_ice * CS%g_Earth
+  endif
 
   do j=js-1,je+1 ; do i=is-1,ie+1
     if (ISS%hmask(i,j) /= 1 .and. ISS%hmask(i,j) /= 3) cycle
-    if (.not. (CS%corner_valid(I-1,J-1) .and. CS%corner_valid(I,J-1) .and. &
-               CS%corner_valid(I-1,J  ) .and. CS%corner_valid(I,J  ))) cycle
+    if (.not. do_DG) then
+      if (.not. (CS%corner_valid(I-1,J-1) .and. CS%corner_valid(I,J-1) .and. &
+                 CS%corner_valid(I-1,J  ) .and. CS%corner_valid(I,J  ))) cycle
+    endif
 
-    hc(1)  = CS%H_corner(I-1,J-1) ; hc(2)  = CS%H_corner(I,J-1)
-    hc(3)  = CS%H_corner(I-1,J  ) ; hc(4)  = CS%H_corner(I,J  )
-    fls(1) = CS%fls_corner(I-1,J-1) ; fls(2) = CS%fls_corner(I,J-1)
-    fls(3) = CS%fls_corner(I-1,J  ) ; fls(4) = CS%fls_corner(I,J  )
+    if (do_DG) then
+      ! DG path: native nodal thickness and bed, matching calc_shelf_driving_stress_DG_strong_sep2.
+      hc(1)  = CS%h_nodal(i,j,1,1) ; hc(2)  = CS%h_nodal(i,j,2,1)
+      hc(3)  = CS%h_nodal(i,j,1,2) ; hc(4)  = CS%h_nodal(i,j,2,2)
+      bedc(1) = CS%bed_node(I-1,J-1) ; bedc(2) = CS%bed_node(I,J-1)
+      bedc(3) = CS%bed_node(I-1,J  ) ; bedc(4) = CS%bed_node(I,J  )
+      fls(:) = (dens_ratio * hc(:)) - bedc(:)
+    else
+      hc(1)  = CS%H_corner(I-1,J-1) ; hc(2)  = CS%H_corner(I,J-1)
+      hc(3)  = CS%H_corner(I-1,J  ) ; hc(4)  = CS%H_corner(I,J  )
+      fls(1) = CS%fls_corner(I-1,J-1) ; fls(2) = CS%fls_corner(I,J-1)
+      fls(3) = CS%fls_corner(I-1,J  ) ; fls(4) = CS%fls_corner(I,J  )
+    endif
 
     ! Only genuinely mixed cells (a real cut) contribute.
     if (.not. (((fls(1) > 0.0) .or. (fls(2) > 0.0) .or. (fls(3) > 0.0) .or. (fls(4) > 0.0)) .and. &
@@ -8385,6 +8427,7 @@ subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, den
     call sep2_fan_gradient(fls, dfxi, dfeta)
     call sep2_fan_gradient(absfls, daxi, daeta)
     call sep2_fan_gradient(hc,  dhxi, dheta)
+    if (do_DG) call sep2_fan_gradient(bedc, dbxi, dbeta)
     block
       real, dimension(4) :: ec, gxi_c, geta_c
       do c=1,4
@@ -8435,11 +8478,28 @@ subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, den
         Kaa(1,1) = Kaa(1,1) + (jac*visc_qp) * ((4.0*gx*gx) + (gy*gy))
         Kaa(2,2) = Kaa(2,2) + (jac*visc_qp) * ((gx*gx) + (4.0*gy*gy))
         Kaa(1,2) = Kaa(1,2) + (jac*visc_qp) * (3.0*gx*gy)
+        hloc = ((b1*hc(1)) + (b4*hc(4))) + ((b2*hc(2)) + (b3*hc(3)))
         if (qpg(k,t)) then
           u_curr_loc = ((b1*uc(1)) + (b4*uc(4))) + ((b2*uc(2)) + (b3*uc(3)))
           v_curr_loc = ((b1*vc(1)) + (b4*vc(4))) + ((b2*vc(2)) + (b3*vc(3)))
           unorm2_loc = ((u_curr_loc**2) + (v_curr_loc**2)) + eps_vel2
-          call compute_basal_coef(unorm2_loc, coef_prefactor, min_trac_area, fB_e, &
+          ! Per-QP Coulomb fB, matching cutfem_condense_sep2 (Weertman fB_e=0 is unaffected).
+          if (do_coulomb) then
+            if (do_DG) then
+              bed_sub = ((b1*bedc(1)) + (b4*bedc(4))) + ((b2*bedc(2)) + (b3*bedc(3)))
+              fB_local = compute_fB_local(max(hloc, CS%min_h_shelf), bed_sub, rho_oi_ratio, &
+                  rho_ice_g_LtoZ, CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, &
+                  CS%CF_MinN, CS%CF_PostPeak, CS%n_basal_fric)
+            else
+              fB_local = compute_fB_from_N( &
+                  subgrid_effective_pressure(fls_loc, hloc, dens_ratio, rho_ocean_g_LtoZ), &
+                  CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
+                  CS%CF_PostPeak, CS%n_basal_fric)
+            endif
+          else
+            fB_local = fB_e
+          endif
+          call compute_basal_coef(unorm2_loc, coef_prefactor, min_trac_area, fB_local, &
               CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .false., &
               basal_coef_loc, drag_newt_loc)
           bcw = jac * basal_coef_loc * psi_qp
@@ -8451,24 +8511,36 @@ subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, den
           Kaa(2,2) = Kaa(2,2) + (jac * basal_coef_loc * (psi_qp*psi_qp))
         endif
 
-        ! --- Driving-stress projection F_a = sum weight*psi*(-rho g He grad S) ---
-        ! Same one-sided surface slope as calc_shelf_driving_stress_fv_subgrid: the fls-kink term
-        ! is dropped on floating QPs so grad S telescopes to grad h - grad bed (grounded) and
-        ! (1-r) grad h (floating), with the kink on the cut.
+        ! --- Driving-stress projection F_a = sum weight*psi*(-rho g H grad S), one-sided grad S. ---
         dhdx_gp = dhxi(t) / a ; dhdy_gp = dheta(t) / d
-        if (qpg(k,t)) then
-          dfdx_gp = dfxi(t) / a ; dfdy_gp = dfeta(t) / d
+        if (do_DG) then
+          ! Mirror calc_shelf_driving_stress_DG_strong_sep2: grad S = grad h - grad bed (grounded),
+          ! (1-r) grad h (floating); per-QP thickness in the prefactor; no MAX_SURFACE_SLOPE clamp.
+          if (qpg(k,t)) then
+            dbdx_gp = dbxi(t) / a ; dbdy_gp = dbeta(t) / d
+            dsdx_gp = dhdx_gp - dbdx_gp ; dsdy_gp = dhdy_gp - dbdy_gp
+          else
+            dsdx_gp = (1.0 - dens_ratio) * dhdx_gp ; dsdy_gp = (1.0 - dens_ratio) * dhdy_gp
+          endif
+          fx_gp = -(rho*grav*max(hloc, CS%min_h_shelf)) * dsdx_gp
+          fy_gp = -(rho*grav*max(hloc, CS%min_h_shelf)) * dsdy_gp
         else
-          dfdx_gp = 0.0 ; dfdy_gp = 0.0
+          ! Mirror calc_shelf_driving_stress_fv_subgrid: grad S = (1-r) grad h + [grad fls on
+          ! grounded]; cell-mean thickness prefactor rgHe; MAX_SURFACE_SLOPE clamp.
+          if (qpg(k,t)) then
+            dfdx_gp = dfxi(t) / a ; dfdy_gp = dfeta(t) / d
+          else
+            dfdx_gp = 0.0 ; dfdy_gp = 0.0
+          endif
+          dsdx_gp = ((1.0 - dens_ratio) * dhdx_gp) + dfdx_gp
+          dsdy_gp = ((1.0 - dens_ratio) * dhdy_gp) + dfdy_gp
+          if (CS%max_surface_slope > 0) then
+            smag = sqrt((dsdx_gp**2) + (dsdy_gp**2))
+            scale = CS%max_surface_slope / max(smag, CS%max_surface_slope)
+            dsdx_gp = scale*dsdx_gp ; dsdy_gp = scale*dsdy_gp
+          endif
+          fx_gp = -rgHe * dsdx_gp ; fy_gp = -rgHe * dsdy_gp
         endif
-        dsdx_gp = ((1.0 - dens_ratio) * dhdx_gp) + dfdx_gp
-        dsdy_gp = ((1.0 - dens_ratio) * dhdy_gp) + dfdy_gp
-        if (CS%max_surface_slope > 0) then
-          smag = sqrt((dsdx_gp**2) + (dsdy_gp**2))
-          scale = CS%max_surface_slope / max(smag, CS%max_surface_slope)
-          dsdx_gp = scale*dsdx_gp ; dsdy_gp = scale*dsdy_gp
-        endif
-        fx_gp = -rgHe * dsdx_gp ; fy_gp = -rgHe * dsdy_gp
         Fa(1) = Fa(1) + ((weight * psi_qp) * fx_gp)
         Fa(2) = Fa(2) + ((weight * psi_qp) * fy_gp)
       enddo
