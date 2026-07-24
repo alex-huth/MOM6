@@ -432,6 +432,12 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! leak-free). One ridge amplitude per cut cell; the ridge level set is
                             !! CS%fls_corner. Requires FV_SUBGRID_GL_FRICTION (for fls_corner) or
                             !! USE_DG_THICKNESS. Experimental.
+  logical :: cutfem_gl_taud !< If true, add the driving-stress half of the CutFEM ridge: project the
+                            !! one-sided sub-element driving stress onto the same ridge mode (F_a =
+                            !! integral of tau_d*psi) and feed the static-condensation RHS correction
+                            !! -K_aU^T Kaa^-1 F_a back to the nodal driving stress, so the grounded
+                            !! surface-slope kink no longer leaks onto floating corners. Requires
+                            !! CUTFEM_GL_FRICTION and FV_SUBGRID_GL_TAUD (FV path only). Experimental.
   real :: cutfem_ridge_reg  !< Relative Tikhonov floor on the 2x2 ridge self-stiffness before it is
                             !! inverted for static condensation, as a fraction of its trace [nondim].
   real, pointer, dimension(:,:) :: H_corner => NULL() !< Ice thickness interpolated to B-grid corners
@@ -1523,6 +1529,13 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "and GL_QUADRANT_FRICTION are two different grounded-drag treatments and cannot "//&
                  "both be used.")
     endif
+    call get_param(param_file, mdl, "CUTFEM_GL_TAUD", CS%cutfem_gl_taud, &
+                 "If true, add the driving-stress half of the CutFEM ridge: project the one-sided "//&
+                 "sub-element driving stress onto the same ridge mode and feed the static-condensation "//&
+                 "RHS correction back to the nodal driving stress, so the grounded surface-slope kink "//&
+                 "no longer leaks onto floating velocity corners. Requires CUTFEM_GL_FRICTION and "//&
+                 "FV_SUBGRID_GL_TAUD (FV path only). Experimental.", &
+                 default=.false., do_not_log=.not.CS%cutfem_gl_friction)
 
     call get_param(param_file, mdl, "ICE_SHELF_ADVECT_LIMITER", adv_limiter_str, &
                  "The TVD slope limiter used for the finite-volume ice thickness advection in "//&
@@ -1712,6 +1725,16 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "MOM_ice_shelf_dynamics: CUTFEM_GL_FRICTION needs the corner flotation field "//&
                  "CS%fls_corner from FV_SUBGRID_GL_FRICTION, or the DG nodal-thickness path "//&
                  "(USE_DG_THICKNESS=True).")
+    endif
+    if (CS%cutfem_gl_taud) then
+      if (.not. CS%cutfem_gl_friction) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
+                 "CUTFEM_GL_TAUD reuses the CUTFEM_GL_FRICTION ridge (K_aU, Kaa) and requires "//&
+                 "CUTFEM_GL_FRICTION=True.")
+      if (.not. CS%fv_subgrid_gl_taud) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
+                 "CUTFEM_GL_TAUD projects the FV sub-element driving stress onto the ridge and "//&
+                 "requires FV_SUBGRID_GL_TAUD=True (the FV path).")
+      if (CS%use_DG_thickness) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: CUTFEM_GL_TAUD is "//&
+                 "implemented for the FV_SUBGRID driving stress only, not the DG driving stress.")
     endif
     call get_param(param_file, mdl, "USE_NODAL_BED_FILE", CS%use_nodal_bed_file, &
                  "If true, read bed elevation directly at B-grid nodes from "//&
@@ -4011,6 +4034,11 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
   Ie_sum = Iecq + (1-Isdq) ; Je_sum = Jecq + (1-Jsdq)
 
   RHSu(:,:) = taudx(:,:) ; RHSv(:,:) = taudy(:,:)
+  ! Driving-stress half of the CutFEM ridge: add the static-condensation RHS correction
+  ! -K_aU^T Kaa^-1 F_a (F_a = the one-sided sub-element driving stress projected on the ridge).
+  ! Recomputed here each outer iteration because K_aU, Kaa depend on the current viscosity/friction.
+  if (CS%cutfem_gl_taud) &
+    call cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, rhoi_rhow)
   call pass_vector(RHSu, RHSv, G%domain, TO_ALL, BGRID_NE, complete=.false.)
 
   call matrix_diagonal(CS, G, US, H_node, CS%ice_visc, u_shlf, v_shlf, &
@@ -8293,6 +8321,187 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
   enddo ; enddo
 
 end subroutine cutfem_diag_ground_fraction
+
+!> Driving-stress half of the CutFEM ridge (FV_SUBGRID path). For each cut cell it assembles the
+!! same ridge stiffness K_aU, Kaa as cutfem_condense_sep2 (membrane + grounded drag at the current
+!! iterate), projects the one-sided sub-element driving stress onto the ridge mode
+!!   F_a = sum_QP weight * psi * (-rho g He grad S)          (weight = wref*a*d, as the nodal taud),
+!! and adds the static-condensation RHS correction  G = -K_aU^T Kaa^-1 F_a  to the nodal driving
+!! stress RHSu/RHSv. This is the RHS analog of the friction ridge: the grounded surface-slope kink
+!! drives the enrichment instead of leaking onto floating corners. Called once per outer iteration
+!! (K_aU, Kaa depend on the current viscosity/friction). FV path only.
+subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, dens_ratio)
+  type(ice_shelf_dyn_CS), intent(in) :: CS   !< Ice shelf control structure
+  type(ice_shelf_state),  intent(in) :: ISS  !< Ice-shelf state (for h_shelf)
+  type(ocean_grid_type),  intent(in) :: G    !< The grid structure
+  type(unit_scale_type),  intent(in) :: US   !< Unit conversion factors
+  real, dimension(SZDIB_(G),SZDJB_(G)), intent(in) :: u_shlf !< Current u iterate at nodes [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), intent(in) :: v_shlf !< Current v iterate at nodes [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), intent(inout) :: RHSu !< Nodal driving-stress RHS, x [R L3 Z T-2]
+  real, dimension(SZDIB_(G),SZDJB_(G)), intent(inout) :: RHSv !< Nodal driving-stress RHS, y [R L3 Z T-2]
+  real,                   intent(in) :: dens_ratio !< Ice/water density ratio [nondim]
+
+  real, dimension(4) :: fls, hc            ! Corner deficit and thickness SW,SE,NW,NE [Z ~> m]
+  real, dimension(4) :: absfls             ! |fls| at corners [Z ~> m]
+  real, dimension(4) :: uc, vc             ! Corner current velocities [L T-1 ~> m s-1]
+  integer, dimension(4) :: nqp             ! QPs per parent triangle
+  real, dimension(4,7,4) :: beta           ! Corner-basis weights per (corner, QP, triangle) [nondim]
+  real, dimension(7,4)   :: wref           ! Reference measure per (QP, triangle) [nondim]
+  logical, dimension(7,4) :: qpg           ! Grounded state per (QP, triangle)
+  real, dimension(4)     :: dfxi, dfeta, daxi, daeta ! P1 gradients of fls and |fls| per triangle [Z]
+  real, dimension(4)     :: dhxi, dheta    ! P1 gradient of corner thickness per triangle [Z ~> m]
+  real, dimension(4,4)   :: dNxi, dNeta    ! P1 gradient of corner basis per triangle [nondim]
+  real, dimension(2,8)   :: KaU            ! Ridge-to-std stiffness [R L3 Z T-1]
+  real, dimension(2,2)   :: Kaa, Kaa_inv   ! Ridge self-stiffness and its inverse
+  real, dimension(2)     :: Fa, svec       ! Driving-stress projection F_a and Kaa^-1 F_a
+  real, dimension(4)     :: Ucorr, Vcorr   ! Per-corner RHS correction [R L3 Z T-2]
+  real :: b1, b2, b3, b4, mS, mN, mW, mE, a, d, jac, weight
+  real :: visc_qp, fls_loc, psi_qp, gx, gy, dNx, dNy, sgn, bcw
+  real :: coef_prefactor, min_trac_area, eps_vel2, fB_e
+  real :: u_curr_loc, v_curr_loc, unorm2_loc, basal_coef_loc, drag_newt_loc
+  real :: dhdx_gp, dhdy_gp, dfdx_gp, dfdy_gp, dsdx_gp, dsdy_gp, fx_gp, fy_gp
+  real :: rho, grav, He, rgHe, smag, scale, det, reg_diag
+  integer :: i, j, is, ie, js, je, t, k, c
+
+  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
+  rho = CS%density_ice ; grav = CS%g_Earth
+
+  do j=js-1,je+1 ; do i=is-1,ie+1
+    if (ISS%hmask(i,j) /= 1 .and. ISS%hmask(i,j) /= 3) cycle
+    if (.not. (CS%corner_valid(I-1,J-1) .and. CS%corner_valid(I,J-1) .and. &
+               CS%corner_valid(I-1,J  ) .and. CS%corner_valid(I,J  ))) cycle
+
+    hc(1)  = CS%H_corner(I-1,J-1) ; hc(2)  = CS%H_corner(I,J-1)
+    hc(3)  = CS%H_corner(I-1,J  ) ; hc(4)  = CS%H_corner(I,J  )
+    fls(1) = CS%fls_corner(I-1,J-1) ; fls(2) = CS%fls_corner(I,J-1)
+    fls(3) = CS%fls_corner(I-1,J  ) ; fls(4) = CS%fls_corner(I,J  )
+
+    ! Only genuinely mixed cells (a real cut) contribute.
+    if (.not. (((fls(1) > 0.0) .or. (fls(2) > 0.0) .or. (fls(3) > 0.0) .or. (fls(4) > 0.0)) .and. &
+               ((fls(1) <= 0.0) .or. (fls(2) <= 0.0) .or. (fls(3) <= 0.0) .or. (fls(4) <= 0.0)))) cycle
+
+    absfls(:) = abs(fls(:))
+    call sep2_cell_qps(fls, nqp, beta, wref, qpg)
+    call sep2_fan_gradient(fls, dfxi, dfeta)
+    call sep2_fan_gradient(absfls, daxi, daeta)
+    call sep2_fan_gradient(hc,  dhxi, dheta)
+    block
+      real, dimension(4) :: ec, gxi_c, geta_c
+      do c=1,4
+        ec(:) = 0.0 ; ec(c) = 1.0
+        call sep2_fan_gradient(ec, gxi_c, geta_c)
+        dNxi(c,:) = gxi_c(:) ; dNeta(c,:) = geta_c(:)
+      enddo
+    end block
+
+    uc(1) = u_shlf(I-1,J-1) ; uc(2) = u_shlf(I,J-1) ; uc(3) = u_shlf(I-1,J) ; uc(4) = u_shlf(I,J)
+    vc(1) = v_shlf(I-1,J-1) ; vc(2) = v_shlf(I,J-1) ; vc(3) = v_shlf(I-1,J) ; vc(4) = v_shlf(I,J)
+
+    coef_prefactor = CS%coef_prefactor(i,j)
+    min_trac_area  = CS%min_basal_traction * G%areaT(i,j)
+    eps_vel2 = CS%eps_glen_min**2 * ((G%dxT(i,j)**2) + (G%dyT(i,j)**2))
+    fB_e = CS%fB_elem(i,j)
+    visc_qp = 0.0
+    do k=1,CS%visc_qps ; visc_qp = visc_qp + CS%ice_visc(i,j,k) ; enddo
+    visc_qp = visc_qp / real(CS%visc_qps)
+    He = max(ISS%h_shelf(i,j), CS%min_h_shelf)
+    rgHe = (rho*grav) * He
+
+    KaU(:,:) = 0.0 ; Kaa(:,:) = 0.0 ; Fa(:) = 0.0
+
+    do t=1,4
+      do k=1,nqp(t)
+        b1 = beta(1,k,t) ; b2 = beta(2,k,t) ; b3 = beta(3,k,t) ; b4 = beta(4,k,t)
+        mS = b1 + b2 ; mN = b3 + b4 ; mW = b1 + b3 ; mE = b2 + b4
+        a = (G%dxCv(i,j-1) * mS) + (G%dxCv(i,j) * mN)
+        d = (G%dyCu(i-1,j) * mW) + (G%dyCu(i,j) * mE)
+        jac = (wref(k,t) * (a * d)) * G%IareaT(i,j)
+        weight = wref(k,t) * (a * d)
+
+        fls_loc = ((b1 * fls(1)) + (b4 * fls(4))) + ((b2 * fls(2)) + (b3 * fls(3)))
+        sgn = merge(1.0, -1.0, qpg(k,t))
+        psi_qp = (((b1*absfls(1)) + (b4*absfls(4))) + ((b2*absfls(2)) + (b3*absfls(3)))) - (sgn*fls_loc)
+        gx = (daxi(t)  - (sgn * dfxi(t)))  / a
+        gy = (daeta(t) - (sgn * dfeta(t))) / d
+
+        ! --- Ridge stiffness (identical to cutfem_condense_sep2) ---
+        do c=1,4
+          dNx = dNxi(c,t) / a ; dNy = dNeta(c,t) / d
+          KaU(1,c)   = KaU(1,c)   + (jac*visc_qp) * ((4.0*dNx*gx) + (dNy*gy))
+          KaU(1,c+4) = KaU(1,c+4) + (jac*visc_qp) * ((2.0*dNy*gx) + (dNx*gy))
+          KaU(2,c)   = KaU(2,c)   + (jac*visc_qp) * ((dNy*gx) + (2.0*dNx*gy))
+          KaU(2,c+4) = KaU(2,c+4) + (jac*visc_qp) * ((dNx*gx) + (4.0*dNy*gy))
+        enddo
+        Kaa(1,1) = Kaa(1,1) + (jac*visc_qp) * ((4.0*gx*gx) + (gy*gy))
+        Kaa(2,2) = Kaa(2,2) + (jac*visc_qp) * ((gx*gx) + (4.0*gy*gy))
+        Kaa(1,2) = Kaa(1,2) + (jac*visc_qp) * (3.0*gx*gy)
+        if (qpg(k,t)) then
+          u_curr_loc = ((b1*uc(1)) + (b4*uc(4))) + ((b2*uc(2)) + (b3*uc(3)))
+          v_curr_loc = ((b1*vc(1)) + (b4*vc(4))) + ((b2*vc(2)) + (b3*vc(3)))
+          unorm2_loc = ((u_curr_loc**2) + (v_curr_loc**2)) + eps_vel2
+          call compute_basal_coef(unorm2_loc, coef_prefactor, min_trac_area, fB_e, &
+              CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .false., &
+              basal_coef_loc, drag_newt_loc)
+          bcw = jac * basal_coef_loc * psi_qp
+          do c=1,4
+            KaU(1,c)   = KaU(1,c)   + (bcw * beta(c,k,t))
+            KaU(2,c+4) = KaU(2,c+4) + (bcw * beta(c,k,t))
+          enddo
+          Kaa(1,1) = Kaa(1,1) + (jac * basal_coef_loc * (psi_qp*psi_qp))
+          Kaa(2,2) = Kaa(2,2) + (jac * basal_coef_loc * (psi_qp*psi_qp))
+        endif
+
+        ! --- Driving-stress projection F_a = sum weight*psi*(-rho g He grad S) ---
+        ! Same one-sided surface slope as calc_shelf_driving_stress_fv_subgrid: the fls-kink term
+        ! is dropped on floating QPs so grad S telescopes to grad h - grad bed (grounded) and
+        ! (1-r) grad h (floating), with the kink on the cut.
+        dhdx_gp = dhxi(t) / a ; dhdy_gp = dheta(t) / d
+        if (qpg(k,t)) then
+          dfdx_gp = dfxi(t) / a ; dfdy_gp = dfeta(t) / d
+        else
+          dfdx_gp = 0.0 ; dfdy_gp = 0.0
+        endif
+        dsdx_gp = ((1.0 - dens_ratio) * dhdx_gp) + dfdx_gp
+        dsdy_gp = ((1.0 - dens_ratio) * dhdy_gp) + dfdy_gp
+        if (CS%max_surface_slope > 0) then
+          smag = sqrt((dsdx_gp**2) + (dsdy_gp**2))
+          scale = CS%max_surface_slope / max(smag, CS%max_surface_slope)
+          dsdx_gp = scale*dsdx_gp ; dsdy_gp = scale*dsdy_gp
+        endif
+        fx_gp = -rgHe * dsdx_gp ; fy_gp = -rgHe * dsdy_gp
+        Fa(1) = Fa(1) + ((weight * psi_qp) * fx_gp)
+        Fa(2) = Fa(2) + ((weight * psi_qp) * fy_gp)
+      enddo
+    enddo
+    Kaa(2,1) = Kaa(1,2)
+
+    reg_diag = CS%cutfem_ridge_reg * (Kaa(1,1) + Kaa(2,2))
+    Kaa(1,1) = Kaa(1,1) + reg_diag ; Kaa(2,2) = Kaa(2,2) + reg_diag
+    det = (Kaa(1,1)*Kaa(2,2)) - (Kaa(1,2)*Kaa(2,1))
+    if (det <= 0.0) cycle
+    Kaa_inv(1,1) =  Kaa(2,2)/det ; Kaa_inv(2,2) =  Kaa(1,1)/det
+    Kaa_inv(1,2) = -Kaa(1,2)/det ; Kaa_inv(2,1) = -Kaa(2,1)/det
+
+    ! RHS correction G = -K_aU^T (Kaa^-1 F_a).
+    svec(1) = (Kaa_inv(1,1)*Fa(1)) + (Kaa_inv(1,2)*Fa(2))
+    svec(2) = (Kaa_inv(2,1)*Fa(1)) + (Kaa_inv(2,2)*Fa(2))
+    do c=1,4
+      Ucorr(c) = -((KaU(1,c)*svec(1))   + (KaU(2,c)*svec(2)))
+      Vcorr(c) = -((KaU(1,c+4)*svec(1)) + (KaU(2,c+4)*svec(2)))
+    enddo
+
+    ! Scatter to the four nodes (SW,SE,NW,NE) = (I-1,J-1),(I,J-1),(I-1,J),(I,J).
+    if (CS%umask(I-1,J-1) == 1) RHSu(I-1,J-1) = RHSu(I-1,J-1) + Ucorr(1)
+    if (CS%umask(I  ,J-1) == 1) RHSu(I  ,J-1) = RHSu(I  ,J-1) + Ucorr(2)
+    if (CS%umask(I-1,J  ) == 1) RHSu(I-1,J  ) = RHSu(I-1,J  ) + Ucorr(3)
+    if (CS%umask(I  ,J  ) == 1) RHSu(I  ,J  ) = RHSu(I  ,J  ) + Ucorr(4)
+    if (CS%vmask(I-1,J-1) == 1) RHSv(I-1,J-1) = RHSv(I-1,J-1) + Vcorr(1)
+    if (CS%vmask(I  ,J-1) == 1) RHSv(I  ,J-1) = RHSv(I  ,J-1) + Vcorr(2)
+    if (CS%vmask(I-1,J  ) == 1) RHSv(I-1,J  ) = RHSv(I-1,J  ) + Vcorr(3)
+    if (CS%vmask(I  ,J  ) == 1) RHSv(I  ,J  ) = RHSv(I  ,J  ) + Vcorr(4)
+  enddo ; enddo
+
+end subroutine cutfem_taud_ridge_rhs
 
 !> SEP2 subgrid basal traction for the preconditioner diagonal: same partition and
 !! quadrature as CG_action_sep2_basal, with squared basis weights and per-block
