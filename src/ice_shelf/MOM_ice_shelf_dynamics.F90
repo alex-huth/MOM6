@@ -1510,11 +1510,8 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       if (CS%gl_quad_friction) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: CUTFEM_GL_FRICTION "//&
                  "and GL_QUADRANT_FRICTION are two different grounded-drag treatments and cannot "//&
                  "both be used.")
-      if (.not. (CS%fv_subgrid_gl_friction .or. CS%use_DG_thickness)) call MOM_error(FATAL, &
-                 "MOM_ice_shelf_dynamics: CUTFEM_GL_FRICTION needs the corner flotation field "//&
-                 "CS%fls_corner from FV_SUBGRID_GL_FRICTION, or the DG nodal-thickness path "//&
-                 "(USE_DG_THICKNESS=True).")
     endif
+
     call get_param(param_file, mdl, "ICE_SHELF_ADVECT_LIMITER", adv_limiter_str, &
                  "The TVD slope limiter used for the finite-volume ice thickness advection in "//&
                  "ice_shelf_advect_thickness_x/y. VAN_LEER is the original scheme; SUPERBEE is "//&
@@ -1698,6 +1695,12 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "with unsplit RK2 advection and sub-element Gauss quadrature for "//&
                  "driving stress. Requires h_x and h_y slope moments.", &
                  default=.false.)
+    if (CS%cutfem_gl_friction) then
+      if (.not. (CS%fv_subgrid_gl_friction .or. CS%use_DG_thickness)) call MOM_error(FATAL, &
+                 "MOM_ice_shelf_dynamics: CUTFEM_GL_FRICTION needs the corner flotation field "//&
+                 "CS%fls_corner from FV_SUBGRID_GL_FRICTION, or the DG nodal-thickness path "//&
+                 "(USE_DG_THICKNESS=True).")
+    endif
     call get_param(param_file, mdl, "USE_NODAL_BED_FILE", CS%use_nodal_bed_file, &
                  "If true, read bed elevation directly at B-grid nodes from "//&
                  "NODAL_BED_FILE into CS%bed_node and derive the cell-centered "//&
