@@ -282,6 +282,11 @@ type, public :: ice_shelf_dyn_CS ; private
                                !! after the CutFEM ridge condensation (actual-velocity probe of the
                                !! enriched operator). Should collapse toward 0 on the downstream node if the
                                !! ridge removes the leak. Compare against CS%fg_cut_naive [nondim].
+  real, pointer, dimension(:,:) :: fg_cut_memfrac => NULL() !< Diagnostic: membrane fraction of the ridge
+                               !! self-stiffness trace, Kaa_mem/(Kaa_mem+Kaa_drag), in each CutFEM cut cell.
+                               !! Near 0 => the ridge amplitude is drag-limited (removal is shape/rank-set,
+                               !! more modes could help); near 1 => membrane (viscosity) dominates and damps
+                               !! the kink, so the modest leak removal is largely physical [nondim].
   ! float_cond used to be a persistent CS field; it is now derived inline at use sites
   ! from CS%ground_frac (a GL cell is "0 < ground_frac < 1" under GL_regularize=True).
   real, pointer, dimension(:,:) :: basal_tr_dfrac => NULL() !< Diagnostic basal-traction smoothing anomaly:
@@ -803,7 +808,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_taudx_shelf = -1, id_taudy_shelf = -1, id_taud_shelf = -1, id_bed_elev = -1, &
              id_ground_frac = -1, id_basal_tr_dfrac = -1, id_col_thick = -1, id_OD_av = -1, &
              id_f_ground_cell = -1, id_f_ground_node = -1, &
-             id_fg_cut_naive = -1, id_fg_cut_eff = -1, &
+             id_fg_cut_naive = -1, id_fg_cut_eff = -1, id_fg_cut_memfrac = -1, &
              id_u_mask = -1, id_v_mask = -1, id_ufb_mask =-1, id_vfb_mask = -1, id_t_mask = -1, &
              id_sx_shelf = -1, id_sy_shelf = -1, id_surf_slope_mag_shelf, &
              id_duHdx = -1, id_dvHdy = -1, id_fluxdiv = -1, &
@@ -1053,6 +1058,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%f_ground_cell(isd:ied,jsd:jed), source=0.0)
     allocate(CS%fg_cut_naive(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%fg_cut_eff(IsdB:IedB,JsdB:JedB), source=0.0)
+    allocate(CS%fg_cut_memfrac(isd:ied,jsd:jed), source=0.0)
     allocate(CS%H_corner(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%fls_corner(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%corner_valid(IsdB:IedB,JsdB:JedB), source=.false.)
@@ -2111,6 +2117,11 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
        '(actual-velocity probe); partial collapse toward 0 on the downstream node measures how much '//&
        'leak the ridge removes. Compare against fg_cut_naive. Nonzero only when CUTFEM_GL_FRICTION '//&
        'is set', 'none')
+    CS%id_fg_cut_memfrac = register_diag_field('ice_shelf_model','fg_cut_memfrac',CS%diag%axesT1, Time, &
+       'CutFEM diagnostic: membrane fraction of the ridge self-stiffness trace, '//&
+       'Kaa_mem/(Kaa_mem+Kaa_drag), per cut cell. Near 1 => viscosity dominates and physically damps '//&
+       'the kink (modest leak removal is real); near 0 => drag-limited. Nonzero only when '//&
+       'CUTFEM_GL_FRICTION is set', 'none')
     CS%id_col_thick = register_diag_field('ice_shelf_model','col_thick',CS%diag%axesT1, Time, &
        'ocean column thickness passed to ice model', 'm', conversion=US%Z_to_m)
     CS%id_visc_shelf = register_diag_field('ice_shelf_model','ice_visc',CS%diag%axesT1, Time, &
@@ -2724,6 +2735,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
     if (CS%id_f_ground_node > 0) call post_data(CS%id_f_ground_node, CS%f_ground_node, CS%diag)
     if (CS%id_fg_cut_naive > 0) call post_data(CS%id_fg_cut_naive, CS%fg_cut_naive, CS%diag)
     if (CS%id_fg_cut_eff > 0) call post_data(CS%id_fg_cut_eff, CS%fg_cut_eff, CS%diag)
+    if (CS%id_fg_cut_memfrac > 0) call post_data(CS%id_fg_cut_memfrac, CS%fg_cut_memfrac, CS%diag)
     if (CS%id_basal_tr_dfrac > 0) call post_data(CS%id_basal_tr_dfrac, CS%basal_tr_dfrac, CS%diag)
     if (CS%id_OD_av >0) call post_data(CS%id_OD_av, CS%OD_av,CS%diag)
     if (CS%id_visc_shelf > 0) then
@@ -3976,7 +3988,8 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   call MOM_mesg(mesg)
 
   ! CutFEM nodal grounded-drag-fraction diagnostic on the converged velocity (leak vs. leak-after-ridge).
-  if (CS%cutfem_gl_friction .and. ((CS%id_fg_cut_naive > 0) .or. (CS%id_fg_cut_eff > 0))) &
+  if (CS%cutfem_gl_friction .and. ((CS%id_fg_cut_naive > 0) .or. (CS%id_fg_cut_eff > 0) .or. &
+      (CS%id_fg_cut_memfrac > 0))) &
     call cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, rhoi_rhow)
 
 end subroutine ice_shelf_solve_outer
@@ -8169,12 +8182,13 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
   real :: u_curr_loc, v_curr_loc, unorm2_loc, basal_coef_loc, drag_newt_loc
   real :: hloc, bed_sub, fB_local, fB_e
   real :: rho_ocean_g_LtoZ, rho_oi_ratio, rho_ice_g_LtoZ
-  real :: det, reg_diag
+  real :: det, reg_diag, kaa_mem_tr, kaa_drag_tr ! Membrane and drag traces of Kaa [R L3 Z T-1]
   logical :: do_DG, fv_sub_fric, do_coulomb
   integer :: i, j, is, ie, js, je, t, k, c
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
   Sg(:,:) = 0.0 ; Seff(:,:) = 0.0 ; Sall(:,:) = 0.0
+  CS%fg_cut_memfrac(:,:) = 0.0
 
   do_DG = CS%use_DG_thickness
   fv_sub_fric = CS%fv_subgrid_gl_friction .and. (.not. CS%use_DG_thickness)
@@ -8241,6 +8255,7 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
     visc_qp = visc_qp / real(CS%visc_qps)
 
     KaU(:,:) = 0.0 ; Kaa(:,:) = 0.0 ; m_g(:) = 0.0 ; m_all(:) = 0.0
+    kaa_mem_tr = 0.0 ; kaa_drag_tr = 0.0
 
     do t=1,4
       do k=1,nqp(t)
@@ -8266,6 +8281,7 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
         Kaa(1,1) = Kaa(1,1) + (jac*visc_qp) * ((4.0*gx*gx) + (gy*gy))
         Kaa(2,2) = Kaa(2,2) + (jac*visc_qp) * ((gx*gx) + (4.0*gy*gy))
         Kaa(1,2) = Kaa(1,2) + (jac*visc_qp) * (3.0*gx*gy)
+        kaa_mem_tr = kaa_mem_tr + ((jac*visc_qp) * (5.0*((gx*gx) + (gy*gy))))
 
         ! Basal drag coupling: grounded QPs feed the ridge; all QPs feed m_all normalizer.
         u_curr_loc = ((b1*uc(1)) + (b4*uc(4))) + ((b2*uc(2)) + (b3*uc(3)))
@@ -8307,10 +8323,13 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
           enddo
           Kaa(1,1) = Kaa(1,1) + (jac * basal_coef_loc * (psi_qp*psi_qp))
           Kaa(2,2) = Kaa(2,2) + (jac * basal_coef_loc * (psi_qp*psi_qp))
+          kaa_drag_tr = kaa_drag_tr + (2.0 * (jac * basal_coef_loc * (psi_qp*psi_qp)))
         endif
       enddo
     enddo
     Kaa(2,1) = Kaa(1,2)
+    if ((kaa_mem_tr + kaa_drag_tr) > 0.0) &
+      CS%fg_cut_memfrac(i,j) = kaa_mem_tr / (kaa_mem_tr + kaa_drag_tr)
 
     ! Actual-velocity probe of the enriched drag operator: the ridge's x-force correction on each
     ! corner under the converged (kinked) velocity, Uc = -K_aU^T Kaa^-1 (K_aU * [uc;vc]). This is the
