@@ -279,7 +279,7 @@ type, public :: ice_shelf_dyn_CS ; private
                                !! fully-grounded per-corner drag mass. Nonzero on the floating (downstream)
                                !! node = the friction leak. Zero away from cut cells [nondim].
   real, pointer, dimension(:,:) :: fg_cut_eff => NULL() !< Diagnostic: the same nodal grounded-drag fraction
-                               !! after the CutFEM ridge condensation (rigid-unit-velocity probe of the
+                               !! after the CutFEM ridge condensation (actual-velocity probe of the
                                !! enriched operator). Should collapse toward 0 on the downstream node if the
                                !! ridge removes the leak. Compare against CS%fg_cut_naive [nondim].
   ! float_cond used to be a persistent CS field; it is now derived inline at use sites
@@ -2103,13 +2103,14 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
        'parameterization (Leguy et al. 2021); multiplies basal friction under '//&
        'GL_QUADRANT_FRICTION', 'none')
     CS%id_fg_cut_naive = register_diag_field('ice_shelf_model','fg_cut_naive',CS%diag%axesB1, Time, &
-       'CutFEM diagnostic: grounded basal-drag fraction the naive (un-cut) consistent assembly '//&
-       'assigns to each B-grid node in cut cells; nonzero on the downstream floating node = the '//&
-       'friction leak. Nonzero only when CUTFEM_GL_FRICTION is set', 'none')
+       'CutFEM diagnostic: naive (un-cut) grounded basal-drag x-force fraction on each B-grid node '//&
+       'in grounding-line cells, on the converged velocity; nonzero on the downstream floating node '//&
+       '= the friction leak. Nonzero only when CUTFEM_GL_FRICTION is set', 'none')
     CS%id_fg_cut_eff = register_diag_field('ice_shelf_model','fg_cut_eff',CS%diag%axesB1, Time, &
-       'CutFEM diagnostic: nodal grounded-drag fraction after the ridge condensation (rigid-unit '//&
-       'velocity probe); collapses toward 0 on the downstream node if the leak is removed. Compare '//&
-       'against fg_cut_naive. Nonzero only when CUTFEM_GL_FRICTION is set', 'none')
+       'CutFEM diagnostic: grounded basal-drag x-force fraction after the rank-2 ridge condensation '//&
+       '(actual-velocity probe); partial collapse toward 0 on the downstream node measures how much '//&
+       'leak the ridge removes. Compare against fg_cut_naive. Nonzero only when CUTFEM_GL_FRICTION '//&
+       'is set', 'none')
     CS%id_col_thick = register_diag_field('ice_shelf_model','col_thick',CS%diag%axesT1, Time, &
        'ocean column thickness passed to ice model', 'm', conversion=US%Z_to_m)
     CS%id_visc_shelf = register_diag_field('ice_shelf_model','ice_visc',CS%diag%axesT1, Time, &
@@ -8124,17 +8125,20 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
 
 end subroutine cutfem_condense_sep2
 
-!> Diagnostic: per-node grounded basal-drag fraction in CutFEM cut cells, both the naive
-!! (un-cut consistent assembly) value and the effective value after the ridge condensation.
-!! For each cut cell (mixed SEP2 partition) it accumulates, per corner c,
-!!   m_g(c)   = sum over grounded QPs of jac*basal_coef*N_c  (the grounded drag mass on c),
-!!   m_all(c) = sum over all QPs      of jac*basal_coef*N_c  (the "if fully grounded" mass),
-!! and a rigid-unit-velocity probe Ucorr_rigid(c) of the enriched (ridge-condensed) drag
-!! operator. Nodes get the mass-weighted fractions fg_naive = Sum m_g / Sum m_all and
-!! fg_eff = Sum (m_g + Ucorr_rigid) / Sum m_all over the cut cells touching the node. On the
-!! downstream (floating) node fg_naive is the friction leak; fg_eff should collapse toward 0.
-!! Diagnostic only -- does not feed the solve. Weertman (fB=0) is exact; Coulomb reuses the
-!! per-QP effective-pressure fB, with the "fully grounded" normalizer m_all approximate.
+!> Diagnostic: per-node grounded basal-drag x-force fraction in CutFEM cut cells, both the naive
+!! (un-cut consistent assembly) value and the effective value after the ridge condensation, all
+!! evaluated on the converged velocity. For each grounding-line cell it accumulates, per corner c,
+!!   m_g(c)   = sum over grounded QPs of jac*basal_coef*N_c*u   (the leaked x-drag force on c),
+!!   m_all(c) = sum over all QPs      of jac*basal_coef*N_c*u   (the "if fully grounded" x-force),
+!! and Uc(c) = the ridge's x-force correction on c under the same velocity,
+!!   Uc = -K_aU^T Kaa^-1 (K_aU * [uc;vc]).
+!! Nodes get the force-weighted fractions fg_naive = Sum m_g / Sum m_all and
+!! fg_eff = Sum (m_g + Uc) / Sum m_all over the cells touching the node. On the downstream
+!! (floating) node fg_naive is the friction leak; fg_eff shows how much of it the rank-2 ridge
+!! removes on the real (kinked) flow -- a partial, not complete, collapse (the rank-2 mode removes
+!! part of the leak; a full nodal enrichment would remove more). The x-component is the relevant
+!! resistance for predominantly-x flow (MISMIP3D). Diagnostic only -- does not feed the solve.
+!! Weertman (fB=0) is exact; Coulomb reuses the per-QP effective-pressure fB.
 subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_ratio)
   type(ice_shelf_dyn_CS), intent(inout) :: CS   !< Ice shelf control structure
   type(ocean_grid_type),  intent(in) :: G       !< The grid structure
@@ -8149,7 +8153,7 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
   real, dimension(4) :: fls, hc, bedc      ! Corner deficit, thickness, bed SW,SE,NW,NE [Z ~> m]
   real, dimension(4) :: absfls             ! |fls| at corners [Z ~> m]
   real, dimension(4) :: uc, vc             ! Corner converged velocities [L T-1 ~> m s-1]
-  real, dimension(4) :: m_g, m_all, Uc_rig ! Per-corner grounded mass, total mass, rigid probe correction
+  real, dimension(4) :: m_g, m_all, Uc_rig ! Per-corner leaked x-force, fully-grounded x-force, ridge x-correction
   integer, dimension(4) :: nqp             ! QPs per parent triangle
   real, dimension(4,7,4) :: beta           ! Corner-basis weights per (corner, QP, triangle) [nondim]
   real, dimension(7,4)   :: wref           ! Reference measure per (QP, triangle) [nondim]
@@ -8187,6 +8191,10 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
 
   do j=js-1,je+1 ; do i=is-1,ie+1
     if (G%mask2dT(i,j) < 0.5) cycle
+    ! Restrict to genuine grounding-line cells, exactly where the friction ridge fires in CG_action
+    ! (ground_frac in (0,1)). Without this, across-wall halo cells with default fls_corner look
+    ! "mixed" and poison boundary nodes.
+    if (.not. (CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0)) cycle
 
     ! Build the same corner deficit/thickness the cut branch of CG_action uses.
     if (fv_sub_fric) then
@@ -8284,15 +8292,18 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
             CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .false., &
             basal_coef_loc, drag_newt_loc)
 
+        ! Actual-velocity x-drag force delivered to each corner: m_all over all QPs (the "fully
+        ! grounded" reference), m_g over grounded QPs (the leaked force). Velocity-weighted so the
+        ! ridge's effect on the true kinked flow shows up (a rigid probe only sees the row sum).
         do c=1,4
-          m_all(c) = m_all(c) + (jac * basal_coef_loc * beta(c,k,t))
+          m_all(c) = m_all(c) + ((jac * basal_coef_loc * beta(c,k,t)) * u_curr_loc)
         enddo
         if (qpg(k,t)) then
           bcw = jac * basal_coef_loc * psi_qp
           do c=1,4
             KaU(1,c)   = KaU(1,c)   + (bcw * beta(c,k,t))
             KaU(2,c+4) = KaU(2,c+4) + (bcw * beta(c,k,t))
-            m_g(c) = m_g(c) + (jac * basal_coef_loc * beta(c,k,t))
+            m_g(c) = m_g(c) + ((jac * basal_coef_loc * beta(c,k,t)) * u_curr_loc)
           enddo
           Kaa(1,1) = Kaa(1,1) + (jac * basal_coef_loc * (psi_qp*psi_qp))
           Kaa(2,2) = Kaa(2,2) + (jac * basal_coef_loc * (psi_qp*psi_qp))
@@ -8301,7 +8312,9 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
     enddo
     Kaa(2,1) = Kaa(1,2)
 
-    ! Rigid-unit-u probe of the enriched drag operator: Uc_rig = -K_aU^T Kaa^-1 (K_aU * [1,1,1,1;0]).
+    ! Actual-velocity probe of the enriched drag operator: the ridge's x-force correction on each
+    ! corner under the converged (kinked) velocity, Uc = -K_aU^T Kaa^-1 (K_aU * [uc;vc]). This is the
+    ! ridge's true contribution to the force balance at the solution (a rigid u=1 probe undercounts it).
     Uc_rig(:) = 0.0
     reg_diag = CS%cutfem_ridge_reg * (Kaa(1,1) + Kaa(2,2))
     Kaa(1,1) = Kaa(1,1) + reg_diag ; Kaa(2,2) = Kaa(2,2) + reg_diag
@@ -8309,8 +8322,11 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
     if (det > 0.0) then
       Kaa_inv(1,1) =  Kaa(2,2)/det ; Kaa_inv(2,2) =  Kaa(1,1)/det
       Kaa_inv(1,2) = -Kaa(1,2)/det ; Kaa_inv(2,1) = -Kaa(2,1)/det
-      tvec(1) = (KaU(1,1) + KaU(1,2)) + (KaU(1,3) + KaU(1,4))
-      tvec(2) = (KaU(2,1) + KaU(2,2)) + (KaU(2,3) + KaU(2,4))
+      tvec(1) = 0.0 ; tvec(2) = 0.0
+      do c=1,4
+        tvec(1) = tvec(1) + ((KaU(1,c)*uc(c)) + (KaU(1,c+4)*vc(c)))
+        tvec(2) = tvec(2) + ((KaU(2,c)*uc(c)) + (KaU(2,c+4)*vc(c)))
+      enddo
       svec(1) = (Kaa_inv(1,1)*tvec(1)) + (Kaa_inv(1,2)*tvec(2))
       svec(2) = (Kaa_inv(2,1)*tvec(1)) + (Kaa_inv(2,2)*tvec(2))
       do c=1,4
@@ -8399,6 +8415,9 @@ subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, den
 
   do j=js-1,je+1 ; do i=is-1,ie+1
     if (ISS%hmask(i,j) /= 1 .and. ISS%hmask(i,j) /= 3) cycle
+    ! Restrict to genuine grounding-line cells, matching where the friction ridge fires in CG_action
+    ! (ground_frac in (0,1)); excludes across-wall halo cells whose default fls_corner looks "mixed".
+    if (.not. (CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0)) cycle
     if (.not. do_DG) then
       if (.not. (CS%corner_valid(I-1,J-1) .and. CS%corner_valid(I,J-1) .and. &
                  CS%corner_valid(I-1,J  ) .and. CS%corner_valid(I,J  ))) cycle
