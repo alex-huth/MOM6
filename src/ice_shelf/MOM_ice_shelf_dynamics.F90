@@ -273,6 +273,15 @@ type, public :: ice_shelf_dyn_CS ; private
                                !! quadrant areas with f_ground_node, so the two grids carry mutually
                                !! consistent grounded areas). Used to blend the surface for the FV
                                !! driving stress when GL_QUADRANT_TAUD is set [nondim].
+  real, pointer, dimension(:,:) :: fg_cut_naive => NULL() !< Diagnostic: grounded basal-drag fraction the
+                               !! naive (un-cut) consistent assembly assigns to each B-grid node in CutFEM
+                               !! cut cells -- the sum of grounded per-corner drag mass over the sum of the
+                               !! fully-grounded per-corner drag mass. Nonzero on the floating (downstream)
+                               !! node = the friction leak. Zero away from cut cells [nondim].
+  real, pointer, dimension(:,:) :: fg_cut_eff => NULL() !< Diagnostic: the same nodal grounded-drag fraction
+                               !! after the CutFEM ridge condensation (rigid-unit-velocity probe of the
+                               !! enriched operator). Should collapse toward 0 on the downstream node if the
+                               !! ridge removes the leak. Compare against CS%fg_cut_naive [nondim].
   ! float_cond used to be a persistent CS field; it is now derived inline at use sites
   ! from CS%ground_frac (a GL cell is "0 < ground_frac < 1" under GL_regularize=True).
   real, pointer, dimension(:,:) :: basal_tr_dfrac => NULL() !< Diagnostic basal-traction smoothing anomaly:
@@ -787,6 +796,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_taudx_shelf = -1, id_taudy_shelf = -1, id_taud_shelf = -1, id_bed_elev = -1, &
              id_ground_frac = -1, id_basal_tr_dfrac = -1, id_col_thick = -1, id_OD_av = -1, &
              id_f_ground_cell = -1, id_f_ground_node = -1, &
+             id_fg_cut_naive = -1, id_fg_cut_eff = -1, &
              id_u_mask = -1, id_v_mask = -1, id_ufb_mask =-1, id_vfb_mask = -1, id_t_mask = -1, &
              id_sx_shelf = -1, id_sy_shelf = -1, id_surf_slope_mag_shelf, &
              id_duHdx = -1, id_dvHdy = -1, id_fluxdiv = -1, &
@@ -1034,6 +1044,8 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%ground_frac(isd:ied,jsd:jed), source=0.0)
     allocate(CS%f_ground_node(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%f_ground_cell(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%fg_cut_naive(IsdB:IedB,JsdB:JedB), source=0.0)
+    allocate(CS%fg_cut_eff(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%H_corner(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%fls_corner(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%corner_valid(IsdB:IedB,JsdB:JedB), source=.false.)
@@ -2050,6 +2062,14 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
        'analytic grounded ice fraction at B-grid nodes from the quadrant grounding-line '//&
        'parameterization (Leguy et al. 2021); multiplies basal friction under '//&
        'GL_QUADRANT_FRICTION', 'none')
+    CS%id_fg_cut_naive = register_diag_field('ice_shelf_model','fg_cut_naive',CS%diag%axesB1, Time, &
+       'CutFEM diagnostic: grounded basal-drag fraction the naive (un-cut) consistent assembly '//&
+       'assigns to each B-grid node in cut cells; nonzero on the downstream floating node = the '//&
+       'friction leak. Nonzero only when CUTFEM_GL_FRICTION is set', 'none')
+    CS%id_fg_cut_eff = register_diag_field('ice_shelf_model','fg_cut_eff',CS%diag%axesB1, Time, &
+       'CutFEM diagnostic: nodal grounded-drag fraction after the ridge condensation (rigid-unit '//&
+       'velocity probe); collapses toward 0 on the downstream node if the leak is removed. Compare '//&
+       'against fg_cut_naive. Nonzero only when CUTFEM_GL_FRICTION is set', 'none')
     CS%id_col_thick = register_diag_field('ice_shelf_model','col_thick',CS%diag%axesT1, Time, &
        'ocean column thickness passed to ice model', 'm', conversion=US%Z_to_m)
     CS%id_visc_shelf = register_diag_field('ice_shelf_model','ice_visc',CS%diag%axesT1, Time, &
@@ -2661,6 +2681,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
     if (CS%id_ground_frac > 0) call post_data(CS%id_ground_frac, CS%ground_frac, CS%diag)
     if (CS%id_f_ground_cell > 0) call post_data(CS%id_f_ground_cell, CS%f_ground_cell, CS%diag)
     if (CS%id_f_ground_node > 0) call post_data(CS%id_f_ground_node, CS%f_ground_node, CS%diag)
+    if (CS%id_fg_cut_naive > 0) call post_data(CS%id_fg_cut_naive, CS%fg_cut_naive, CS%diag)
+    if (CS%id_fg_cut_eff > 0) call post_data(CS%id_fg_cut_eff, CS%fg_cut_eff, CS%diag)
     if (CS%id_basal_tr_dfrac > 0) call post_data(CS%id_basal_tr_dfrac, CS%basal_tr_dfrac, CS%diag)
     if (CS%id_OD_av >0) call post_data(CS%id_OD_av, CS%OD_av,CS%diag)
     if (CS%id_visc_shelf > 0) then
@@ -3911,6 +3933,10 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   endif
   write(mesg,*) "ice_shelf_solve_outer: exiting nonlinear solve after ",iter," iterations"
   call MOM_mesg(mesg)
+
+  ! CutFEM nodal grounded-drag-fraction diagnostic on the converged velocity (leak vs. leak-after-ridge).
+  if (CS%cutfem_gl_friction .and. ((CS%id_fg_cut_naive > 0) .or. (CS%id_fg_cut_eff > 0))) &
+    call cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, rhoi_rhow)
 
 end subroutine ice_shelf_solve_outer
 
@@ -8052,6 +8078,221 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   Vcorr(2,2) = -((KaU(1,8)*svec(1)) + (KaU(2,8)*svec(2)))
 
 end subroutine cutfem_condense_sep2
+
+!> Diagnostic: per-node grounded basal-drag fraction in CutFEM cut cells, both the naive
+!! (un-cut consistent assembly) value and the effective value after the ridge condensation.
+!! For each cut cell (mixed SEP2 partition) it accumulates, per corner c,
+!!   m_g(c)   = sum over grounded QPs of jac*basal_coef*N_c  (the grounded drag mass on c),
+!!   m_all(c) = sum over all QPs      of jac*basal_coef*N_c  (the "if fully grounded" mass),
+!! and a rigid-unit-velocity probe Ucorr_rigid(c) of the enriched (ridge-condensed) drag
+!! operator. Nodes get the mass-weighted fractions fg_naive = Sum m_g / Sum m_all and
+!! fg_eff = Sum (m_g + Ucorr_rigid) / Sum m_all over the cut cells touching the node. On the
+!! downstream (floating) node fg_naive is the friction leak; fg_eff should collapse toward 0.
+!! Diagnostic only -- does not feed the solve. Weertman (fB=0) is exact; Coulomb reuses the
+!! per-QP effective-pressure fB, with the "fully grounded" normalizer m_all approximate.
+subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_ratio)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS   !< Ice shelf control structure
+  type(ocean_grid_type),  intent(in) :: G       !< The grid structure
+  type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
+  real, dimension(SZDIB_(G),SZDJB_(G)), intent(in) :: u_shlf !< Converged u at nodes [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), intent(in) :: v_shlf !< Converged v at nodes [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), intent(in) :: H_node !< Nodal ice thickness [Z ~> m]
+  real,                   intent(in) :: dens_ratio !< Ice/water density ratio [nondim]
+
+  real, dimension(:,:,:,:), pointer :: hgate => NULL() ! DG flotation-gate thickness [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: Sg, Seff, Sall ! Nodal accumulators [R L3 Z T-1 ~> kg s-1]
+  real, dimension(4) :: fls, hc, bedc      ! Corner deficit, thickness, bed SW,SE,NW,NE [Z ~> m]
+  real, dimension(4) :: absfls             ! |fls| at corners [Z ~> m]
+  real, dimension(4) :: uc, vc             ! Corner converged velocities [L T-1 ~> m s-1]
+  real, dimension(4) :: m_g, m_all, Uc_rig ! Per-corner grounded mass, total mass, rigid probe correction
+  integer, dimension(4) :: nqp             ! QPs per parent triangle
+  real, dimension(4,7,4) :: beta           ! Corner-basis weights per (corner, QP, triangle) [nondim]
+  real, dimension(7,4)   :: wref           ! Reference measure per (QP, triangle) [nondim]
+  logical, dimension(7,4) :: qpg           ! Grounded state per (QP, triangle)
+  real, dimension(4)     :: dfxi, dfeta, daxi, daeta ! P1 gradients of fls and |fls| per triangle [Z]
+  real, dimension(4,4)   :: dNxi, dNeta    ! P1 gradient of corner basis per triangle [nondim]
+  real, dimension(2,8)   :: KaU            ! Ridge-to-std stiffness [R L3 Z T-1]
+  real, dimension(2,2)   :: Kaa, Kaa_inv   ! Ridge self-stiffness and its inverse
+  real, dimension(2)     :: tvec, svec     ! Rigid probe intermediates
+  real :: b1, b2, b3, b4, mS, mN, mW, mE, a, d, jac
+  real :: visc_qp, fls_loc, psi_qp, gx, gy, dNx, dNy, sgn, bcw
+  real :: coef_prefactor, min_trac_area, eps_vel2
+  real :: u_curr_loc, v_curr_loc, unorm2_loc, basal_coef_loc, drag_newt_loc
+  real :: hloc, bed_sub, fB_local, fB_e
+  real :: rho_ocean_g_LtoZ, rho_oi_ratio, rho_ice_g_LtoZ
+  real :: det, reg_diag
+  logical :: do_DG, fv_sub_fric, do_coulomb
+  integer :: i, j, is, ie, js, je, t, k, c
+
+  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
+  Sg(:,:) = 0.0 ; Seff(:,:) = 0.0 ; Sall(:,:) = 0.0
+
+  do_DG = CS%use_DG_thickness
+  fv_sub_fric = CS%fv_subgrid_gl_friction .and. (.not. CS%use_DG_thickness)
+  if (do_DG) then
+    hgate => CS%h_nodal
+    if (CS%dg_gl_gate_continuous) hgate => CS%h_flot
+  endif
+  do_coulomb = CS%CoulombFriction
+  if (do_coulomb) then
+    rho_ocean_g_LtoZ = US%L_to_Z * CS%density_ocean_avg * CS%g_Earth
+    rho_oi_ratio     = CS%density_ocean_avg / CS%density_ice
+    rho_ice_g_LtoZ   = US%L_to_Z * CS%density_ice * CS%g_Earth
+  endif
+
+  do j=js-1,je+1 ; do i=is-1,ie+1
+    if (G%mask2dT(i,j) < 0.5) cycle
+
+    ! Build the same corner deficit/thickness the cut branch of CG_action uses.
+    if (fv_sub_fric) then
+      hc(1)  = CS%H_corner(i-1,j-1) ; hc(2)  = CS%H_corner(i,j-1)
+      hc(3)  = CS%H_corner(i-1,j)   ; hc(4)  = CS%H_corner(i,j)
+      fls(1) = CS%fls_corner(i-1,j-1) ; fls(2) = CS%fls_corner(i,j-1)
+      fls(3) = CS%fls_corner(i-1,j)   ; fls(4) = CS%fls_corner(i,j)
+    elseif (do_DG) then
+      hc(1)  = hgate(i,j,1,1) ; hc(2)  = hgate(i,j,2,1)
+      hc(3)  = hgate(i,j,1,2) ; hc(4)  = hgate(i,j,2,2)
+      bedc(1) = CS%bed_node(i-1,j-1) ; bedc(2) = CS%bed_node(i,j-1)
+      bedc(3) = CS%bed_node(i-1,j)   ; bedc(4) = CS%bed_node(i,j)
+      fls(:) = (dens_ratio * hc(:)) - bedc(:)
+    else
+      cycle
+    endif
+
+    ! Only genuinely mixed cells (a real cut) contribute.
+    if (.not. (((fls(1) > 0.0) .or. (fls(2) > 0.0) .or. (fls(3) > 0.0) .or. (fls(4) > 0.0)) .and. &
+               ((fls(1) <= 0.0) .or. (fls(2) <= 0.0) .or. (fls(3) <= 0.0) .or. (fls(4) <= 0.0)))) cycle
+
+    absfls(:) = abs(fls(:))
+    call sep2_cell_qps(fls, nqp, beta, wref, qpg)
+    call sep2_fan_gradient(fls, dfxi, dfeta)
+    call sep2_fan_gradient(absfls, daxi, daeta)
+    block
+      real, dimension(4) :: ec, gxi_c, geta_c
+      do c=1,4
+        ec(:) = 0.0 ; ec(c) = 1.0
+        call sep2_fan_gradient(ec, gxi_c, geta_c)
+        dNxi(c,:) = gxi_c(:) ; dNeta(c,:) = geta_c(:)
+      enddo
+    end block
+
+    uc(1) = u_shlf(i-1,j-1) ; uc(2) = u_shlf(i,j-1) ; uc(3) = u_shlf(i-1,j) ; uc(4) = u_shlf(i,j)
+    vc(1) = v_shlf(i-1,j-1) ; vc(2) = v_shlf(i,j-1) ; vc(3) = v_shlf(i-1,j) ; vc(4) = v_shlf(i,j)
+
+    coef_prefactor = CS%coef_prefactor(i,j)
+    min_trac_area  = CS%min_basal_traction * G%areaT(i,j)
+    eps_vel2 = CS%eps_glen_min**2 * ((G%dxT(i,j)**2) + (G%dyT(i,j)**2))
+    fB_e = CS%fB_elem(i,j)
+    visc_qp = 0.0
+    do k=1,CS%visc_qps ; visc_qp = visc_qp + CS%ice_visc(i,j,k) ; enddo
+    visc_qp = visc_qp / real(CS%visc_qps)
+
+    KaU(:,:) = 0.0 ; Kaa(:,:) = 0.0 ; m_g(:) = 0.0 ; m_all(:) = 0.0
+
+    do t=1,4
+      do k=1,nqp(t)
+        b1 = beta(1,k,t) ; b2 = beta(2,k,t) ; b3 = beta(3,k,t) ; b4 = beta(4,k,t)
+        mS = b1 + b2 ; mN = b3 + b4 ; mW = b1 + b3 ; mE = b2 + b4
+        a = (G%dxCv(i,j-1) * mS) + (G%dxCv(i,j) * mN)
+        d = (G%dyCu(i-1,j) * mW) + (G%dyCu(i,j) * mE)
+        jac = (wref(k,t) * (a * d)) * G%IareaT(i,j)
+
+        fls_loc = ((b1 * fls(1)) + (b4 * fls(4))) + ((b2 * fls(2)) + (b3 * fls(3)))
+        sgn = merge(1.0, -1.0, qpg(k,t))
+        psi_qp = (((b1*absfls(1)) + (b4*absfls(4))) + ((b2*absfls(2)) + (b3*absfls(3)))) - (sgn*fls_loc)
+        gx = (daxi(t)  - (sgn * dfxi(t)))  / a
+        gy = (daeta(t) - (sgn * dfeta(t))) / d
+
+        do c=1,4
+          dNx = dNxi(c,t) / a ; dNy = dNeta(c,t) / d
+          KaU(1,c)   = KaU(1,c)   + (jac*visc_qp) * ((4.0*dNx*gx) + (dNy*gy))
+          KaU(1,c+4) = KaU(1,c+4) + (jac*visc_qp) * ((2.0*dNy*gx) + (dNx*gy))
+          KaU(2,c)   = KaU(2,c)   + (jac*visc_qp) * ((dNy*gx) + (2.0*dNx*gy))
+          KaU(2,c+4) = KaU(2,c+4) + (jac*visc_qp) * ((dNx*gx) + (4.0*dNy*gy))
+        enddo
+        Kaa(1,1) = Kaa(1,1) + (jac*visc_qp) * ((4.0*gx*gx) + (gy*gy))
+        Kaa(2,2) = Kaa(2,2) + (jac*visc_qp) * ((gx*gx) + (4.0*gy*gy))
+        Kaa(1,2) = Kaa(1,2) + (jac*visc_qp) * (3.0*gx*gy)
+
+        ! Basal drag coupling: grounded QPs feed the ridge; all QPs feed m_all normalizer.
+        u_curr_loc = ((b1*uc(1)) + (b4*uc(4))) + ((b2*uc(2)) + (b3*uc(3)))
+        v_curr_loc = ((b1*vc(1)) + (b4*vc(4))) + ((b2*vc(2)) + (b3*vc(3)))
+        unorm2_loc = ((u_curr_loc**2) + (v_curr_loc**2)) + eps_vel2
+        if (do_coulomb) then
+          hloc = ((b1*hc(1)) + (b4*hc(4))) + ((b2*hc(2)) + (b3*hc(3)))
+          if (do_DG) then
+            hloc = max(hloc, CS%min_h_shelf)
+            bed_sub = ((b1*bedc(1)) + (b4*bedc(4))) + ((b2*bedc(2)) + (b3*bedc(3)))
+            fB_local = compute_fB_local(hloc, bed_sub, rho_oi_ratio, rho_ice_g_LtoZ, &
+                CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
+                CS%CF_PostPeak, CS%n_basal_fric)
+          else
+            fB_local = compute_fB_from_N( &
+                subgrid_effective_pressure(fls_loc, hloc, dens_ratio, rho_ocean_g_LtoZ), &
+                CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
+                CS%CF_PostPeak, CS%n_basal_fric)
+          endif
+        else
+          fB_local = fB_e
+        endif
+        call compute_basal_coef(unorm2_loc, coef_prefactor, min_trac_area, fB_local, &
+            CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .false., &
+            basal_coef_loc, drag_newt_loc)
+
+        do c=1,4
+          m_all(c) = m_all(c) + (jac * basal_coef_loc * beta(c,k,t))
+        enddo
+        if (qpg(k,t)) then
+          bcw = jac * basal_coef_loc * psi_qp
+          do c=1,4
+            KaU(1,c)   = KaU(1,c)   + (bcw * beta(c,k,t))
+            KaU(2,c+4) = KaU(2,c+4) + (bcw * beta(c,k,t))
+            m_g(c) = m_g(c) + (jac * basal_coef_loc * beta(c,k,t))
+          enddo
+          Kaa(1,1) = Kaa(1,1) + (jac * basal_coef_loc * (psi_qp*psi_qp))
+          Kaa(2,2) = Kaa(2,2) + (jac * basal_coef_loc * (psi_qp*psi_qp))
+        endif
+      enddo
+    enddo
+    Kaa(2,1) = Kaa(1,2)
+
+    ! Rigid-unit-u probe of the enriched drag operator: Uc_rig = -K_aU^T Kaa^-1 (K_aU * [1,1,1,1;0]).
+    Uc_rig(:) = 0.0
+    reg_diag = CS%cutfem_ridge_reg * (Kaa(1,1) + Kaa(2,2))
+    Kaa(1,1) = Kaa(1,1) + reg_diag ; Kaa(2,2) = Kaa(2,2) + reg_diag
+    det = (Kaa(1,1)*Kaa(2,2)) - (Kaa(1,2)*Kaa(2,1))
+    if (det > 0.0) then
+      Kaa_inv(1,1) =  Kaa(2,2)/det ; Kaa_inv(2,2) =  Kaa(1,1)/det
+      Kaa_inv(1,2) = -Kaa(1,2)/det ; Kaa_inv(2,1) = -Kaa(2,1)/det
+      tvec(1) = (KaU(1,1) + KaU(1,2)) + (KaU(1,3) + KaU(1,4))
+      tvec(2) = (KaU(2,1) + KaU(2,2)) + (KaU(2,3) + KaU(2,4))
+      svec(1) = (Kaa_inv(1,1)*tvec(1)) + (Kaa_inv(1,2)*tvec(2))
+      svec(2) = (Kaa_inv(2,1)*tvec(1)) + (Kaa_inv(2,2)*tvec(2))
+      do c=1,4
+        Uc_rig(c) = -((KaU(1,c)*svec(1)) + (KaU(2,c)*svec(2)))
+      enddo
+    endif
+
+    ! Scatter corner masses to the four nodes (SW,SE,NW,NE) = (i-1,j-1),(i,j-1),(i-1,j),(i,j).
+    Sg(i-1,j-1)  = Sg(i-1,j-1)  + m_g(1) ; Sall(i-1,j-1) = Sall(i-1,j-1) + m_all(1)
+    Seff(i-1,j-1) = Seff(i-1,j-1) + (m_g(1) + Uc_rig(1))
+    Sg(i,j-1)    = Sg(i,j-1)    + m_g(2) ; Sall(i,j-1)   = Sall(i,j-1)   + m_all(2)
+    Seff(i,j-1)  = Seff(i,j-1)  + (m_g(2) + Uc_rig(2))
+    Sg(i-1,j)    = Sg(i-1,j)    + m_g(3) ; Sall(i-1,j)   = Sall(i-1,j)   + m_all(3)
+    Seff(i-1,j)  = Seff(i-1,j)  + (m_g(3) + Uc_rig(3))
+    Sg(i,j)      = Sg(i,j)      + m_g(4) ; Sall(i,j)     = Sall(i,j)     + m_all(4)
+    Seff(i,j)    = Seff(i,j)    + (m_g(4) + Uc_rig(4))
+  enddo ; enddo
+
+  CS%fg_cut_naive(:,:) = 0.0 ; CS%fg_cut_eff(:,:) = 0.0
+  do J=G%jscB,G%jecB ; do I=G%iscB,G%iecB
+    if (Sall(I,J) > 0.0) then
+      CS%fg_cut_naive(I,J) = Sg(I,J)   / Sall(I,J)
+      CS%fg_cut_eff(I,J)   = Seff(I,J) / Sall(I,J)
+    endif
+  enddo ; enddo
+
+end subroutine cutfem_diag_ground_fraction
 
 !> SEP2 subgrid basal traction for the preconditioner diagonal: same partition and
 !! quadrature as CG_action_sep2_basal, with squared basis weights and per-block
