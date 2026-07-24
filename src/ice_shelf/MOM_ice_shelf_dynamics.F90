@@ -417,6 +417,14 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! elevation reconstructed as S = (1-r)*H + max(fls,0) so that its slope
                             !! kink lies exactly on the partition's grounding line. Requires
                             !! GROUNDING_LINE_INTERPOLATE.
+  logical :: cutfem_gl_friction !< If true, add a CutFEM ridge (weak-discontinuity) enrichment to
+                            !! the SEP2 basal-friction cells and statically condense it, so grounded
+                            !! drag no longer leaks onto floating velocity corners (consistent,
+                            !! leak-free). One ridge amplitude per cut cell; the ridge level set is
+                            !! CS%fls_corner. Requires FV_SUBGRID_GL_FRICTION (for fls_corner) or
+                            !! USE_DG_THICKNESS. Experimental.
+  real :: cutfem_ridge_reg  !< Relative Tikhonov floor on the 2x2 ridge self-stiffness before it is
+                            !! inverted for static condensation, as a fraction of its trace [nondim].
   real, pointer, dimension(:,:) :: H_corner => NULL() !< Ice thickness interpolated to B-grid corners
                             !! with dual-cell Lagrange weights over the included cells only
                             !! (FV_SUBGRID_GL_* paths) [Z ~> m].
@@ -1475,6 +1483,38 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "MOM_ice_shelf_dynamics: FV_SUBGRID_GL_TAUD replaces the cell-centroid surface slope "//&
                  "with a sub-element reconstruction, which has no one-sided analog; it cannot be used "//&
                  "with FV_GL_ONE_SIDED_TAUD.")
+    call get_param(param_file, mdl, "CUTFEM_GL_FRICTION", CS%cutfem_gl_friction, &
+                 "If true, enrich the SEP2 basal-friction cells with a CutFEM ridge "//&
+                 "(weak-discontinuity) function whose level set is the corner flotation deficit, "//&
+                 "and statically condense one ridge amplitude per cut cell into the element "//&
+                 "action. This lets the velocity kink at the sub-cell grounding line, so grounded "//&
+                 "basal drag no longer leaks onto floating velocity corners while the assembly "//&
+                 "stays consistent (unlike LOCAL_BASAL_FRICTION, which removes the leak by "//&
+                 "lumping). Experimental; requires the SEP2 sub-element friction path "//&
+                 "(FV_SUBGRID_GL_FRICTION or USE_DG_THICKNESS).", &
+                 default=.false.)
+    call get_param(param_file, mdl, "CUTFEM_RIDGE_REG", CS%cutfem_ridge_reg, &
+                 "Relative Tikhonov floor added to the diagonal of the 2x2 ridge self-stiffness "//&
+                 "before inversion for static condensation, as a fraction of its trace. Guards "//&
+                 "against ill-conditioned sliver cuts.", units="nondim", default=1.0e-6, &
+                 do_not_log=.not.CS%cutfem_gl_friction)
+    if (CS%cutfem_gl_friction) then
+      if (.not. CS%GL_regularize) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
+                 "CUTFEM_GL_FRICTION enriches the sub-cell grounding-line partition and requires "//&
+                 "GROUNDING_LINE_INTERPOLATE=True.")
+      if (.not. CS%use_sep2) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: CUTFEM_GL_FRICTION "//&
+                 "currently uses the SEP2 partition and requires GROUNDING_LINE_SUBGRID_SCHEME='SEP2'.")
+      if (CS%local_basal_friction) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
+                 "CUTFEM_GL_FRICTION is a consistent (element-assembled) enrichment and is "//&
+                 "incompatible with LOCAL_BASAL_FRICTION (nodal-diagonal drag).")
+      if (CS%gl_quad_friction) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: CUTFEM_GL_FRICTION "//&
+                 "and GL_QUADRANT_FRICTION are two different grounded-drag treatments and cannot "//&
+                 "both be used.")
+      if (.not. (CS%fv_subgrid_gl_friction .or. CS%use_DG_thickness)) call MOM_error(FATAL, &
+                 "MOM_ice_shelf_dynamics: CUTFEM_GL_FRICTION needs the corner flotation field "//&
+                 "CS%fls_corner from FV_SUBGRID_GL_FRICTION, or the DG nodal-thickness path "//&
+                 "(USE_DG_THICKNESS=True).")
+    endif
     call get_param(param_file, mdl, "ICE_SHELF_ADVECT_LIMITER", adv_limiter_str, &
                  "The TVD slope limiter used for the finite-volume ice thickness advection in "//&
                  "ice_shelf_advect_thickness_x/y. VAN_LEER is the original scheme; SUPERBEE is "//&
@@ -6088,6 +6128,10 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   logical :: do_newton_visc  ! Whether to apply viscosity-related Newton tangent stiffness corrections
   real, dimension(2) :: xquad  ! Nondimensional quadrature ratios [nondim]
   real, dimension(2,2) :: Usub, Vsub  ! Subgrid nodal contributions to basal traction [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(2,2) :: Ucorr, Vcorr ! CutFEM ridge condensation correction to the nodal action [R L3 Z T-2]
+  real, dimension(4)   :: fls_cf       ! Corner flotation deficit for the CutFEM ridge, SW,SE,NW,NE [Z ~> m]
+  real, dimension(4)   :: hc_cf        ! Corner thickness for the CutFEM ridge, SW,SE,NW,NE [Z ~> m]
+  real, dimension(4)   :: bedc_cf      ! Corner bed elevation for the CutFEM ridge (DG mode), SW,SE,NW,NE [Z ~> m]
   real, dimension(2,2) :: Hcell   ! Ice shelf thickness at nodal (corner) points [Z ~> m]
   real, dimension(2,2,4) :: uret_qp, vret_qp                ! Temporary arrays in [R Z L3 T-2 ~> kg m s-2]
   real, dimension(SZDIB_(G),SZDJB_(G),4) :: uret_b, vret_b  ! Temporary arrays in [R Z L3 T-2 ~> kg m s-2]
@@ -6376,6 +6420,44 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
         if (vmask(I-1,J  ) == 1) vret_b(I-1,J  ,2) = vret_b(I-1,J  ,2) + Vsub(1,2)
         if (vmask(I  ,J-1) == 1) vret_b(I  ,J-1,3) = vret_b(I  ,J-1,3) + Vsub(2,1)
         if (vmask(I  ,J  ) == 1) vret_b(I  ,J  ,1) = vret_b(I  ,J  ,1) + Vsub(2,2)
+
+        ! CutFEM ridge enrichment: statically-condensed correction that decouples grounded drag
+        ! from floating corners without lumping. Uses the same SEP2 partition; the ridge level set
+        ! is the corner flotation deficit (fls_corner under FV_SUBGRID, else r*h_nodal - bed_node).
+        if (CS%cutfem_gl_friction .and. (fv_sub_fric .or. do_DG)) then
+          if (fv_sub_fric) then
+            ! Corner thickness and the SAME flotation-deficit field the drag block used.
+            hc_cf(1)  = CS%H_corner(I-1,J-1)   ; hc_cf(2)  = CS%H_corner(I,J-1)
+            hc_cf(3)  = CS%H_corner(I-1,J  )   ; hc_cf(4)  = CS%H_corner(I,J  )
+            fls_cf(1) = CS%fls_corner(I-1,J-1) ; fls_cf(2) = CS%fls_corner(I,J-1)
+            fls_cf(3) = CS%fls_corner(I-1,J  ) ; fls_cf(4) = CS%fls_corner(I,J  )
+            call cutfem_condense_sep2(CS, G, US, i, j, fls_cf, hc_cf, &
+                u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+                u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
+                CS%ice_visc(i,j,:), fB_e, G%dxCv(i,j-1), G%dxCv(i,j), &
+                G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr)
+          else  ! do_DG: bed and (unclamped) nodal thickness define the partition, matching
+                ! the DG branch of CG_action_sep2_basal (fls = r*h_nodal - bed, no min_h clamp).
+            hc_cf(1)  = hgate(i,j,1,1) ; hc_cf(2)  = hgate(i,j,2,1)
+            hc_cf(3)  = hgate(i,j,1,2) ; hc_cf(4)  = hgate(i,j,2,2)
+            bedc_cf(1) = CS%bed_node(I-1,J-1) ; bedc_cf(2) = CS%bed_node(I  ,J-1)
+            bedc_cf(3) = CS%bed_node(I-1,J  ) ; bedc_cf(4) = CS%bed_node(I  ,J  )
+            fls_cf(:) = (dens_ratio * hc_cf(:)) - bedc_cf(:)
+            call cutfem_condense_sep2(CS, G, US, i, j, fls_cf, hc_cf, &
+                u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+                u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
+                CS%ice_visc(i,j,:), fB_e, G%dxCv(i,j-1), G%dxCv(i,j), &
+                G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr, bedc=bedc_cf)
+          endif
+          if (umask(I-1,J-1) == 1) uret_b(I-1,J-1,4) = uret_b(I-1,J-1,4) + Ucorr(1,1)
+          if (umask(I-1,J  ) == 1) uret_b(I-1,J  ,2) = uret_b(I-1,J  ,2) + Ucorr(1,2)
+          if (umask(I  ,J-1) == 1) uret_b(I  ,J-1,3) = uret_b(I  ,J-1,3) + Ucorr(2,1)
+          if (umask(I  ,J  ) == 1) uret_b(I  ,J  ,1) = uret_b(I  ,J  ,1) + Ucorr(2,2)
+          if (vmask(I-1,J-1) == 1) vret_b(I-1,J-1,4) = vret_b(I-1,J-1,4) + Vcorr(1,1)
+          if (vmask(I-1,J  ) == 1) vret_b(I-1,J  ,2) = vret_b(I-1,J  ,2) + Vcorr(1,2)
+          if (vmask(I  ,J-1) == 1) vret_b(I  ,J-1,3) = vret_b(I  ,J-1,3) + Vcorr(2,1)
+          if (vmask(I  ,J  ) == 1) vret_b(I  ,J  ,1) = vret_b(I  ,J  ,1) + Vcorr(2,2)
+        endif
       endif
   endif ; enddo ; enddo
 
@@ -7749,6 +7831,224 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
   Vcontr(2,2) = (pv(4,3) + pv(4,2)) + (pv(4,4) + pv(4,1))
 
 end subroutine CG_action_sep2_basal
+
+!> CutFEM ridge-enrichment static-condensation correction for one SEP2 cut cell.
+!!
+!! Adds a single ridge (weak-discontinuity) velocity mode per cell,
+!!   u_h = u_std + psi*a_x ,  v_h = v_std + psi*a_y ,
+!! whose level set is the corner flotation deficit fls (so the kink lies exactly on the SEP2
+!! cut). The 2 amplitudes a=(a_x,a_y) are statically condensed out of the element system, so
+!! this routine returns only their effect on the 8 standard corner DOFs: the rank-2 Schur
+!! correction  -K_Ua (K_aa)^-1 K_aU  applied to the search direction (U_delta,V_delta). Because
+!! the ridge can absorb part of the grounded basal drag, the effective drag no longer leaks
+!! onto floating corners, while the assembly stays consistent (no lumping). K_aa collects the
+!! viscous membrane self-stiffness (over all QPs) and the Picard basal-drag self-stiffness
+!! (over grounded QPs only); the Newton drag/viscosity tangents are omitted here (inexact
+!! Newton -- the enrichment still fixes the converged operator via the Picard action).
+!!
+!! Symmetric by construction: the same K_aU multiplies on both sides of K_aa^-1.
+subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_curr, U_delta, V_delta, &
+                                ice_visc_c, fB_e, dxCv_S, dxCv_N, dyCu_W, dyCu_E, IareaT, &
+                                dens_ratio, Ucorr, Vcorr, bedc)
+  type(ice_shelf_dyn_CS), intent(in) :: CS      !< Ice shelf control structure
+  type(ocean_grid_type),  intent(in) :: G       !< The grid structure
+  type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
+  integer,                intent(in) :: i_elem  !< Tracer-grid i-index of the element
+  integer,                intent(in) :: j_elem  !< Tracer-grid j-index of the element
+  real, dimension(4),     intent(in) :: fls     !< Corner flotation deficit r*h-bed, SW,SE,NW,NE [Z ~> m]
+  real, dimension(4),     intent(in) :: hc      !< Corner thickness (for the Coulomb effective
+                                                !! pressure), SW,SE,NW,NE [Z ~> m]
+  real, dimension(2,2),   intent(in) :: U_curr  !< Frozen u^k at element corners [L T-1 ~> m s-1]
+  real, dimension(2,2),   intent(in) :: V_curr  !< Frozen v^k at element corners [L T-1 ~> m s-1]
+  real, dimension(2,2),   intent(in) :: U_delta !< Search direction du at element corners [L T-1 ~> m s-1]
+  real, dimension(2,2),   intent(in) :: V_delta !< Search direction dv at element corners [L T-1 ~> m s-1]
+  real, dimension(CS%visc_qps), intent(in) :: ice_visc_c !< Ice viscosity at the cell QPs [R L4 Z T-1]
+  real,                   intent(in) :: fB_e    !< Element Coulomb parameter fB; 0 for Weertman
+  real,                   intent(in) :: dxCv_S  !< Southern edge width [L ~> m]
+  real,                   intent(in) :: dxCv_N  !< Northern edge width [L ~> m]
+  real,                   intent(in) :: dyCu_W  !< Western edge height [L ~> m]
+  real,                   intent(in) :: dyCu_E  !< Eastern edge height [L ~> m]
+  real,                   intent(in) :: IareaT  !< Inverse cell area [L-2 ~> m-2]
+  real,                   intent(in) :: dens_ratio !< Ice/water density ratio [nondim]
+  real, dimension(2,2),   intent(out) :: Ucorr !< Additive correction to the u nodal action [R L3 Z T-2]
+  real, dimension(2,2),   intent(out) :: Vcorr !< Additive correction to the v nodal action [R L3 Z T-2]
+  real, dimension(4), optional, intent(in) :: bedc !< Corner bed elevation, SW,SE,NW,NE [Z ~> m]. Present
+                                                !! selects DG mode (Coulomb fB from h and bed); absent
+                                                !! selects FV-subgrid mode (fB from the flotation deficit).
+
+  integer, dimension(4)  :: nqp        ! QPs per parent triangle
+  real, dimension(4,7,4) :: beta       ! Corner-basis weights per (corner, QP, triangle) [nondim]
+  real, dimension(7,4)   :: wref       ! Reference measure per (QP, triangle) [nondim]
+  logical, dimension(7,4) :: qpg       ! Grounded state per (QP, triangle)
+  real, dimension(4)     :: dfxi, dfeta   ! P1 reference gradient of fls per triangle [Z ~> m]
+  real, dimension(4)     :: daxi, daeta   ! P1 reference gradient of |fls| per triangle [Z ~> m]
+  real, dimension(4,4)   :: dNxi, dNeta   ! P1 reference gradient of corner basis c per triangle [nondim]
+  real, dimension(4)     :: absfls     ! |fls| at corners [Z ~> m]
+  real, dimension(4)     :: uc, vc, duc, dvc ! Corner frozen velocities and search directions [L T-1]
+  real, dimension(2,8)   :: KaU        ! Ridge-to-std stiffness: rows (a_x,a_y), cols (u1..4,v1..4)
+  real, dimension(2,2)   :: Kaa        ! Ridge self-stiffness
+  real :: b1, b2, b3, b4               ! Corner-basis weights at the QP [nondim]
+  real :: mS, mN, mW, mE               ! Marginal edge weights [nondim]
+  real :: a, d                         ! Interpolated cell-edge spacings at the QP [L ~> m]
+  real :: jac                          ! Quadrature weight wref*(a*d)*IareaT [nondim]
+  real :: visc_qp                      ! Viscosity at this QP [R L4 Z T-1]
+  real :: fls_loc                      ! P1 flotation deficit at the QP [Z ~> m]
+  real :: psi_qp                       ! Ridge value at the QP [Z ~> m]
+  real :: gx, gy                       ! Physical ridge gradient at the QP [nondim]
+  real :: dNx, dNy                     ! Physical corner-basis gradient at the QP [L-1 ~> m-1]
+  real :: sgn                          ! +1 grounded side, -1 floating side [nondim]
+  real :: bcw                          ! Ridge basis value weight beta-independent (psi_qp) [Z ~> m]
+  real :: coef_prefactor, min_trac_area, eps_vel2 ! Basal-drag prefactors
+  real :: u_curr_loc, v_curr_loc, unorm2_loc, basal_coef_loc, drag_newt_loc
+  real :: hloc, bed_sub, fB_local      ! QP thickness, bed, and Coulomb fB [Z ~> m], [Z ~> m], [(T L-1)^CF_PostPeak]
+  real :: rho_ocean_g_LtoZ, rho_oi_ratio, rho_ice_g_LtoZ ! Coulomb effective-pressure constants
+  logical :: do_dg_local, do_coulomb   ! DG-mode (bedc present) and Coulomb-sliding flags
+  real :: det                          ! 2x2 determinant of Kaa
+  real, dimension(2,2) :: Kaa_inv      ! Inverse ridge self-stiffness
+  real, dimension(2) :: tvec, svec     ! K_aU*U_delta and K_aa^-1*that
+  real :: reg_diag                     ! Absolute Tikhonov added to Kaa diagonal
+  integer :: t, k, c
+
+  Ucorr(:,:) = 0.0 ; Vcorr(:,:) = 0.0
+
+  ! Corner |fls| and its P1 gradient (both P1 operators so the ridge kink sits on the cut).
+  absfls(:) = abs(fls(:))
+  call sep2_cell_qps(fls, nqp, beta, wref, qpg)
+  call sep2_fan_gradient(fls, dfxi, dfeta)
+  call sep2_fan_gradient(absfls, daxi, daeta)
+  ! P1 reference gradients of the four corner basis functions (linear in the field, so probe
+  ! sep2_fan_gradient with unit corner vectors). dNxi(c,t) = d(N_c)/dxi on triangle t.
+  block
+    real, dimension(4) :: ec, gxi_c, geta_c
+    do c=1,4
+      ec(:) = 0.0 ; ec(c) = 1.0
+      call sep2_fan_gradient(ec, gxi_c, geta_c)
+      dNxi(c,:) = gxi_c(:) ; dNeta(c,:) = geta_c(:)
+    enddo
+  end block
+
+  uc(1)  = U_curr(1,1)  ; uc(2)  = U_curr(2,1)  ; uc(3)  = U_curr(1,2)  ; uc(4)  = U_curr(2,2)
+  vc(1)  = V_curr(1,1)  ; vc(2)  = V_curr(2,1)  ; vc(3)  = V_curr(1,2)  ; vc(4)  = V_curr(2,2)
+  duc(1) = U_delta(1,1) ; duc(2) = U_delta(2,1) ; duc(3) = U_delta(1,2) ; duc(4) = U_delta(2,2)
+  dvc(1) = V_delta(1,1) ; dvc(2) = V_delta(2,1) ; dvc(3) = V_delta(1,2) ; dvc(4) = V_delta(2,2)
+
+  coef_prefactor = CS%coef_prefactor(i_elem,j_elem)
+  min_trac_area  = CS%min_basal_traction * G%areaT(i_elem,j_elem)
+  eps_vel2 = CS%eps_glen_min**2 * ((G%dxT(i_elem,j_elem)**2) + (G%dyT(i_elem,j_elem)**2))
+
+  ! The SEP2 sub-QP index has no spatial correspondence to the 2x2 Gauss layout of ice_visc, so use
+  ! one cell-representative (mean) viscosity for the coarse ridge mode rather than aliasing by index.
+  visc_qp = 0.0
+  do k=1,CS%visc_qps ; visc_qp = visc_qp + ice_visc_c(k) ; enddo
+  visc_qp = visc_qp / real(CS%visc_qps)
+
+  do_dg_local = present(bedc)
+  do_coulomb  = CS%CoulombFriction
+  if (do_coulomb) then
+    rho_ocean_g_LtoZ = US%L_to_Z * CS%density_ocean_avg * CS%g_Earth
+    rho_oi_ratio     = CS%density_ocean_avg / CS%density_ice
+    rho_ice_g_LtoZ   = US%L_to_Z * CS%density_ice * CS%g_Earth
+  endif
+
+  KaU(:,:) = 0.0 ; Kaa(:,:) = 0.0
+
+  do t=1,4
+    do k=1,nqp(t)
+      b1 = beta(1,k,t) ; b2 = beta(2,k,t) ; b3 = beta(3,k,t) ; b4 = beta(4,k,t)
+      mS = b1 + b2 ; mN = b3 + b4 ; mW = b1 + b3 ; mE = b2 + b4
+      a = (dxCv_S * mS) + (dxCv_N * mN)
+      d = (dyCu_W * mW) + (dyCu_E * mE)
+      jac = (wref(k,t) * (a * d)) * IareaT
+
+      fls_loc = ((b1 * fls(1)) + (b4 * fls(4))) + ((b2 * fls(2)) + (b3 * fls(3)))
+      sgn = merge(1.0, -1.0, qpg(k,t))
+      psi_qp = (((b1*absfls(1)) + (b4*absfls(4))) + ((b2*absfls(2)) + (b3*absfls(3)))) - (sgn*fls_loc)
+      gx = (daxi(t)  - (sgn * dfxi(t)))  / a
+      gy = (daeta(t) - (sgn * dfeta(t))) / d
+
+      ! --- Membrane (viscous) coupling, all QPs. SSA bilinear form; see CG_action. ---
+      ! Ridge test a_x is a u-field mode with gradient (gx,gy); a_y a v-field mode.
+      do c=1,4
+        dNx = dNxi(c,t) / a ; dNy = dNeta(c,t) / d
+        ! test a_x (u-field) : trial u_c, v_c
+        KaU(1,c)   = KaU(1,c)   + (jac*visc_qp) * ((4.0*dNx*gx) + (dNy*gy))
+        KaU(1,c+4) = KaU(1,c+4) + (jac*visc_qp) * ((2.0*dNy*gx) + (dNx*gy))
+        ! test a_y (v-field) : trial u_c, v_c
+        KaU(2,c)   = KaU(2,c)   + (jac*visc_qp) * ((dNy*gx) + (2.0*dNx*gy))
+        KaU(2,c+4) = KaU(2,c+4) + (jac*visc_qp) * ((dNx*gx) + (4.0*dNy*gy))
+      enddo
+      Kaa(1,1) = Kaa(1,1) + (jac*visc_qp) * ((4.0*gx*gx) + (gy*gy))
+      Kaa(2,2) = Kaa(2,2) + (jac*visc_qp) * ((gx*gx) + (4.0*gy*gy))
+      Kaa(1,2) = Kaa(1,2) + (jac*visc_qp) * (3.0*gx*gy)
+
+      ! --- Basal drag coupling, grounded QPs only (Picard part). ---
+      if (qpg(k,t)) then
+        u_curr_loc = ((b1*uc(1)) + (b4*uc(4))) + ((b2*uc(2)) + (b3*uc(3)))
+        v_curr_loc = ((b1*vc(1)) + (b4*vc(4))) + ((b2*vc(2)) + (b3*vc(3)))
+        unorm2_loc = ((u_curr_loc**2) + (v_curr_loc**2)) + eps_vel2
+        ! Coulomb fB must be the same per-QP sub-element value the drag block used
+        ! (CG_action_sep2_basal), not the cell-mean fB_e, or the correction is inconsistent for
+        ! Coulomb sliding. Weertman (fB_e = 0) is unaffected. hloc is the interpolated corner
+        ! thickness; the effective pressure comes from the flotation deficit (FV-sub) or h and bed (DG).
+        if (do_coulomb) then
+          hloc = ((b1*hc(1)) + (b4*hc(4))) + ((b2*hc(2)) + (b3*hc(3)))
+          if (do_dg_local) then
+            hloc = max(hloc, CS%min_h_shelf)
+            bed_sub = ((b1*bedc(1)) + (b4*bedc(4))) + ((b2*bedc(2)) + (b3*bedc(3)))
+            fB_local = compute_fB_local(hloc, bed_sub, rho_oi_ratio, rho_ice_g_LtoZ, &
+                CS%C_basal_friction(i_elem,j_elem), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
+                CS%CF_PostPeak, CS%n_basal_fric)
+          else
+            fB_local = compute_fB_from_N( &
+                subgrid_effective_pressure(fls_loc, hloc, dens_ratio, rho_ocean_g_LtoZ), &
+                CS%C_basal_friction(i_elem,j_elem), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
+                CS%CF_PostPeak, CS%n_basal_fric)
+          endif
+        else
+          fB_local = fB_e
+        endif
+        call compute_basal_coef(unorm2_loc, coef_prefactor, min_trac_area, fB_local, &
+            CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .false., &
+            basal_coef_loc, drag_newt_loc)
+        bcw = jac * basal_coef_loc * psi_qp
+        do c=1,4
+          KaU(1,c)   = KaU(1,c)   + (bcw * beta(c,k,t))  ! a_x <- u_c drag
+          KaU(2,c+4) = KaU(2,c+4) + (bcw * beta(c,k,t))  ! a_y <- v_c drag
+        enddo
+        Kaa(1,1) = Kaa(1,1) + (jac * basal_coef_loc * (psi_qp*psi_qp))
+        Kaa(2,2) = Kaa(2,2) + (jac * basal_coef_loc * (psi_qp*psi_qp))
+      endif
+    enddo
+  enddo
+  Kaa(2,1) = Kaa(1,2)
+
+  ! Tikhonov floor for sliver cuts, then explicit 2x2 inverse.
+  reg_diag = CS%cutfem_ridge_reg * (Kaa(1,1) + Kaa(2,2))
+  Kaa(1,1) = Kaa(1,1) + reg_diag ; Kaa(2,2) = Kaa(2,2) + reg_diag
+  det = (Kaa(1,1)*Kaa(2,2)) - (Kaa(1,2)*Kaa(2,1))
+  if (det <= 0.0) return   ! degenerate (no grounded/floating split of consequence): no correction
+  Kaa_inv(1,1) =  Kaa(2,2)/det ; Kaa_inv(2,2) =  Kaa(1,1)/det
+  Kaa_inv(1,2) = -Kaa(1,2)/det ; Kaa_inv(2,1) = -Kaa(2,1)/det
+
+  ! Schur correction on the search direction: corr = -K_aU^T (K_aa^-1 (K_aU U_delta)).
+  tvec(1) = 0.0 ; tvec(2) = 0.0
+  do c=1,4
+    tvec(1) = tvec(1) + (KaU(1,c)*duc(c)) + (KaU(1,c+4)*dvc(c))
+    tvec(2) = tvec(2) + (KaU(2,c)*duc(c)) + (KaU(2,c+4)*dvc(c))
+  enddo
+  svec(1) = (Kaa_inv(1,1)*tvec(1)) + (Kaa_inv(1,2)*tvec(2))
+  svec(2) = (Kaa_inv(2,1)*tvec(1)) + (Kaa_inv(2,2)*tvec(2))
+  ! corner order SW,SE,NW,NE -> (2,2) layout (1,1),(2,1),(1,2),(2,2)
+  Ucorr(1,1) = -((KaU(1,1)*svec(1)) + (KaU(2,1)*svec(2)))
+  Ucorr(2,1) = -((KaU(1,2)*svec(1)) + (KaU(2,2)*svec(2)))
+  Ucorr(1,2) = -((KaU(1,3)*svec(1)) + (KaU(2,3)*svec(2)))
+  Ucorr(2,2) = -((KaU(1,4)*svec(1)) + (KaU(2,4)*svec(2)))
+  Vcorr(1,1) = -((KaU(1,5)*svec(1)) + (KaU(2,5)*svec(2)))
+  Vcorr(2,1) = -((KaU(1,6)*svec(1)) + (KaU(2,6)*svec(2)))
+  Vcorr(1,2) = -((KaU(1,7)*svec(1)) + (KaU(2,7)*svec(2)))
+  Vcorr(2,2) = -((KaU(1,8)*svec(1)) + (KaU(2,8)*svec(2)))
+
+end subroutine cutfem_condense_sep2
 
 !> SEP2 subgrid basal traction for the preconditioner diagonal: same partition and
 !! quadrature as CG_action_sep2_basal, with squared basis weights and per-block
