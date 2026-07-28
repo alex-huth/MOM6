@@ -5493,6 +5493,10 @@ subroutine calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
   real    :: grav      ! The gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
   real    :: num_x, num_y ! Sum of the valid parallel-edge surface differences at a node [Z ~> m]
   real    :: den_x, den_y ! Sum of the valid parallel-edge lengths at a node [L ~> m]
+  real    :: g_x1, g_x2   ! Per-edge x-direction surface slopes at a node; 0 on a dropped edge [Z L-1 ~> nondim]
+  real    :: g_y1, g_y2   ! Per-edge y-direction surface slopes at a node; 0 on a dropped edge [Z L-1 ~> nondim]
+  integer :: ndom_x, ndom_y ! Number of in-domain parallel edges at a node, the gradient divisor
+  integer :: nok_x, nok_y   ! Number of those edges that also carry ice and so contribute
   real    :: smag      ! Surface slope magnitude at a node [Z L-1 ~> nondim]
   real    :: scale     ! Scaling factor enforcing MAX_SURFACE_SLOPE [nondim]
   real    :: neumann_val ! Lateral-pressure boundary term [R Z L2 T-2 ~> kg s-2]
@@ -5552,34 +5556,75 @@ subroutine calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
   ! (i,j),(i+1,j),(i,j+1),(i+1,j+1) (uppercase I,J equal lowercase i,j in Fortran). Computed over a
   ! node range wide enough to cover every corner of the element-integration loop below.
   !
-  ! The two parallel edges are combined as a ratio of summed surface differences over summed edge
-  ! lengths -- num/den -- which is the isoparametric bilinear gradient CG_action forms for nodal
-  ! fields (metric-interpolated numerator over metric-interpolated denominator), not an average of
-  ! the two per-edge ratios. The two are bitwise identical on a uniform grid but differ where the
-  ! parallel edges have unequal length (e.g. lat/lon, where dxCu varies with latitude), so this
-  ! matches CG_action's metric treatment. A single valid edge (option 3) reduces to num/den =
-  ! that edge's one-sided slope, exactly as before.
+  ! When both parallel edges are usable, they are combined as a ratio of summed surface differences
+  ! over summed edge lengths -- num/den -- which is the isoparametric bilinear gradient CG_action
+  ! forms for nodal fields (metric-interpolated numerator over metric-interpolated denominator), not
+  ! an average of the two per-edge ratios. The two are bitwise identical on a uniform grid but differ
+  ! where the parallel edges have unequal length (e.g. lat/lon, where dxCu varies with latitude), so
+  ! this matches CG_action's metric treatment.
+  !
+  ! When an edge is dropped, the two reasons are treated differently, following CISM
+  ! (glissade_surface_elevation_gradient with ho_gradient = HO_GRADIENT_CENTERED, which forms
+  ! 0.5*(ds_dx_edge(i,j) + ds_dx_edge(i,j+1)) with a masked edge left at zero):
+  !
+  ! (a) The neighbor cell is genuinely ice-free (the option-3 margin rule). CISM leaves that edge's
+  !     gradient at zero but still divides by two, so the nodal slope is HALVED. The surviving edge
+  !     therefore carries a fixed 1/2 weight here, not a renormalized full weight.
+  ! (b) The edge crosses a non-reentrant domain wall. CISM has no such case: its halo BC is periodic
+  !     (parallel_halo), so the across-wall cells hold ice and both edges are valid. The faithful
+  !     analogue is a mirror BC, under which the out-of-domain edge gradient equals the in-domain one
+  !     and 0.5*(g+g) = g -- i.e. renormalize over the in-domain edges. Halving here instead would
+  !     cut the wall-node driving stress in half while its friction and viscous terms keep their
+  !     (half) control volume, breaking the meridional symmetry of channel configs (MISMIP3D).
+  !
+  ! So the divisor is the number of IN-DOMAIN parallel edges, while only the ice-usable ones
+  ! contribute. With no ice-free cells anywhere (e.g. MISMIP3D, fixed front, hmask=1 everywhere)
+  ! case (a) never arises and this reduces exactly to the renormalized num/den form.
   sx_n(:,:) = 0.0 ; sy_n(:,:) = 0.0
   do j=jsc-2,jec+1 ; do i=isc-2,iec+1
     ! x-slope: south edge (i,j)->(i+1,j) and north edge (i,j+1)->(i+1,j+1)
-    num_x = 0.0 ; den_x = 0.0
-    if (edge_ok(i,j,  i+1,j  )) then
-      num_x = num_x + (S(i+1,j)   - S(i,j)  ) ; den_x = den_x + G%dxCu(I,j)
+    num_x = 0.0 ; den_x = 0.0 ; g_x1 = 0.0 ; g_x2 = 0.0 ; ndom_x = 0 ; nok_x = 0
+    if (edge_in_domain(i,j,  i+1,j  )) then
+      ndom_x = ndom_x + 1
+      if (edge_ice_ok(i,j,  i+1,j  )) then
+        nok_x = nok_x + 1 ; g_x1 = (S(i+1,j)   - S(i,j)  ) / G%dxCu(I,j)
+        num_x = num_x + (S(i+1,j)   - S(i,j)  ) ; den_x = den_x + G%dxCu(I,j)
+      endif
     endif
-    if (edge_ok(i,j+1,i+1,j+1)) then
-      num_x = num_x + (S(i+1,j+1) - S(i,j+1)) ; den_x = den_x + G%dxCu(I,j+1)
+    if (edge_in_domain(i,j+1,i+1,j+1)) then
+      ndom_x = ndom_x + 1
+      if (edge_ice_ok(i,j+1,i+1,j+1)) then
+        nok_x = nok_x + 1 ; g_x2 = (S(i+1,j+1) - S(i,j+1)) / G%dxCu(I,j+1)
+        num_x = num_x + (S(i+1,j+1) - S(i,j+1)) ; den_x = den_x + G%dxCu(I,j+1)
+      endif
     endif
-    if (den_x > 0.0) sx_n(I,J) = num_x / den_x
+    if (nok_x == ndom_x) then
+      if (den_x > 0.0) sx_n(I,J) = num_x / den_x
+    elseif (nok_x > 0) then
+      sx_n(I,J) = (g_x1 + g_x2) / real(ndom_x)
+    endif
 
     ! y-slope: west edge (i,j)->(i,j+1) and east edge (i+1,j)->(i+1,j+1)
-    num_y = 0.0 ; den_y = 0.0
-    if (edge_ok(i,j,  i,  j+1)) then
-      num_y = num_y + (S(i,j+1)   - S(i,j)  ) ; den_y = den_y + G%dyCv(i,J)
+    num_y = 0.0 ; den_y = 0.0 ; g_y1 = 0.0 ; g_y2 = 0.0 ; ndom_y = 0 ; nok_y = 0
+    if (edge_in_domain(i,j,  i,  j+1)) then
+      ndom_y = ndom_y + 1
+      if (edge_ice_ok(i,j,  i,  j+1)) then
+        nok_y = nok_y + 1 ; g_y1 = (S(i,j+1)   - S(i,j)  ) / G%dyCv(i,J)
+        num_y = num_y + (S(i,j+1)   - S(i,j)  ) ; den_y = den_y + G%dyCv(i,J)
+      endif
     endif
-    if (edge_ok(i+1,j,i+1,j+1)) then
-      num_y = num_y + (S(i+1,j+1) - S(i+1,j)) ; den_y = den_y + G%dyCv(i+1,J)
+    if (edge_in_domain(i+1,j,i+1,j+1)) then
+      ndom_y = ndom_y + 1
+      if (edge_ice_ok(i+1,j,i+1,j+1)) then
+        nok_y = nok_y + 1 ; g_y2 = (S(i+1,j+1) - S(i+1,j)) / G%dyCv(i+1,J)
+        num_y = num_y + (S(i+1,j+1) - S(i+1,j)) ; den_y = den_y + G%dyCv(i+1,J)
+      endif
     endif
-    if (den_y > 0.0) sy_n(I,J) = num_y / den_y
+    if (nok_y == ndom_y) then
+      if (den_y > 0.0) sy_n(I,J) = num_y / den_y
+    elseif (nok_y > 0) then
+      sy_n(I,J) = (g_y1 + g_y2) / real(ndom_y)
+    endif
 
     ! Cap the surface slope magnitude (MAX_SURFACE_SLOPE), as in calc_shelf_driving_stress.
     if (CS%max_surface_slope > 0) then
@@ -5721,10 +5766,13 @@ contains
   !! across a solid wall into the (unphysical) across-wall halo. Without this guard the N/S (and E/W)
   !! wall nodes pick up a spurious cross-wall slope, breaking the meridional symmetry of channel
   !! configurations like MISMIP3D, matching the boundary handling in calc_shelf_driving_stress.
-  logical function edge_ok(ia, ja, ib, jb)
+  !> True if both cells of an edge lie inside the global computational domain. An edge that fails
+  !! this test has no CISM counterpart (CISM's halo BC is periodic, so its across-wall cells hold
+  !! ice); it is excluded from both the numerator and the divisor, which is equivalent to a mirror
+  !! boundary condition on the surface slope.
+  logical function edge_in_domain(ia, ja, ib, jb)
     integer, intent(in) :: ia, ja, ib, jb
-    edge_ok = .false.
-    ! Both cells must be inside the global computational domain unless the domain is reentrant.
+    edge_in_domain = .false.
     if (.not. CS%reentrant_x) then
       if ((ia+i_off < gisc) .or. (ia+i_off > giec) .or. &
           (ib+i_off < gisc) .or. (ib+i_off > giec)) return
@@ -5733,14 +5781,24 @@ contains
       if ((ja+j_off < gjsc) .or. (ja+j_off > gjec) .or. &
           (jb+j_off < gjsc) .or. (jb+j_off > gjec)) return
     endif
+    edge_in_domain = .true.
+  end function edge_in_domain
+
+  !> True if an in-domain edge carries a meaningful surface gradient: ice in both cells, or ice
+  !! standing above an ice-free land cell (CISM HO_GRADIENT_MARGIN_HYBRID). An edge that fails this
+  !! test is the option-3 margin case: it contributes nothing but still counts in the divisor, so
+  !! the surviving parallel edge is halved, as in CISM's centered edge-gradient average.
+  logical function edge_ice_ok(ia, ja, ib, jb)
+    integer, intent(in) :: ia, ja, ib, jb
+    edge_ice_ok = .false.
     if (ice_cell(ia,ja) .and. ice_cell(ib,jb)) then
-      edge_ok = .true.
+      edge_ice_ok = .true.
     elseif (ice_cell(ia,ja) .and. land_cell(ib,jb)) then
-      edge_ok = (S(ia,ja) > S(ib,jb))
+      edge_ice_ok = (S(ia,ja) > S(ib,jb))
     elseif (ice_cell(ib,jb) .and. land_cell(ia,ja)) then
-      edge_ok = (S(ib,jb) > S(ia,ja))
+      edge_ice_ok = (S(ib,jb) > S(ia,ja))
     endif
-  end function edge_ok
+  end function edge_ice_ok
 
   !> Metric-exact lumped (row-sum) nodal mass contribution of cell (ic,jc) to the node at its
   !! (icorner,jcorner) corner: h * integral of that corner's bilinear basis against the element
