@@ -205,12 +205,14 @@ type, public :: ice_shelf_dyn_CS ; private
   real, pointer, dimension(:,:) :: fB_node => NULL()        !< Pre-computed nodal Coulomb fB parameter at B-grid
                                !! nodes for LOCAL_BASAL_FRICTION [(T L-1)^CF_PostPeak]; 0 for Weertman.
   real, pointer, dimension(:,:) :: area_node => NULL()      !< Nodal control-volume area for the local
-                               !! (LOCAL_BASAL_FRICTION) drag: the sum of the ice-covered surrounding cells'
+                               !! (LOCAL_BASAL_FRICTION) drag: the sum of the surrounding cells'
                                !! lumped corner areas (0.25*areaT each), i.e. the same control volume the
                                !! lumped driving stress and the CG_action element assembly integrate over.
-                               !! Equals areaBu at all-ice interior nodes but halves/quarters at domain-edge
-                               !! and margin nodes, so the local taud and friction share one control volume
-                               !! and the wall-node x-force balance stays meridionally symmetric [L2 ~> m2].
+                               !! With LOCAL_NODE_FULL_AREA the sum is over all four in-domain cells (the
+                               !! CISM convention, dx*dy at every active vertex); otherwise it is restricted
+                               !! to the ice-covered cells. Either way it halves at domain-edge nodes, so the
+                               !! local taud and friction share one control volume and the wall-node x-force
+                               !! balance stays meridionally symmetric [L2 ~> m2].
   real :: alpha_coulomb = 1.0  !< Coulomb prefactor (CF_PostPeak-1)^(CF_PostPeak-1)/CF_PostPeak^CF_PostPeak [nondim]
   real, pointer, dimension(:,:) :: OD_rt => NULL()         !< A running total for calculating OD_av [Z ~> m].
   real, pointer, dimension(:,:) :: ground_frac_rt => NULL() !< A running total for calculating ground_frac.
@@ -328,6 +330,30 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! f_ground_node, with no element integration or neighbor coupling. Requires
                             !! GL_QUADRANT_FRICTION (for f_ground_node). Pairs with LOCAL_FV_TAUD_VERTEX
                             !! to reproduce the all-local CISM/Leguy-2021 grounding-line setup.
+  logical :: local_node_full_area !< If true, the LOCAL_BASAL_FRICTION nodal control volume
+                            !! (CS%area_node) is the full dual-cell area of the four in-domain cells
+                            !! around the node, as in CISM (dx*dy at every active vertex). If false,
+                            !! it is restricted to the ice-covered cells. The local driving stress is
+                            !! unaffected: its lumped mass already counts ice-free cells with zero
+                            !! thickness, matching CISM's dx*dy*stagthck with stagger_margin = 0.
+  logical :: cism_nodal_effecpress !< If true, the LOCAL_BASAL_FRICTION nodal Coulomb effective
+                            !! pressure is built as CISM builds it: N is formed in each cell, capped
+                            !! to [0, overburden] there, and only then averaged to the node over all
+                            !! four in-domain cells (ice-free cells contributing N = 0). If false, the
+                            !! thickness and bed elevation are averaged to the node over the ice-covered
+                            !! cells first and N is formed from those means. Coulomb friction only.
+  logical :: beta_limit_absolute !< If true, the LOCAL_BASAL_FRICTION nodal drag is multiplied by the
+                            !! grounded fraction f_ground_node before the MIN_BASAL_TRACTION floor is
+                            !! applied, so partly grounded nodes still carry the floor (CISM
+                            !! HO_BETA_LIMIT_ABSOLUTE, its default). If false, the floor is applied to
+                            !! the unscaled drag and the product tends to zero as f_ground_node does
+                            !! (CISM HO_BETA_LIMIT_FLOATING_FRAC).
+  logical :: gl_flot_linearb !< If true, the quadrant grounding-line flotation function is evaluated
+                            !! directly in ice-free cells from their own bed elevation (CISM
+                            !! HO_FLOTATION_FUNCTION_LINEARB, used by Leguy et al. 2021), with land
+                            !! cells assigned a strongly grounded value and a small floor on |f|. If
+                            !! false, ice-free cells are filled by extrapolation from ice-covered
+                            !! neighbors (CISM HO_FLOTATION_FUNCTION_LINEAR).
   logical :: fv_subgrid_gl_friction !< If true, the FV (non-DG) basal friction and the Coulomb
                             !! effective pressure are integrated over the sub-element grounding-line
                             !! partition selected by GROUNDING_LINE_SUBGRID_SCHEME, using the corner
@@ -1045,6 +1071,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   character(len=32) :: filename_appendix = '' ! FMS appendix to filename for ensemble runs
   character(len=16) :: inner_solver_str ! The type of inner solver to use for the SSA
   character(len=16) :: basal_tr_scale_str ! Near-GL basal-traction smoothing mode string
+  character(len=16) :: flot_function_str  ! Quadrant grounding-line flotation function name
   character(len=16) :: gl_subgrid_scheme_str ! Grounding-line subgrid quadrature scheme string
   character(len=16) :: adv_limiter_str ! Thickness-advection TVD slope-limiter choice string
 
@@ -1199,6 +1226,53 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     if (CS%local_basal_friction .and. .not. CS%gl_quad_friction) call MOM_error(FATAL, &
                  "LOCAL_BASAL_FRICTION needs the nodal grounded fraction f_ground_node; set "//&
                  "GL_QUADRANT_FRICTION=True.")
+    call get_param(param_file, mdl, "LOCAL_NODE_FULL_AREA", CS%local_node_full_area, &
+                 "If true, the LOCAL_BASAL_FRICTION nodal control volume is the full dual-cell area "//&
+                 "of the four in-domain cells around the node, as in CISM, which adds beta*dx*dy to "//&
+                 "the diagonal at every active vertex regardless of how many neighbor cells hold ice. "//&
+                 "If false, only the ice-covered cells contribute. The local driving stress is "//&
+                 "unaffected either way, since its lumped nodal mass already counts an ice-free cell "//&
+                 "with zero thickness, exactly as CISM's dx*dy*stagthck does with stagger_margin = 0. "//&
+                 "The two therefore agree at interior and domain-edge nodes and differ only at ice "//&
+                 "margins, where CISM keeps the full area. Only affects grounded ice margins.", &
+                 default=.false., do_not_log=.not.CS%local_basal_friction)
+    call get_param(param_file, mdl, "CISM_NODAL_EFFECPRESS", CS%cism_nodal_effecpress, &
+                 "If true, build the LOCAL_BASAL_FRICTION nodal Coulomb effective pressure the way "//&
+                 "CISM does (glissade_basal_traction, calc_effective_pressure): form N in each cell, "//&
+                 "cap it to [0, overburden] there, and only then average it to the node over all four "//&
+                 "in-domain cells, with ice-free cells contributing N = 0. If false, the thickness and "//&
+                 "bed elevation are averaged to the node over the ice-covered cells alone and N is "//&
+                 "formed from those means -- N(<H>,<b>) rather than <N(H,b)>. The CISM order keeps the "//&
+                 "nodal N continuous as a cell gains or loses ice and stops a deeply floating neighbor "//&
+                 "from dragging the nodal average below zero. Nodes whose N averages to zero carry no "//&
+                 "Coulomb drag, which is exact for the sliding law. Has no effect under Weertman "//&
+                 "friction, where the Coulomb term is absent.", &
+                 default=.false., do_not_log=.not.CS%local_basal_friction)
+    call get_param(param_file, mdl, "BETA_LIMIT_ABSOLUTE", CS%beta_limit_absolute, &
+                 "If true, the LOCAL_BASAL_FRICTION nodal drag is scaled by the grounded fraction "//&
+                 "f_ground_node before the MIN_BASAL_TRACTION floor is applied, so that every node "//&
+                 "with any grounded area keeps at least the floor (CISM HO_BETA_LIMIT_ABSOLUTE, which "//&
+                 "is CISM's default). If false, the floor is applied to the unscaled drag and the "//&
+                 "scaled result tends to zero with f_ground_node (CISM HO_BETA_LIMIT_FLOATING_FRAC). "//&
+                 "Only matters where MIN_BASAL_TRACTION is nonzero.", &
+                 default=.false., do_not_log=.not.CS%local_basal_friction)
+    call get_param(param_file, mdl, "GL_FLOTATION_FUNCTION", flot_function_str, &
+                 "The flotation function interpolated over cell quadrants by GL_QUADRANT_FRICTION and "//&
+                 "GL_QUADRANT_TAUD, following Leguy et al. (2021). Both forms are the ocean cavity "//&
+                 "thickness bed_elev - (rho_i/rho_w)*H in ice-covered cells, and differ in ice-free "//&
+                 "cells. 'linear' (CISM HO_FLOTATION_FUNCTION_LINEAR) fills ice-free cells by "//&
+                 "extrapolating the most-grounded value from an ice-covered neighbor. 'linearb' (CISM "//&
+                 "HO_FLOTATION_FUNCTION_LINEARB, used for the Leguy et al. 2021 experiments) instead "//&
+                 "evaluates the same expression there, so an ice-free cell reports its own bed, with "//&
+                 "cells whose bed is above sea level assigned a strongly grounded value and a small "//&
+                 "floor imposed on |f| for robustness.", &
+                 default="linear", do_not_log=.not.(CS%gl_quad_friction .or. CS%gl_quad_taud))
+    select case (trim(flot_function_str))
+      case ("linear")  ; CS%gl_flot_linearb = .false.
+      case ("linearb") ; CS%gl_flot_linearb = .true.
+      case default ; call MOM_error(FATAL, "MOM_ice_shelf_dynamics: GL_FLOTATION_FUNCTION must be "//&
+                 "'linear' or 'linearb', but got '"//trim(flot_function_str)//"'.")
+    end select
 
     ! Sub-element grounding line for the FV (non-DG) path: one flotation field (CS%fls_corner) on one
     ! partition drives the grounding-line location, the basal friction, the Coulomb effective pressure,
@@ -6418,16 +6492,31 @@ subroutine compute_basal_coef_node(CS, G, US, I, J, u_c, v_c, use_newton, bcoef,
   real :: mintrac  ! min_basal_traction * area_node floor at the node [R L2 Z T-1 ~> kg s-1]
   real :: unorm2   ! Regularized |u|^2 at the node [L2 T-2 ~> m2 s-2]
 
-  ! Scale the regularization and traction floor by the same ice-restricted nodal control volume
-  ! (CS%area_node) the drag prefactor uses, not areaBu, so every term in the local node balance shares
-  ! one control volume and the domain-edge nodes stay consistent with the interior (meridional symmetry).
+  ! Scale the regularization and traction floor by the same nodal control volume (CS%area_node) the
+  ! drag prefactor uses, not areaBu, so every term in the local node balance shares one control volume
+  ! and the domain-edge nodes stay consistent with the interior (meridional symmetry).
   eps2    = CS%eps_glen_min**2 * CS%area_node(I,J)
   mintrac = CS%min_basal_traction * CS%area_node(I,J)
   unorm2  = ((u_c**2) + (v_c**2)) + eps2
-  call compute_basal_coef(unorm2, CS%coef_prefactor_node(I,J), mintrac, CS%fB_node(I,J), &
-      CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, use_newton, bcoef, dnewt)
-  bcoef = bcoef * CS%f_ground_node(I,J)
-  dnewt = dnewt * CS%f_ground_node(I,J)
+  if (CS%beta_limit_absolute) then
+    ! CISM HO_BETA_LIMIT_ABSOLUTE (its default): scale by the grounded fraction first, then floor, so
+    ! that a node with any grounded area keeps at least MIN_BASAL_TRACTION. Where the floor binds the
+    ! drag is constant in |u|, so the Newton tangent factor vanishes, as in compute_basal_coef.
+    call compute_basal_coef(unorm2, CS%coef_prefactor_node(I,J), 0.0, CS%fB_node(I,J), &
+        CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, use_newton, bcoef, dnewt)
+    bcoef = bcoef * CS%f_ground_node(I,J)
+    dnewt = dnewt * CS%f_ground_node(I,J)
+    if ((CS%f_ground_node(I,J) > 0.0) .and. (bcoef < mintrac)) then
+      bcoef = mintrac ; dnewt = 0.0
+    endif
+  else
+    ! CISM HO_BETA_LIMIT_FLOATING_FRAC: floor the unscaled drag, so the scaled result still tends to
+    ! zero as the node floats.
+    call compute_basal_coef(unorm2, CS%coef_prefactor_node(I,J), mintrac, CS%fB_node(I,J), &
+        CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, use_newton, bcoef, dnewt)
+    bcoef = bcoef * CS%f_ground_node(I,J)
+    dnewt = dnewt * CS%f_ground_node(I,J)
+  endif
 end subroutine compute_basal_coef_node
 
 !> Compute the Coulomb fB parameter at a single quadrature point from local (subgrid) ice
@@ -6446,13 +6535,33 @@ pure real function compute_fB_local(h_local, bed_local, rho_oi_ratio, rho_ice_g_
   real, intent(in) :: CF_PostPeak   !< Coulomb post-peak exponent q [nondim]
   real, intent(in) :: n_basal_fric  !< Friction sliding exponent m [nondim]
 
-  real :: Hf  ! Flotation thickness [Z ~> m]
   real :: fN  ! Effective pressure [R Z L T-2 ~> Pa]
 
-  Hf = max(rho_oi_ratio * bed_local, 0.0)
-  fN = max(rho_ice_g_LtoZ * (h_local - Hf), CF_MinN)
-  compute_fB_local = alpha_coulomb * (C_basal / (CF_Max * fN))**(CF_PostPeak / n_basal_fric)
+  ! N is already floored at CF_MinN by coulomb_effective_pressure, so no further floor is applied here.
+  fN = coulomb_effective_pressure(h_local, bed_local, rho_oi_ratio, rho_ice_g_LtoZ, CF_MinN)
+  compute_fB_local = compute_fB_from_N(fN, C_basal, alpha_coulomb, CF_Max, 0.0, CF_PostPeak, n_basal_fric)
 end function compute_fB_local
+
+!> The Coulomb effective pressure N = rho_i*g*(H - H_f) at a point, with H_f the flotation
+!! thickness, floored at N_min and capped at the overburden pressure rho_i*g*H. This is the
+!! p_ocean_penetration = 1 case of the Leguy et al. (2021) effective pressure, and matches CISM's
+!! calc_effective_pressure (glissade_basal_traction) with that exponent, including its cap of N to
+!! [0, overburden]. The upper cap is redundant here (H_f >= 0 already gives N <= rho_i*g*H) but is
+!! kept explicit so the correspondence with CISM is visible. It is applied before the floor, so that
+!! passing N_min = CF_MinN reproduces the unclamped expression exactly for any thickness.
+pure real function coulomb_effective_pressure(h_local, bed_local, rho_oi_ratio, rho_ice_g_LtoZ, N_min)
+  real, intent(in) :: h_local        !< Ice thickness at the point [Z ~> m]
+  real, intent(in) :: bed_local      !< Bed elevation (positive below sea level) at the point [Z ~> m]
+  real, intent(in) :: rho_oi_ratio   !< density_ocean_avg / density_ice [nondim]
+  real, intent(in) :: rho_ice_g_LtoZ !< US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
+  real, intent(in) :: N_min          !< Minimum effective pressure [R Z L T-2 ~> Pa]
+
+  real :: Hf  ! Flotation thickness [Z ~> m]
+
+  Hf = max(rho_oi_ratio * bed_local, 0.0)
+  coulomb_effective_pressure = max(min(rho_ice_g_LtoZ * (h_local - Hf), rho_ice_g_LtoZ * h_local), N_min)
+end function coulomb_effective_pressure
+
 
 !! Returns the sum of the elements in a square matrix. This sum is bitwise identical even if the matrices are rotated.
 subroutine sum_square_matrix(sum_out, mat_in, n)
@@ -7941,8 +8050,10 @@ end subroutine calc_shelf_basal_prefactors
 !> Pre-compute the nodal basal-friction prefactors for LOCAL_BASAL_FRICTION. C_basal_friction is a
 !! static bed property defined under grounded, floating, and ice-free cells alike, so the nodal C is
 !! an area-weighted average over all four cells around the node -- the nodal C does not change as the
-!! (grounded) ice front moves across the node. The Coulomb fB instead uses thickness and bed averaged
-!! over only the ice-covered cells, since the effective pressure is an ice-state quantity. These are
+!! (grounded) ice front moves across the node. The Coulomb effective pressure is instead an ice-state
+!! quantity: with CISM_NODAL_EFFECPRESS it is formed and capped in each cell and then averaged over
+!! all four in-domain cells (ice-free cells contributing zero), as CISM does; otherwise the thickness
+!! and bed are averaged over the ice-covered cells alone and N is formed from those means. These are
 !! velocity-independent, so they are computed once per solve alongside calc_shelf_basal_prefactors.
 !! Node (I,J) is the NE corner of cell (i,j); its four surrounding cells are
 !! (I,J),(I+1,J),(I,J+1),(I+1,J+1).
@@ -7954,15 +8065,18 @@ subroutine calc_shelf_basal_prefactors_node(CS, ISS, G, US)
 
   real :: rho_oi_ratio   ! density_ocean_avg / density_ice [nondim]
   real :: rho_ice_g_LtoZ ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
-  real :: asum_all       ! Sum of all four cell areas at the node [L2 ~> m2]
+  real :: asum_all       ! Sum of all four in-domain cell areas at the node [L2 ~> m2]
   real :: asum_ice       ! Sum of the ice-covered cell areas at the node [L2 ~> m2]
   real :: w              ! Area weight of one cell [L2 ~> m2]
   real :: Cw             ! Area-weighted sum of C_basal_friction over all four cells [R L Z T-2 (s m-1)^n L2]
+  real :: Nw             ! Area-weighted sum of the cell effective pressures [R Z L T-2 L2]
   real :: hw             ! Area-weighted sum of ice thickness over ice cells [Z L2 ~> m3]
   real :: bw             ! Area-weighted sum of bed elevation over ice cells [Z L2 ~> m3]
   real :: C_n            ! Nodal area-weighted C_basal_friction [R L Z T-2 (s m-1)^n]
+  real :: N_n            ! Nodal area-weighted effective pressure [R Z L T-2 ~> Pa]
   real :: h_n            ! Nodal area-weighted ice thickness [Z ~> m]
   real :: bed_n          ! Nodal area-weighted bed elevation [Z ~> m]
+  logical :: ice_here    ! True if this cell holds ice
   integer :: i, j, ii, jj, ic, jc
   integer :: i_off, j_off, gisc, gjsc, giec, gjec
 
@@ -7972,7 +8086,8 @@ subroutine calc_shelf_basal_prefactors_node(CS, ISS, G, US)
   gisc = 1 ; gjsc = 1 ; giec = G%domain%niglobal ; gjec = G%domain%njglobal
 
   do J=G%jsd,G%jed-1 ; do I=G%isd,G%ied-1
-    asum_all = 0.0 ; asum_ice = 0.0 ; Cw = 0.0 ; hw = 0.0 ; bw = 0.0 ; C_n = 0.0
+    asum_all = 0.0 ; asum_ice = 0.0 ; Cw = 0.0 ; Nw = 0.0 ; hw = 0.0 ; bw = 0.0
+    C_n = 0.0 ; N_n = 0.0
     do jj=0,1 ; jc = J+jj ; do ii=0,1 ; ic = I+ii
       ! Skip across-wall halo cells: beyond a non-reentrant wall C_basal_friction is not read from
       ! file and pass_var does not fill it, so it keeps the (large) allocate default and would poison
@@ -7985,38 +8100,72 @@ subroutine calc_shelf_basal_prefactors_node(CS, ISS, G, US)
         if ((jc+j_off < gjsc) .or. (jc+j_off > gjec)) cycle
       endif
       w = G%areaT(ic,jc)
+      ice_here = (ISS%hmask(ic,jc) == 1 .or. ISS%hmask(ic,jc) == 3)
       ! C is a static bed property under floating and ice-free ice alike: average over all in-domain
       ! cells so the nodal C is fixed by geometry, not by where the ice front happens to be.
       asum_all = asum_all + w
       Cw = Cw + w*CS%C_basal_friction(ic,jc)
-      ! Thickness/bed for the Coulomb effective pressure are only meaningful under ice.
-      if (ISS%hmask(ic,jc) == 1 .or. ISS%hmask(ic,jc) == 3) then
-        asum_ice = asum_ice + w
+      if (ice_here) asum_ice = asum_ice + w
+      if (CS%cism_nodal_effecpress) then
+        ! CISM order of operations (glissade_basal_traction, calc_effective_pressure): form N in the
+        ! cell and cap it to [0, overburden] there, then stagger N itself to the node over ALL four
+        ! in-domain cells. An ice-free cell has no overburden and so contributes N = 0, exactly as
+        ! CISM's glissade_stagger with stagger_margin = 0 does. Including the ice-free cells is what
+        ! makes the nodal N continuous as a cell gains or loses thin ice, and capping per cell stops a
+        ! deeply floating neighbor from pulling the nodal average below zero without bound.
+        if (ice_here) &
+          Nw = Nw + w*coulomb_effective_pressure(max(ISS%h_shelf(ic,jc), CS%min_h_shelf), &
+                        CS%bed_elev(ic,jc), rho_oi_ratio, rho_ice_g_LtoZ, 0.0)
+      elseif (ice_here) then
+        ! Thickness/bed for the Coulomb effective pressure are only meaningful under ice.
         hw = hw + w*max(ISS%h_shelf(ic,jc), CS%min_h_shelf)
         bw = bw + w*CS%bed_elev(ic,jc)
       endif
     enddo ; enddo
-    ! Nodal control volume for the local drag: the lumped corner areas of the ICE-COVERED surrounding
-    ! cells only (0.25*areaT each), matching both the lumped driving stress (sum of lumped_corner_mass
-    ! over ice cells) and the CG_action element assembly (which loops over ice cells). This is NOT
-    ! areaBu: at a domain-edge node areaBu is the full dual-cell area but the across-wall halo cells
-    ! carry no ice, so areaBu would give the boundary node a full-strength drag while its driving stress
-    ! and viscous terms are integrated over only the interior (half) control volume. That mismatch
-    ! slows the wall-node along-flow velocity relative to the interior, breaking the meridional symmetry
-    ! of channel configs (MISMIP3D) -- spurious y-velocity and y-surface-slope near the y walls.
-    CS%area_node(I,J) = 0.25 * asum_ice
+    ! Nodal control volume for the local drag, as lumped corner areas (0.25*areaT per cell). With
+    ! LOCAL_NODE_FULL_AREA this is the full dual-cell area of the in-domain cells, which is what CISM
+    ! adds to the diagonal (dx*dy) at every active vertex; otherwise it is restricted to the
+    ! ice-covered cells. Neither is areaBu: at a domain-edge node the across-wall halo cells are out
+    ! of the domain, and counting them would give the boundary node a full-strength drag while its
+    ! driving stress and viscous terms are integrated over only the interior (half) control volume.
+    ! That mismatch slows the wall-node along-flow velocity relative to the interior, breaking the
+    ! meridional symmetry of channel configs (MISMIP3D) -- spurious y-velocity and y-surface-slope
+    ! near the y walls. The two choices agree wherever every in-domain cell at the node holds ice, so
+    ! they differ only at ice margins, and never at the walls of an ice-filled channel.
+    if (asum_ice > 0.0) then
+      if (CS%local_node_full_area) then
+        CS%area_node(I,J) = 0.25 * asum_all
+      else
+        CS%area_node(I,J) = 0.25 * asum_ice
+      endif
+    else
+      ! No ice anywhere around the node: it is not an active vertex and carries no drag (CISM vmask).
+      CS%area_node(I,J) = 0.0
+    endif
     if (CS%area_node(I,J) > 0.0) then
       C_n = Cw/asum_all
       CS%coef_prefactor_node(I,J) = (CS%area_node(I,J) * C_n) * US%L_T_to_m_s
     else
       CS%coef_prefactor_node(I,J) = 0.0
     endif
+    CS%fB_node(I,J) = 0.0
     if (CS%CoulombFriction .and. asum_ice > 0.0) then
-      h_n = hw/asum_ice ; bed_n = bw/asum_ice
-      CS%fB_node(I,J) = compute_fB_local(h_n, bed_n, rho_oi_ratio, rho_ice_g_LtoZ, &
-          C_n, CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, CS%CF_PostPeak, CS%n_basal_fric)
-    else
-      CS%fB_node(I,J) = 0.0
+      if (CS%cism_nodal_effecpress) then
+        N_n = Nw/asum_all
+        if (N_n > 0.0) then
+          CS%fB_node(I,J) = compute_fB_from_N(N_n, C_n, CS%alpha_coulomb, CS%CF_Max, 0.0, &
+              CS%CF_PostPeak, CS%n_basal_fric)
+        else
+          ! A vanishing effective pressure gives no Coulomb drag at all. Zero the prefactor rather
+          ! than pass an infinite fB through the sliding law; MIN_BASAL_TRACTION is still applied
+          ! downstream, so a partly grounded node keeps its floor under BETA_LIMIT_ABSOLUTE.
+          CS%coef_prefactor_node(I,J) = 0.0
+        endif
+      else
+        h_n = hw/asum_ice ; bed_n = bw/asum_ice
+        CS%fB_node(I,J) = compute_fB_local(h_n, bed_n, rho_oi_ratio, rho_ice_g_LtoZ, &
+            C_n, CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, CS%CF_PostPeak, CS%n_basal_fric)
+      endif
     endif
   enddo ; enddo
 
@@ -8674,38 +8823,82 @@ subroutine compute_gl_quadrant_fractions(CS, ISS, G)
   real, allocatable, dimension(:,:,:) :: fgq    ! Grounded fraction of the 4 quadrants around each node [nondim]
   real, dimension(4) :: fv                       ! Flotation at the 4 CCW corners of one quadrant [Z ~> m]
   real :: rhoi_rhow                              ! Ice/ocean density ratio [nondim]
+  real :: f_flot_land_min                        ! Minimum depth below sea level assigned to a land cell
+                                                 ! in the LINEARB flotation function [Z ~> m]
+  real :: f_flot_marine_min                      ! Minimum magnitude of f_flot in a marine cell under
+                                                 ! the LINEARB flotation function [Z ~> m]
+  real :: h_cell                                 ! Ice thickness used in the flotation function [Z ~> m]
   logical :: filled                              ! True once an ice-free cell has an ice neighbor to copy from
   logical :: vmask                               ! True if the node has at least one ice-covered neighbor cell
   integer :: i, j, ii, jj, isd, ied, jsd, jed, isc, iec, jsc, jec
+  integer :: i_in, j_in, i_off, j_off, gisc, gjsc, giec, gjec
 
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   rhoi_rhow = CS%density_ice / CS%density_ocean_avg
+  ! CISM's f_flotation_land_topg_min and f_flotation_marine_min (glissade_grounding_line).
+  f_flot_land_min   = 50.0 * G%US%m_to_Z
+  f_flot_marine_min = 1.0e-4 * G%US%m_to_Z
+  i_off = G%idg_offset ; j_off = G%jdg_offset
+  gisc = 1 ; gjsc = 1 ; giec = G%domain%niglobal ; gjec = G%domain%njglobal
 
   ! Cell-center flotation function (Leguy 2021 "linear" form = ocean cavity thickness): f > 0 where
   ! floating, f <= 0 where grounded, with the grounding line at f = 0. Sign matches the existing
-  ! cell-center flotation test rhoi_rhow*h - bed (grounded when positive). Following CISM
-  ! (glissade_grounded_fraction), f_flot is meaningful only in ice-covered cells; ice-free cells are
-  ! set to 0 here and filled by extrapolation below, so the quadrant integral never reads bed/thickness
-  ! from ice-free cells. This is essential at the domain edges: the halo across a solid N/S wall has
-  ! bed_elev = 0 (no neighbor PE to fill it), which a raw f_flot would read as spuriously grounded.
+  ! cell-center flotation test rhoi_rhow*h - bed (grounded when positive). Note CS%bed_elev is the
+  ! depth of the bed below sea level, so it is CISM's -(topg - eus) and a land cell has bed_elev < 0.
   do j=jsd,jed ; do i=isd,ied
     ice_cell(i,j) = (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3)
-    if (ice_cell(i,j)) then
+    if (CS%gl_flot_linearb) then
+      ! CISM HO_FLOTATION_FUNCTION_LINEARB: evaluate the same expression in every cell, so an ice-free
+      ! cell reports its own bed rather than an extrapolated neighbor value, and no extrapolation pass
+      ! is needed. Cells whose bed stands above sea level are land and are made strongly grounded with
+      ! a floor on the assumed freeboard, and |f| is floored in marine cells for robustness.
+      if (CS%bed_elev(i,j) <= 0.0) then   ! land: the bed stands at or above sea level
+        f_flot(i,j) = min(CS%bed_elev(i,j), -f_flot_land_min)
+      else
+        h_cell = 0.0
+        if (ice_cell(i,j)) h_cell = max(ISS%h_shelf(i,j), CS%min_h_shelf)
+        f_flot(i,j) = CS%bed_elev(i,j) - rhoi_rhow * h_cell
+        if (abs(f_flot(i,j)) < f_flot_marine_min) &
+          f_flot(i,j) = sign(f_flot_marine_min, f_flot(i,j))
+      endif
+    elseif (ice_cell(i,j)) then
+      ! CISM HO_FLOTATION_FUNCTION_LINEAR: f_flot is meaningful only in ice-covered cells; ice-free
+      ! cells are set to 0 here and filled by extrapolation below, so the quadrant integral never reads
+      ! bed/thickness from ice-free cells.
       f_flot(i,j) = CS%bed_elev(i,j) - rhoi_rhow * max(ISS%h_shelf(i,j), CS%min_h_shelf)
     else
       f_flot(i,j) = 0.0
     endif
   enddo ; enddo
 
+  ! Under LINEARB the halo across a solid (non-reentrant) wall would otherwise be read as real ocean:
+  ! it holds bed_elev = 0 there (no neighbor PE fills it), which the expression above turns into a
+  ! barely floating marine cell and which would then unground the wall nodes. Fill those cells by
+  ! zero-gradient extension of the nearest in-domain cell, so a wall bounding grounded ice stays
+  ! grounded and one bounding a shelf stays floating. The LINEAR branch does not need this: its
+  ! ice-free cells carry no bed information at all and are handled by the extrapolation below.
+  if (CS%gl_flot_linearb) then
+    do j=jsd,jed ; do i=isd,ied
+      i_in = i ; j_in = j
+      if (.not. CS%reentrant_x) i_in = min(max(i+i_off, gisc), giec) - i_off
+      if (.not. CS%reentrant_y) j_in = min(max(j+j_off, gjsc), gjec) - j_off
+      if ((i_in /= i) .or. (j_in /= j)) then
+        if ((i_in >= isd) .and. (i_in <= ied) .and. (j_in >= jsd) .and. (j_in <= jed)) &
+          f_flot(i,j) = f_flot(i_in,j_in)
+      endif
+    enddo ; enddo
+  endif
+
   ! Extrapolate f_flot into ice-free cells, taking the most-grounded (minimum) value among
   ! ice-covered neighbors -- edge neighbors first, then corners if there is no ice edge-neighbor.
   ! This guarantees every node with an ice-covered neighbor is surrounded by four physically
   ! meaningful corner values for the quadrant interpolation (CISM glissade_grounded_fraction).
   ! Ice-free cells with no ice neighbor keep 0 and never enter an active grounded fraction (vmask).
+  ! LINEARB skips this: every cell already holds its own physically meaningful value.
   f_flot_ex(:,:) = f_flot(:,:)
   do j=jsd+1,jed-1 ; do i=isd+1,ied-1
-    if (.not. ice_cell(i,j)) then
+    if ((.not. ice_cell(i,j)) .and. (.not. CS%gl_flot_linearb)) then
       filled = .false.
       do jj=j-1,j+1 ; do ii=i-1,i+1   ! edge neighbors
         if ((ii == i .or. jj == j) .and. ice_cell(ii,jj)) then
