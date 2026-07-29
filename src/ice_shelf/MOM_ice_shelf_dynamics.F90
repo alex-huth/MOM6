@@ -54,6 +54,14 @@ integer, parameter :: BASAL_TR_NONE = 0     !< No smoothing (hard Weertman step 
 integer, parameter :: BASAL_TR_CENTERED = 1 !< Symmetric cosine ramp over [-W,W]; phi(0)=0.5, GL not displaced
 integer, parameter :: BASAL_TR_ONESIDED = 2 !< STREAMICE-style ramp over [0,W]; reduces grounded traction only
 
+! Sentinel returned by the Coulomb fB routines when the effective pressure is zero. The sliding law
+! tau_b = C |u|^m / (1 + fB |u|^q)^m gives exactly zero drag as N -> 0, but it encodes that limit as
+! fB -> infinity, which is not representable. Any negative fB therefore means "no Coulomb drag here",
+! and compute_basal_coef takes that branch instead of evaluating the divergent expression. This is
+! what lets CF_MinN be set to zero: with a positive CF_MinN the effective pressure is floored before
+! fB is formed and the sentinel is never produced.
+real, parameter :: FB_NO_COULOMB_DRAG = -1.0 !< fB value meaning zero effective pressure [(T L-1)^CF_PostPeak]
+
 ! SEP2 sub-element quadrature constants (GROUNDING_LINE_SUBGRID_SCHEME="SEP2").
 real, parameter :: SEP2_W23 = 2.0/3.0    !< Heavy vertex weight of the interior 3-pt triangle rule [nondim]
 real, parameter :: SEP2_W16 = 1.0/6.0    !< Light vertex weight of the interior 3-pt triangle rule [nondim]
@@ -6498,6 +6506,12 @@ subroutine compute_basal_coef(unorm2_qp, coef_prefactor, min_trac_area, fB_e, &
     ! Linear Weertman: coef is independent of |u|; sqrt and Newton correction not needed
     basal_coef = max(coef_prefactor, min_trac_area)
     drag_newt  = 0.0
+  elseif (CoulombFriction .and. (fB_e < 0.0)) then
+    ! Zero effective pressure (FB_NO_COULOMB_DRAG): the Coulomb law gives exactly zero basal drag
+    ! and its Newton tangent vanishes with it, since the drag is identically zero in u. Taking this
+    ! branch avoids forming the divergent fB expression at all. min_trac_area reproduces what the
+    ! Coulomb branch below would do with raw_coef = 0: the floor when one is set, zero otherwise.
+    basal_coef = min_trac_area  ;  drag_newt = 0.0
   elseif (CoulombFriction) then
     ! Schoof/Gagliardini Coulomb friction
     unorm    = L_T_to_m_s * sqrt(unorm2_qp)
@@ -6595,7 +6609,8 @@ pure real function compute_fB_local(h_local, bed_local, rho_oi_ratio, rho_ice_g_
 
   real :: fN  ! Effective pressure [R Z L T-2 ~> Pa]
 
-  ! N is already floored at CF_MinN by coulomb_effective_pressure, so no further floor is applied here.
+  ! N is already floored at CF_MinN by coulomb_effective_pressure, so no further floor is applied
+  ! here; compute_fB_from_N returns FB_NO_COULOMB_DRAG if that leaves it at zero.
   fN = coulomb_effective_pressure(h_local, bed_local, rho_oi_ratio, rho_ice_g_LtoZ, CF_MinN)
   compute_fB_local = compute_fB_from_N(fN, C_basal, alpha_coulomb, CF_Max, 0.0, CF_PostPeak, n_basal_fric)
 end function compute_fB_local
@@ -8093,11 +8108,13 @@ subroutine calc_shelf_basal_prefactors(CS, ISS, G, US)
       ! DG mode: fB is computed at each quadrature point via compute_fB_local; zero the element value.
       CS%fB_elem(i,j) = 0.0
     elseif (CS%CoulombFriction .and. (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3)) then
+      ! This runs over every ice cell, floating ones included, where h < Hf makes the unfloored
+      ! effective pressure negative. compute_fB_from_N clamps it at CF_MinN and returns
+      ! FB_NO_COULOMB_DRAG if that leaves it at zero, so CF_MinN = 0 is safe here.
       Hf = max((CS%density_ocean_avg/CS%density_ice) * CS%bed_elev(i,j), 0.0)
-      fN = max((US%L_to_Z*(CS%density_ice * CS%g_Earth) * &
-                (max(ISS%h_shelf(i,j), CS%min_h_shelf) - Hf)), CS%CF_MinN)
-      CS%fB_elem(i,j) = CS%alpha_coulomb * &
-          (CS%C_basal_friction(i,j) / (CS%CF_Max * fN))**(CS%CF_PostPeak/CS%n_basal_fric)
+      fN = US%L_to_Z*(CS%density_ice * CS%g_Earth) * (max(ISS%h_shelf(i,j), CS%min_h_shelf) - Hf)
+      CS%fB_elem(i,j) = compute_fB_from_N(fN, CS%C_basal_friction(i,j), CS%alpha_coulomb, &
+          CS%CF_Max, CS%CF_MinN, CS%CF_PostPeak, CS%n_basal_fric)
     else
       CS%fB_elem(i,j) = 0.0
     endif
@@ -9956,7 +9973,13 @@ pure real function compute_fB_from_N(N_eff, C_basal, alpha_coulomb, CF_Max, CF_M
   real :: fN  ! Floored effective pressure [R Z L T-2 ~> Pa]
 
   fN = max(N_eff, CF_MinN)
-  compute_fB_from_N = alpha_coulomb * (C_basal / (CF_Max * fN))**(CF_PostPeak / n_basal_fric)
+  if (fN > 0.0) then
+    compute_fB_from_N = alpha_coulomb * (C_basal / (CF_Max * fN))**(CF_PostPeak / n_basal_fric)
+  else
+    ! Zero effective pressure: the Coulomb drag is exactly zero, which this factorization can only
+    ! express as an infinite fB. Signal it instead. Unreachable when CF_MinN > 0.
+    compute_fB_from_N = FB_NO_COULOMB_DRAG
+  endif
 end function compute_fB_from_N
 
 !> Effective pressure at a quadrature point from the sub-element flotation field:
