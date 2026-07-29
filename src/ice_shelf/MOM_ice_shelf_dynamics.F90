@@ -431,6 +431,15 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! runs unchanged on the flat field, with the in-cell flotation
                                   !! deficit varying only through the nodal bed. Forces
                                   !! DG1_ART_VISC_C_MAX = 0 (no slope/jump dofs exist to damp).
+  logical :: dg_source_local_to_cell !< If true, the DG(1) thickness source (basal melt plus
+                                  !! surface mass balance) is applied as a piecewise-constant
+                                  !! field: every corner of a cell receives that cell's own
+                                  !! cell-mean rate, so the source never crosses a cell face. If
+                                  !! false, the cell-mean rates are first projected onto a
+                                  !! continuous Q1 nodal field, so a corner carries the weighted
+                                  !! average of the cells sharing it. Both are exactly
+                                  !! mass-conservative; they differ in whether a cell's source can
+                                  !! change the thickness of its neighbours.
   logical :: nodal_positivity     !< If true, apply Liu-style positivity-preserving limiter
                                   !! to the nodal DG(1) thickness corners.
   logical :: dg_hierarchical_lim  !< If true, apply a per-mode hierarchical
@@ -12469,6 +12478,20 @@ subroutine project_h_source_rate_to_nodes(CS, ISS, G, S_node)
   real :: src                                      ! Cached source rate of cell (i,j) [Z T-1]
   integer :: i, j
 
+  ! Piecewise-constant source: every corner of a cell takes that cell's own rate, so no source
+  ! crosses a cell face. This is exactly conservative on its own, because the corner weights are a
+  ! partition of unity -- sum(cell_mean_w) = areaT -- so the nodal cell mean of a constant is that
+  ! constant. It is also the faithful representation of melt and SMB, which arrive as cell means.
+  if (CS%dg_source_local_to_cell) then
+    call pass_var(CS%h_source_rate, G%domain)
+    S_node(:,:,:,:) = 0.0
+    do j = G%jsc, G%jec ; do i = G%isc, G%iec
+      if (ISS%hmask(i,j) /= 1.0) cycle
+      S_node(i,j,:,:) = CS%h_source_rate(i,j)
+    enddo ; enddo
+    return
+  endif
+
   S_corner(:,:) = 0.0
   w_corner(:,:) = 0.0
 
@@ -12588,6 +12611,21 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "the nodal bed. The DG(1) artificial viscosity is forced off (no "//&
                  "slope or jump degrees of freedom exist to damp). Requires "//&
                  "USE_DG_THICKNESS.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
+
+  call get_param(param_file, mdl, "DG_SOURCE_LOCAL_TO_CELL", CS%dg_source_local_to_cell, &
+                 "If true, apply the DG(1) thickness source (basal melt plus surface mass "//&
+                 "balance) as a piecewise-constant field: every corner of a cell receives that "//&
+                 "cell's own cell-mean rate, so a cell's source only ever changes its own "//&
+                 "thickness. If false, the cell-mean rates are first projected onto a continuous "//&
+                 "Q1 nodal field, so each corner carries the weighted average of the cells that "//&
+                 "share it and part of a cell's source is deposited in its neighbours. Both are "//&
+                 "exactly mass-conservative. The continuous projection gives a smoother source "//&
+                 "and so provokes less DG limiting where melt rates differ sharply between "//&
+                 "neighbouring cells, but it spreads melt across the grounding line, thinning "//&
+                 "grounded ice with melt computed for an adjacent floating cell. Since melt and "//&
+                 "SMB are supplied as cell means, the piecewise-constant form is the more "//&
+                 "faithful representation of the input data. Requires USE_DG_THICKNESS.", &
                  default=.false., do_not_log=.not.CS%use_DG_thickness)
 
   call get_param(param_file, mdl, "DG1_ART_VISC_C_MAX", CS%dg_art_visc_c_max, &
