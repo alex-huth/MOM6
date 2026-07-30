@@ -57,6 +57,7 @@ use MOM_EOS, only : EOS_type, EOS_init
 use MOM_ice_shelf_dynamics, only : ice_shelf_dyn_CS, update_ice_shelf, write_ice_shelf_energy
 use MOM_ice_shelf_dynamics, only : reset_DG_to_cellmean_at_cell, reset_DG_to_cellmean_bulk
 use MOM_ice_shelf_dynamics, only : accumulate_DG_source_rate
+use MOM_ice_shelf_dynamics, only : calc_prescribed_basal_melt
 use MOM_ice_shelf_dynamics, only : register_ice_shelf_dyn_restarts, initialize_ice_shelf_dyn
 use MOM_ice_shelf_dynamics, only : ice_shelf_min_thickness_calve, change_in_draft
 use MOM_ice_shelf_dynamics, only : ice_time_step_CFL, ice_shelf_dyn_end, IS_dynamics_post_data
@@ -1277,7 +1278,10 @@ subroutine change_thickness_using_melt(CS, ISS, G, US, time_step, fluxes)
           ISS%tflux_ocn(i,j)=ISS%tflux_ocn(i,j)*scale
           if (CS%threeeq .and. ISS%tflux_ocn(i,j) < 0.0 .and. (.not. CS%insulator)) &
             ISS%tflux_shelf(i,j)=ISS%tflux_ocn(i,j) + CS%Lat_fusion*ISS%water_flux(i,j)
-          fluxes%iceshelf_melt(i,j) = ISS%water_flux(i,j) * CS%flux_factor
+          ! Guarded because the ice-only driver reaches this routine with a forcing structure
+          ! that need not have the ice-shelf melt diagnostic allocated.
+          if (associated(fluxes%iceshelf_melt)) &
+            fluxes%iceshelf_melt(i,j) = ISS%water_flux(i,j) * CS%flux_factor
           ISS%h_shelf(i,j) = 0.0
           ISS%hmask(i,j) = 0.0
           ISS%area_shelf_h(i,j) = 0.0
@@ -1287,7 +1291,7 @@ subroutine change_thickness_using_melt(CS, ISS, G, US, time_step, fluxes)
           ISS%water_flux(i,j)=0.0
           ISS%tflux_ocn(i,j)=0.0
           ISS%tflux_shelf(i,j)=0.0
-          fluxes%iceshelf_melt(i,j) = 0.0
+          if (associated(fluxes%iceshelf_melt)) fluxes%iceshelf_melt(i,j) = 0.0
           count=count+1
         endif
         ISS%mass_shelf(i,j) = ISS%h_shelf(i,j) * CS%density_ice
@@ -2995,7 +2999,9 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
                                !for all ice sheets, Antarctica only, or Greenland only [Z L2 ~> m3]
   real, dimension(SZI_(CS%grid),SZJ_(CS%grid)) :: &
     dh_adott_sum, &    ! Surface melt/accumulation over a full time step, used for diagnostics [Z ~> m]
-    dh_adott           ! Surface melt/accumulation over a partial time step, used for diagnostics [Z ~> m]
+    dh_adott, &        ! Surface melt/accumulation over a partial time step, used for diagnostics [Z ~> m]
+    dh_bdott_sum, &    ! Basal melt/accumulation over a full time step, used for diagnostics [Z ~> m]
+    dh_bdott           ! Basal melt/accumulation over a partial time step, used for diagnostics [Z ~> m]
 
   G => CS%grid
   US => CS%US
@@ -3017,9 +3023,10 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
 
   ISS%dhdt_shelf(:,:) = ISS%h_shelf(:,:)
 
-  dh_adott(:,:)=0.0
+  dh_adott(:,:)=0.0 ; dh_bdott(:,:)=0.0
 
   if (CS%smb_diag) dh_adott_sum(:,:) = 0.0
+  if (CS%bmb_diag) dh_bdott_sum(:,:) = 0.0
 
   !calculate previous volumes above floatation
   if (CS%id_dvafdt     > 0) call volume_above_floatation(CS%dCS, G, ISS, vaf0)                 !all ice sheet
@@ -3043,6 +3050,16 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
     call change_thickness_using_precip(CS, ISS, G, US, fluxes_in, time_step, Time)
     if (CS%smb_diag) dh_adott_sum(is:ie,js:je) = dh_adott_sum(is:ie,js:je) + &
                                              (ISS%h_shelf(is:ie,js:je) - dh_adott(is:ie,js:je))
+
+    ! Prescribed basal melt. calc_prescribed_basal_melt only fills ISS%water_flux (and is a
+    ! no-op unless ICE_ONLY_BASAL_MELT is set); change_thickness_using_melt then applies it
+    ! exactly as it does for ocean-supplied melt in a coupled run, so the melt-away handling,
+    ! the mass_hole accounting and the DG source accumulation are shared between the two paths.
+    if (CS%bmb_diag) dh_bdott(is:ie,js:je) = ISS%h_shelf(is:ie,js:je)
+    call calc_prescribed_basal_melt(CS%dCS, ISS, G, US)
+    call change_thickness_using_melt(CS, ISS, G, US, time_step, fluxes_in)
+    if (CS%bmb_diag) dh_bdott_sum(is:ie,js:je) = dh_bdott_sum(is:ie,js:je) + &
+                                             (ISS%h_shelf(is:ie,js:je) - dh_bdott(is:ie,js:je))
 
     remaining_time = remaining_time - time_step
 
@@ -3068,7 +3085,7 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
   if (CS%id_h_shelf > 0)      call post_data(CS%id_h_shelf      ,ISS%h_shelf     ,CS%diag)
   if (CS%id_dhdt_shelf > 0)   call post_data(CS%id_dhdt_shelf   ,ISS%dhdt_shelf  ,CS%diag)
   if (CS%id_h_mask > 0)       call post_data(CS%id_h_mask       ,ISS%hmask       ,CS%diag)
-  call process_and_post_scalar_data(CS, vaf0, vaf0_A, vaf0_G, Ifull_time_step, dh_adott, dh_adott*0.0)
+  call process_and_post_scalar_data(CS, vaf0, vaf0_A, vaf0_G, Ifull_time_step, dh_adott, dh_bdott_sum)
   call disable_averaging(CS%diag)
 
   call IS_dynamics_post_data(full_time_step, Time, CS%dCS, ISS, G)

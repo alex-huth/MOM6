@@ -42,6 +42,7 @@ public ice_time_step_CFL, ice_shelf_dyn_end, change_in_draft, write_ice_shelf_en
 public shelf_advance_front, ice_shelf_min_thickness_calve, calve_to_mask, volume_above_floatation
 public reset_DG_to_cellmean_at_cell, reset_DG_to_cellmean_bulk, is_DG_thickness_active
 public accumulate_DG_source_rate
+public calc_prescribed_basal_melt
 public masked_var_grounded
 
 ! SSA inner solver flags
@@ -77,6 +78,16 @@ integer, parameter :: LIMITER_VANLEER = 0   !< Van Leer limiter (original scheme
 integer, parameter :: LIMITER_SUPERBEE = 1  !< Superbee limiter (least diffusive; STREAMICE default)
 integer, parameter :: LIMITER_MINMOD = 2    !< Minmod limiter (most diffusive)
 integer, parameter :: LIMITER_MC = 3        !< Monotonized-central limiter (between Van Leer and superbee)
+
+! Grounding-line treatment of the prescribed ice-only basal melt (ICE_ONLY_BASAL_MELT_GLP).
+! Named after Leguy, Lipscomb & Asay-Davis (2021) sec. 2.3 and Seroussi & Morlighem (2018) sec. 2.
+integer, parameter :: MELT_GLP_FMP = 0  !< Full melt: the fully-floating rate is applied in every
+                                        !! ice-covered cell regardless of its grounded fraction.
+integer, parameter :: MELT_GLP_FCMP = 1 !< Flotation-condition melt: full rate where the cell centre
+                                        !! satisfies the flotation condition, zero otherwise.
+integer, parameter :: MELT_GLP_PMP = 2  !< Partial melt: the rate is scaled by the floating area
+                                        !! fraction of the cell. Equivalent to Seroussi's SEM1.
+integer, parameter :: MELT_GLP_NMP = 3  !< No melt: zero rate in every partly grounded cell.
 
 ! Friction-assembly gate codes stored in CS%basal_gate (real-valued for halo updates)
 real, parameter :: BG_SKIP = 0.0    !< No basal traction in this cell
@@ -314,6 +325,15 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! following Cornford et al. (2013) eqs 27-29, rather than the
                             !! centered difference (their eq 25) that would straddle the
                             !! grounding line. Only used by the FV (non-DG) driving stress.
+
+  logical :: ice_only_basal_melt !< If true, the ice-only (solo) driver applies a prescribed
+                            !! depth-dependent basal melt rate under floating ice, following
+                            !! Leguy et al. (2021) eq. 18 (= Seroussi & Morlighem 2018 eq. 4).
+                            !! Has no effect in coupled runs, where the melt rate comes from the
+                            !! ocean via shelf_calc_flux.
+  integer :: ice_only_melt_glp !< The grounding-line treatment of the prescribed ice-only basal
+                            !! melt, one of MELT_GLP_FMP, MELT_GLP_FCMP, MELT_GLP_PMP or
+                            !! MELT_GLP_NMP.
 
   logical :: gl_quad_friction !< If true, scale basal friction by an analytic nodal grounded
                             !! fraction (CS%f_ground_node) computed by the quadrant grounding-line
@@ -1099,6 +1119,8 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   character(len=16) :: flot_function_str  ! Quadrant grounding-line flotation function name
   character(len=16) :: gl_subgrid_scheme_str ! Grounding-line subgrid quadrature scheme string
   character(len=16) :: adv_limiter_str ! Thickness-advection TVD slope-limiter choice string
+  character(len=16) :: melt_glp_str    ! Ice-only prescribed basal melt grounding-line scheme string
+  logical :: solo_ice_sheet   ! True if this is an ice-only (solo ice sheet) run
 
   Isdq = G%isdB ; Iedq = G%iedB ; Jsdq = G%jsdB ; Jedq = G%jedB
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -1222,6 +1244,45 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     if (CS%gl_quad_taud .and. CS%FV_GL_one_sided) call MOM_error(FATAL, &
                  "GL_QUADRANT_TAUD and FV_GL_ONE_SIDED_TAUD both regularize the grounding-line "//&
                  "driving stress and cannot be used together.")
+
+    ! Prescribed basal melt for the ice-only driver. In a coupled run the melt rate comes from
+    ! the ocean through shelf_calc_flux and these are ignored.
+    solo_ice_sheet = .false.
+    if (present(solo_ice_sheet_in)) solo_ice_sheet = solo_ice_sheet_in
+    call get_param(param_file, mdl, "ICE_ONLY_BASAL_MELT", CS%ice_only_basal_melt, &
+                 "If true, the ice-only (solo ice sheet) driver applies a prescribed basal melt "//&
+                 "rate under floating ice, following Leguy et al. (2021, The Cryosphere "//&
+                 "15:3229-3253) eq. 18, which is the same profile as Seroussi & Morlighem (2018, "//&
+                 "The Cryosphere 12:3085-3096) eq. 4 and the MISMIP+ Ice1r experiment. The melt "//&
+                 "rate ramps linearly from 0 at an ice-base depth of 50 m to 30 m yr-1 at 500 m "//&
+                 "and is constant below that. Ignored in coupled runs, where the melt rate is "//&
+                 "supplied by the ocean.", &
+                 default=.false., do_not_log=.not.solo_ice_sheet)
+    call get_param(param_file, mdl, "ICE_ONLY_BASAL_MELT_GLP", melt_glp_str, &
+                 "How the prescribed ice-only basal melt is applied in cells that contain the "//&
+                 "grounding line. 'FMP' applies the full fully-floating rate in every ice-covered "//&
+                 "cell. 'FCMP' applies the full rate where the cell centre satisfies the "//&
+                 "flotation condition and none elsewhere. 'PMP' scales the rate by the floating "//&
+                 "area fraction of the cell, so the total melt is proportional to the floating "//&
+                 "area; this is the partial-melt parameterization of Leguy et al. (2021) sec. 2.3 "//&
+                 "and is equivalent to the sub-element melt 1 (SEM1) scheme of Seroussi & "//&
+                 "Morlighem (2018). 'NMP' applies no melt in any partly grounded cell. Applying "//&
+                 "the full rate in partly grounded cells melts grounded ice and is known to drive "//&
+                 "spurious grounding-line retreat, so FMP is provided mainly as a baseline. "//&
+                 "Requires ICE_ONLY_BASAL_MELT.", &
+                 default="FMP", do_not_log=.not.CS%ice_only_basal_melt)
+    select case (trim(melt_glp_str))
+      case ("FMP")  ; CS%ice_only_melt_glp = MELT_GLP_FMP
+      case ("FCMP") ; CS%ice_only_melt_glp = MELT_GLP_FCMP
+      case ("PMP")  ; CS%ice_only_melt_glp = MELT_GLP_PMP
+      case ("NMP")  ; CS%ice_only_melt_glp = MELT_GLP_NMP
+      case default  ; call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
+                        "ICE_ONLY_BASAL_MELT_GLP must be one of 'FMP', 'FCMP', 'PMP' or 'NMP', "//&
+                        "but got '"//trim(melt_glp_str)//"'.")
+    end select
+    if (CS%ice_only_basal_melt .and. .not.solo_ice_sheet) call MOM_error(FATAL, &
+                 "MOM_ice_shelf_dynamics: ICE_ONLY_BASAL_MELT is only meaningful for the ice-only "//&
+                 "driver; in a coupled run the basal melt rate is supplied by the ocean.")
     call get_param(param_file, mdl, "FV_TAUD_VERTEX_GRADIENT", CS%fv_taud_vertex_grad, &
                  "If true, the finite-volume (non-DG) driving stress evaluates the surface gradient "//&
                  "directly at B-grid nodes from the four surrounding cell centers (Lipscomb et al. "//&
@@ -12434,6 +12495,113 @@ subroutine reset_DG_to_cellmean_bulk(CS)
   if (.not. CS%use_DG_thickness) return
   CS%h_nodal(:,:,:,:) = 0.0
 end subroutine reset_DG_to_cellmean_bulk
+
+!> Return the grounded area fraction of cell (i,j) from whichever sub-element grounding-line
+!! scheme is active: the analytic quadrant fraction of Leguy et al. (2021) when
+!! GL_QUADRANT_FRICTION is set, and the sub-element sampled fraction otherwise. With no
+!! sub-element scheme active, CS%ground_frac is the binary flotation state of the cell centre,
+!! so this returns 0 or 1 and any scheme built on it degenerates to a binary treatment.
+!! Centralized here because both the prescribed melt parameterizations and the sub-element
+!! nodal source weights must read the same grounded geometry the friction does; if they read
+!! different partitions, melt would switch on at a different sub-cell location than friction
+!! switches off.
+pure function grounded_frac_cell(CS, i, j) result(fg)
+  type(ice_shelf_dyn_CS), intent(in) :: CS !< Ice shelf dynamics control structure.
+  integer,                intent(in) :: i  !< i index of the cell.
+  integer,                intent(in) :: j  !< j index of the cell.
+  real :: fg !< The grounded area fraction of the cell [nondim]
+
+  if (CS%gl_quad_friction) then
+    fg = CS%f_ground_cell(i,j)
+  else
+    fg = CS%ground_frac(i,j)
+  endif
+  fg = min(max(fg, 0.0), 1.0)
+end function grounded_frac_cell
+
+!> Set ISS%water_flux from the prescribed depth-dependent basal melt profile of Leguy et al.
+!! (2021) eq. 18, which is the profile used for the MISMIP+ Ice1r experiment and is identical
+!! to Seroussi & Morlighem (2018) eq. 4:
+!!
+!!     m = 0                            for z_d > -50 m
+!!     m = -(1/15) * (z_d + 50) m yr-1  for -500 m < z_d < -50 m
+!!     m = 30 m yr-1                    for z_d < -500 m
+!!
+!! where z_d is the ice-shelf basal elevation (negative below sea level) and m is positive for
+!! melting. Writing z_d in terms of the flotation draft d = (rho_i/rho_w) * h, so that
+!! z_d = -d, the profile is the clamped ramp m = min(max((d - 50)/15, 0), 30) m yr-1, which is
+!! continuous at both breakpoints.
+!!
+!! The profile is a property of freely floating ice, so the draft is taken from flotation
+!! rather than from the bed: using the bed elevation would give grounded cells a melt rate set
+!! by how deep their bed is. How the rate is applied in cells that contain the grounding line
+!! is set by CS%ice_only_melt_glp; see the MELT_GLP_* parameters.
+!!
+!! This routine only fills ISS%water_flux. The thickness change, the melt-away handling and the
+!! DG source accumulation are all left to change_thickness_using_melt, so the ice-only path and
+!! the coupled path share exactly one implementation of those. No-op unless the run is ice-only
+!! and ICE_ONLY_BASAL_MELT is set.
+subroutine calc_prescribed_basal_melt(CS, ISS, G, US)
+  type(ice_shelf_dyn_CS), pointer       :: CS  !< Ice shelf dynamics control structure.
+  type(ice_shelf_state),  intent(inout) :: ISS !< Ice shelf state (hmask, h_shelf, water_flux).
+  type(ocean_grid_type),  intent(in)    :: G   !< The grid structure.
+  type(unit_scale_type),  intent(in)    :: US  !< A structure containing unit conversion factors
+
+  real :: rhoi_rhow   ! The ratio of ice to ocean density [nondim]
+  real :: draft       ! The flotation draft of the ice, (rho_i/rho_w)*h [Z ~> m]
+  real :: melt_rate   ! The fully-floating basal melt rate, positive for melting [Z T-1 ~> m s-1]
+  real :: fg          ! The grounded area fraction of the cell [nondim]
+  real :: d_min       ! Draft at which melting begins, 50 m in Leguy eq. 18 [Z ~> m]
+  real :: d_max       ! Draft at which melting saturates, 500 m in Leguy eq. 18 [Z ~> m]
+  real :: m_max       ! The saturated melt rate, 30 m yr-1 in Leguy eq. 18 [Z T-1 ~> m s-1]
+  real :: I_d_range   ! The reciprocal of (d_max - d_min) [Z-1 ~> m-1]
+  logical :: floating ! True where the cell centre satisfies the flotation condition
+  integer :: i, j
+
+  if (.not. associated(CS)) return
+  if (.not. CS%ice_only_basal_melt) return
+
+  rhoi_rhow = CS%density_ice / CS%density_ocean_avg
+  d_min = 50.0 * US%m_to_Z
+  d_max = 500.0 * US%m_to_Z
+  m_max = (30.0 / (365.0*86400.0)) * US%m_to_Z * US%T_to_s
+  I_d_range = 1.0 / (d_max - d_min)
+
+  do j=G%jsc,G%jec ; do i=G%isc,G%iec
+    if ((ISS%hmask(i,j) /= 1.0) .and. (ISS%hmask(i,j) /= 2.0)) then
+      ISS%water_flux(i,j) = 0.0 ; cycle
+    endif
+
+    draft = rhoi_rhow * ISS%h_shelf(i,j)
+    ! The clamped ramp. Written as a fraction of the saturated rate so that the two breakpoints
+    ! are exact: the melt rate is 0 at draft = d_min and m_max at draft = d_max.
+    melt_rate = m_max * min(max((draft - d_min) * I_d_range, 0.0), 1.0)
+
+    ! Grounding-line treatment. CS%ground_frac / CS%f_ground_cell give the grounded area
+    ! fraction on whatever sub-element partition is active; without one they are binary and
+    ! FCMP, PMP and NMP all collapse to the same cell-centre test.
+    fg = grounded_frac_cell(CS, i, j)
+    select case (CS%ice_only_melt_glp)
+      case (MELT_GLP_FMP)
+        ! Full rate everywhere, including partly grounded cells.
+      case (MELT_GLP_FCMP)
+        ! Flotation condition evaluated at the cell centre, as in Leguy et al. (2021) sec. 2.3.
+        ! The ice floats where the flotation draft does not reach the bed.
+        floating = (CS%bed_elev(i,j) - rhoi_rhow * max(ISS%h_shelf(i,j), CS%min_h_shelf)) >= 0.0
+        if (.not. floating) melt_rate = 0.0
+      case (MELT_GLP_PMP)
+        ! Scale by the floating area fraction, so the total melt applied to the cell is
+        ! proportional to its floating area.
+        melt_rate = melt_rate * (1.0 - fg)
+      case (MELT_GLP_NMP)
+        ! No melt in any cell that is even partly grounded.
+        if (fg > 0.0) melt_rate = 0.0
+    end select
+
+    ! ISS%water_flux is a mass flux from the ice into the ocean, positive for melting.
+    ISS%water_flux(i,j) = melt_rate * CS%density_ice
+  enddo ; enddo
+end subroutine calc_prescribed_basal_melt
 
 !> Accumulate a cell-mean ice-thickness source rate (positive for accumulation,
 !! negative for melt) at cell (i,j) into the DG source buffer. The buffer is
