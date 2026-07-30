@@ -3085,7 +3085,7 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
   if (CS%id_h_shelf > 0)      call post_data(CS%id_h_shelf      ,ISS%h_shelf     ,CS%diag)
   if (CS%id_dhdt_shelf > 0)   call post_data(CS%id_dhdt_shelf   ,ISS%dhdt_shelf  ,CS%diag)
   if (CS%id_h_mask > 0)       call post_data(CS%id_h_mask       ,ISS%hmask       ,CS%diag)
-  call process_and_post_scalar_data(CS, vaf0, vaf0_A, vaf0_G, Ifull_time_step, dh_adott, dh_bdott_sum)
+  call process_and_post_scalar_data(CS, vaf0, vaf0_A, vaf0_G, Ifull_time_step, dh_adott_sum, dh_bdott_sum)
   call disable_averaging(CS%diag)
 
   call IS_dynamics_post_data(full_time_step, Time, CS%dCS, ISS, G)
