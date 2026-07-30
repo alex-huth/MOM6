@@ -79,6 +79,15 @@ integer, parameter :: LIMITER_SUPERBEE = 1  !< Superbee limiter (least diffusive
 integer, parameter :: LIMITER_MINMOD = 2    !< Minmod limiter (most diffusive)
 integer, parameter :: LIMITER_MC = 3        !< Monotonized-central limiter (between Van Leer and superbee)
 
+! Cross-cell operators for the DG(1) Q1 nodal thickness source, i.e. how much of a cell's source
+! is shared with the neighbours it meets at a corner (DG_BASAL_SOURCE_SCHEME,
+! DG_SURFACE_SOURCE_LOCAL). All are exactly mass-conservative.
+integer, parameter :: SRC_OP_AVERAGED = 0 !< Each corner takes the cell_mean_w-weighted average of
+                                        !! the cells sharing it, giving a source that is continuous
+                                        !! across cell faces.
+integer, parameter :: SRC_OP_LOCAL = 1  !< Each corner of a cell takes that cell's own rate, so no
+                                        !! source crosses a cell face.
+
 ! Grounding-line treatment of the prescribed ice-only basal melt (ICE_ONLY_BASAL_MELT_GLP).
 ! Named after Leguy, Lipscomb & Asay-Davis (2021) sec. 2.3 and Seroussi & Morlighem (2018) sec. 2.
 integer, parameter :: MELT_GLP_FMP = 0  !< Full melt: the fully-floating rate is applied in every
@@ -458,15 +467,15 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! runs unchanged on the flat field, with the in-cell flotation
                                   !! deficit varying only through the nodal bed. Forces
                                   !! DG1_ART_VISC_C_MAX = 0 (no slope/jump dofs exist to damp).
-  logical :: dg_source_local_to_cell !< If true, the DG(1) thickness source (basal melt plus
-                                  !! surface mass balance) is applied as a piecewise-constant
-                                  !! field: every corner of a cell receives that cell's own
-                                  !! cell-mean rate, so the source never crosses a cell face. If
-                                  !! false, the cell-mean rates are first projected onto a
-                                  !! continuous Q1 nodal field, so a corner carries the weighted
-                                  !! average of the cells sharing it. Both are exactly
-                                  !! mass-conservative; they differ in whether a cell's source can
-                                  !! change the thickness of its neighbours.
+  integer :: dg_basal_source_op   !< The cross-cell operator applied to the basal part of the
+                                  !! DG(1) thickness source, one of the SRC_OP_* parameters.
+                                  !! Decides how much of a cell's basal melt is shared with the
+                                  !! neighbours it meets at a corner.
+  logical :: dg_surface_source_local !< If true, the surface part of the DG(1) thickness source is
+                                  !! applied as a piecewise-constant field (SRC_OP_LOCAL), so a
+                                  !! cell's surface mass balance only ever changes its own
+                                  !! thickness; if false it is averaged at shared corners
+                                  !! (SRC_OP_AVERAGED). Both are exactly mass-conservative.
   logical :: nodal_positivity     !< If true, apply Liu-style positivity-preserving limiter
                                   !! to the nodal DG(1) thickness corners.
   logical :: dg_hierarchical_lim  !< If true, apply a per-mode hierarchical
@@ -12634,47 +12643,53 @@ subroutine accumulate_DG_source_rate(CS, i, j, rate, basal)
   if (basal) CS%h_source_rate_bmb(i,j) = CS%h_source_rate_bmb(i,j) + rate
 end subroutine accumulate_DG_source_rate
 
-!> Project the cell-mean DG source rate CS%h_source_rate onto a continuous Q1
-!! nodal source field S_node, used inside ice_shelf_advect_DG1_nodal to apply
-!! basal melt + surface SMB as an RHS contribution in each SSP-RK2 stage.
-!! The projection is exactly mass-conservative on hmask=1 cells: each T-cell
-!! distributes its source*areaT across its 4 corners weighted by
-!! CS%cell_mean_w(a,b), and each B-grid corner is the cell_mean_w-weighted
-!! average of the up-to-4 hmask=1 T-cells that share it. Summing the resulting
-!! corner values over a cell with the cell_mean_w weights recovers
-!! areaT*S_cell exactly for cells whose corners are not at a non-hmask=1
-!! boundary, and the global integral of S_node equals the global integral of
-!! S_cell over hmask=1 cells. Cells with hmask=3 (Dirichlet thickness BC) are
-!! excluded from the contributor pool because their h_source_rate=0 would
-!! dilute the projected source at shared corners and silently lose mass from
-!! the global integral. Climate-model mass deposited on hmask=3 cells is
-!! accounted for separately via ISS%mass_hole in shelf_calc_flux.
-!! The continuity of S_node across cell faces makes the source field smoother
-!! than the per-cell S_cell, which avoids spuriously increasing DG jumps
-!! where melt rates differ sharply between neighbouring cells.
-subroutine project_h_source_rate_to_nodes(CS, ISS, G, S_node)
+!> Apply one cross-cell operator to one cell-mean source field, producing a Q1 nodal source.
+!!
+!! SRC_OP_LOCAL is piecewise constant: every corner of a cell takes that cell's own rate, so no
+!! source crosses a cell face. SRC_OP_AVERAGED makes each B-grid corner the cell_mean_w-weighted
+!! average of the up-to-4 contributing cells that share it, giving a source that is continuous
+!! across faces and so does not provoke the DG limiter where rates differ sharply between
+!! neighbours.
+!!
+!! Both are exactly mass-conservative, because the corner weights are a partition of unity,
+!! sum_ab cell_mean_w = areaT. For SRC_OP_LOCAL the nodal cell mean of a constant is that
+!! constant, so each cell keeps its own source exactly. For SRC_OP_AVERAGED the volume deposited
+!! at corner P is (sum_c w_c(P)) * S_P = sum_c w_c(P) * src_c, so summing over corners recovers
+!! sum_c areaT_c * src_c. That identity holds only because the same set of cells appears in the
+!! numerator and in the denominator, which is why the contributor pool is defined in exactly one
+!! place below.
+!!
+!! Only hmask=1 cells contribute. Cells with hmask=3 (Dirichlet thickness BC) hold a source of
+!! zero by construction, so including them would add nothing to the numerator while still adding
+!! their cell_mean_w to the denominator, diluting the projected source at shared corners and
+!! silently losing the corresponding mass from the global integral. Excluding them means each
+!! hmask=1 cell's full source is applied to its own area; mass that a climate model would deposit
+!! on hmask=3 cells still flows into ISS%mass_hole via the accounting in shelf_calc_flux.
+!!
+!! The caller is responsible for having updated the halo of src before calling.
+subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node)
   type(ice_shelf_dyn_CS), intent(in)  :: CS  !< Ice shelf dynamics control structure.
   type(ice_shelf_state),  intent(in)  :: ISS !< Ice shelf state (hmask, h_shelf).
   type(ocean_grid_type),  intent(in)  :: G   !< The grid structure.
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: src !< Cell-mean source rate, halo
+                                             !! updated by the caller [Z T-1 ~> m s-1].
+  integer,                intent(in)  :: op  !< The cross-cell operator, SRC_OP_LOCAL or
+                                             !! SRC_OP_AVERAGED.
   real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out) :: S_node !< Q1 nodal source per
                                              !! cell at the 4 corners [Z T-1 ~> m s-1].
 
   real, dimension(SZDIB_(G),SZDJB_(G)) :: S_corner ! Projected B-grid corner source [Z T-1]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: w_corner ! Total cell_mean_w summed at corner [L2]
   real :: w_contrib                                ! Per-cell-corner contribution weight [L2]
-  real :: src                                      ! Cached source rate of cell (i,j) [Z T-1]
+  real :: src_cell                                 ! Cached source rate of cell (i,j) [Z T-1]
   integer :: i, j
 
-  ! Piecewise-constant source: every corner of a cell takes that cell's own rate, so no source
-  ! crosses a cell face. This is exactly conservative on its own, because the corner weights are a
-  ! partition of unity -- sum(cell_mean_w) = areaT -- so the nodal cell mean of a constant is that
-  ! constant. It is also the faithful representation of melt and SMB, which arrive as cell means.
-  if (CS%dg_source_local_to_cell) then
-    call pass_var(CS%h_source_rate, G%domain)
-    S_node(:,:,:,:) = 0.0
+  S_node(:,:,:,:) = 0.0
+
+  if (op == SRC_OP_LOCAL) then
     do j = G%jsc, G%jec ; do i = G%isc, G%iec
       if (ISS%hmask(i,j) /= 1.0) cycle
-      S_node(i,j,:,:) = CS%h_source_rate(i,j)
+      S_node(i,j,:,:) = src(i,j)
     enddo ; enddo
     return
   endif
@@ -12682,36 +12697,26 @@ subroutine project_h_source_rate_to_nodes(CS, ISS, G, S_node)
   S_corner(:,:) = 0.0
   w_corner(:,:) = 0.0
 
-  call pass_var(CS%h_source_rate, G%domain)
-  ! Accumulate contributions from every hmask=1 T-cell to its 4 B-grid
-  ! corners, weighted by CS%cell_mean_w. Only hmask=1 cells contribute, for
-  ! mass conservation: cells with hmask=3 (Dirichlet thickness BC) hold
-  ! h_source_rate=0 by construction, so including them in the contributor
-  ! pool would add zero to num while still adding their cell_mean_w to den,
-  ! diluting the projected source at shared corners and silently losing the
-  ! corresponding mass from the global integral. Excluding them means each
-  ! hmask=1 cell's full source is applied to its own area; mass that would
-  ! be deposited on hmask=3 cells by the climate model still flows into
-  ! ISS%mass_hole via the (IS_adot_int_land - adot_intt) accounting in
-  ! shelf_calc_flux, unchanged from the non-DG path.
+  ! Accumulate contributions from every hmask=1 T-cell to its 4 B-grid corners, weighted by
+  ! CS%cell_mean_w.
   do j = G%jsd, G%jed ; do i = G%isd, G%ied
     if (ISS%hmask(i,j) /= 1.0) cycle
-    src = CS%h_source_rate(i,j)
+    src_cell = src(i,j)
     ! Cell-local corner (a,b) = (1,1) is the SW corner, i.e. B-node (I-1, J-1).
     w_contrib = CS%cell_mean_w(i,j,1,1)
-    S_corner(I-1, J-1) = S_corner(I-1, J-1) + w_contrib * src
+    S_corner(I-1, J-1) = S_corner(I-1, J-1) + w_contrib * src_cell
     w_corner(I-1, J-1) = w_corner(I-1, J-1) + w_contrib
     ! (a,b) = (2,1) = SE corner, B-node (I, J-1)
     w_contrib = CS%cell_mean_w(i,j,2,1)
-    S_corner(I,   J-1) = S_corner(I,   J-1) + w_contrib * src
+    S_corner(I,   J-1) = S_corner(I,   J-1) + w_contrib * src_cell
     w_corner(I,   J-1) = w_corner(I,   J-1) + w_contrib
     ! (a,b) = (1,2) = NW corner, B-node (I-1, J)
     w_contrib = CS%cell_mean_w(i,j,1,2)
-    S_corner(I-1, J  ) = S_corner(I-1, J  ) + w_contrib * src
+    S_corner(I-1, J  ) = S_corner(I-1, J  ) + w_contrib * src_cell
     w_corner(I-1, J  ) = w_corner(I-1, J  ) + w_contrib
     ! (a,b) = (2,2) = NE corner, B-node (I, J)
     w_contrib = CS%cell_mean_w(i,j,2,2)
-    S_corner(I,   J  ) = S_corner(I,   J  ) + w_contrib * src
+    S_corner(I,   J  ) = S_corner(I,   J  ) + w_contrib * src_cell
     w_corner(I,   J  ) = w_corner(I,   J  ) + w_contrib
   enddo ; enddo
 
@@ -12725,13 +12730,65 @@ subroutine project_h_source_rate_to_nodes(CS, ISS, G, S_node)
   ! Distribute B-grid corner values to DG cell-local corner indices for the
   ! hmask=1 cells the advect step will update. hmask=3 cells are held to
   ! their Dirichlet h_bdry_val and do not consume S_node.
-  S_node(:,:,:,:) = 0.0
   do j = G%jsc, G%jec ; do i = G%isc, G%iec
     if (ISS%hmask(i,j) /= 1.0) cycle
     S_node(i,j,1,1) = S_corner(I-1, J-1)
     S_node(i,j,2,1) = S_corner(I,   J-1)
     S_node(i,j,1,2) = S_corner(I-1, J  )
     S_node(i,j,2,2) = S_corner(I,   J  )
+  enddo ; enddo
+end subroutine project_source_to_nodes
+
+!> Build the Q1 nodal source field S_node consumed by ice_shelf_advect_DG1_nodal, applying the
+!! basal and surface parts of the accumulated cell-mean source with their own cross-cell
+!! operators (DG_BASAL_SOURCE_SCHEME and DG_SURFACE_SOURCE_LOCAL).
+!!
+!! When both parts use the same operator the combined buffer CS%h_source_rate is projected in a
+!! single pass. This is not merely an optimization: projection is linear, so projecting the parts
+!! separately and summing gives the same answer in exact arithmetic but rounds differently, and
+!! the single pass is what keeps the uniform-operator configurations reproducing their previous
+!! answers bitwise.
+subroutine project_h_source_rate_to_nodes(CS, ISS, G, S_node)
+  type(ice_shelf_dyn_CS), intent(in)    :: CS  !< Ice shelf dynamics control structure.
+  type(ice_shelf_state),  intent(in)    :: ISS !< Ice shelf state (hmask, h_shelf).
+  type(ocean_grid_type),  intent(in)    :: G   !< The grid structure.
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out) :: S_node !< Q1 nodal source per
+                                             !! cell at the 4 corners [Z T-1 ~> m s-1].
+
+  real, dimension(SZDI_(G),SZDJ_(G)) :: src_smb ! Surface part of the source rate [Z T-1]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: S_smb ! Surface part of the nodal source [Z T-1]
+  integer :: surface_op ! The cross-cell operator applied to the surface source
+  integer :: i, j, a, b
+
+  surface_op = SRC_OP_AVERAGED
+  if (CS%dg_surface_source_local) surface_op = SRC_OP_LOCAL
+
+  call pass_var(CS%h_source_rate, G%domain)
+
+  if (CS%dg_basal_source_op == surface_op) then
+    call project_source_to_nodes(CS, ISS, G, CS%h_source_rate, surface_op, S_node)
+    return
+  endif
+
+  ! The two parts need different operators, so project them separately and sum. The surface part
+  ! is recovered by difference rather than accumulated in its own buffer, so that the combined
+  ! buffer above keeps the exact summation order of the uniform-operator path. The difference is
+  ! formed over the full data domain after both halos are current, so src_smb needs no halo
+  ! update of its own.
+  call pass_var(CS%h_source_rate_bmb, G%domain)
+
+  src_smb(:,:) = 0.0
+  do j = G%jsd, G%jed ; do i = G%isd, G%ied
+    src_smb(i,j) = CS%h_source_rate(i,j) - CS%h_source_rate_bmb(i,j)
+  enddo ; enddo
+
+  call project_source_to_nodes(CS, ISS, G, CS%h_source_rate_bmb, CS%dg_basal_source_op, S_node)
+  call project_source_to_nodes(CS, ISS, G, src_smb, surface_op, S_smb)
+
+  do b = 1, 2 ; do a = 1, 2
+    do j = G%jsc, G%jec ; do i = G%isc, G%iec
+      S_node(i,j,a,b) = S_node(i,j,a,b) + S_smb(i,j,a,b)
+    enddo ; enddo
   enddo ; enddo
 end subroutine project_h_source_rate_to_nodes
 
@@ -12812,6 +12869,8 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
   type(ice_shelf_dyn_CS),  intent(inout) :: CS
   type(unit_scale_type),   intent(in)    :: US
 
+  character(len=16) :: src_scheme_str ! DG(1) basal source cross-cell operator name
+
   call get_param(param_file, mdl, "DG1_NODAL_POSITIVITY", CS%nodal_positivity, &
                  "If true, apply the Liu-style positivity-preserving limiter to the "//&
                  "nodal DG(1) thickness corners as a safety floor against negative "//&
@@ -12863,19 +12922,34 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "USE_DG_THICKNESS.", &
                  default=.false., do_not_log=.not.CS%use_DG_thickness)
 
-  call get_param(param_file, mdl, "DG_SOURCE_LOCAL_TO_CELL", CS%dg_source_local_to_cell, &
-                 "If true, apply the DG(1) thickness source (basal melt plus surface mass "//&
-                 "balance) as a piecewise-constant field: every corner of a cell receives that "//&
-                 "cell's own cell-mean rate, so a cell's source only ever changes its own "//&
-                 "thickness. If false, the cell-mean rates are first projected onto a continuous "//&
-                 "Q1 nodal field, so each corner carries the weighted average of the cells that "//&
-                 "share it and part of a cell's source is deposited in its neighbours. Both are "//&
-                 "exactly mass-conservative. The continuous projection gives a smoother source "//&
-                 "and so provokes less DG limiting where melt rates differ sharply between "//&
-                 "neighbouring cells, but it spreads melt across the grounding line, thinning "//&
-                 "grounded ice with melt computed for an adjacent floating cell. Since melt and "//&
-                 "SMB are supplied as cell means, the piecewise-constant form is the more "//&
-                 "faithful representation of the input data. Requires USE_DG_THICKNESS.", &
+  call get_param(param_file, mdl, "DG_BASAL_SOURCE_SCHEME", src_scheme_str, &
+                 "How the basal (melt) part of the DG(1) thickness source is shared between "//&
+                 "cells at a shared corner. 'AVERAGED' projects the cell-mean rates onto a "//&
+                 "continuous Q1 nodal field, so each corner carries the cell_mean_w-weighted "//&
+                 "average of the cells sharing it and part of a cell's melt is deposited in its "//&
+                 "neighbours. 'LOCAL' applies a piecewise-constant source, so every corner of a "//&
+                 "cell receives that cell's own rate and melt never crosses a cell face. Both "//&
+                 "are exactly mass-conservative. AVERAGED gives a smoother source and so "//&
+                 "provokes less DG limiting where melt rates differ sharply between neighbours, "//&
+                 "but it spreads melt across the grounding line, thinning grounded ice with melt "//&
+                 "computed for an adjacent floating cell. Requires USE_DG_THICKNESS.", &
+                 default="AVERAGED", do_not_log=.not.CS%use_DG_thickness)
+  select case (trim(src_scheme_str))
+    case ("AVERAGED") ; CS%dg_basal_source_op = SRC_OP_AVERAGED
+    case ("LOCAL")    ; CS%dg_basal_source_op = SRC_OP_LOCAL
+    case default      ; call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
+                          "DG_BASAL_SOURCE_SCHEME must be 'AVERAGED' or 'LOCAL', but got '"//&
+                          trim(src_scheme_str)//"'.")
+  end select
+
+  call get_param(param_file, mdl, "DG_SURFACE_SOURCE_LOCAL", CS%dg_surface_source_local, &
+                 "If true, apply the surface (mass balance) part of the DG(1) thickness source "//&
+                 "as a piecewise-constant field, so a cell's surface mass balance only ever "//&
+                 "changes its own thickness. If false, the cell-mean rates are projected onto a "//&
+                 "continuous Q1 nodal field and each corner carries the weighted average of the "//&
+                 "cells sharing it. Both are exactly mass-conservative. Unlike basal melt, "//&
+                 "surface mass balance has no grounding line to respect, so the smoother "//&
+                 "averaged form is usually the appropriate choice. Requires USE_DG_THICKNESS.", &
                  default=.false., do_not_log=.not.CS%use_DG_thickness)
 
   call get_param(param_file, mdl, "DG1_ART_VISC_C_MAX", CS%dg_art_visc_c_max, &
