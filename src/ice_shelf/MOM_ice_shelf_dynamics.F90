@@ -87,6 +87,11 @@ integer, parameter :: SRC_OP_AVERAGED = 0 !< Each corner takes the cell_mean_w-w
                                         !! across cell faces.
 integer, parameter :: SRC_OP_LOCAL = 1  !< Each corner of a cell takes that cell's own rate, so no
                                         !! source crosses a cell face.
+integer, parameter :: SRC_OP_SUBGRID = 2 !< Sub-element weighted: the melt rate is averaged over the
+                                        !! floating part of each corner's support and delivered to
+                                        !! each cell in proportion to its own floating fraction
+                                        !! there, so a grounded corner neither donates nor receives.
+                                        !! Requires the SEM2 nodal floating fractions.
 
 ! Grounding-line treatment of the prescribed ice-only basal melt (ICE_ONLY_BASAL_MELT_GLP).
 ! Named after Leguy, Lipscomb & Asay-Davis (2021) sec. 2.3 and Seroussi & Morlighem (2018) sec. 2.
@@ -97,6 +102,10 @@ integer, parameter :: MELT_GLP_FCMP = 1 !< Flotation-condition melt: full rate w
 integer, parameter :: MELT_GLP_PMP = 2  !< Partial melt: the rate is scaled by the floating area
                                         !! fraction of the cell. Equivalent to Seroussi's SEM1.
 integer, parameter :: MELT_GLP_NMP = 3  !< No melt: zero rate in every partly grounded cell.
+integer, parameter :: MELT_GLP_SEM2 = 4 !< Sub-element melt 2 of Seroussi & Morlighem (2018): the
+                                        !! cell total is the same as PMP, but it is distributed
+                                        !! within the cell in proportion to the nodal floating
+                                        !! fraction instead of uniformly. DG only.
 
 ! Friction-assembly gate codes stored in CS%basal_gate (real-valued for halo updates)
 real, parameter :: BG_SKIP = 0.0    !< No basal traction in this cell
@@ -471,6 +480,16 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! DG(1) thickness source, one of the SRC_OP_* parameters.
                                   !! Decides how much of a cell's basal melt is shared with the
                                   !! neighbours it meets at a corner.
+  real, pointer, dimension(:,:,:,:) :: xi_basal => NULL() !< Nodal floating fraction: the share of
+                                  !! corner (a,b)'s support that is floating [nondim]. Built from
+                                  !! whichever sub-element grounding-line partition is active, so
+                                  !! that melt keys off the same geometry the basal friction does.
+                                  !! Identically 1 wherever no sub-element treatment applies.
+  logical :: dg_basal_source_sem2 !< If true, the basal part of the DG(1) thickness source is
+                                  !! distributed within each cell in proportion to the nodal
+                                  !! floating fraction CS%xi_basal (the SEM2 scheme of Seroussi &
+                                  !! Morlighem 2018) rather than uniformly. Set by
+                                  !! ICE_ONLY_BASAL_MELT_GLP = "SEM2".
   logical :: dg_surface_source_local !< If true, the surface part of the DG(1) thickness source is
                                   !! applied as a piecewise-constant field (SRC_OP_LOCAL), so a
                                   !! cell's surface mass balance only ever changes its own
@@ -1010,6 +1029,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%cell_mean_w(isd:ied,jsd:jed,1:2,1:2), source=0.0)
     allocate(CS%h_source_rate(isd:ied,jsd:jed), source=0.0)
     allocate(CS%h_source_rate_bmb(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%xi_basal(isd:ied,jsd:jed,1:2,1:2), source=1.0)
     allocate(CS%h_source_rate_last(isd:ied,jsd:jed), source=0.0)
     allocate(CS%phi_x_FV(IsdB:IedB,jsd:jed), source=1.0)
     allocate(CS%phi_y_FV(isd:ied,JsdB:JedB), source=1.0)
@@ -1258,6 +1278,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     ! the ocean through shelf_calc_flux and these are ignored.
     solo_ice_sheet = .false.
     if (present(solo_ice_sheet_in)) solo_ice_sheet = solo_ice_sheet_in
+    CS%dg_basal_source_sem2 = .false.
     call get_param(param_file, mdl, "ICE_ONLY_BASAL_MELT", CS%ice_only_basal_melt, &
                  "If true, the ice-only (solo ice sheet) driver applies a prescribed basal melt "//&
                  "rate under floating ice, following Leguy et al. (2021, The Cryosphere "//&
@@ -1278,6 +1299,13 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "Morlighem (2018). 'NMP' applies no melt in any partly grounded cell. Applying "//&
                  "the full rate in partly grounded cells melts grounded ice and is known to drive "//&
                  "spurious grounding-line retreat, so FMP is provided mainly as a baseline. "//&
+                 "'SEM2' is the sub-element melt 2 scheme of Seroussi & Morlighem (2018): the "//&
+                 "cell total is the same as PMP, but it is distributed within the cell in "//&
+                 "proportion to the nodal floating fraction rather than uniformly, so a corner "//&
+                 "whose surroundings are grounded receives little or none of it. SEM2 needs "//&
+                 "nodal thickness degrees of freedom and so requires USE_DG_THICKNESS, and it "//&
+                 "needs sub-element grounding-line geometry, so it requires either "//&
+                 "GROUNDING_LINE_INTERPOLATE or GL_QUADRANT_FRICTION. "//&
                  "Requires ICE_ONLY_BASAL_MELT.", &
                  default="FMP", do_not_log=.not.CS%ice_only_basal_melt)
     select case (trim(melt_glp_str))
@@ -1285,13 +1313,27 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       case ("FCMP") ; CS%ice_only_melt_glp = MELT_GLP_FCMP
       case ("PMP")  ; CS%ice_only_melt_glp = MELT_GLP_PMP
       case ("NMP")  ; CS%ice_only_melt_glp = MELT_GLP_NMP
+      case ("SEM2") ; CS%ice_only_melt_glp = MELT_GLP_SEM2
       case default  ; call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
-                        "ICE_ONLY_BASAL_MELT_GLP must be one of 'FMP', 'FCMP', 'PMP' or 'NMP', "//&
-                        "but got '"//trim(melt_glp_str)//"'.")
+                        "ICE_ONLY_BASAL_MELT_GLP must be one of 'FMP', 'FCMP', 'PMP', 'NMP' or "//&
+                        "'SEM2', but got '"//trim(melt_glp_str)//"'.")
     end select
+    CS%dg_basal_source_sem2 = (CS%ice_only_melt_glp == MELT_GLP_SEM2)
     if (CS%ice_only_basal_melt .and. .not.solo_ice_sheet) call MOM_error(FATAL, &
                  "MOM_ice_shelf_dynamics: ICE_ONLY_BASAL_MELT is only meaningful for the ice-only "//&
                  "driver; in a coupled run the basal melt rate is supplied by the ocean.")
+    if (CS%ice_only_melt_glp == MELT_GLP_SEM2) then
+      if (.not.CS%use_DG_thickness) call MOM_error(FATAL, &
+                 "MOM_ice_shelf_dynamics: ICE_ONLY_BASAL_MELT_GLP = 'SEM2' distributes melt "//&
+                 "between the nodes of a cell and so requires USE_DG_THICKNESS. A finite-volume "//&
+                 "cell has a single thickness and can only express the cell-mean scaling of PMP.")
+      if (.not.(CS%GL_regularize .or. CS%gl_quad_friction)) call MOM_error(FATAL, &
+                 "MOM_ice_shelf_dynamics: ICE_ONLY_BASAL_MELT_GLP = 'SEM2' needs a sub-element "//&
+                 "grounding line to measure the nodal floating fractions against, so it requires "//&
+                 "either GROUNDING_LINE_INTERPOLATE or GL_QUADRANT_FRICTION. With neither, the "//&
+                 "grounded fraction is the binary flotation state of the cell centre and SEM2 "//&
+                 "would degenerate to FMP or NMP.")
+    endif
     call get_param(param_file, mdl, "FV_TAUD_VERTEX_GRADIENT", CS%fv_taud_vertex_grad, &
                  "If true, the finite-volume (non-DG) driving stress evaluates the surface gradient "//&
                  "directly at B-grid nodes from the four surrounding cell centers (Lipscomb et al. "//&
@@ -8632,7 +8674,12 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
   real :: mS_gf, mN_gf, mW_gf, mE_gf ! Marginal edge-interpolation weights [nondim]
   real :: a_gf, d_gf                 ! Interpolated cell-edge spacings at the QP [L ~> m]
   real :: w_ground, w_total          ! Grounded and total Jacobian weights of the cell [L2 ~> m2]
-  integer :: tq, kq
+  real, dimension(4,7) :: vxg_gf, vxt_gf ! Per-(corner,QP) grounded and total weights [L2 ~> m2]
+  real, dimension(4,4) :: pxg_gf, pxt_gf ! Per-(corner,triangle) grounded and total sums [L2 ~> m2]
+  real, dimension(4)   :: xg_gf, xt_gf   ! Per-corner grounded and total weights [L2 ~> m2]
+  real, dimension(2,2) :: xi_num, xi_den ! Per-corner floating and total basis weights [nondim]
+  real :: wq_gf                          ! Basis weight of a corner at a sub-IP [nondim]
+  integer :: tq, kq, cq, ia, ib
 
   if (.not. CS%GL_regularize) return
 
@@ -8713,9 +8760,11 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
     if (fv_sub) then
       if (d_min > 0.0) then
         CS%ground_frac(i,j) = 1.0 ; CS%basal_gate(i,j) = BG_FULL
+        CS%xi_basal(i,j,:,:) = 0.0
         cycle
       elseif (d_max <= 0.0) then
         CS%ground_frac(i,j) = 0.0 ; CS%basal_gate(i,j) = BG_SKIP
+        CS%xi_basal(i,j,:,:) = 1.0
         cycle
       endif
     ! Exact early-outs (bilinear extrema at the corners). Without smoothing these reproduce the
@@ -8726,17 +8775,21 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
     elseif (gate_scan) then
       if (d_min > thr_full) then
         CS%ground_frac(i,j) = 1.0 ; CS%basal_gate(i,j) = BG_FULL
+        CS%xi_basal(i,j,:,:) = 0.0
         cycle
       elseif ((d_max <= thr_lo) .and. ((rhoi_rhow*CS%min_h_shelf) - bed_min <= thr_lo)) then
         CS%ground_frac(i,j) = 0.0 ; CS%basal_gate(i,j) = BG_SKIP
+        CS%xi_basal(i,j,:,:) = 1.0
         cycle
       endif
     else
       if (d_min > 0.0) then
         CS%ground_frac(i,j) = 1.0 ; CS%basal_gate(i,j) = BG_FULL
+        CS%xi_basal(i,j,:,:) = 0.0
         cycle
       elseif ((d_max <= 0.0) .and. ((rhoi_rhow*CS%min_h_shelf) - bed_min <= 0.0)) then
         CS%ground_frac(i,j) = 0.0 ; CS%basal_gate(i,j) = BG_SKIP
+        CS%xi_basal(i,j,:,:) = 1.0
         cycle
       endif
     endif
@@ -8758,22 +8811,55 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
           d_gf = (G%dyCu(i-1,j) * mW_gf) + (G%dyCu(i,j) * mE_gf)
           vt_gf(kq) = wref_gf(kq,tq) * (a_gf * d_gf)
           vg_gf(kq) = merge(vt_gf(kq), 0.0, qpg_gf(kq,tq))
+          ! Same quadrature weighted by each corner's basis function, giving the shape-function
+          ! weighted grounded fraction seen by that corner rather than by the cell as a whole.
+          do cq=1,4
+            vxt_gf(cq,kq) = vt_gf(kq) * beta_gf(cq,kq,tq)
+            vxg_gf(cq,kq) = merge(vxt_gf(cq,kq), 0.0, qpg_gf(kq,tq))
+          enddo
         enddo
         ! Orbit-grouped QP sums: (2,3), (4,5) and (6,7) are reflection pairs.
         if (nqp_gf(tq) == 3) then
           pg_gf(tq) = vg_gf(1) + (vg_gf(2) + vg_gf(3))
           pt_gf(tq) = vt_gf(1) + (vt_gf(2) + vt_gf(3))
+          do cq=1,4
+            pxg_gf(cq,tq) = vxg_gf(cq,1) + (vxg_gf(cq,2) + vxg_gf(cq,3))
+            pxt_gf(cq,tq) = vxt_gf(cq,1) + (vxt_gf(cq,2) + vxt_gf(cq,3))
+          enddo
         else
           pg_gf(tq) = (vg_gf(1) + (vg_gf(2) + vg_gf(3))) + &
                       ((vg_gf(4) + vg_gf(5)) + (vg_gf(6) + vg_gf(7)))
           pt_gf(tq) = (vt_gf(1) + (vt_gf(2) + vt_gf(3))) + &
                       ((vt_gf(4) + vt_gf(5)) + (vt_gf(6) + vt_gf(7)))
+          do cq=1,4
+            pxg_gf(cq,tq) = (vxg_gf(cq,1) + (vxg_gf(cq,2) + vxg_gf(cq,3))) + &
+                            ((vxg_gf(cq,4) + vxg_gf(cq,5)) + (vxg_gf(cq,6) + vxg_gf(cq,7)))
+            pxt_gf(cq,tq) = (vxt_gf(cq,1) + (vxt_gf(cq,2) + vxt_gf(cq,3))) + &
+                            ((vxt_gf(cq,4) + vxt_gf(cq,5)) + (vxt_gf(cq,6) + vxt_gf(cq,7)))
+          enddo
         endif
       enddo
       ! Opposite-pair grouping is invariant under any rotation/reflection (S=1,E=2,N=3,W=4).
       w_ground = (pg_gf(1) + pg_gf(3)) + (pg_gf(2) + pg_gf(4))
       w_total  = (pt_gf(1) + pt_gf(3)) + (pt_gf(2) + pt_gf(4))
       CS%ground_frac(i,j) = w_ground / w_total
+      ! Role-grouped cross-triangle reduction: each corner takes each of the roles (A, B, farA,
+      ! farB) exactly once over the 4 triangles (S=1, E=2, N=3, W=4), so under a rotation the
+      ! corner and the triangles move together and the operand order is preserved. Same
+      ! construction as CG_action_sep2_basal, which is what makes the result rotation-invariant
+      ! to the bit. Corner order is SW, SE, NW, NE, matching fls_gf.
+      xg_gf(1) = (pxg_gf(1,1) + pxg_gf(1,4)) + (pxg_gf(1,2) + pxg_gf(1,3))
+      xg_gf(2) = (pxg_gf(2,2) + pxg_gf(2,1)) + (pxg_gf(2,3) + pxg_gf(2,4))
+      xg_gf(3) = (pxg_gf(3,4) + pxg_gf(3,3)) + (pxg_gf(3,1) + pxg_gf(3,2))
+      xg_gf(4) = (pxg_gf(4,3) + pxg_gf(4,2)) + (pxg_gf(4,4) + pxg_gf(4,1))
+      xt_gf(1) = (pxt_gf(1,1) + pxt_gf(1,4)) + (pxt_gf(1,2) + pxt_gf(1,3))
+      xt_gf(2) = (pxt_gf(2,2) + pxt_gf(2,1)) + (pxt_gf(2,3) + pxt_gf(2,4))
+      xt_gf(3) = (pxt_gf(3,4) + pxt_gf(3,3)) + (pxt_gf(3,1) + pxt_gf(3,2))
+      xt_gf(4) = (pxt_gf(4,3) + pxt_gf(4,2)) + (pxt_gf(4,4) + pxt_gf(4,1))
+      CS%xi_basal(i,j,1,1) = 1.0 - (xg_gf(1) / xt_gf(1))
+      CS%xi_basal(i,j,2,1) = 1.0 - (xg_gf(2) / xt_gf(2))
+      CS%xi_basal(i,j,1,2) = 1.0 - (xg_gf(3) / xt_gf(3))
+      CS%xi_basal(i,j,2,2) = 1.0 - (xg_gf(4) / xt_gf(4))
       if (CS%ground_frac(i,j) <= 0.0) then ; CS%basal_gate(i,j) = BG_SKIP
       elseif (CS%ground_frac(i,j) >= 1.0) then ; CS%basal_gate(i,j) = BG_FULL
       else ; CS%basal_gate(i,j) = BG_SUBGRID ; endif
@@ -8781,6 +8867,7 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
     endif
 
     n_grounded = 0 ; n_active = 0 ; n_full = 0 ; phi_sum = 0.0
+    xi_num(:,:) = 0.0 ; xi_den(:,:) = 0.0
     do jsub=1,CS%n_sub_regularize ; do isub=1,CS%n_sub_regularize
       do jq=1,2 ; do iq=1,2
         if (fv_sub) then
@@ -8814,6 +8901,14 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
           g_ip = rhoi_rhow * h_ip - bed_ip
         endif
         if (g_ip > 0.0) n_grounded = n_grounded + 1
+        ! Shape-function weighted floating fraction per corner: the same sub-point flotation test,
+        ! accumulated against each corner's basis function instead of counted. Normalising by the
+        ! same weights makes xi dimensionless, bounded by [0,1], and free of the cell metric.
+        do ib=1,2 ; do ia=1,2
+          wq_gf = CS%Phisub(iq,jq,isub,jsub,ia,ib)
+          xi_den(ia,ib) = xi_den(ia,ib) + wq_gf
+          if (g_ip <= 0.0) xi_num(ia,ib) = xi_num(ia,ib) + wq_gf
+        enddo ; enddo
         if (gate_scan) then
           if (g_ip > thr_lo)    n_active = n_active + 1
           if (g_ip >= thr_full) n_full   = n_full + 1
@@ -8824,6 +8919,9 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
 
     ! Strict (unsmeared) grounded fraction for the diagnostic, unchanged by smoothing.
     CS%ground_frac(i,j) = real(n_grounded) / real(n_total)
+    do ib=1,2 ; do ia=1,2
+      CS%xi_basal(i,j,ia,ib) = xi_num(ia,ib) / xi_den(ia,ib)
+    enddo ; enddo
     ! Smoothing anomaly diagnostic: effective traction fraction (mean phi) minus the strict grounded
     ! fraction. Only the active-smoothing scan can make this nonzero; otherwise it keeps its reset 0.
     if (gate_scan) CS%basal_tr_dfrac(i,j) = phi_sum / real(n_total) - CS%ground_frac(i,j)
@@ -8843,6 +8941,9 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
 
   call pass_var(CS%ground_frac, G%Domain, complete=.false.)
   call pass_var(CS%basal_gate, G%Domain, complete=.true.)
+  ! xi is read at every corner of every cell in the data domain by the averaged and sub-element
+  ! nodal source operators, so its halo has to be current before the next advect step.
+  call pass_corner_field(CS%xi_basal, G)
 
 end subroutine compute_ground_frac
 
@@ -9132,9 +9233,17 @@ subroutine compute_gl_quadrant_fractions(CS, ISS, G)
   ! and quadrant 2 of node (i-1,j).
   do j=jsd+1,jed-1 ; do i=isd+1,ied-1
     CS%f_ground_cell(i,j) = 0.25*((fgq(3,i-1,j-1) + fgq(4,i,j-1)) + (fgq(1,i,j) + fgq(2,i-1,j)))
+    ! Each quadrant is the quarter of the cell adjacent to one corner, so the same four numbers
+    ! that average to the cell grounded fraction are, individually, the nodal grounded fractions.
+    ! The floating fraction is their complement. No extra integration is needed.
+    CS%xi_basal(i,j,1,1) = 1.0 - fgq(3,i-1,j-1)
+    CS%xi_basal(i,j,2,1) = 1.0 - fgq(4,i,  j-1)
+    CS%xi_basal(i,j,1,2) = 1.0 - fgq(2,i-1,j  )
+    CS%xi_basal(i,j,2,2) = 1.0 - fgq(1,i,  j  )
   enddo ; enddo
 
   deallocate(fgq)
+  call pass_corner_field(CS%xi_basal, G)
   call pass_var(CS%f_ground_cell, G%Domain)
   call pass_var(CS%f_ground_node, G%Domain, position=CORNER)
 
@@ -10233,6 +10342,7 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%cell_mean_w)) deallocate(CS%cell_mean_w)
   if (associated(CS%h_source_rate)) deallocate(CS%h_source_rate)
   if (associated(CS%h_source_rate_bmb)) deallocate(CS%h_source_rate_bmb)
+  if (associated(CS%xi_basal)) deallocate(CS%xi_basal)
   if (associated(CS%h_source_rate_last)) deallocate(CS%h_source_rate_last)
   if (associated(CS%phi_x_FV)) deallocate(CS%phi_x_FV)
   if (associated(CS%phi_y_FV)) deallocate(CS%phi_y_FV)
@@ -12598,9 +12708,12 @@ subroutine calc_prescribed_basal_melt(CS, ISS, G, US)
         ! The ice floats where the flotation draft does not reach the bed.
         floating = (CS%bed_elev(i,j) - rhoi_rhow * max(ISS%h_shelf(i,j), CS%min_h_shelf)) >= 0.0
         if (.not. floating) melt_rate = 0.0
-      case (MELT_GLP_PMP)
+      case (MELT_GLP_PMP, MELT_GLP_SEM2)
         ! Scale by the floating area fraction, so the total melt applied to the cell is
-        ! proportional to its floating area.
+        ! proportional to its floating area. SEM2 shares this cell total with PMP -- the two
+        ! differ only in how the total is distributed inside the cell, which is applied later by
+        ! the nodal source projection -- so scaling here keeps ISS%water_flux, and every
+        ! diagnostic and mass budget that reads it, consistent with what the ice actually loses.
         melt_rate = melt_rate * (1.0 - fg)
       case (MELT_GLP_NMP)
         ! No melt in any cell that is even partly grounded.
@@ -12667,29 +12780,66 @@ end subroutine accumulate_DG_source_rate
 !! on hmask=3 cells still flows into ISS%mass_hole via the accounting in shelf_calc_flux.
 !!
 !! The caller is responsible for having updated the halo of src before calling.
-subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node)
+subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
   type(ice_shelf_dyn_CS), intent(in)  :: CS  !< Ice shelf dynamics control structure.
   type(ice_shelf_state),  intent(in)  :: ISS !< Ice shelf state (hmask, h_shelf).
   type(ocean_grid_type),  intent(in)  :: G   !< The grid structure.
   real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: src !< Cell-mean source rate, halo
                                              !! updated by the caller [Z T-1 ~> m s-1].
-  integer,                intent(in)  :: op  !< The cross-cell operator, SRC_OP_LOCAL or
-                                             !! SRC_OP_AVERAGED.
+  integer,                intent(in)  :: op  !< The cross-cell operator, SRC_OP_LOCAL,
+                                             !! SRC_OP_AVERAGED or SRC_OP_SUBGRID.
   real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out) :: S_node !< Q1 nodal source per
                                              !! cell at the 4 corners [Z T-1 ~> m s-1].
+  logical,      optional, intent(in)  :: use_xi !< If true, distribute each cell's total within
+                                             !! the cell in proportion to CS%xi_basal instead of
+                                             !! uniformly (the SEM2 in-cell distribution).
 
   real, dimension(SZDIB_(G),SZDJB_(G)) :: S_corner ! Projected B-grid corner source [Z T-1]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: w_corner ! Total cell_mean_w summed at corner [L2]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: S_loc ! Per-cell nodal source before sharing [Z T-1]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: m_eff ! Rate over the floating part of a cell [Z T-1]
   real :: w_contrib                                ! Per-cell-corner contribution weight [L2]
-  real :: src_cell                                 ! Cached source rate of cell (i,j) [Z T-1]
-  integer :: i, j
+  real :: w_sum                                    ! The DG area of a cell, sum_ab w [L2 ~> m2]
+  real :: wxi_sum                                  ! The floating DG area, sum_ab w*xi [L2 ~> m2]
+  logical :: xi_on                                 ! True when the SEM2 distribution is in use
+  integer :: i, j, a, b
+
+  xi_on = .false. ; if (present(use_xi)) xi_on = use_xi
+
+  ! In-cell distribution. Without xi a cell's source is uniform over the cell. With xi the same
+  ! cell total is instead distributed in proportion to the nodal floating fraction, so a corner
+  ! whose support is grounded receives none of it. m_eff is the rate over the floating part: the
+  ! cell total divided by the floating DG area, so that sum_ab w*S_loc recovers the cell total
+  ! exactly whatever xi looks like, and no separate normalisation step is needed.
+  m_eff(:,:) = 0.0
+  S_loc(:,:,:,:) = 0.0
+  do j = G%jsd, G%jed ; do i = G%isd, G%ied
+    if (ISS%hmask(i,j) /= 1.0) cycle
+    if (xi_on) then
+      w_sum = (CS%cell_mean_w(i,j,1,1) + CS%cell_mean_w(i,j,2,2)) + &
+              (CS%cell_mean_w(i,j,2,1) + CS%cell_mean_w(i,j,1,2))
+      wxi_sum = ((CS%cell_mean_w(i,j,1,1) * CS%xi_basal(i,j,1,1)) + &
+                 (CS%cell_mean_w(i,j,2,2) * CS%xi_basal(i,j,2,2))) + &
+                ((CS%cell_mean_w(i,j,2,1) * CS%xi_basal(i,j,2,1)) + &
+                 (CS%cell_mean_w(i,j,1,2) * CS%xi_basal(i,j,1,2)))
+      ! A cell with no floating area has no melt to place; its total is already zero under any
+      ! grounding-line melt parameterization, so leaving m_eff at zero loses nothing.
+      if (wxi_sum > 0.0) m_eff(i,j) = (w_sum * src(i,j)) / wxi_sum
+      do b = 1, 2 ; do a = 1, 2
+        S_loc(i,j,a,b) = m_eff(i,j) * CS%xi_basal(i,j,a,b)
+      enddo ; enddo
+    else
+      m_eff(i,j) = src(i,j)
+      S_loc(i,j,:,:) = src(i,j)
+    endif
+  enddo ; enddo
 
   S_node(:,:,:,:) = 0.0
 
   if (op == SRC_OP_LOCAL) then
     do j = G%jsc, G%jec ; do i = G%isc, G%iec
       if (ISS%hmask(i,j) /= 1.0) cycle
-      S_node(i,j,:,:) = src(i,j)
+      S_node(i,j,:,:) = S_loc(i,j,:,:)
     enddo ; enddo
     return
   endif
@@ -12697,26 +12847,62 @@ subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node)
   S_corner(:,:) = 0.0
   w_corner(:,:) = 0.0
 
+  if (op == SRC_OP_SUBGRID) then
+    ! Average the melt rate over the floating part of each corner's support, weighting each cell
+    ! by the floating area it contributes there. A fully grounded corner has xi = 0, so it adds
+    ! nothing to either sum and receives nothing back: it neither dilutes its floating neighbours
+    ! nor picks up their melt. A consequence worth knowing is that when the rate is spatially
+    ! uniform this operator reduces identically to SRC_OP_LOCAL, so it redistributes only genuine
+    ! differences in melt rate and never geometry alone.
+    do j = G%jsd, G%jed ; do i = G%isd, G%ied
+      if (ISS%hmask(i,j) /= 1.0) cycle
+      w_contrib = CS%cell_mean_w(i,j,1,1) * CS%xi_basal(i,j,1,1)
+      S_corner(I-1, J-1) = S_corner(I-1, J-1) + w_contrib * m_eff(i,j)
+      w_corner(I-1, J-1) = w_corner(I-1, J-1) + w_contrib
+      w_contrib = CS%cell_mean_w(i,j,2,1) * CS%xi_basal(i,j,2,1)
+      S_corner(I,   J-1) = S_corner(I,   J-1) + w_contrib * m_eff(i,j)
+      w_corner(I,   J-1) = w_corner(I,   J-1) + w_contrib
+      w_contrib = CS%cell_mean_w(i,j,1,2) * CS%xi_basal(i,j,1,2)
+      S_corner(I-1, J  ) = S_corner(I-1, J  ) + w_contrib * m_eff(i,j)
+      w_corner(I-1, J  ) = w_corner(I-1, J  ) + w_contrib
+      w_contrib = CS%cell_mean_w(i,j,2,2) * CS%xi_basal(i,j,2,2)
+      S_corner(I,   J  ) = S_corner(I,   J  ) + w_contrib * m_eff(i,j)
+      w_corner(I,   J  ) = w_corner(I,   J  ) + w_contrib
+    enddo ; enddo
+
+    do j = G%JsdB, G%JedB ; do i = G%IsdB, G%IedB
+      if (w_corner(I,J) > 0.0) S_corner(I,J) = S_corner(I,J) / w_corner(I,J)
+    enddo ; enddo
+
+    do j = G%jsc, G%jec ; do i = G%isc, G%iec
+      if (ISS%hmask(i,j) /= 1.0) cycle
+      S_node(i,j,1,1) = CS%xi_basal(i,j,1,1) * S_corner(I-1, J-1)
+      S_node(i,j,2,1) = CS%xi_basal(i,j,2,1) * S_corner(I,   J-1)
+      S_node(i,j,1,2) = CS%xi_basal(i,j,1,2) * S_corner(I-1, J  )
+      S_node(i,j,2,2) = CS%xi_basal(i,j,2,2) * S_corner(I,   J  )
+    enddo ; enddo
+    return
+  endif
+
   ! Accumulate contributions from every hmask=1 T-cell to its 4 B-grid corners, weighted by
   ! CS%cell_mean_w.
   do j = G%jsd, G%jed ; do i = G%isd, G%ied
     if (ISS%hmask(i,j) /= 1.0) cycle
-    src_cell = src(i,j)
     ! Cell-local corner (a,b) = (1,1) is the SW corner, i.e. B-node (I-1, J-1).
     w_contrib = CS%cell_mean_w(i,j,1,1)
-    S_corner(I-1, J-1) = S_corner(I-1, J-1) + w_contrib * src_cell
+    S_corner(I-1, J-1) = S_corner(I-1, J-1) + w_contrib * S_loc(i,j,1,1)
     w_corner(I-1, J-1) = w_corner(I-1, J-1) + w_contrib
     ! (a,b) = (2,1) = SE corner, B-node (I, J-1)
     w_contrib = CS%cell_mean_w(i,j,2,1)
-    S_corner(I,   J-1) = S_corner(I,   J-1) + w_contrib * src_cell
+    S_corner(I,   J-1) = S_corner(I,   J-1) + w_contrib * S_loc(i,j,2,1)
     w_corner(I,   J-1) = w_corner(I,   J-1) + w_contrib
     ! (a,b) = (1,2) = NW corner, B-node (I-1, J)
     w_contrib = CS%cell_mean_w(i,j,1,2)
-    S_corner(I-1, J  ) = S_corner(I-1, J  ) + w_contrib * src_cell
+    S_corner(I-1, J  ) = S_corner(I-1, J  ) + w_contrib * S_loc(i,j,1,2)
     w_corner(I-1, J  ) = w_corner(I-1, J  ) + w_contrib
     ! (a,b) = (2,2) = NE corner, B-node (I, J)
     w_contrib = CS%cell_mean_w(i,j,2,2)
-    S_corner(I,   J  ) = S_corner(I,   J  ) + w_contrib * src_cell
+    S_corner(I,   J  ) = S_corner(I,   J  ) + w_contrib * S_loc(i,j,2,2)
     w_corner(I,   J  ) = w_corner(I,   J  ) + w_contrib
   enddo ; enddo
 
@@ -12765,7 +12951,9 @@ subroutine project_h_source_rate_to_nodes(CS, ISS, G, S_node)
 
   call pass_var(CS%h_source_rate, G%domain)
 
-  if (CS%dg_basal_source_op == surface_op) then
+  ! The uniform-operator fast path is only available when the basal part needs no sub-element
+  ! distribution; with SEM2 the two parts differ inside the cell even if their operators agree.
+  if ((CS%dg_basal_source_op == surface_op) .and. .not.CS%dg_basal_source_sem2) then
     call project_source_to_nodes(CS, ISS, G, CS%h_source_rate, surface_op, S_node)
     return
   endif
@@ -12782,7 +12970,8 @@ subroutine project_h_source_rate_to_nodes(CS, ISS, G, S_node)
     src_smb(i,j) = CS%h_source_rate(i,j) - CS%h_source_rate_bmb(i,j)
   enddo ; enddo
 
-  call project_source_to_nodes(CS, ISS, G, CS%h_source_rate_bmb, CS%dg_basal_source_op, S_node)
+  call project_source_to_nodes(CS, ISS, G, CS%h_source_rate_bmb, CS%dg_basal_source_op, S_node, &
+                               use_xi=CS%dg_basal_source_sem2)
   call project_source_to_nodes(CS, ISS, G, src_smb, surface_op, S_smb)
 
   do b = 1, 2 ; do a = 1, 2
@@ -12854,6 +13043,51 @@ subroutine check_nodal_source_conservation(CS, ISS, G, S_cell, S_node, label)
     call MOM_mesg(trim(mesg))
   endif
 end subroutine check_nodal_source_conservation
+
+!> Debug check that the nodal floating fractions agree with the cell grounded fraction that
+!! compute_ground_frac derives independently. By partition of unity,
+!! sum_ab w_ab * xi_ab = sum_ab int_float N_ab = int_float 1 = A_float, so every backend must
+!! satisfy sum_ab w_ab * xi_ab == (1 - ground_frac) * sum_ab w_ab. The two sides come from
+!! different code paths -- one shape-function weighted, one the scalar area fraction -- so this
+!! catches a mis-indexed corner or a wrong quadrature weight, which the source-conservation check
+!! cannot: a wrong xi still conserves mass exactly, it merely puts the melt in the wrong place.
+!!
+!! The identity is exact on a uniform grid. Off-uniform it is only approximate, because the SEP3
+!! grounded fraction is an unweighted sub-point count and the quadrant one an unweighted mean of
+!! four quadrant areas, while xi carries cell_mean_w. A real error shows up far above that gap.
+subroutine check_xi_basal_consistency(CS, ISS, G)
+  type(ice_shelf_dyn_CS), intent(in) :: CS   !< Ice shelf dynamics control structure.
+  type(ice_shelf_state),  intent(in) :: ISS  !< Ice shelf state (hmask).
+  type(ocean_grid_type),  intent(in) :: G    !< The grid structure.
+
+  real :: w_sum      ! The DG area of a cell, sum_ab cell_mean_w [L2 ~> m2]
+  real :: wxi_sum    ! The floating DG area, sum_ab cell_mean_w*xi [L2 ~> m2]
+  real :: dev        ! Absolute deviation from the identity, as an area fraction [nondim]
+  real :: dev_max    ! The largest deviation over the computational domain [nondim]
+  character(len=256) :: mesg
+  integer :: i, j
+
+  dev_max = 0.0
+  do j=G%jsc,G%jec ; do i=G%isc,G%iec
+    if (ISS%hmask(i,j) /= 1.0) cycle
+    w_sum = (CS%cell_mean_w(i,j,1,1) + CS%cell_mean_w(i,j,2,2)) + &
+            (CS%cell_mean_w(i,j,2,1) + CS%cell_mean_w(i,j,1,2))
+    if (w_sum <= 0.0) cycle
+    wxi_sum = ((CS%cell_mean_w(i,j,1,1) * CS%xi_basal(i,j,1,1)) + &
+               (CS%cell_mean_w(i,j,2,2) * CS%xi_basal(i,j,2,2))) + &
+              ((CS%cell_mean_w(i,j,2,1) * CS%xi_basal(i,j,2,1)) + &
+               (CS%cell_mean_w(i,j,1,2) * CS%xi_basal(i,j,1,2)))
+    dev = abs((wxi_sum / w_sum) - (1.0 - CS%ground_frac(i,j)))
+    dev_max = max(dev_max, dev)
+  enddo ; enddo
+  call max_across_PEs(dev_max)
+
+  if (is_root_pe()) then
+    write(mesg,'("Nodal floating fraction consistency: max |sum(w*xi)/sum(w) - (1-ground_frac)| =",&
+                &ES12.5)') dev_max
+    call MOM_mesg(trim(mesg))
+  endif
+end subroutine check_xi_basal_consistency
 
 
 ! ===========================================================================
@@ -12932,15 +13166,28 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "are exactly mass-conservative. AVERAGED gives a smoother source and so "//&
                  "provokes less DG limiting where melt rates differ sharply between neighbours, "//&
                  "but it spreads melt across the grounding line, thinning grounded ice with melt "//&
-                 "computed for an adjacent floating cell. Requires USE_DG_THICKNESS.", &
+                 "computed for an adjacent floating cell -- including into cells that are "//&
+                 "entirely grounded. 'SUBGRID' averages the melt rate over the floating part of "//&
+                 "each corner's support and gives each cell back a share in proportion to its "//&
+                 "own floating fraction there, so a grounded corner neither donates nor "//&
+                 "receives; when the melt rate is spatially uniform it reduces identically to "//&
+                 "LOCAL, redistributing only genuine differences in rate and never geometry "//&
+                 "alone. SUBGRID requires ICE_ONLY_BASAL_MELT_GLP = 'SEM2'. "//&
+                 "Requires USE_DG_THICKNESS.", &
                  default="AVERAGED", do_not_log=.not.CS%use_DG_thickness)
   select case (trim(src_scheme_str))
     case ("AVERAGED") ; CS%dg_basal_source_op = SRC_OP_AVERAGED
     case ("LOCAL")    ; CS%dg_basal_source_op = SRC_OP_LOCAL
+    case ("SUBGRID")  ; CS%dg_basal_source_op = SRC_OP_SUBGRID
     case default      ; call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
-                          "DG_BASAL_SOURCE_SCHEME must be 'AVERAGED' or 'LOCAL', but got '"//&
-                          trim(src_scheme_str)//"'.")
+                          "DG_BASAL_SOURCE_SCHEME must be 'AVERAGED', 'LOCAL' or 'SUBGRID', "//&
+                          "but got '"//trim(src_scheme_str)//"'.")
   end select
+  if ((CS%dg_basal_source_op == SRC_OP_SUBGRID) .and. .not.CS%dg_basal_source_sem2) &
+    call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG_BASAL_SOURCE_SCHEME = 'SUBGRID' weights "//&
+                   "the sharing at each corner by the nodal floating fraction, which is "//&
+                   "identically one unless ICE_ONLY_BASAL_MELT_GLP = 'SEM2'. Without SEM2 it "//&
+                   "would be algebraically identical to 'AVERAGED'; set that instead.")
 
   call get_param(param_file, mdl, "DG_SURFACE_SOURCE_LOCAL", CS%dg_surface_source_local, &
                  "If true, apply the surface (mass balance) part of the DG(1) thickness source "//&
@@ -15163,8 +15410,10 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   ! source enters each SSP-RK2 stage as a simple additive term on dh.
   call project_h_source_rate_to_nodes(CS, ISS, G, S_node)
 
-  if (CS%debug) call check_nodal_source_conservation(CS, ISS, G, CS%h_source_rate, S_node, &
-                                                     "basal+surface")
+  if (CS%debug) then
+    call check_nodal_source_conservation(CS, ISS, G, CS%h_source_rate, S_node, "basal+surface")
+    if (CS%dg_basal_source_sem2) call check_xi_basal_consistency(CS, ISS, G)
+  endif
 
   ! Stage 1: positivity floor -> hierarchical limiter -> spatial op -> M^-1 -> Euler step.
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
