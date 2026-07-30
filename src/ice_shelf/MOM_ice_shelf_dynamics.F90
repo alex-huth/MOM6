@@ -196,6 +196,13 @@ type, public :: ice_shelf_dyn_CS ; private
                                                        !! Consumed inside ice_shelf_advect_DG1_nodal: projected
                                                        !! to a continuous Q1 nodal source field and added to
                                                        !! each SSP-RK2 stage RHS. Reset to zero after consumption.
+  real, pointer, dimension(:,:) :: h_source_rate_bmb => NULL() !< The basal (ice-shelf melt) part of
+                                                       !! h_source_rate, accumulated in parallel with it since the
+                                                       !! last DG advect step [Z T-1 ~> m s-1]. The surface part is
+                                                       !! h_source_rate - h_source_rate_bmb. Kept as a separate
+                                                       !! buffer rather than replacing h_source_rate so that the
+                                                       !! default single-projection path is unchanged and its
+                                                       !! summation order (and hence its answers) is preserved.
   real, pointer, dimension(:,:) :: h_source_rate_last => NULL() !< Snapshot of h_source_rate as consumed by the
                                                        !! most recent DG advect step [Z T-1 ~> m s-1], kept for
                                                        !! diagnostic posting after h_source_rate has been zeroed.
@@ -973,6 +980,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%Minv_eta(isd:ied,jsd:jed,1:2,1:2), source=0.0)
     allocate(CS%cell_mean_w(isd:ied,jsd:jed,1:2,1:2), source=0.0)
     allocate(CS%h_source_rate(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%h_source_rate_bmb(isd:ied,jsd:jed), source=0.0)
     allocate(CS%h_source_rate_last(isd:ied,jsd:jed), source=0.0)
     allocate(CS%phi_x_FV(IsdB:IedB,jsd:jed), source=1.0)
     allocate(CS%phi_y_FV(isd:ied,JsdB:JedB), source=1.0)
@@ -10154,6 +10162,7 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%Minv_eta)) deallocate(CS%Minv_eta)
   if (associated(CS%cell_mean_w)) deallocate(CS%cell_mean_w)
   if (associated(CS%h_source_rate)) deallocate(CS%h_source_rate)
+  if (associated(CS%h_source_rate_bmb)) deallocate(CS%h_source_rate_bmb)
   if (associated(CS%h_source_rate_last)) deallocate(CS%h_source_rate_last)
   if (associated(CS%phi_x_FV)) deallocate(CS%phi_x_FV)
   if (associated(CS%phi_y_FV)) deallocate(CS%phi_y_FV)
@@ -12431,12 +12440,21 @@ end subroutine reset_DG_to_cellmean_bulk
 !! consumed by the next ice_shelf_advect_DG1_nodal call, projected onto a
 !! continuous Q1 nodal field, and applied inside the SSP-RK2 stages. No-op
 !! when DG(1) thickness is not active.
-subroutine accumulate_DG_source_rate(CS, i, j, rate)
+!!
+!! Basal contributions are additionally accumulated into CS%h_source_rate_bmb so
+!! that the basal and surface parts can be given different nodal treatments. The
+!! combined buffer CS%h_source_rate is still accumulated exactly as before, so the
+!! default single-projection path retains its summation order and its answers; the
+!! surface part is recovered as h_source_rate - h_source_rate_bmb only on the paths
+!! that need it.
+subroutine accumulate_DG_source_rate(CS, i, j, rate, basal)
   type(ice_shelf_dyn_CS), pointer    :: CS !< Ice shelf dynamics control structure.
   integer,                intent(in) :: i  !< i index of the cell.
   integer,                intent(in) :: j  !< j index of the cell.
   real,                   intent(in) :: rate !< Cell-mean thickness source rate
                                              !! to add [Z T-1 ~> m s-1].
+  logical,                intent(in) :: basal !< If true, this rate is basal melt or
+                                             !! freeze-on; if false it is surface mass balance.
 
   if (.not. associated(CS)) return
   if (.not. CS%use_DG_thickness) return
@@ -12445,6 +12463,7 @@ subroutine accumulate_DG_source_rate(CS, i, j, rate)
   ! would double-count on restartless diagnostics and grow the buffer unboundedly.
   if (CS%dg_fv_advect) return
   CS%h_source_rate(i,j) = CS%h_source_rate(i,j) + rate
+  if (basal) CS%h_source_rate_bmb(i,j) = CS%h_source_rate_bmb(i,j) + rate
 end subroutine accumulate_DG_source_rate
 
 !> Project the cell-mean DG source rate CS%h_source_rate onto a continuous Q1
@@ -12547,6 +12566,69 @@ subroutine project_h_source_rate_to_nodes(CS, ISS, G, S_node)
     S_node(i,j,2,2) = S_corner(I,   J  )
   enddo ; enddo
 end subroutine project_h_source_rate_to_nodes
+
+!> Verify that a projected Q1 nodal source carries exactly the cell-mean source it was built
+!! from. The DG mass measure of a cell is sum_ab cell_mean_w(a,b)*h(a,b), so the volume a nodal
+!! source deposits in cell (i,j) per unit time is sum_ab cell_mean_w(a,b)*S_node(a,b). Any
+!! projection that redistributes a source between cells must leave the global sum of that
+!! quantity equal to the global sum of the intended per-cell totals; a mismatch means the
+!! projection itself is creating or destroying mass, which no downstream limiter will repair.
+!! The intended per-cell area is taken as sum_ab cell_mean_w rather than G%areaT so that the
+!! check isolates the projection and does not report the (unrelated) difference between the
+!! DG metric and the grid area on a non-uniform grid. Debug-only; costs two reproducing sums.
+subroutine check_nodal_source_conservation(CS, ISS, G, S_cell, S_node, label)
+  type(ice_shelf_dyn_CS), intent(in) :: CS   !< Ice shelf dynamics control structure.
+  type(ice_shelf_state),  intent(in) :: ISS  !< Ice shelf state (hmask).
+  type(ocean_grid_type),  intent(in) :: G    !< The grid structure.
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: S_cell !< The intended cell-mean source
+                                             !! rate [Z T-1 ~> m s-1].
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in) :: S_node !< The projected nodal source
+                                             !! rate at the 4 corners [Z T-1 ~> m s-1].
+  character(len=*),       intent(in) :: label !< Text identifying the caller in the message.
+
+  real, dimension(SZDI_(G),SZDJ_(G)) :: tmp_node ! Per-cell nodal source integral [Z L2 T-1]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: tmp_cell ! Per-cell intended source integral [Z L2 T-1]
+  real :: total_node ! Global integral of the projected nodal source [m3 s-1]
+  real :: total_cell ! Global integral of the intended cell-mean source [m3 s-1]
+  real :: denom      ! Larger of the two integrals in magnitude, for a relative error [m3 s-1]
+  real :: w_sum      ! The DG area of a cell, sum_ab cell_mean_w [L2 ~> m2]
+  real :: unscale    ! Conversion factor from [Z L2 T-1] to [m3 s-1]
+  character(len=256) :: mesg
+  integer :: i, j, is, ie, js, je, isr, ier, jsr, jer
+
+  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
+  isr = is - (G%isd-1) ; ier = ie - (G%isd-1) ; jsr = js - (G%jsd-1) ; jer = je - (G%jsd-1)
+  unscale = (G%US%Z_to_m * G%US%L_to_m**2) * G%US%s_to_T
+
+  tmp_node(:,:) = 0.0 ; tmp_cell(:,:) = 0.0
+  do j=js,je ; do i=is,ie
+    if (ISS%hmask(i,j) /= 1.0) cycle
+    tmp_node(i,j) = ((CS%cell_mean_w(i,j,1,1) * S_node(i,j,1,1)) + &
+                     (CS%cell_mean_w(i,j,2,2) * S_node(i,j,2,2))) + &
+                    ((CS%cell_mean_w(i,j,2,1) * S_node(i,j,2,1)) + &
+                     (CS%cell_mean_w(i,j,1,2) * S_node(i,j,1,2)))
+    w_sum = (CS%cell_mean_w(i,j,1,1) + CS%cell_mean_w(i,j,2,2)) + &
+            (CS%cell_mean_w(i,j,2,1) + CS%cell_mean_w(i,j,1,2))
+    tmp_cell(i,j) = w_sum * S_cell(i,j)
+  enddo ; enddo
+
+  total_node = reproducing_sum(tmp_node, isr, ier, jsr, jer, unscale=unscale)
+  total_cell = reproducing_sum(tmp_cell, isr, ier, jsr, jer, unscale=unscale)
+
+  ! Both integrals are legitimately zero when there is no melt and no accumulation, so report
+  ! an absolute statement in that case rather than dividing by zero.
+  denom = max(abs(total_cell), abs(total_node))
+  if (is_root_pe()) then
+    if (denom > 0.0) then
+      write(mesg,'("DG source conservation (",A,"): nodal=",ES22.15," cell=",ES22.15, &
+                  &" rel_err=",ES12.5)') trim(label), total_node, total_cell, &
+                  (total_node - total_cell) / denom
+    else
+      write(mesg,'("DG source conservation (",A,"): both integrals are zero.")') trim(label)
+    endif
+    call MOM_mesg(trim(mesg))
+  endif
+end subroutine check_nodal_source_conservation
 
 
 ! ===========================================================================
@@ -14839,6 +14921,9 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   ! source enters each SSP-RK2 stage as a simple additive term on dh.
   call project_h_source_rate_to_nodes(CS, ISS, G, S_node)
 
+  if (CS%debug) call check_nodal_source_conservation(CS, ISS, G, CS%h_source_rate, S_node, &
+                                                     "basal+surface")
+
   ! Stage 1: positivity floor -> hierarchical limiter -> spatial op -> M^-1 -> Euler step.
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
   if (CS%dg_hierarchical_lim) call nodal_surface_slope_limit(CS, G, ISS)
@@ -14874,6 +14959,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   ! reset the buffer so subsequent melt/SMB callers start from a clean slate.
   CS%h_source_rate_last(:,:) = CS%h_source_rate(:,:)
   CS%h_source_rate(:,:) = 0.0
+  CS%h_source_rate_bmb(:,:) = 0.0
 
   ! Final positivity floor + optional hierarchical limit on the SSP-RK2 result.
   if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)

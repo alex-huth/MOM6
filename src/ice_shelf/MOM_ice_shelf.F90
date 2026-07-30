@@ -1266,7 +1266,7 @@ subroutine change_thickness_using_melt(CS, ISS, G, US, time_step, fluxes)
         ! No-op when DG is inactive.
         if (ISS%hmask(i,j) == 1) then
           call accumulate_DG_source_rate(CS%dCS, i, j, &
-                  -ISS%water_flux(i,j) * I_rho_ice)
+                  -ISS%water_flux(i,j) * I_rho_ice, basal=.true.)
         endif
       else
         ! The ice is about to ablate. If allowing cells to fully melt, set thickness, area, and mask to zero
@@ -2774,7 +2774,7 @@ subroutine change_thickness_using_precip(CS, ISS, G, US, fluxes, time_step, Time
         ! direct h_shelf path. No-op when DG is inactive.
         if (ISS%hmask(i,j) == 1) then
           call accumulate_DG_source_rate(CS%dCS, i, j, &
-                  fluxes%shelf_sfc_mass_flux(i,j) * I_rho_ice)
+                  fluxes%shelf_sfc_mass_flux(i,j) * I_rho_ice, basal=.false.)
         endif
       else
         ! The ice is about to ablate. If allowing cells to fully melt, set thickness, area, and mask to zero,
