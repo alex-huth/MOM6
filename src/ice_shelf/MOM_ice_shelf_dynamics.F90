@@ -579,6 +579,22 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! interior faces where |u_face| ~ 0 but strain rate is
                                   !! nonzero. strain_coef = 0 (default) recovers the pure
                                   !! velocity-magnitude scaling.
+  real :: dg_art_visc_advect_L_ref !< Reference length that renders the |u_face| advective
+                                  !! contribution to u_eff grid-invariant [L ~> m]. When
+                                  !! positive, the advective term becomes advect_coef *
+                                  !! |u_face| * (dx_perp/L_ref), so its jump-mode decay rate
+                                  !! 4*amp*c*advect_coef*|u_face|/L_ref no longer carries a
+                                  !! 1/dx_perp and is the same at every resolution, matching
+                                  !! the strain-rate term (whose dx_perp already cancels).
+                                  !! Non-positive (default) recovers the legacy advect_coef *
+                                  !! |u_face|, whose damping timescale scales with dx_perp.
+  real :: dg_art_visc_tau_floor   !< Absolute damping timescale for the DG(1) artificial
+                                  !! viscosity [T ~> s]. When positive, dx_perp/tau_floor is
+                                  !! added to u_eff, giving a jump-mode decay rate floor of
+                                  !! 4*amp*c/tau_floor that is independent of both resolution
+                                  !! and flow speed, so jumps are still damped where |u_face|
+                                  !! and eps_e_face are both small (stagnant grounded ice).
+                                  !! Non-positive (default) disables the floor.
   real :: dg_art_visc_c_min       !< Baseline (smooth-face) DG(1) artificial-viscosity
                                   !! coefficient [nondim]. Nonzero values damp sub-gate jump
                                   !! drift at the cost of first-order dissipation in smooth
@@ -13241,6 +13257,37 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  units="nondim", default=0.0, &
                  do_not_log=(.not.CS%use_DG_thickness .or. CS%dg_art_visc_c_max == 0.0))
 
+  call get_param(param_file, mdl, "DG1_ART_VISC_ADVECT_L_REF", CS%dg_art_visc_advect_L_ref, &
+                 "Reference length that makes the |u_face| advective term of the DG(1) "//&
+                 "artificial viscosity grid-invariant. When positive, that term becomes "//&
+                 "ADVECT_COEF*|u_face|*(dx_perp/L_REF), so the jump-mode decay rate it "//&
+                 "produces, 4*amp*C_MAX*ADVECT_COEF*|u_face|/L_REF, carries no 1/dx_perp "//&
+                 "and is therefore the same at every resolution - matching the strain-rate "//&
+                 "term, whose dx_perp already cancels against the rate's 1/dx_perp. With "//&
+                 "the legacy form the advective damping timescale is proportional to "//&
+                 "dx_perp, so a fixed C_MAX damps roughly N times more slowly on an N-times "//&
+                 "coarser grid and the balance between the u_eff terms shifts with "//&
+                 "resolution. Setting L_REF to the grid spacing of the resolution the "//&
+                 "coefficients were tuned at reproduces that tuning there and carries it to "//&
+                 "the others. Non-positive (the default) recovers the legacy "//&
+                 "ADVECT_COEF*|u_face|.", &
+                 units="m", default=-1.0, scale=US%m_to_L, &
+                 do_not_log=(.not.CS%use_DG_thickness .or. CS%dg_art_visc_c_max == 0.0))
+
+  call get_param(param_file, mdl, "DG1_ART_VISC_TAU_FLOOR", CS%dg_art_visc_tau_floor, &
+                 "Absolute damping timescale for the DG(1) artificial viscosity. When "//&
+                 "positive, dx_perp/TAU_FLOOR is added to u_eff, so every active face has a "//&
+                 "jump-mode decay rate of at least 4*amp*C_MAX/TAU_FLOOR - independent of "//&
+                 "resolution, timestep, and flow speed. This is the only u_eff term that "//&
+                 "survives where |u_face| and eps_e_face are both small, as in stagnant "//&
+                 "grounded interior ice, which the advective and strain-rate terms leave "//&
+                 "undamped however large C_MAX is made. With amp = 2 (WB_HARMONIC) the "//&
+                 "floor rate is 8*C_MAX/TAU_FLOOR, so C_MAX = 0.0625 and TAU_FLOOR = 1 yr "//&
+                 "give a 2 yr jump e-folding time. Non-positive (the default) disables the "//&
+                 "floor.", &
+                 units="s", default=-1.0, scale=US%s_to_T, &
+                 do_not_log=(.not.CS%use_DG_thickness .or. CS%dg_art_visc_c_max == 0.0))
+
   call get_param(param_file, mdl, "DG1_ART_VISC_C_MIN", CS%dg_art_visc_c_min, &
                  "Baseline DG(1) artificial-viscosity coefficient applied at smooth "//&
                  "faces (smoothness ramp = 0). Nonzero values trade O(dx^2) smooth-"//&
@@ -14759,7 +14806,14 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: bed_qp             ! Bed elevation at a face QP [Z ~> m]
   real :: rhoi_rhow_wb       ! Ice/ocean density ratio for the well-balanced jump [nondim]
   real :: u_floor_qp         ! Strain-rate-scaled velocity-independent floor at a face QP [L T-1 ~> m s-1]
+  real :: u_adv_qp           ! Advective contribution to u_eff at a face QP [L T-1 ~> m s-1]
   real :: u_eff_qp           ! |u_face| + u_floor for the viscosity flux and CFL cap [L T-1 ~> m s-1]
+  real :: advect_inv_L       ! Reciprocal of DG1_ART_VISC_ADVECT_L_REF, or 0 to select the
+                             ! legacy (grid-dependent) advective scaling [L-1 ~> m-1]
+  real :: inv_tau_floor      ! Reciprocal of DG1_ART_VISC_TAU_FLOOR, or 0 when the absolute
+                             ! damping floor is disabled [T-1 ~> s-1]
+  logical :: advect_grid_inv ! If true, scale the advective term by dx_perp/L_ref so its
+                             ! jump-mode decay rate is resolution-independent.
   real :: eps_e_face         ! Effective strain rate at the face midpoint [T-1]
   real :: dudx_f, dudy_f, dvdx_f, dvdy_f ! Face-midpoint velocity gradients [T-1]
   real :: u_mn, u_pl, v_mn, v_pl ! 4-corner-averaged cell velocities on the [L T-1 ~> m s-1]
@@ -14806,6 +14860,15 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   ! the cap loop never visits (non-ice cells, or the whole domain when the
   ! viscosity is disabled).
   if (associated(CS%dg_art_visc_cell_scale)) CS%dg_art_visc_cell_scale(:,:) = 1.0
+
+  ! Optional rate-denominated forms of the two velocity-independent u_eff terms. Both are
+  ! off by default (sentinel <= 0), in which case advect_grid_inv is false and inv_tau_floor
+  ! is 0, and u_eff reduces exactly to the legacy advect_coef*|u| + strain_coef*eps*dx_perp.
+  advect_grid_inv = (CS%dg_art_visc_advect_L_ref > 0.0)
+  advect_inv_L = 0.0
+  if (advect_grid_inv) advect_inv_L = 1.0 / CS%dg_art_visc_advect_L_ref
+  inv_tau_floor = 0.0
+  if (CS%dg_art_visc_tau_floor > 0.0) inv_tau_floor = 1.0 / CS%dg_art_visc_tau_floor
 
   ! Volume integral over each cell.
   do j = jsc, jec ; do i = isc, iec
@@ -15035,7 +15098,14 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         amp_qp = dg1_wb_jump_rate_amp(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb, &
                                       CS%dg_art_visc_wb_harmonic)
         u_floor_qp = CS%dg_art_visc_strain_coef * eps_e_face * dx_perp
-        u_eff_qp = CS%dg_art_visc_advect_coef * u_mag_qp + u_floor_qp
+        if (advect_grid_inv) then
+          u_adv_qp = (CS%dg_art_visc_advect_coef * u_mag_qp) * (dx_perp * advect_inv_L)
+        else
+          u_adv_qp = CS%dg_art_visc_advect_coef * u_mag_qp
+        endif
+        ! The +0 from a disabled tau floor is exact, so the defaults are bitwise identical
+        ! to the legacy single-expression form.
+        u_eff_qp = (u_adv_qp + u_floor_qp) + (dx_perp * inv_tau_floor)
 
         ueff_E(i,j,gp) = u_eff_qp
         dheq_E(i,j,gp) = dh_eq
@@ -15240,7 +15310,14 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         amp_qp = dg1_wb_jump_rate_amp(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb, &
                                       CS%dg_art_visc_wb_harmonic)
         u_floor_qp = CS%dg_art_visc_strain_coef * eps_e_face * dx_perp
-        u_eff_qp = CS%dg_art_visc_advect_coef * u_mag_qp + u_floor_qp
+        if (advect_grid_inv) then
+          u_adv_qp = (CS%dg_art_visc_advect_coef * u_mag_qp) * (dx_perp * advect_inv_L)
+        else
+          u_adv_qp = CS%dg_art_visc_advect_coef * u_mag_qp
+        endif
+        ! The +0 from a disabled tau floor is exact, so the defaults are bitwise identical
+        ! to the legacy single-expression form.
+        u_eff_qp = (u_adv_qp + u_floor_qp) + (dx_perp * inv_tau_floor)
 
         ueff_N(i,j,gp) = u_eff_qp
         dheq_N(i,j,gp) = dh_eq
