@@ -287,6 +287,13 @@ type, public :: ice_shelf_dyn_CS ; private
                                !! Near 0 => the ridge amplitude is drag-limited (removal is shape/rank-set,
                                !! more modes could help); near 1 => membrane (viscosity) dominates and damps
                                !! the kink, so the modest leak removal is largely physical [nondim].
+  real, pointer, dimension(:,:) :: fg_cut_fallback => NULL() !< Diagnostic: rank reduction applied by the CutFEM
+                               !! condensation solve in each cut cell [nondim]. 0 = the full 2*CUTFEM_RIDGE_MODES
+                               !! block was used; 1 = the psi*xi mode was dropped because the 4x4 lost positive
+                               !! definiteness (psi*xi becomes nearly parallel to psi as the cut approaches a cell
+                               !! face); 2 = even the rank-2 block was degenerate, so the cell gets no correction.
+                               !! Nonzero values are face-registered and are the first thing to check if a moving
+                               !! grounding line shows hysteresis.
   ! float_cond used to be a persistent CS field; it is now derived inline at use sites
   ! from CS%ground_frac (a GL cell is "0 < ground_frac < 1" under GL_regularize=True).
   real, pointer, dimension(:,:) :: basal_tr_dfrac => NULL() !< Diagnostic basal-traction smoothing anomaly:
@@ -449,8 +456,9 @@ type, public :: ice_shelf_dyn_CS ; private
   integer :: cutfem_ridge_modes !< Number of enrichment shapes per velocity component in the CutFEM
                             !! ridge: 1 = the single kink psi (2 DOFs/cell, a_x,a_y); 2 = add the
                             !! x-modulated kink psi*xi (4 DOFs/cell). The two-shape span {psi, psi*xi}
-                            !! matches the nodal enrichment {N_up*psi, N_down*psi} within a cell, so it
-                            !! tests whether more DOFs overcome the viscous damping. Default 1.
+                            !! equals the nodal enrichment span {N_up*psi, N_down*psi} only for a
+                            !! straight, grid-aligned grounding line; it carries no along-grounding-line
+                            !! variation of the kink. Default 1.
   real, pointer, dimension(:,:) :: H_corner => NULL() !< Ice thickness interpolated to B-grid corners
                             !! with dual-cell Lagrange weights over the included cells only
                             !! (FV_SUBGRID_GL_* paths) [Z ~> m].
@@ -813,7 +821,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_taudx_shelf = -1, id_taudy_shelf = -1, id_taud_shelf = -1, id_bed_elev = -1, &
              id_ground_frac = -1, id_basal_tr_dfrac = -1, id_col_thick = -1, id_OD_av = -1, &
              id_f_ground_cell = -1, id_f_ground_node = -1, &
-             id_fg_cut_naive = -1, id_fg_cut_eff = -1, id_fg_cut_memfrac = -1, &
+             id_fg_cut_naive = -1, id_fg_cut_eff = -1, id_fg_cut_memfrac = -1, id_fg_cut_fallback = -1, &
              id_u_mask = -1, id_v_mask = -1, id_ufb_mask =-1, id_vfb_mask = -1, id_t_mask = -1, &
              id_sx_shelf = -1, id_sy_shelf = -1, id_surf_slope_mag_shelf, &
              id_duHdx = -1, id_dvHdy = -1, id_fluxdiv = -1, &
@@ -1064,6 +1072,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%fg_cut_naive(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%fg_cut_eff(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%fg_cut_memfrac(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%fg_cut_fallback(isd:ied,jsd:jed), source=0.0)
     allocate(CS%H_corner(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%fls_corner(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%corner_valid(IsdB:IedB,JsdB:JedB), source=.false.)
@@ -1531,8 +1540,11 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     call get_param(param_file, mdl, "CUTFEM_RIDGE_MODES", CS%cutfem_ridge_modes, &
                  "Number of enrichment shapes per velocity component in the CutFEM ridge: 1 = the "//&
                  "single kink psi; 2 = add the x-modulated kink psi*xi (still statically condensed, "//&
-                 "no solver change). The two-shape span matches the in-cell nodal enrichment, so it "//&
-                 "tests whether more DOFs overcome the viscous damping of the single mode.", &
+                 "no solver change). The two-shape span {psi, psi*xi} equals the nodal enrichment "//&
+                 "span only for a one-dimensional (straight, grid-aligned) grounding line, where it "//&
+                 "is one amplitude for the upstream node column and one for the downstream column. "//&
+                 "It carries no along-grounding-line variation, so it cannot represent a kink whose "//&
+                 "strength changes along a curved or oblique grounding line.", &
                  default=1, do_not_log=.not.CS%cutfem_gl_friction)
     if (CS%cutfem_gl_friction .and. (CS%cutfem_ridge_modes < 1 .or. CS%cutfem_ridge_modes > 2)) &
       call MOM_error(FATAL, "MOM_ice_shelf_dynamics: CUTFEM_RIDGE_MODES must be 1 or 2.")
@@ -2135,6 +2147,11 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
        'Kaa_mem/(Kaa_mem+Kaa_drag), per cut cell. Near 1 => viscosity dominates and physically damps '//&
        'the kink (modest leak removal is real); near 0 => drag-limited. Nonzero only when '//&
        'CUTFEM_GL_FRICTION is set', 'none')
+    CS%id_fg_cut_fallback = register_diag_field('ice_shelf_model','fg_cut_fallback',CS%diag%axesT1, Time, &
+       'CutFEM diagnostic: rank reduction in the ridge condensation solve, per cut cell. '//&
+       '0 = full 2*CUTFEM_RIDGE_MODES block used; 1 = the psi*xi mode was dropped because the 4x4 '//&
+       'lost positive definiteness (cut near a cell face); 2 = rank-2 block also degenerate, no '//&
+       'correction applied. Nonzero only when CUTFEM_GL_FRICTION is set', 'none')
     CS%id_col_thick = register_diag_field('ice_shelf_model','col_thick',CS%diag%axesT1, Time, &
        'ocean column thickness passed to ice model', 'm', conversion=US%Z_to_m)
     CS%id_visc_shelf = register_diag_field('ice_shelf_model','ice_visc',CS%diag%axesT1, Time, &
@@ -2749,6 +2766,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
     if (CS%id_fg_cut_naive > 0) call post_data(CS%id_fg_cut_naive, CS%fg_cut_naive, CS%diag)
     if (CS%id_fg_cut_eff > 0) call post_data(CS%id_fg_cut_eff, CS%fg_cut_eff, CS%diag)
     if (CS%id_fg_cut_memfrac > 0) call post_data(CS%id_fg_cut_memfrac, CS%fg_cut_memfrac, CS%diag)
+    if (CS%id_fg_cut_fallback > 0) call post_data(CS%id_fg_cut_fallback, CS%fg_cut_fallback, CS%diag)
     if (CS%id_basal_tr_dfrac > 0) call post_data(CS%id_basal_tr_dfrac, CS%basal_tr_dfrac, CS%diag)
     if (CS%id_OD_av >0) call post_data(CS%id_OD_av, CS%OD_av,CS%diag)
     if (CS%id_visc_shelf > 0) then
@@ -4002,7 +4020,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
   ! CutFEM nodal grounded-drag-fraction diagnostic on the converged velocity (leak vs. leak-after-ridge).
   if (CS%cutfem_gl_friction .and. ((CS%id_fg_cut_naive > 0) .or. (CS%id_fg_cut_eff > 0) .or. &
-      (CS%id_fg_cut_memfrac > 0))) &
+      (CS%id_fg_cut_memfrac > 0) .or. (CS%id_fg_cut_fallback > 0))) &
     call cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, rhoi_rhow)
 
 end subroutine ice_shelf_solve_outer
@@ -8003,7 +8021,10 @@ end subroutine cutfem_spd_solve
 !! amplitudes are statically condensed out of the element system, so this routine returns only
 !! their effect on the 8 standard corner DOFs: the Schur correction  -K_Ua (K_aa)^-1 K_aU
 !! applied to the search direction (U_delta,V_delta) (single mode: explicit 2x2 inverse; two
-!! modes: 4x4 Cholesky). Because
+!! modes: 4x4 Cholesky, falling back to the rank-2 psi-only solve if the 4x4 is not positive
+!! definite, which happens as the cut approaches a cell face and psi*xi becomes nearly parallel
+!! to psi -- dropping the whole correction there would put a face-registered discontinuity in
+!! the operator). Because
 !! the ridge can absorb part of the grounded basal drag, the effective drag no longer leaks
 !! onto floating corners, while the assembly stays consistent (no lumping). K_aa collects the
 !! viscous membrane self-stiffness (over all QPs) and the Picard basal-drag self-stiffness
@@ -8077,6 +8098,8 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   real, dimension(4) :: tvec, svec     ! K_aU*U_delta and K_aa^-1*that
   real :: reg_diag                     ! Absolute Tikhonov added to Kaa diagonal
   integer :: nmodes                    ! 1 (psi) or 2 (psi, psi*xi)
+  integer :: nsolve                    ! Size of the condensation solve actually used: 2*nmodes,
+                                       ! or 2 after the rank-reducing fallback
   integer :: t, k, c
   logical :: solve_ok
 
@@ -8229,9 +8252,50 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
     enddo
   enddo
 
+  ! Symmetrize the assembled ridge self-stiffness (only the upper triangle was accumulated).
+  Kaa(2,1) = Kaa(1,2)
+  if (nmodes == 2) then
+    Kaa(3,1) = Kaa(1,3) ; Kaa(3,2) = Kaa(2,3)
+    Kaa(4,1) = Kaa(1,4) ; Kaa(4,2) = Kaa(2,4) ; Kaa(4,3) = Kaa(3,4)
+  endif
+
+  ! Ridge load from the search direction, t = K_aU * (du,dv). Rows 1-2 are the psi mode, so the
+  ! rank-2 fallback below reuses t(1:2) unchanged. The two branches differ only in summation
+  ! grouping, which is kept as it was so that each CUTFEM_RIDGE_MODES setting stays bitwise
+  ! identical to the code before the fallback was added.
+  tvec(:) = 0.0
   if (nmodes == 1) then
-    ! Tikhonov floor for sliver cuts, then explicit 2x2 inverse.
-    Kaa(2,1) = Kaa(1,2)
+    do c=1,4
+      tvec(1) = tvec(1) + (KaU(1,c)*duc(c)) + (KaU(1,c+4)*dvc(c))
+      tvec(2) = tvec(2) + (KaU(2,c)*duc(c)) + (KaU(2,c+4)*dvc(c))
+    enddo
+  else
+    do c=1,4
+      do k=1,4
+        tvec(c) = tvec(c) + ((KaU(c,k)*duc(k)) + (KaU(c,k+4)*dvc(k)))
+      enddo
+    enddo
+  endif
+
+  svec(:) = 0.0
+  nsolve = 2*nmodes
+  if (nsolve == 4) then
+    ! Two modes: Tikhonov floor on the diagonal, then Cholesky.
+    Kaa_f(:,:) = Kaa(:,:)
+    reg_diag = CS%cutfem_ridge_reg * (((Kaa(1,1) + Kaa(2,2)) + (Kaa(3,3) + Kaa(4,4))))
+    do c=1,4 ; Kaa_f(c,c) = Kaa_f(c,c) + reg_diag ; enddo
+    call cutfem_spd_solve(4, Kaa_f, tvec, svec, solve_ok)
+    ! Rank-reducing fallback: near a cell face psi*xi becomes nearly parallel to psi and the 4x4
+    ! loses positive definiteness. Drop the second mode rather than dropping the whole correction,
+    ! which would be a face-registered discontinuity in the operator. cutfem_diag_ground_fraction
+    ! reports where this happens as fg_cut_fallback.
+    if (.not. solve_ok) then
+      nsolve = 2 ; svec(:) = 0.0
+    endif
+  endif
+
+  if (nsolve == 2) then
+    ! Single mode: Tikhonov floor for sliver cuts, then the explicit 2x2 inverse.
     reg_diag = CS%cutfem_ridge_reg * (Kaa(1,1) + Kaa(2,2))
     Kaa(1,1) = Kaa(1,1) + reg_diag ; Kaa(2,2) = Kaa(2,2) + reg_diag
     det = (Kaa(1,1)*Kaa(2,2)) - (Kaa(1,2)*Kaa(2,1))
@@ -8239,31 +8303,9 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
     Kaa_inv(1,1) =  Kaa(2,2)/det ; Kaa_inv(2,2) =  Kaa(1,1)/det
     Kaa_inv(1,2) = -Kaa(1,2)/det ; Kaa_inv(2,1) = -Kaa(2,1)/det
     ! Schur correction on the search direction: corr = -K_aU^T (K_aa^-1 (K_aU U_delta)).
-    tvec(1) = 0.0 ; tvec(2) = 0.0
-    do c=1,4
-      tvec(1) = tvec(1) + (KaU(1,c)*duc(c)) + (KaU(1,c+4)*dvc(c))
-      tvec(2) = tvec(2) + (KaU(2,c)*duc(c)) + (KaU(2,c+4)*dvc(c))
-    enddo
     svec(1) = (Kaa_inv(1,1)*tvec(1)) + (Kaa_inv(1,2)*tvec(2))
     svec(2) = (Kaa_inv(2,1)*tvec(1)) + (Kaa_inv(2,2)*tvec(2))
     svec(3) = 0.0 ; svec(4) = 0.0
-  else
-    ! Two modes: symmetrize the 4x4, Tikhonov floor on the diagonal, Cholesky solve.
-    Kaa(2,1) = Kaa(1,2)
-    Kaa(3,1) = Kaa(1,3) ; Kaa(3,2) = Kaa(2,3)
-    Kaa(4,1) = Kaa(1,4) ; Kaa(4,2) = Kaa(2,4) ; Kaa(4,3) = Kaa(3,4)
-    reg_diag = CS%cutfem_ridge_reg * (((Kaa(1,1) + Kaa(2,2)) + (Kaa(3,3) + Kaa(4,4))))
-    Kaa(1,1) = Kaa(1,1) + reg_diag ; Kaa(2,2) = Kaa(2,2) + reg_diag
-    Kaa(3,3) = Kaa(3,3) + reg_diag ; Kaa(4,4) = Kaa(4,4) + reg_diag
-    do c=1,4
-      tvec(c) = 0.0
-      do k=1,4
-        tvec(c) = tvec(c) + ((KaU(c,k)*duc(k)) + (KaU(c,k+4)*dvc(k)))
-      enddo
-    enddo
-    Kaa_f(:,:) = Kaa(:,:)
-    call cutfem_spd_solve(4, Kaa_f, tvec, svec, solve_ok)
-    if (.not. solve_ok) return
   endif
 
   ! Scatter the Schur correction to the corner DOFs: corr(col) = -sum_m KaU(m,col)*svec(m).
@@ -8328,10 +8370,13 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
   real :: det, reg_diag, kaa_mem_tr, kaa_drag_tr ! Membrane and drag traces of Kaa [R L3 Z T-1]
   logical :: do_DG, fv_sub_fric, do_coulomb, solve_ok
   integer :: i, j, is, ie, js, je, t, k, c, nmodes
+  integer :: nsolve   ! Size of the condensation solve actually used: 2*nmodes, or 2 after the
+                      ! rank-reducing fallback
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
   Sg(:,:) = 0.0 ; Seff(:,:) = 0.0 ; Sall(:,:) = 0.0
   CS%fg_cut_memfrac(:,:) = 0.0
+  CS%fg_cut_fallback(:,:) = 0.0
   nmodes = CS%cutfem_ridge_modes
 
   do_DG = CS%use_DG_thickness
@@ -8519,8 +8564,26 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
         tvec(k) = tvec(k) + ((KaU(k,c)*uc(c)) + (KaU(k,c+4)*vc(c)))
       enddo
     enddo
-    if (nmodes == 1) then
-      Kaa(2,1) = Kaa(1,2)
+    Kaa(2,1) = Kaa(1,2)
+    if (nmodes == 2) then
+      Kaa(3,1) = Kaa(1,3) ; Kaa(3,2) = Kaa(2,3)
+      Kaa(4,1) = Kaa(1,4) ; Kaa(4,2) = Kaa(2,4) ; Kaa(4,3) = Kaa(3,4)
+    endif
+
+    svec(:) = 0.0
+    nsolve = 2*nmodes
+    if (nsolve == 4) then
+      Kaa_f(:,:) = Kaa(:,:)
+      reg_diag = CS%cutfem_ridge_reg * (((Kaa(1,1) + Kaa(2,2)) + (Kaa(3,3) + Kaa(4,4))))
+      do c=1,4 ; Kaa_f(c,c) = Kaa_f(c,c) + reg_diag ; enddo
+      call cutfem_spd_solve(4, Kaa_f, tvec, svec, solve_ok)
+      if (.not. solve_ok) then
+        nsolve = 2 ; svec(:) = 0.0
+        CS%fg_cut_fallback(i,j) = 1.0   ! psi*xi dropped here; the production solve does the same
+      endif
+    endif
+
+    if (nsolve == 2) then
       reg_diag = CS%cutfem_ridge_reg * (Kaa(1,1) + Kaa(2,2))
       Kaa(1,1) = Kaa(1,1) + reg_diag ; Kaa(2,2) = Kaa(2,2) + reg_diag
       det = (Kaa(1,1)*Kaa(2,2)) - (Kaa(1,2)*Kaa(2,1))
@@ -8533,16 +8596,8 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
         solve_ok = .true.
       else
         solve_ok = .false.
+        CS%fg_cut_fallback(i,j) = 2.0   ! even the rank-2 block is degenerate: no correction at all
       endif
-    else
-      Kaa(2,1) = Kaa(1,2)
-      Kaa(3,1) = Kaa(1,3) ; Kaa(3,2) = Kaa(2,3)
-      Kaa(4,1) = Kaa(1,4) ; Kaa(4,2) = Kaa(2,4) ; Kaa(4,3) = Kaa(3,4)
-      reg_diag = CS%cutfem_ridge_reg * (((Kaa(1,1) + Kaa(2,2)) + (Kaa(3,3) + Kaa(4,4))))
-      Kaa(1,1) = Kaa(1,1) + reg_diag ; Kaa(2,2) = Kaa(2,2) + reg_diag
-      Kaa(3,3) = Kaa(3,3) + reg_diag ; Kaa(4,4) = Kaa(4,4) + reg_diag
-      Kaa_f(:,:) = Kaa(:,:)
-      call cutfem_spd_solve(4, Kaa_f, tvec, svec, solve_ok)
     endif
     if (solve_ok) then
       do c=1,4
@@ -8620,6 +8675,8 @@ subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, den
   real :: rho, grav, He, rgHe, smag, scale, det, reg_diag
   logical :: do_DG, do_coulomb, solve_ok
   integer :: i, j, is, ie, js, je, t, k, c, nmodes
+  integer :: nsolve   ! Size of the condensation solve actually used: 2*nmodes, or 2 after the
+                      ! rank-reducing fallback
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
   rho = CS%density_ice ; grav = CS%g_Earth
@@ -8820,8 +8877,27 @@ subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, den
       enddo
     enddo
 
-    if (nmodes == 1) then
-      Kaa(2,1) = Kaa(1,2)
+    Kaa(2,1) = Kaa(1,2)
+    if (nmodes == 2) then
+      Kaa(3,1) = Kaa(1,3) ; Kaa(3,2) = Kaa(2,3)
+      Kaa(4,1) = Kaa(1,4) ; Kaa(4,2) = Kaa(2,4) ; Kaa(4,3) = Kaa(3,4)
+    endif
+
+    svec(:) = 0.0
+    nsolve = 2*nmodes
+    if (nsolve == 4) then
+      Kaa_f(:,:) = Kaa(:,:)
+      reg_diag = CS%cutfem_ridge_reg * (((Kaa(1,1) + Kaa(2,2)) + (Kaa(3,3) + Kaa(4,4))))
+      do c=1,4 ; Kaa_f(c,c) = Kaa_f(c,c) + reg_diag ; enddo
+      call cutfem_spd_solve(4, Kaa_f, Fa, svec, solve_ok)
+      ! Same rank-reducing fallback as cutfem_condense_sep2, so the operator and the RHS always
+      ! use the same ridge span in a given cell.
+      if (.not. solve_ok) then
+        nsolve = 2 ; svec(:) = 0.0
+      endif
+    endif
+
+    if (nsolve == 2) then
       reg_diag = CS%cutfem_ridge_reg * (Kaa(1,1) + Kaa(2,2))
       Kaa(1,1) = Kaa(1,1) + reg_diag ; Kaa(2,2) = Kaa(2,2) + reg_diag
       det = (Kaa(1,1)*Kaa(2,2)) - (Kaa(1,2)*Kaa(2,1))
@@ -8832,16 +8908,6 @@ subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, den
       svec(1) = (Kaa_inv(1,1)*Fa(1)) + (Kaa_inv(1,2)*Fa(2))
       svec(2) = (Kaa_inv(2,1)*Fa(1)) + (Kaa_inv(2,2)*Fa(2))
       svec(3) = 0.0 ; svec(4) = 0.0
-    else
-      Kaa(2,1) = Kaa(1,2)
-      Kaa(3,1) = Kaa(1,3) ; Kaa(3,2) = Kaa(2,3)
-      Kaa(4,1) = Kaa(1,4) ; Kaa(4,2) = Kaa(2,4) ; Kaa(4,3) = Kaa(3,4)
-      reg_diag = CS%cutfem_ridge_reg * (((Kaa(1,1) + Kaa(2,2)) + (Kaa(3,3) + Kaa(4,4))))
-      Kaa(1,1) = Kaa(1,1) + reg_diag ; Kaa(2,2) = Kaa(2,2) + reg_diag
-      Kaa(3,3) = Kaa(3,3) + reg_diag ; Kaa(4,4) = Kaa(4,4) + reg_diag
-      Kaa_f(:,:) = Kaa(:,:)
-      call cutfem_spd_solve(4, Kaa_f, Fa, svec, solve_ok)
-      if (.not. solve_ok) cycle
     endif
 
     ! RHS correction G(col) = -sum_m KaU(m,col)*svec(m).
