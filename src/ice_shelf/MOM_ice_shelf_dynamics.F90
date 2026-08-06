@@ -8276,7 +8276,7 @@ end subroutine cutfem_ridge_shapes
 subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_curr, U_delta, V_delta, &
                                 ice_visc_c, fB_e, dxCv_S, dxCv_N, dyCu_W, dyCu_E, IareaT, &
                                 dens_ratio, Ucorr, Vcorr, bedc, use_newton, diag_only, h_visc_c, &
-                                quad_mismatch)
+                                quad_mismatch, quad_swap)
   type(ice_shelf_dyn_CS), intent(in) :: CS      !< Ice shelf control structure
   type(ocean_grid_type),  intent(in) :: G       !< The grid structure
   type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
@@ -8308,6 +8308,13 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
                                                 !! evaluated at each SEP2 quadrature point, which is
                                                 !! what K_uu uses and what the positive-definiteness
                                                 !! of the condensed operator requires.
+  logical, optional,      intent(in) :: quad_swap !< Overrides CUTFEM_CONSISTENT_QUAD for this call.
+                                                !! The symmetry probe sets it false for its mirror
+                                                !! tests, because the Gauss block reads CS%Phi and
+                                                !! CS%Jac at a fixed cell and so cannot be mirrored
+                                                !! from outside; the mirror tests are about the
+                                                !! enrichment, and the standard block's own symmetry
+                                                !! is covered by test.rotate.
   real, optional,        intent(out) :: quad_mismatch !< If present, the largest entry of the
                                                 !! SEP2-minus-Gauss standard membrane block relative
                                                 !! to the largest entry of the Gauss block [nondim].
@@ -8447,6 +8454,7 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   ! The standard membrane can only be re-integrated on the SEP2 rule if the viscosity is available
   ! there, so the two switch together.
   do_cons_quad = do_visc_qp .and. CS%cutfem_consistent_quad
+  if (present(quad_swap)) do_cons_quad = do_visc_qp .and. quad_swap
   Kuu_sep(:,:) = 0.0 ; Kuu_gau(:,:) = 0.0
   if (do_visc_qp) Visc_coef = (CS%AGlen_visc(i_elem,j_elem))**(-1./CS%n_glen)
   do_newton = .false.
@@ -8850,6 +8858,8 @@ subroutine cutfem_symmetry_probe(CS, G, US, dens_ratio)
   real :: rquad         ! Worst relative SEP2-minus-Gauss standard membrane mismatch [nondim]
   real :: qm            ! Per-configuration value of the same [nondim]
   real, dimension(2,2) :: Uz, Vz ! Discarded corrections from the strain-free quadrature probe
+  real :: visc_rigid, nvf_rigid  ! Glen's law at zero strain [R L4 Z T-1], [R L4 Z T]
+  real, dimension(CS%visc_qps) :: visc_c_rigid ! That value at every viscosity sample [R L4 Z T-1]
   real :: r1            ! Residual of the current comparison [nondim]
   real :: dx_S, dx_N, dy_W, dy_E ! Cell edge spacings of the probe cell [L ~> m]
   integer :: i, j, ia, io, c, ncut
@@ -8899,10 +8909,18 @@ subroutine cutfem_symmetry_probe(CS, G, US, dens_ratio)
     !     The two standard blocks must then agree to roundoff. A larger residual means the Gauss
     !     block assembled inside cutfem_condense_sep2 does not reproduce the one CG_action adds,
     !     in which case their difference is not a quadrature swap but an error. ---
+    ! The comparison is only meaningful if both blocks see the same viscosity. The SEP2 block
+    ! re-evaluates Glen's law at its own points, so the Gauss block must be fed the value that law
+    ! returns for the same rigid, strain-free state rather than the stored field, which was built
+    ! from the real velocity.
     Uc_m(:,:) = u0 ; Vc_m(:,:) = u0
+    call shelf_visc_point(0.0, 0.0, 0.0, 0.0, G%areaT(i,j) * max(h0, CS%min_h_shelf), &
+        (CS%AGlen_visc(i,j))**(-1./CS%n_glen), CS%n_glen, CS%eps_glen_min, CS%min_ice_visc, &
+        US%s_to_T, US%Pa_to_RL2_T2, visc_rigid, nvf_rigid)
+    visc_c_rigid(:) = visc_rigid
     call cutfem_condense_sep2(CS, G, US, i, j, fls, hc, Uc_m, Vc_m, Uc_m, Vc_m, &
-        CS%ice_visc(i,j,:), CS%fB_elem(i,j), dx_S, dx_N, dy_W, dy_E, G%IareaT(i,j), &
-        dens_ratio, Uz, Vz, h_visc_c=hv_cf, quad_mismatch=qm)
+        visc_c_rigid, CS%fB_elem(i,j), dx_S, dx_N, dy_W, dy_E, G%IareaT(i,j), &
+        dens_ratio, Uz, Vz, h_visc_c=hv_cf, quad_mismatch=qm, quad_swap=.true.)
     rquad = max(rquad, qm)
 
     ! --- North-south reflection: SW<->NW, SE<->NE; u unchanged, v negated; dxCv_S <-> dxCv_N. ---
