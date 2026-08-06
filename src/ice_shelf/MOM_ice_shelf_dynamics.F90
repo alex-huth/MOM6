@@ -59,6 +59,13 @@ integer, parameter :: BASAL_TR_NONE = 0     !< No smoothing (hard Weertman step 
 !! physical regularization and not the conditioning safety net.
 real, parameter :: cutfem_cond_floor = 1.0e-14
 
+!> Smallest fraction of the un-condensed Jacobi diagonal that the CutFEM condensation is allowed to
+!! leave standing at a node [nondim]. The Schur correction is negative semi-definite and in exact
+!! arithmetic cannot exhaust the diagonal, so this only guards the reciprocal against a node whose
+!! stiffness is almost entirely absorbed by the ridge. It affects the preconditioner only, never
+!! the operator, so it cannot change the converged solution.
+real, parameter :: cutfem_diag_keep = 0.1
+
 integer, parameter :: BASAL_TR_CENTERED = 1 !< Symmetric cosine ramp over [-W,W]; phi(0)=0.5, GL not displaced
 integer, parameter :: BASAL_TR_ONESIDED = 2 !< STREAMICE-style ramp over [0,W]; reduces grounded traction only
 
@@ -6575,7 +6582,8 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
                 u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
                 u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
                 CS%ice_visc(i,j,:), fB_e, G%dxCv(i,j-1), G%dxCv(i,j), &
-                G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr)
+                G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr, &
+                use_newton=use_newton)
           else  ! do_DG: bed and (unclamped) nodal thickness define the partition, matching
                 ! the DG branch of CG_action_sep2_basal (fls = r*h_nodal - bed, no min_h clamp).
             hc_cf(1)  = hgate(i,j,1,1) ; hc_cf(2)  = hgate(i,j,2,1)
@@ -6587,7 +6595,8 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
                 u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
                 u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
                 CS%ice_visc(i,j,:), fB_e, G%dxCv(i,j-1), G%dxCv(i,j), &
-                G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr, bedc=bedc_cf)
+                G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr, bedc=bedc_cf, &
+                use_newton=use_newton)
           endif
           if (umask(I-1,J-1) == 1) uret_b(I-1,J-1,4) = uret_b(I-1,J-1,4) + Ucorr(1,1)
           if (umask(I-1,J  ) == 1) uret_b(I-1,J  ,2) = uret_b(I-1,J  ,2) + Ucorr(1,2)
@@ -7115,6 +7124,11 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
   real, dimension(2,2) :: Hcell, u_diag_sub, v_diag_sub  ! Subgrid diagonal contributions [R L2 Z T-1 ~> kg s-1]
   real, dimension(2,2,4) :: u_diag_qp, v_diag_qp
   real, dimension(SZDIB_(G),SZDJB_(G),4) :: u_diag_b, v_diag_b
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: cut_du, cut_dv ! CutFEM condensation corrections to the
+                         ! nodal Jacobi diagonal, <= 0 [R L2 Z T-1 ~> kg s-1]
+  real, dimension(2,2) :: Ucorr, Vcorr    ! Per-element CutFEM diagonal correction [R L2 Z T-1 ~> kg s-1]
+  real, dimension(4)   :: fls_cf, hc_cf, bedc_cf ! Corner flotation deficit, thickness and bed for the
+                         ! CutFEM ridge, SW,SE,NW,NE [Z ~> m]
   logical :: do_newton_visc  ! Whether to apply viscosity-related Newton tangent stiffness corrections
   logical :: visc_qp4
   integer :: i, j, isc, jsc, iec, jec, iphi, jphi, iq, jq, ilq, jlq, Itgt, Jtgt, qp, qpv
@@ -7144,6 +7158,7 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
 
   u_diag_b(:,:,:)=0.0
   v_diag_b(:,:,:)=0.0
+  cut_du(:,:) = 0.0 ; cut_dv(:,:) = 0.0
 
   do j=jsc-1,jec+1 ; do i=isc-1,iec+1 ; if (hmask(i,j) == 1 .or. hmask(i,j)==3) then
 
@@ -7375,6 +7390,44 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
       if (CS%vmask(I-1,J  )==1) v_diag_b(I-1,J  ,2) = v_diag_b(I-1,J  ,2) + v_diag_sub(1,2)
       if (CS%vmask(I  ,J-1)==1) v_diag_b(I  ,J-1,3) = v_diag_b(I  ,J-1,3) + v_diag_sub(2,1)
       if (CS%vmask(I  ,J  )==1) v_diag_b(I  ,J  ,1) = v_diag_b(I  ,J  ,1) + v_diag_sub(2,2)
+
+      ! Diagonal of the CutFEM ridge condensation, so the Jacobi preconditioner sees the operator
+      ! CG_action actually applies. The Schur correction is negative semi-definite, so without this
+      ! the preconditioner systematically overestimates the near-grounding-line diagonal.
+      if (CS%cutfem_gl_friction .and. (fv_sub_fric .or. do_DG)) then
+        if (fv_sub_fric) then
+          hc_cf(1)  = CS%H_corner(I-1,J-1)   ; hc_cf(2)  = CS%H_corner(I,J-1)
+          hc_cf(3)  = CS%H_corner(I-1,J  )   ; hc_cf(4)  = CS%H_corner(I,J  )
+          fls_cf(1) = CS%fls_corner(I-1,J-1) ; fls_cf(2) = CS%fls_corner(I,J-1)
+          fls_cf(3) = CS%fls_corner(I-1,J  ) ; fls_cf(4) = CS%fls_corner(I,J  )
+          call cutfem_condense_sep2(CS, G, US, i, j, fls_cf, hc_cf, &
+              u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+              u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+              CS%ice_visc(i,j,:), fB_e, G%dxCv(i,j-1), G%dxCv(i,j), &
+              G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr, &
+              use_newton=CS%doing_newton, diag_only=.true.)
+        else
+          hc_cf(1)  = hgate(i,j,1,1) ; hc_cf(2)  = hgate(i,j,2,1)
+          hc_cf(3)  = hgate(i,j,1,2) ; hc_cf(4)  = hgate(i,j,2,2)
+          bedc_cf(1) = CS%bed_node(I-1,J-1) ; bedc_cf(2) = CS%bed_node(I  ,J-1)
+          bedc_cf(3) = CS%bed_node(I-1,J  ) ; bedc_cf(4) = CS%bed_node(I  ,J  )
+          fls_cf(:) = (dens_ratio * hc_cf(:)) - bedc_cf(:)
+          call cutfem_condense_sep2(CS, G, US, i, j, fls_cf, hc_cf, &
+              u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+              u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+              CS%ice_visc(i,j,:), fB_e, G%dxCv(i,j-1), G%dxCv(i,j), &
+              G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr, &
+              bedc=bedc_cf, use_newton=CS%doing_newton, diag_only=.true.)
+        endif
+        if (CS%umask(I-1,J-1)==1) cut_du(I-1,J-1) = cut_du(I-1,J-1) + Ucorr(1,1)
+        if (CS%umask(I  ,J-1)==1) cut_du(I  ,J-1) = cut_du(I  ,J-1) + Ucorr(2,1)
+        if (CS%umask(I-1,J  )==1) cut_du(I-1,J  ) = cut_du(I-1,J  ) + Ucorr(1,2)
+        if (CS%umask(I  ,J  )==1) cut_du(I  ,J  ) = cut_du(I  ,J  ) + Ucorr(2,2)
+        if (CS%vmask(I-1,J-1)==1) cut_dv(I-1,J-1) = cut_dv(I-1,J-1) + Vcorr(1,1)
+        if (CS%vmask(I  ,J-1)==1) cut_dv(I  ,J-1) = cut_dv(I  ,J-1) + Vcorr(2,1)
+        if (CS%vmask(I-1,J  )==1) cut_dv(I-1,J  ) = cut_dv(I-1,J  ) + Vcorr(1,2)
+        if (CS%vmask(I  ,J  )==1) cut_dv(I  ,J  ) = cut_dv(I  ,J  ) + Vcorr(2,2)
+      endif
     endif
   endif ; enddo ; enddo
 
@@ -7382,6 +7435,20 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
     u_diagonal(I,J) = (u_diag_b(I,J,1)+u_diag_b(I,J,4)) + (u_diag_b(I,J,2)+u_diag_b(I,J,3))
     v_diagonal(I,J) = (v_diag_b(I,J,1)+v_diag_b(I,J,4)) + (v_diag_b(I,J,2)+v_diag_b(I,J,3))
   enddo ; enddo
+
+  ! Apply the CutFEM diagonal correction. It is negative semi-definite and, in exact arithmetic,
+  ! bounded by the contribution of the cut element itself, so the corrected diagonal stays
+  ! positive. The floor guards the reciprocal taken by the caller against a node whose stiffness
+  ! is almost entirely absorbed by the ridge, and is continuous (a max of two continuous
+  ! functions), so it introduces no switch into the preconditioner.
+  if (CS%cutfem_gl_friction) then
+    do J=jsc-2,jec+1 ; do I=isc-2,iec+1
+      if (cut_du(I,J) < 0.0) &
+        u_diagonal(I,J) = max(u_diagonal(I,J) + cut_du(I,J), cutfem_diag_keep * u_diagonal(I,J))
+      if (cut_dv(I,J) < 0.0) &
+        v_diagonal(I,J) = max(v_diagonal(I,J) + cut_dv(I,J), cutfem_diag_keep * v_diagonal(I,J))
+    enddo ; enddo
+  endif
 
   ! Local (nodal-diagonal) basal friction (CISM HO_ASSEMBLE_BETA_LOCAL): the diagonal of the nodal
   ! drag bcoef*u (+ Newton tangent dnewt*u^2), matching the term added in CG_action.
@@ -8070,7 +8137,7 @@ end subroutine cutfem_spd_solve
 !! Symmetric by construction: the same K_aU multiplies on both sides of K_aa^-1.
 subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_curr, U_delta, V_delta, &
                                 ice_visc_c, fB_e, dxCv_S, dxCv_N, dyCu_W, dyCu_E, IareaT, &
-                                dens_ratio, Ucorr, Vcorr, bedc)
+                                dens_ratio, Ucorr, Vcorr, bedc, use_newton, diag_only)
   type(ice_shelf_dyn_CS), intent(in) :: CS      !< Ice shelf control structure
   type(ocean_grid_type),  intent(in) :: G       !< The grid structure
   type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
@@ -8096,6 +8163,14 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   real, dimension(4), optional, intent(in) :: bedc !< Corner bed elevation, SW,SE,NW,NE [Z ~> m]. Present
                                                 !! selects DG mode (Coulomb fB from h and bed); absent
                                                 !! selects FV-subgrid mode (fB from the flotation deficit).
+  logical, optional,      intent(in) :: use_newton !< If true, include the Newton drag and viscosity
+                                                !! tangents in K_aU and K_aa so the condensed correction
+                                                !! is part of the Jacobian rather than of the Picard
+                                                !! operator. Absent or false gives the Picard blocks.
+  logical, optional,      intent(in) :: diag_only !< If true, return the DIAGONAL of the Schur correction
+                                                !! in Ucorr/Vcorr instead of its action on
+                                                !! (U_delta,V_delta), for the Jacobi preconditioner.
+                                                !! U_delta and V_delta are then unused.
 
   integer, dimension(4)  :: nqp        ! QPs per parent triangle
   real, dimension(4,7,4) :: beta       ! Corner-basis weights per (corner, QP, triangle) [nondim]
@@ -8133,9 +8208,26 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   real, dimension(4,4) :: Kaa_f        ! Working copy of Kaa for the multi-mode Cholesky solve
   real, dimension(4) :: tvec, svec     ! K_aU*U_delta and K_aa^-1*that
   real :: reg_diag                     ! Absolute Tikhonov added to Kaa diagonal
+  real, dimension(4) :: Gm             ! Newton viscosity strain contraction per ridge row [L-1 T-1]
+  real, dimension(8) :: Gc             ! Newton viscosity strain contraction per nodal column [L-1 T-1]
+  real, dimension(4) :: psim           ! Ridge shape value per row (psi or psi*xi) [Z ~> m]
+  real, dimension(4) :: uvm            ! Frozen velocity component matching each row [L T-1 ~> m s-1]
+  real :: nvf_c                        ! Cell-mean Newton viscosity tangent factor [R L4 Z T]
+  real :: strx_c, stry_c, strsh_c      ! Cell-mean Newton strain rates [T-1 ~> s-1]
+  real :: tw_x, tw_y, tw_s             ! Strain-direction weights 2ex+ey, 2ey+ex, esh/2 [T-1 ~> s-1]
+  real :: jnvf                         ! jac*nvf_c [R L4 Z T]
+  real :: dnw                          ! jac*drag_newt_loc [R Z T]
+  logical :: do_newton                 ! Include the Newton drag tangent
+  logical :: do_newton_visc            ! Include the Newton viscosity tangent
+  logical :: do_diag                   ! Return the Schur diagonal rather than its action
+  real, dimension(4) :: rhs            ! One column of K_aU, for the diagonal path
+  real :: piv_floor                    ! Conditioning floor on the Cholesky pivots [R L4 Z T-1]
+  real :: det_min                      ! Roundoff-scale floor on the 2x2 determinant [(R L4 Z T-1)2]
+  real :: dval                         ! One entry of the Schur diagonal [R L2 Z T-1]
+  integer :: col                       ! Nodal column index, 1-4 = u at SW,SE,NW,NE; 5-8 = v
+  integer :: m, n                      ! Ridge row indices
   integer :: nmodes                    ! 1 (psi) or 2 (psi, psi*xi)
   integer :: n_floored                 ! Number of conditioning-floor hits in the condensation solve
-  real :: det_min                      ! Roundoff-scale floor on the 2x2 determinant [(R L4 Z T-1)2]
   integer :: t, k, c
 
   Ucorr(:,:) = 0.0 ; Vcorr(:,:) = 0.0
@@ -8171,6 +8263,26 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   do k=1,CS%visc_qps ; visc_qp = visc_qp + ice_visc_c(k) ; enddo
   visc_qp = visc_qp / real(CS%visc_qps)
   nmodes = CS%cutfem_ridge_modes
+
+  do_newton = .false.
+  if (present(use_newton)) do_newton = use_newton
+  do_diag = .false.
+  if (present(diag_only)) do_diag = diag_only
+  do_newton_visc = do_newton .and. (trim(CS%ice_viscosity_compute) == "MODEL")
+  if (do_newton_visc) then
+    ! Cell means, for the same reason ice_visc is cell-averaged above: the SEP2 sub-QP index has
+    ! no spatial correspondence to the 2x2 Gauss layout these tangent fields are stored on.
+    nvf_c = 0.0 ; strx_c = 0.0 ; stry_c = 0.0 ; strsh_c = 0.0
+    do k=1,CS%visc_qps
+      nvf_c   = nvf_c   + CS%newton_visc_factor(i_elem,j_elem,k)
+      strx_c  = strx_c  + CS%newton_str_ux(i_elem,j_elem,k)
+      stry_c  = stry_c  + CS%newton_str_vy(i_elem,j_elem,k)
+      strsh_c = strsh_c + CS%newton_str_sh(i_elem,j_elem,k)
+    enddo
+    nvf_c   = nvf_c   / real(CS%visc_qps) ; strx_c  = strx_c  / real(CS%visc_qps)
+    stry_c  = stry_c  / real(CS%visc_qps) ; strsh_c = strsh_c / real(CS%visc_qps)
+    tw_x = (2.0*strx_c) + stry_c ; tw_y = (2.0*stry_c) + strx_c ; tw_s = 0.5*strsh_c
+  endif
 
   do_dg_local = present(bedc)
   do_coulomb  = CS%CoulombFriction
@@ -8236,6 +8348,31 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
         Kaa(2,4) = Kaa(2,4) + jvisc * cutfem_mem_couple(2, gx, gy, 2, g2x, g2y)
       endif
 
+      ! --- Newton viscosity tangent: the symmetric rank-1 nvf * G(row) * G(col), the same form
+      !     CG_action applies to the standard blocks. G contracts the frozen strain direction with
+      !     each shape's own strain, so a u-field shape with gradient (px,py) has G = tw_x*px +
+      !     tw_s*py and a v-field shape has G = tw_s*px + tw_y*py. Added to the Picard membrane
+      !     block above; the sum is the Hessian of the (convex) Glen dissipation potential and so
+      !     remains positive semi-definite even though this rank-1 piece alone is negative. ---
+      if (do_newton_visc) then
+        Gm(1) = (tw_x * gx) + (tw_s * gy)
+        Gm(2) = (tw_s * gx) + (tw_y * gy)
+        if (nmodes == 2) then
+          Gm(3) = (tw_x * g2x) + (tw_s * g2y)
+          Gm(4) = (tw_s * g2x) + (tw_y * g2y)
+        endif
+        do c=1,4
+          dNx = dNxi(c,t) / a ; dNy = dNeta(c,t) / d
+          Gc(c)   = (tw_x * dNx) + (tw_s * dNy)
+          Gc(c+4) = (tw_s * dNx) + (tw_y * dNy)
+        enddo
+        jnvf = jac * nvf_c
+        do m=1,2*nmodes
+          do c=1,8 ; KaU(m,c) = KaU(m,c) + (jnvf * (Gm(m)*Gc(c))) ; enddo
+          do n=m,2*nmodes ; Kaa(m,n) = Kaa(m,n) + (jnvf * (Gm(m)*Gm(n))) ; enddo
+        enddo
+      endif
+
       ! --- Basal drag coupling, grounded QPs only (Picard part). ---
       if (qpg(k,t)) then
         u_curr_loc = ((b1*uc(1)) + (b4*uc(4))) + ((b2*uc(2)) + (b3*uc(3)))
@@ -8263,7 +8400,7 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
           fB_local = fB_e
         endif
         call compute_basal_coef(unorm2_loc, coef_prefactor, min_trac_area, fB_local, &
-            CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .false., &
+            CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, do_newton, &
             basal_coef_loc, drag_newt_loc)
         bcw = jac * basal_coef_loc * psi_qp
         do c=1,4
@@ -8283,6 +8420,30 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
           Kaa(1,3) = Kaa(1,3) + (jac * basal_coef_loc * (psi_qp*psi2)) ! mode1-mode2 x-x drag
           Kaa(2,4) = Kaa(2,4) + (jac * basal_coef_loc * (psi_qp*psi2)) ! mode1-mode2 y-y drag
         endif
+
+        ! Newton drag tangent. The pointwise Jacobian is T = basal_coef*I + drag_newt*(u^k (x) u^k);
+        ! the isotropic part is the Picard block above, so only the outer product is added here. It
+        ! introduces the x-y cross coupling that the Picard blocks do not have. T is positive
+        ! semi-definite for the sliding laws in use (its eigenvalues are basal_coef and
+        ! n_basal_fric*basal_coef), so K_aa stays positive semi-definite.
+        if (do_newton) then
+          dnw = jac * drag_newt_loc
+          psim(1) = psi_qp ; psim(2) = psi_qp
+          uvm(1)  = u_curr_loc ; uvm(2) = v_curr_loc
+          if (nmodes == 2) then
+            psim(3) = psi2 ; psim(4) = psi2
+            uvm(3)  = u_curr_loc ; uvm(4) = v_curr_loc
+          endif
+          do m=1,2*nmodes
+            do c=1,4
+              KaU(m,c)   = KaU(m,c)   + ((dnw * (psim(m)*uvm(m))) * (beta(c,k,t)*u_curr_loc))
+              KaU(m,c+4) = KaU(m,c+4) + ((dnw * (psim(m)*uvm(m))) * (beta(c,k,t)*v_curr_loc))
+            enddo
+            do n=m,2*nmodes
+              Kaa(m,n) = Kaa(m,n) + ((dnw * (psim(m)*uvm(m))) * (psim(n)*uvm(n)))
+            enddo
+          enddo
+        endif
       endif
     enddo
   enddo
@@ -8294,10 +8455,64 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
     Kaa(4,1) = Kaa(1,4) ; Kaa(4,2) = Kaa(2,4) ; Kaa(4,3) = Kaa(3,4)
   endif
 
-  ! Ridge load from the search direction, t = K_aU * (du,dv). Rows 1-2 are the psi mode, so the
-  ! rank-2 fallback below reuses t(1:2) unchanged. The two branches differ only in summation
-  ! grouping, which is kept as it was so that each CUTFEM_RIDGE_MODES setting stays bitwise
-  ! identical to the code before the fallback was added.
+  ! Tikhonov floor for sliver cuts, applied once and shared by the action and diagonal paths.
+  if (nmodes == 2) then
+    reg_diag = CS%cutfem_ridge_reg * (((Kaa(1,1) + Kaa(2,2)) + (Kaa(3,3) + Kaa(4,4))))
+  else
+    reg_diag = CS%cutfem_ridge_reg * (Kaa(1,1) + Kaa(2,2))
+  endif
+  do c=1,2*nmodes ; Kaa(c,c) = Kaa(c,c) + reg_diag ; enddo
+
+  if (nmodes == 2) then
+    piv_floor = cutfem_cond_floor * (((Kaa(1,1) + Kaa(2,2)) + (Kaa(3,3) + Kaa(4,4))))
+  else
+    ! Single mode: the explicit 2x2 inverse. The determinant is floored at the same roundoff scale
+    ! the Cholesky pivots are, and for the same reason: it is a difference of nearly equal numbers
+    ! once the modes degenerate, so it can come out wrong or negative. Flooring it only shrinks
+    ! Kaa^-1, so the condensed operator stays positive semi-definite and the correction stays
+    ! continuous in the cut position.
+    det = (Kaa(1,1)*Kaa(2,2)) - (Kaa(1,2)*Kaa(2,1))
+    det_min = (cutfem_cond_floor * (Kaa(1,1) + Kaa(2,2)))**2
+    if (det < det_min) then
+      det = det_min ; n_floored = 1
+    endif
+    Kaa_inv(1,1) =  Kaa(2,2)/det ; Kaa_inv(2,2) =  Kaa(1,1)/det
+    Kaa_inv(1,2) = -Kaa(1,2)/det ; Kaa_inv(2,1) = -Kaa(2,1)/det
+  endif
+
+  if (do_diag) then
+    ! Diagonal of the Schur correction, for the Jacobi preconditioner:
+    !   Delta_col = -K_aU(:,col)^T K_aa^-1 K_aU(:,col)  <= 0.
+    ! One small solve per nodal column. This path runs once per outer iterate in matrix_diagonal,
+    ! not inside the CG loop, so re-factorizing per column is not worth avoiding.
+    do col=1,8
+      if (nmodes == 2) then
+        Kaa_f(:,:) = Kaa(:,:)
+        do m=1,4 ; rhs(m) = KaU(m,col) ; enddo
+        call cutfem_spd_solve(4, Kaa_f, piv_floor, rhs, svec, n_floored)
+        dval = -(((KaU(1,col)*svec(1)) + (KaU(2,col)*svec(2))) + &
+                 ((KaU(3,col)*svec(3)) + (KaU(4,col)*svec(4))))
+      else
+        dval = -(((KaU(1,col)*((Kaa_inv(1,1)*KaU(1,col)) + (Kaa_inv(1,2)*KaU(2,col)))) + &
+                  (KaU(2,col)*((Kaa_inv(2,1)*KaU(1,col)) + (Kaa_inv(2,2)*KaU(2,col))))))
+      endif
+      select case (col)
+        case (1) ; Ucorr(1,1) = dval
+        case (2) ; Ucorr(2,1) = dval
+        case (3) ; Ucorr(1,2) = dval
+        case (4) ; Ucorr(2,2) = dval
+        case (5) ; Vcorr(1,1) = dval
+        case (6) ; Vcorr(2,1) = dval
+        case (7) ; Vcorr(1,2) = dval
+        case (8) ; Vcorr(2,2) = dval
+      end select
+    enddo
+    return
+  endif
+
+  ! Ridge load from the search direction, t = K_aU * (du,dv). The two branches differ only in
+  ! summation grouping, which is kept as it was so that each CUTFEM_RIDGE_MODES setting stays
+  ! bitwise identical to the code before these options were added.
   tvec(:) = 0.0
   if (nmodes == 1) then
     do c=1,4
@@ -8314,28 +8529,9 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
 
   svec(:) = 0.0
   if (nmodes == 2) then
-    ! Two modes: Tikhonov floor on the diagonal, then the conditioning-floored Cholesky.
     Kaa_f(:,:) = Kaa(:,:)
-    reg_diag = CS%cutfem_ridge_reg * (((Kaa(1,1) + Kaa(2,2)) + (Kaa(3,3) + Kaa(4,4))))
-    do c=1,4 ; Kaa_f(c,c) = Kaa_f(c,c) + reg_diag ; enddo
-    call cutfem_spd_solve(4, Kaa_f, cutfem_cond_floor * &
-                          (((Kaa_f(1,1) + Kaa_f(2,2)) + (Kaa_f(3,3) + Kaa_f(4,4)))), &
-                          tvec, svec, n_floored)
+    call cutfem_spd_solve(4, Kaa_f, piv_floor, tvec, svec, n_floored)
   else
-    ! Single mode: Tikhonov floor for sliver cuts, then the explicit 2x2 inverse. The determinant
-    ! is floored at the same roundoff scale for the same reason the Cholesky pivots are: it is a
-    ! difference of nearly equal numbers once the modes degenerate, so it can come out wrong or
-    ! negative. Flooring it only shrinks Kaa^-1, so the condensed operator stays positive
-    ! semi-definite, and the correction stays continuous in the cut position.
-    reg_diag = CS%cutfem_ridge_reg * (Kaa(1,1) + Kaa(2,2))
-    Kaa(1,1) = Kaa(1,1) + reg_diag ; Kaa(2,2) = Kaa(2,2) + reg_diag
-    det = (Kaa(1,1)*Kaa(2,2)) - (Kaa(1,2)*Kaa(2,1))
-    det_min = (cutfem_cond_floor * (Kaa(1,1) + Kaa(2,2)))**2
-    if (det < det_min) then
-      det = det_min ; n_floored = 1
-    endif
-    Kaa_inv(1,1) =  Kaa(2,2)/det ; Kaa_inv(2,2) =  Kaa(1,1)/det
-    Kaa_inv(1,2) = -Kaa(1,2)/det ; Kaa_inv(2,1) = -Kaa(2,1)/det
     ! Schur correction on the search direction: corr = -K_aU^T (K_aa^-1 (K_aU U_delta)).
     svec(1) = (Kaa_inv(1,1)*tvec(1)) + (Kaa_inv(1,2)*tvec(2))
     svec(2) = (Kaa_inv(2,1)*tvec(1)) + (Kaa_inv(2,2)*tvec(2))
