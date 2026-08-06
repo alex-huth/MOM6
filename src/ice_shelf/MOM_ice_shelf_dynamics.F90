@@ -475,6 +475,8 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! variation of the kink. Default 1.
   logical :: cutfem_sym_probe !< If true, run cutfem_symmetry_probe after each velocity solve and report
                             !! the worst mirror asymmetry of the ridge condensation. Diagnostic only.
+  logical :: cutfem_patch_mean_strain !< If true, subtract the element mean of the enhanced strain so
+                            !! that the element-local enrichment passes the constant-stress patch test.
   logical :: cutfem_consistent_quad !< If true, re-integrate the standard membrane block on cut cells
                             !! with the SEP2 sub-quadrature so that it, K_aU and K_aa all come from one
                             !! bilinear form, which is what makes the condensed operator positive
@@ -1569,6 +1571,20 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     if (CS%cutfem_gl_friction .and. .not. ((CS%cutfem_ridge_modes == 1) .or. &
         (CS%cutfem_ridge_modes == 2) .or. (CS%cutfem_ridge_modes == 4))) &
       call MOM_error(FATAL, "MOM_ice_shelf_dynamics: CUTFEM_RIDGE_MODES must be 1, 2 or 4.")
+    call get_param(param_file, mdl, "CUTFEM_PATCH_MEAN_STRAIN", CS%cutfem_patch_mean_strain, &
+                 "If true, subtract the element mean of the enhanced strain from the CutFEM ridge "//&
+                 "modes. Element-local enrichment amplitudes make a nonconforming element, which "//&
+                 "reproduces a constant-stress state exactly only if the enhanced strain is "//&
+                 "orthogonal to constant stress, i.e. if the integral of grad(psi_m) over the "//&
+                 "element vanishes. That holds for a single mode on a grid-aligned cut but not for "//&
+                 "the nodal mode set, and the classical consequence of failing it is a spurious "//&
+                 "low-energy mode of the hourglass family. Subtracting the mean enforces the "//&
+                 "condition by construction; it is the correction Taylor et al. applied to Wilson's "//&
+                 "incompatible modes, in the enhanced-strain form of Simo and Rifai. The membrane "//&
+                 "enrichment is then an enhanced strain rather than the gradient of a velocity "//&
+                 "field; the basal drag, which couples to the value of psi and not to its gradient, "//&
+                 "is unaffected. The probe's patch-test residual should read zero when this is set.", &
+                 default=.false., do_not_log=.not.CS%cutfem_gl_friction)
     call get_param(param_file, mdl, "CUTFEM_CONSISTENT_QUAD", CS%cutfem_consistent_quad, &
                  "If true, re-integrate the standard membrane block on CutFEM cut cells with the "//&
                  "SEP2 sub-quadrature that the ridge blocks use, instead of leaving it on the 2x2 "//&
@@ -8357,6 +8373,8 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   logical :: do_visc_qp                ! Evaluate Glen's law at each SEP2 QP rather than a cell mean
   logical :: do_cons_quad              ! Re-integrate the standard membrane on the SEP2 quadrature
   logical :: do_patch                  ! Accumulate the patch-test integral of grad(psi_m)
+  logical :: do_patch_fix              ! Subtract the element mean of the enhanced strain
+  real, dimension(8) :: gbar_x, gbar_y ! Element mean of grad(psi_m), subtracted when do_patch_fix
   real, dimension(8) :: igx, igy       ! Integral of grad(psi_m) over the cell [nondim]
   real, dimension(8) :: gmax           ! Largest |grad(psi_m)| at any QP [nondim]
   real :: wsum                         ! Sum of the QP weights, the cell measure [nondim]
@@ -8466,6 +8484,7 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   visc_qp = visc_qp / real(CS%visc_qps)
   nmodes = CS%cutfem_ridge_modes
 
+  do_patch_fix = CS%cutfem_patch_mean_strain
   do_visc_qp = present(h_visc_c)
   ! The standard membrane can only be re-integrated on the SEP2 rule if the viscosity is available
   ! there, so the two switch together.
@@ -8501,6 +8520,42 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
     rho_ice_g_LtoZ   = US%L_to_Z * CS%density_ice * CS%g_Earth
   endif
 
+  ! Patch-test correction. An element-local enrichment is a nonconforming element, and it
+  ! reproduces a constant-stress state exactly only if its enhanced strain is orthogonal to
+  ! constant stress, that is if the integral of grad(psi_m) over the element vanishes. The ridge
+  ! satisfies this for a single mode on a grid-aligned cut, where the two crossed edges cancel, but
+  ! the nodal weighting of CUTFEM_RIDGE_MODES=4 breaks the cancellation. Subtracting the element
+  ! mean enforces it by construction; it is the device Taylor et al. used to make Wilson's
+  ! incompatible modes pass the patch test, in the enhanced-strain form of Simo and Rifai. The
+  ! mean has to be known before the assembly, hence this light pre-pass.
+  gbar_x(:) = 0.0 ; gbar_y(:) = 0.0
+  if (do_patch_fix) then
+    wsum = 0.0 ; igx(:) = 0.0 ; igy(:) = 0.0
+    do t=1,4 ; do k=1,nqp(t)
+      b1 = beta(1,k,t) ; b2 = beta(2,k,t) ; b3 = beta(3,k,t) ; b4 = beta(4,k,t)
+      mS = b1 + b2 ; mN = b3 + b4 ; mW = b1 + b3 ; mE = b2 + b4
+      a = (dxCv_S * mS) + (dxCv_N * mN)
+      d = (dyCu_W * mW) + (dyCu_E * mE)
+      jac = (wref(k,t) * (a * d)) * IareaT
+      fls_loc = ((b1 * fls(1)) + (b4 * fls(4))) + ((b2 * fls(2)) + (b3 * fls(3)))
+      sgn = merge(1.0, -1.0, qpg(k,t))
+      psi_qp = (((b1*absfls(1)) + (b4*absfls(4))) + ((b2*absfls(2)) + (b3*absfls(3)))) - (sgn*fls_loc)
+      gx = (daxi(t)  - (sgn * dfxi(t)))  / a
+      gy = (daeta(t) - (sgn * dfeta(t))) / d
+      call cutfem_q1_grads(beta(:,k,t), a, d, dNxq, dNyq)
+      call cutfem_ridge_shapes(nmodes, beta(:,k,t), psi_qp, gx, gy, dNxq, dNyq, shp, gsx, gsy)
+      wsum = wsum + jac
+      do m=1,nmodes
+        igx(m) = igx(m) + (jac * gsx(m)) ; igy(m) = igy(m) + (jac * gsy(m))
+      enddo
+    enddo ; enddo
+    if (wsum > 0.0) then
+      do m=1,nmodes ; gbar_x(m) = igx(m)/wsum ; gbar_y(m) = igy(m)/wsum ; enddo
+    endif
+    ! The diagnostic accumulators are shared with the pre-pass, so restart them.
+    if (do_patch) then ; igx(:) = 0.0 ; igy(:) = 0.0 ; wsum = 0.0 ; endif
+  endif
+
   KaU(:,:) = 0.0 ; Kaa(:,:) = 0.0
 
   do t=1,4
@@ -8520,6 +8575,12 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
       ! --- Mode shapes and their physical gradients at this QP. ---
       call cutfem_q1_grads(beta(:,k,t), a, d, dNxq, dNyq)
       call cutfem_ridge_shapes(nmodes, beta(:,k,t), psi_qp, gx, gy, dNxq, dNyq, shp, gsx, gsy)
+
+      if (do_patch_fix) then
+        do m=1,nmodes
+          gsx(m) = gsx(m) - gbar_x(m) ; gsy(m) = gsy(m) - gbar_y(m)
+        enddo
+      endif
 
       ! Patch-test integral. An element-local enrichment is a nonconforming element, and Irons'
       ! criterion for those is that a constant-stress state be reproduced exactly. For the membrane
