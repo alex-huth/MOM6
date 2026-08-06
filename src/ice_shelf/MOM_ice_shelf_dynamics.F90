@@ -9641,6 +9641,43 @@ subroutine IS_dynamics_post_data_2(CS, ISS, G)
   endif
 end subroutine IS_dynamics_post_data_2
 
+!> Glen's-law effective viscosity and its Newton tangent factor at a single point.
+!!
+!! Factored out of calc_shelf_visc so that the CutFEM ridge blocks can evaluate the same law at
+!! the SEP2 sub-quadrature points instead of reusing a cell mean. The condensed operator
+!! K_uu - K_Ua K_aa^-1 K_aU is only guaranteed positive semi-definite if all three blocks come from
+!! one bilinear form, which means one viscosity per quadrature point shared by all of them; having
+!! two copies of the law would let that agreement drift.
+!!
+!! The vertically integrated viscosity carries the element area and thickness, so Ah is
+!! areaT*thickness and min_ice_visc is compared against the viscosity per unit Ah.
+pure subroutine shelf_visc_point(ux, uy, vx, vy, Ah, Visc_coef, n_g, eps_min, min_ice_visc, &
+                                 s_to_T, Pa_to_RL2_T2, visc, nvf)
+  real, intent(in)  :: ux           !< du/dx at the point [T-1 ~> s-1]
+  real, intent(in)  :: uy           !< du/dy at the point [T-1 ~> s-1]
+  real, intent(in)  :: vx           !< dv/dx at the point [T-1 ~> s-1]
+  real, intent(in)  :: vy           !< dv/dy at the point [T-1 ~> s-1]
+  real, intent(in)  :: Ah           !< Cell area times ice thickness [L2 Z ~> m3]
+  real, intent(in)  :: Visc_coef    !< AGlen_visc^(-1/n_g) [Pa-1 s-1]^(-1/n_g)
+  real, intent(in)  :: n_g          !< Glen's law exponent [nondim]
+  real, intent(in)  :: eps_min      !< Strain-rate regularization [T-1 ~> s-1]
+  real, intent(in)  :: min_ice_visc !< Floor on the viscosity per unit Ah [R L2 T-1 ~> Pa s]
+  real, intent(in)  :: s_to_T       !< US%s_to_T [T s-1]
+  real, intent(in)  :: Pa_to_RL2_T2 !< US%Pa_to_RL2_T2 [R L2 T-2 Pa-1]
+  real, intent(out) :: visc         !< Vertically integrated viscosity times area [R L4 Z T-1]
+  real, intent(out) :: nvf          !< Newton viscosity tangent factor [R L4 Z T]; 0 at the floor
+
+  real :: eps_e2 ! Effective strain rate squared, ux^2 + vy^2 + ux*vy + (uy+vx)^2/4 + eps_min^2 [T-2]
+
+  eps_e2 = ((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2)) + eps_min**2
+  visc = Ah * max(0.5 * Visc_coef * &
+      (s_to_T**2 * eps_e2)**((1.-n_g)/(2.*n_g)) * (Pa_to_RL2_T2*s_to_T), min_ice_visc)
+  ! The Newton correction coefficient is (1/n-1) * ice_visc / eps_e2. It is zero where the
+  ! viscosity is limited by min_ice_visc, since the viscosity is not smooth there.
+  nvf = 0.0
+  if (visc > min_ice_visc * Ah) nvf = ((1./n_g - 1.) / eps_e2) * visc
+end subroutine shelf_visc_point
+
 !> Update depth integrated viscosity, based on horizontal strain rates
 subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< A pointer to the ice shelf control structure
@@ -9728,22 +9765,13 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
              ((v_shlf(I-1,J) * CS%PhiC(6,i,j)) + &
               (v_shlf(I,J-1) * CS%PhiC(4,i,j)))
 
-        CS%ice_visc(i,j,1) = (G%areaT(i,j) * max(ISS%h_shelf(i,j),CS%min_h_shelf)) * &
-            max(0.5 * Visc_coef * &
-            (US%s_to_T**2 * (((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2)) + eps_min**2))**((1.-n_g)/(2.*n_g)) * &
-            (US%Pa_to_RL2_T2*US%s_to_T),CS%min_ice_visc)  ! Rescale after the fractional power law.
-        ! Store Newton tangent stiffness data: strain rates and coefficient for Newton iterations.
-        ! The Newton correction coefficient is (1/n-1)/2 * ice_visc / eps_e2,
-        ! where eps_e2 = ux^2 + vy^2 + ux*vy + (uy+vx)^2/4 + eps_min^2 [T-2].
-        ! It is zero where ice_visc is limited by min_ice_visc (viscosity is not smooth there).
+        call shelf_visc_point(ux, uy, vx, vy, &
+            G%areaT(i,j) * max(ISS%h_shelf(i,j),CS%min_h_shelf), Visc_coef, n_g, eps_min, &
+            CS%min_ice_visc, US%s_to_T, US%Pa_to_RL2_T2, &
+            CS%ice_visc(i,j,1), CS%newton_visc_factor(i,j,1))
+        ! Store the strain rates that set the direction of the Newton tangent's rank-1 update.
         CS%newton_str_ux(i,j,1) = ux ; CS%newton_str_vy(i,j,1) = vy
         CS%newton_str_sh(i,j,1) = uy + vx
-        CS%newton_visc_factor(i,j,1) = 0.0
-        if (CS%ice_visc(i,j,1) > CS%min_ice_visc * (G%areaT(i,j) * max(ISS%h_shelf(i,j),CS%min_h_shelf))) then
-          CS%newton_visc_factor(i,j,1) = ((1./n_g - 1.) / &
-              (((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2)) + eps_min**2)) * &
-              CS%ice_visc(i,j,1)
-        endif
       elseif (model_qp4) then
         !calculate viscosity at 4 quadrature points per cell
 
@@ -9782,19 +9810,12 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
                ((v_shlf(I,J-1) * CS%Phi(4,2*(jq-1)+iq,i,j)) + &
                 (v_shlf(I-1,J) * CS%Phi(6,2*(jq-1)+iq,i,j)))
 
-          CS%ice_visc(i,j,2*(jq-1)+iq) = (G%areaT(i,j) * h_gp) * &
-              max(0.5 * Visc_coef * &
-              (US%s_to_T**2*(((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2)) + eps_min**2))**((1.-n_g)/(2.*n_g)) * &
-              (US%Pa_to_RL2_T2*US%s_to_T),CS%min_ice_visc)  ! Rescale after the fractional power law.
-          ! Store Newton tangent stiffness data at each quadrature point.
+          call shelf_visc_point(ux, uy, vx, vy, G%areaT(i,j) * h_gp, Visc_coef, n_g, eps_min, &
+              CS%min_ice_visc, US%s_to_T, US%Pa_to_RL2_T2, &
+              CS%ice_visc(i,j,2*(jq-1)+iq), CS%newton_visc_factor(i,j,2*(jq-1)+iq))
+          ! Store the strain rates that set the direction of the Newton tangent's rank-1 update.
           CS%newton_str_ux(i,j,2*(jq-1)+iq) = ux ; CS%newton_str_vy(i,j,2*(jq-1)+iq) = vy
           CS%newton_str_sh(i,j,2*(jq-1)+iq) = (uy + vx)
-          CS%newton_visc_factor(i,j,2*(jq-1)+iq) = 0.0
-          if (CS%ice_visc(i,j,2*(jq-1)+iq) > CS%min_ice_visc * (G%areaT(i,j) * h_gp)) then
-            CS%newton_visc_factor(i,j,2*(jq-1)+iq) = ((1./n_g - 1.) / &
-                (((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2)) + eps_min**2)) * &
-                CS%ice_visc(i,j,2*(jq-1)+iq)
-          endif
         enddo ; enddo
       endif
     endif
