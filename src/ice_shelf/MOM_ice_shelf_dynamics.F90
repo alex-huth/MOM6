@@ -8805,10 +8805,10 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
 
   do j=js-1,je+1 ; do i=is-1,ie+1
     if (G%mask2dT(i,j) < 0.5) cycle
-    ! Restrict to genuine grounding-line cells, exactly where the friction ridge fires in CG_action
-    ! (ground_frac in (0,1)). Without this, across-wall halo cells with default fls_corner look
-    ! "mixed" and poison boundary nodes.
-    if (.not. (CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0)) cycle
+    ! No ground_frac gate: the operator, the preconditioner and the load correction all dropped
+    ! theirs, so gating here would make the diagnostic blind to exactly the near-face cells the
+    ! ridge is most active in. The mixed-sign test below is the operator's own criterion, and it
+    ! also excludes the across-wall halo cells whose default fls_corner looks "mixed".
 
     ! Build the same corner deficit/thickness the cut branch of CG_action uses.
     if (fv_sub_fric) then
@@ -8897,12 +8897,44 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
                         cutfem_mem_couple(2, gsx(m), gsy(m), 2, gsx(m), gsy(m))))
         enddo
 
+        ! Basal drag coupling: grounded QPs feed the ridge; all QPs feed m_all normalizer.
+        u_curr_loc = ((b1*uc(1)) + (b4*uc(4))) + ((b2*uc(2)) + (b3*uc(3)))
+        v_curr_loc = ((b1*vc(1)) + (b4*vc(4))) + ((b2*vc(2)) + (b3*vc(3)))
+        unorm2_loc = ((u_curr_loc**2) + (v_curr_loc**2)) + eps_vel2
+        if (do_coulomb) then
+          hloc = ((b1*hc(1)) + (b4*hc(4))) + ((b2*hc(2)) + (b3*hc(3)))
+          if (do_DG) then
+            hloc = max(hloc, CS%min_h_shelf)
+            bed_sub = ((b1*bedc(1)) + (b4*bedc(4))) + ((b2*bedc(2)) + (b3*bedc(3)))
+            fB_local = compute_fB_local(hloc, bed_sub, rho_oi_ratio, rho_ice_g_LtoZ, &
+                CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
+                CS%CF_PostPeak, CS%n_basal_fric)
+          else
+            fB_local = compute_fB_from_N( &
+                subgrid_effective_pressure(fls_loc, hloc, dens_ratio, rho_ocean_g_LtoZ), &
+                CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
+                CS%CF_PostPeak, CS%n_basal_fric)
+          endif
+        else
+          fB_local = fB_e
+        endif
+        call compute_basal_coef(unorm2_loc, coef_prefactor, min_trac_area, fB_local, &
+            CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .false., &
+            basal_coef_loc, drag_newt_loc)
+
+        ! Actual-velocity x-drag force delivered to each corner: m_all over all QPs (the "fully
+        ! grounded" reference), m_g over grounded QPs (the leaked force). Velocity-weighted so the
+        ! ridge's effect on the true kinked flow shows up (a rigid probe only sees the row sum).
+        do c=1,4
+          m_all(c) = m_all(c) + ((jac * basal_coef_loc * beta(c,k,t)) * u_curr_loc)
+        enddo
         if (qpg(k,t)) then
           do m=1,nmodes
             bcw = (jac * basal_coef_loc) * shp(m)
             do c=1,4
               KaU(2*m-1,c)   = KaU(2*m-1,c)   + (bcw * beta(c,k,t))
               KaU(2*m,  c+4) = KaU(2*m,  c+4) + (bcw * beta(c,k,t))
+              if (m == 1) m_g(c) = m_g(c) + ((jac * basal_coef_loc * beta(c,k,t)) * u_curr_loc)
             enddo
             do n=1,nmodes
               Kaa(2*m-1,2*n-1) = Kaa(2*m-1,2*n-1) + ((jac * basal_coef_loc) * (shp(m)*shp(n)))
