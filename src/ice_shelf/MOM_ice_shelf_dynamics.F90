@@ -6276,6 +6276,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   real, dimension(2) :: xquad  ! Nondimensional quadrature ratios [nondim]
   real, dimension(2,2) :: Usub, Vsub  ! Subgrid nodal contributions to basal traction [R L3 Z T-2 ~> kg m s-2]
   real, dimension(2,2) :: Ucorr, Vcorr ! CutFEM ridge condensation correction to the nodal action [R L3 Z T-2]
+  logical :: cf_corners_ok             ! True if all four corner flotation values are usable (FV path only)
   real, dimension(4)   :: fls_cf       ! Corner flotation deficit for the CutFEM ridge, SW,SE,NW,NE [Z ~> m]
   real, dimension(4)   :: hc_cf        ! Corner thickness for the CutFEM ridge, SW,SE,NW,NE [Z ~> m]
   real, dimension(4)   :: bedc_cf      ! Corner bed elevation for the CutFEM ridge (DG mode), SW,SE,NW,NE [Z ~> m]
@@ -6568,45 +6569,58 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
         if (vmask(I  ,J-1) == 1) vret_b(I  ,J-1,3) = vret_b(I  ,J-1,3) + Vsub(2,1)
         if (vmask(I  ,J  ) == 1) vret_b(I  ,J  ,1) = vret_b(I  ,J  ,1) + Vsub(2,2)
 
-        ! CutFEM ridge enrichment: statically-condensed correction that decouples grounded drag
-        ! from floating corners without lumping. Uses the same SEP2 partition; the ridge level set
-        ! is the corner flotation deficit (fls_corner under FV_SUBGRID, else r*h_nodal - bed_node).
-        if (CS%cutfem_gl_friction .and. (fv_sub_fric .or. do_DG)) then
-          if (fv_sub_fric) then
-            ! Corner thickness and the SAME flotation-deficit field the drag block used.
-            hc_cf(1)  = CS%H_corner(I-1,J-1)   ; hc_cf(2)  = CS%H_corner(I,J-1)
-            hc_cf(3)  = CS%H_corner(I-1,J  )   ; hc_cf(4)  = CS%H_corner(I,J  )
-            fls_cf(1) = CS%fls_corner(I-1,J-1) ; fls_cf(2) = CS%fls_corner(I,J-1)
-            fls_cf(3) = CS%fls_corner(I-1,J  ) ; fls_cf(4) = CS%fls_corner(I,J  )
-            call cutfem_condense_sep2(CS, G, US, i, j, fls_cf, hc_cf, &
-                u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
-                u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
-                CS%ice_visc(i,j,:), fB_e, G%dxCv(i,j-1), G%dxCv(i,j), &
-                G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr, &
-                use_newton=use_newton)
-          else  ! do_DG: bed and (unclamped) nodal thickness define the partition, matching
-                ! the DG branch of CG_action_sep2_basal (fls = r*h_nodal - bed, no min_h clamp).
-            hc_cf(1)  = hgate(i,j,1,1) ; hc_cf(2)  = hgate(i,j,2,1)
-            hc_cf(3)  = hgate(i,j,1,2) ; hc_cf(4)  = hgate(i,j,2,2)
-            bedc_cf(1) = CS%bed_node(I-1,J-1) ; bedc_cf(2) = CS%bed_node(I  ,J-1)
-            bedc_cf(3) = CS%bed_node(I-1,J  ) ; bedc_cf(4) = CS%bed_node(I  ,J  )
-            fls_cf(:) = (dens_ratio * hc_cf(:)) - bedc_cf(:)
-            call cutfem_condense_sep2(CS, G, US, i, j, fls_cf, hc_cf, &
-                u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
-                u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
-                CS%ice_visc(i,j,:), fB_e, G%dxCv(i,j-1), G%dxCv(i,j), &
-                G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr, bedc=bedc_cf, &
-                use_newton=use_newton)
-          endif
-          if (umask(I-1,J-1) == 1) uret_b(I-1,J-1,4) = uret_b(I-1,J-1,4) + Ucorr(1,1)
-          if (umask(I-1,J  ) == 1) uret_b(I-1,J  ,2) = uret_b(I-1,J  ,2) + Ucorr(1,2)
-          if (umask(I  ,J-1) == 1) uret_b(I  ,J-1,3) = uret_b(I  ,J-1,3) + Ucorr(2,1)
-          if (umask(I  ,J  ) == 1) uret_b(I  ,J  ,1) = uret_b(I  ,J  ,1) + Ucorr(2,2)
-          if (vmask(I-1,J-1) == 1) vret_b(I-1,J-1,4) = vret_b(I-1,J-1,4) + Vcorr(1,1)
-          if (vmask(I-1,J  ) == 1) vret_b(I-1,J  ,2) = vret_b(I-1,J  ,2) + Vcorr(1,2)
-          if (vmask(I  ,J-1) == 1) vret_b(I  ,J-1,3) = vret_b(I  ,J-1,3) + Vcorr(2,1)
-          if (vmask(I  ,J  ) == 1) vret_b(I  ,J  ,1) = vret_b(I  ,J  ,1) + Vcorr(2,2)
+      endif
+      ! CutFEM ridge enrichment: statically-condensed correction that decouples grounded drag
+      ! from floating corners without lumping. Uses the same SEP2 partition; the ridge level set
+      ! is the corner flotation deficit (fls_corner under FV_SUBGRID, else r*h_nodal - bed_node).
+      ! Deliberately NOT gated on 0 < ground_frac < 1: cutfem_condense_sep2 returns zero of its own
+      ! accord on any cell whose corner deficits share a sign, and it does so continuously, whereas
+      ! a ground_frac branch here switches the whole correction on and off as the grounding line
+      ! crosses a cell edge. GL_regularize, and the exclusion of GL_QUADRANT_FRICTION and
+      ! LOCAL_BASAL_FRICTION, are already enforced as FATALs when CUTFEM_GL_FRICTION is set.
+      ! Widening the guard above brings in cells the ground_frac branch used to exclude, so the
+      ! corner-validity test that cutfem_taud_ridge_rhs already applies is needed here too: an
+      ! across-wall halo corner carries a default fls_corner that can make an uncut cell look
+      ! mixed-sign. The DG path builds fls from bed_node and hgate, which are valid everywhere.
+      cf_corners_ok = .true.
+      if (CS%cutfem_gl_friction .and. fv_sub_fric) &
+        cf_corners_ok = ((CS%corner_valid(I-1,J-1) .and. CS%corner_valid(I,J-1)) .and. &
+                         (CS%corner_valid(I-1,J  ) .and. CS%corner_valid(I,J  )))
+      if (CS%cutfem_gl_friction .and. (fv_sub_fric .or. do_DG) .and. cf_corners_ok) then
+        if (fv_sub_fric) then
+          ! Corner thickness and the SAME flotation-deficit field the drag block used.
+          hc_cf(1)  = CS%H_corner(I-1,J-1)   ; hc_cf(2)  = CS%H_corner(I,J-1)
+          hc_cf(3)  = CS%H_corner(I-1,J  )   ; hc_cf(4)  = CS%H_corner(I,J  )
+          fls_cf(1) = CS%fls_corner(I-1,J-1) ; fls_cf(2) = CS%fls_corner(I,J-1)
+          fls_cf(3) = CS%fls_corner(I-1,J  ) ; fls_cf(4) = CS%fls_corner(I,J  )
+          call cutfem_condense_sep2(CS, G, US, i, j, fls_cf, hc_cf, &
+              u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+              u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
+              CS%ice_visc(i,j,:), fB_e, G%dxCv(i,j-1), G%dxCv(i,j), &
+              G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr, &
+              use_newton=use_newton)
+        else  ! do_DG: bed and (unclamped) nodal thickness define the partition, matching
+              ! the DG branch of CG_action_sep2_basal (fls = r*h_nodal - bed, no min_h clamp).
+          hc_cf(1)  = hgate(i,j,1,1) ; hc_cf(2)  = hgate(i,j,2,1)
+          hc_cf(3)  = hgate(i,j,1,2) ; hc_cf(4)  = hgate(i,j,2,2)
+          bedc_cf(1) = CS%bed_node(I-1,J-1) ; bedc_cf(2) = CS%bed_node(I  ,J-1)
+          bedc_cf(3) = CS%bed_node(I-1,J  ) ; bedc_cf(4) = CS%bed_node(I  ,J  )
+          fls_cf(:) = (dens_ratio * hc_cf(:)) - bedc_cf(:)
+          call cutfem_condense_sep2(CS, G, US, i, j, fls_cf, hc_cf, &
+              u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+              u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
+              CS%ice_visc(i,j,:), fB_e, G%dxCv(i,j-1), G%dxCv(i,j), &
+              G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr, bedc=bedc_cf, &
+              use_newton=use_newton)
         endif
+        if (umask(I-1,J-1) == 1) uret_b(I-1,J-1,4) = uret_b(I-1,J-1,4) + Ucorr(1,1)
+        if (umask(I-1,J  ) == 1) uret_b(I-1,J  ,2) = uret_b(I-1,J  ,2) + Ucorr(1,2)
+        if (umask(I  ,J-1) == 1) uret_b(I  ,J-1,3) = uret_b(I  ,J-1,3) + Ucorr(2,1)
+        if (umask(I  ,J  ) == 1) uret_b(I  ,J  ,1) = uret_b(I  ,J  ,1) + Ucorr(2,2)
+        if (vmask(I-1,J-1) == 1) vret_b(I-1,J-1,4) = vret_b(I-1,J-1,4) + Vcorr(1,1)
+        if (vmask(I-1,J  ) == 1) vret_b(I-1,J  ,2) = vret_b(I-1,J  ,2) + Vcorr(1,2)
+        if (vmask(I  ,J-1) == 1) vret_b(I  ,J-1,3) = vret_b(I  ,J-1,3) + Vcorr(2,1)
+        if (vmask(I  ,J  ) == 1) vret_b(I  ,J  ,1) = vret_b(I  ,J  ,1) + Vcorr(2,2)
       endif
   endif ; enddo ; enddo
 
@@ -7129,6 +7143,7 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
   real, dimension(2,2) :: Ucorr, Vcorr    ! Per-element CutFEM diagonal correction [R L2 Z T-1 ~> kg s-1]
   real, dimension(4)   :: fls_cf, hc_cf, bedc_cf ! Corner flotation deficit, thickness and bed for the
                          ! CutFEM ridge, SW,SE,NW,NE [Z ~> m]
+  logical :: cf_corners_ok ! True if all four corner flotation values are usable (FV path only)
   logical :: do_newton_visc  ! Whether to apply viscosity-related Newton tangent stiffness corrections
   logical :: visc_qp4
   integer :: i, j, isc, jsc, iec, jec, iphi, jphi, iq, jq, ilq, jlq, Itgt, Jtgt, qp, qpv
@@ -7391,43 +7406,53 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
       if (CS%vmask(I  ,J-1)==1) v_diag_b(I  ,J-1,3) = v_diag_b(I  ,J-1,3) + v_diag_sub(2,1)
       if (CS%vmask(I  ,J  )==1) v_diag_b(I  ,J  ,1) = v_diag_b(I  ,J  ,1) + v_diag_sub(2,2)
 
-      ! Diagonal of the CutFEM ridge condensation, so the Jacobi preconditioner sees the operator
-      ! CG_action actually applies. The Schur correction is negative semi-definite, so without this
-      ! the preconditioner systematically overestimates the near-grounding-line diagonal.
-      if (CS%cutfem_gl_friction .and. (fv_sub_fric .or. do_DG)) then
-        if (fv_sub_fric) then
-          hc_cf(1)  = CS%H_corner(I-1,J-1)   ; hc_cf(2)  = CS%H_corner(I,J-1)
-          hc_cf(3)  = CS%H_corner(I-1,J  )   ; hc_cf(4)  = CS%H_corner(I,J  )
-          fls_cf(1) = CS%fls_corner(I-1,J-1) ; fls_cf(2) = CS%fls_corner(I,J-1)
-          fls_cf(3) = CS%fls_corner(I-1,J  ) ; fls_cf(4) = CS%fls_corner(I,J  )
-          call cutfem_condense_sep2(CS, G, US, i, j, fls_cf, hc_cf, &
-              u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
-              u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
-              CS%ice_visc(i,j,:), fB_e, G%dxCv(i,j-1), G%dxCv(i,j), &
-              G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr, &
-              use_newton=CS%doing_newton, diag_only=.true.)
-        else
-          hc_cf(1)  = hgate(i,j,1,1) ; hc_cf(2)  = hgate(i,j,2,1)
-          hc_cf(3)  = hgate(i,j,1,2) ; hc_cf(4)  = hgate(i,j,2,2)
-          bedc_cf(1) = CS%bed_node(I-1,J-1) ; bedc_cf(2) = CS%bed_node(I  ,J-1)
-          bedc_cf(3) = CS%bed_node(I-1,J  ) ; bedc_cf(4) = CS%bed_node(I  ,J  )
-          fls_cf(:) = (dens_ratio * hc_cf(:)) - bedc_cf(:)
-          call cutfem_condense_sep2(CS, G, US, i, j, fls_cf, hc_cf, &
-              u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
-              u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
-              CS%ice_visc(i,j,:), fB_e, G%dxCv(i,j-1), G%dxCv(i,j), &
-              G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr, &
-              bedc=bedc_cf, use_newton=CS%doing_newton, diag_only=.true.)
-        endif
-        if (CS%umask(I-1,J-1)==1) cut_du(I-1,J-1) = cut_du(I-1,J-1) + Ucorr(1,1)
-        if (CS%umask(I  ,J-1)==1) cut_du(I  ,J-1) = cut_du(I  ,J-1) + Ucorr(2,1)
-        if (CS%umask(I-1,J  )==1) cut_du(I-1,J  ) = cut_du(I-1,J  ) + Ucorr(1,2)
-        if (CS%umask(I  ,J  )==1) cut_du(I  ,J  ) = cut_du(I  ,J  ) + Ucorr(2,2)
-        if (CS%vmask(I-1,J-1)==1) cut_dv(I-1,J-1) = cut_dv(I-1,J-1) + Vcorr(1,1)
-        if (CS%vmask(I  ,J-1)==1) cut_dv(I  ,J-1) = cut_dv(I  ,J-1) + Vcorr(2,1)
-        if (CS%vmask(I-1,J  )==1) cut_dv(I-1,J  ) = cut_dv(I-1,J  ) + Vcorr(1,2)
-        if (CS%vmask(I  ,J  )==1) cut_dv(I  ,J  ) = cut_dv(I  ,J  ) + Vcorr(2,2)
+    endif
+    ! Diagonal of the CutFEM ridge condensation, so the Jacobi preconditioner sees the operator
+    ! CG_action actually applies. The Schur correction is negative semi-definite, so without this
+    ! the preconditioner systematically overestimates the near-grounding-line diagonal. Guarded the
+    ! same way as the operator: no ground_frac branch, the routine returns zero continuously on
+    ! cells whose corner deficits share a sign.
+    ! Widening the guard above brings in cells the ground_frac branch used to exclude, so the
+    ! corner-validity test that cutfem_taud_ridge_rhs already applies is needed here too: an
+    ! across-wall halo corner carries a default fls_corner that can make an uncut cell look
+    ! mixed-sign. The DG path builds fls from bed_node and hgate, which are valid everywhere.
+    cf_corners_ok = .true.
+    if (CS%cutfem_gl_friction .and. fv_sub_fric) &
+      cf_corners_ok = ((CS%corner_valid(I-1,J-1) .and. CS%corner_valid(I,J-1)) .and. &
+                       (CS%corner_valid(I-1,J  ) .and. CS%corner_valid(I,J  )))
+    if (CS%cutfem_gl_friction .and. (fv_sub_fric .or. do_DG) .and. cf_corners_ok) then
+      if (fv_sub_fric) then
+        hc_cf(1)  = CS%H_corner(I-1,J-1)   ; hc_cf(2)  = CS%H_corner(I,J-1)
+        hc_cf(3)  = CS%H_corner(I-1,J  )   ; hc_cf(4)  = CS%H_corner(I,J  )
+        fls_cf(1) = CS%fls_corner(I-1,J-1) ; fls_cf(2) = CS%fls_corner(I,J-1)
+        fls_cf(3) = CS%fls_corner(I-1,J  ) ; fls_cf(4) = CS%fls_corner(I,J  )
+        call cutfem_condense_sep2(CS, G, US, i, j, fls_cf, hc_cf, &
+            u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+            u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+            CS%ice_visc(i,j,:), fB_e, G%dxCv(i,j-1), G%dxCv(i,j), &
+            G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr, &
+            use_newton=CS%doing_newton, diag_only=.true.)
+      else
+        hc_cf(1)  = hgate(i,j,1,1) ; hc_cf(2)  = hgate(i,j,2,1)
+        hc_cf(3)  = hgate(i,j,1,2) ; hc_cf(4)  = hgate(i,j,2,2)
+        bedc_cf(1) = CS%bed_node(I-1,J-1) ; bedc_cf(2) = CS%bed_node(I  ,J-1)
+        bedc_cf(3) = CS%bed_node(I-1,J  ) ; bedc_cf(4) = CS%bed_node(I  ,J  )
+        fls_cf(:) = (dens_ratio * hc_cf(:)) - bedc_cf(:)
+        call cutfem_condense_sep2(CS, G, US, i, j, fls_cf, hc_cf, &
+            u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+            u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+            CS%ice_visc(i,j,:), fB_e, G%dxCv(i,j-1), G%dxCv(i,j), &
+            G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr, &
+            bedc=bedc_cf, use_newton=CS%doing_newton, diag_only=.true.)
       endif
+      if (CS%umask(I-1,J-1)==1) cut_du(I-1,J-1) = cut_du(I-1,J-1) + Ucorr(1,1)
+      if (CS%umask(I  ,J-1)==1) cut_du(I  ,J-1) = cut_du(I  ,J-1) + Ucorr(2,1)
+      if (CS%umask(I-1,J  )==1) cut_du(I-1,J  ) = cut_du(I-1,J  ) + Ucorr(1,2)
+      if (CS%umask(I  ,J  )==1) cut_du(I  ,J  ) = cut_du(I  ,J  ) + Ucorr(2,2)
+      if (CS%vmask(I-1,J-1)==1) cut_dv(I-1,J-1) = cut_dv(I-1,J-1) + Vcorr(1,1)
+      if (CS%vmask(I  ,J-1)==1) cut_dv(I  ,J-1) = cut_dv(I  ,J-1) + Vcorr(2,1)
+      if (CS%vmask(I-1,J  )==1) cut_dv(I-1,J  ) = cut_dv(I-1,J  ) + Vcorr(1,2)
+      if (CS%vmask(I  ,J  )==1) cut_dv(I  ,J  ) = cut_dv(I  ,J  ) + Vcorr(2,2)
     endif
   endif ; enddo ; enddo
 
@@ -8232,6 +8257,15 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
 
   Ucorr(:,:) = 0.0 ; Vcorr(:,:) = 0.0
 
+  ! The ridge vanishes identically on a cell whose corner deficits all share a sign, because then
+  ! sum_c |fls_c| N_c = |sum_c fls_c N_c|. Returning zero here, rather than excluding such cells
+  ! with a ground_frac test at the call site, is what makes the correction a CONTINUOUS function of
+  ! grounding-line position: as the last minority corner approaches flotation its |fls_c| -> 0, so
+  ! psi -> 0 and the correction fades out smoothly instead of being switched off by a branch. A
+  ! branch there is a state discontinuity of the full correction size (order 6% of the nodal force
+  ! in MISMIP3D), sitting exactly where the steady grounding line parks.
+  if ((minval(fls) >= 0.0) .or. (maxval(fls) <= 0.0)) return
+
   ! Corner |fls| and its P1 gradient (both P1 operators so the ridge kink sits on the cut).
   absfls(:) = abs(fls(:))
   call sep2_cell_qps(fls, nqp, beta, wref, qpg)
@@ -9035,9 +9069,10 @@ subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, den
 
   do j=js-1,je+1 ; do i=is-1,ie+1
     if (ISS%hmask(i,j) /= 1 .and. ISS%hmask(i,j) /= 3) cycle
-    ! Restrict to genuine grounding-line cells, matching where the friction ridge fires in CG_action
-    ! (ground_frac in (0,1)); excludes across-wall halo cells whose default fls_corner looks "mixed".
-    if (.not. (CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0)) cycle
+    ! No ground_frac branch here, matching the friction ridge in CG_action: the mixed-sign test
+    ! below is the continuous criterion, and gating on ground_frac in (0,1) instead would switch the
+    ! whole RHS correction on and off as the grounding line crosses a cell edge. The corner_valid
+    ! test still excludes across-wall halo cells, whose default fls_corner can look "mixed".
     if (.not. do_DG) then
       if (.not. (CS%corner_valid(I-1,J-1) .and. CS%corner_valid(I,J-1) .and. &
                  CS%corner_valid(I-1,J  ) .and. CS%corner_valid(I,J  ))) cycle
