@@ -8140,6 +8140,34 @@ subroutine cutfem_spd_solve(n, A, floor_piv, b, x, n_floored)
   enddo
 end subroutine cutfem_spd_solve
 
+!> Bilinear (Q1) shape-function gradients at a SEP2 quadrature point.
+!!
+!! The SEP2 machinery carries the corner-basis weights N_c at each sub-quadrature point, and the
+!! reference coordinates follow from them directly, xi = N_SE + N_NE and eta = N_NW + N_NE. The Q1
+!! gradients are then analytic. This matters because K_uu is assembled in CG_action from the true
+!! bilinear gradients, so the ridge blocks must use the same ones: the Schur complement
+!! K_Ua K_aa^-1 K_aU is only guaranteed to leave a positive semi-definite operator behind if all
+!! three blocks come from one bilinear form on one space. Using the P1 fan gradients here instead
+!! makes the enrichment couple to a different element than the one it is subtracted from, and the
+!! condensed operator can then lose positive definiteness. The ridge psi itself keeps its P1 fan
+!! gradient, because its kink has to lie exactly on the SEP2 cut, which is the P1 contour.
+subroutine cutfem_q1_grads(bqp, a, d, dNx, dNy)
+  real, dimension(4), intent(in)  :: bqp !< Corner-basis weights N_c at the QP, SW,SE,NW,NE [nondim]
+  real,               intent(in)  :: a   !< Interpolated cell-edge spacing in x at the QP [L ~> m]
+  real,               intent(in)  :: d   !< Interpolated cell-edge spacing in y at the QP [L ~> m]
+  real, dimension(4), intent(out) :: dNx !< d(N_c)/dx at the QP [L-1 ~> m-1]
+  real, dimension(4), intent(out) :: dNy !< d(N_c)/dy at the QP [L-1 ~> m-1]
+
+  real :: xi, eta ! Reference coordinates of the QP [nondim]
+
+  xi  = bqp(2) + bqp(4)
+  eta = bqp(3) + bqp(4)
+  dNx(1) = -(1.0 - eta) / a ; dNx(2) =  (1.0 - eta) / a
+  dNx(3) = -eta / a         ; dNx(4) =  eta / a
+  dNy(1) = -(1.0 - xi) / d  ; dNy(2) = -xi / d
+  dNy(3) =  (1.0 - xi) / d  ; dNy(4) =  xi / d
+end subroutine cutfem_q1_grads
+
 !> Evaluate the CutFEM ridge mode shapes and their physical gradients at one SEP2 quadrature point.
 !!
 !! The mode set is selected by CUTFEM_RIDGE_MODES:
@@ -8159,38 +8187,35 @@ end subroutine cutfem_spd_solve
 !!                                basis-invariant.
 !!
 !! The gradient of a nodal shape follows the product rule, grad(N_c psi) = psi grad(N_c) + N_c grad(psi).
-subroutine cutfem_ridge_shapes(nmodes, bqp, psi_qp, gx, gy, dNxi_t, dNeta_t, a, d, shp, gsx, gsy)
+subroutine cutfem_ridge_shapes(nmodes, bqp, psi_qp, gx, gy, dNx, dNy, shp, gsx, gsy)
   integer,            intent(in)  :: nmodes  !< Number of enrichment shapes (1, 2 or 4)
   real, dimension(4), intent(in)  :: bqp     !< Corner-basis weights N_c at the QP [nondim]
   real,               intent(in)  :: psi_qp  !< Ridge value at the QP [Z ~> m]
   real,               intent(in)  :: gx      !< Physical ridge gradient, x [nondim]
   real,               intent(in)  :: gy      !< Physical ridge gradient, y [nondim]
-  real, dimension(4), intent(in)  :: dNxi_t  !< d(N_c)/dxi on this parent triangle [nondim]
-  real, dimension(4), intent(in)  :: dNeta_t !< d(N_c)/deta on this parent triangle [nondim]
-  real,               intent(in)  :: a       !< Interpolated cell-edge spacing in x at the QP [L ~> m]
-  real,               intent(in)  :: d       !< Interpolated cell-edge spacing in y at the QP [L ~> m]
+  real, dimension(4), intent(in)  :: dNx     !< Physical Q1 gradient d(N_c)/dx [L-1 ~> m-1]
+  real, dimension(4), intent(in)  :: dNy     !< Physical Q1 gradient d(N_c)/dy [L-1 ~> m-1]
   real, dimension(8), intent(out) :: shp     !< Mode shape values [Z ~> m]
   real, dimension(8), intent(out) :: gsx     !< Physical mode gradients, x [nondim]
   real, dimension(8), intent(out) :: gsy     !< Physical mode gradients, y [nondim]
 
   real :: mu           ! East reference coordinate xi at the QP [nondim]
-  real :: dmu_dx, dmu_dy ! Physical gradient of xi [L-1 ~> m-1]
   integer :: m
 
   shp(:) = 0.0 ; gsx(:) = 0.0 ; gsy(:) = 0.0
   if (nmodes == 4) then
     do m=1,4
       shp(m) = bqp(m) * psi_qp
-      gsx(m) = (bqp(m) * gx) + (psi_qp * (dNxi_t(m) / a))
-      gsy(m) = (bqp(m) * gy) + (psi_qp * (dNeta_t(m) / d))
+      gsx(m) = (bqp(m) * gx) + (psi_qp * dNx(m))
+      gsy(m) = (bqp(m) * gy) + (psi_qp * dNy(m))
     enddo
   else
     shp(1) = psi_qp ; gsx(1) = gx ; gsy(1) = gy
     if (nmodes == 2) then
       mu = bqp(2) + bqp(4)
-      dmu_dx = (dNxi_t(2) + dNxi_t(4)) / a ; dmu_dy = (dNeta_t(2) + dNeta_t(4)) / d
       shp(2) = psi_qp * mu
-      gsx(2) = (mu * gx) + (psi_qp * dmu_dx) ; gsy(2) = (mu * gy) + (psi_qp * dmu_dy)
+      gsx(2) = (mu * gx) + (psi_qp * (dNx(2) + dNx(4)))
+      gsy(2) = (mu * gy) + (psi_qp * (dNy(2) + dNy(4)))
     endif
   endif
 end subroutine cutfem_ridge_shapes
@@ -8266,6 +8291,7 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
                                        ! shape; cols are (u1..4, v1..4) [R L4 Z T-1]
   real, dimension(8,8)   :: Kaa        ! Ridge self-stiffness, 2*nmodes square [R L4 Z T-1]
   real, dimension(8)     :: shp        ! Mode shape values at the QP [Z ~> m]
+  real, dimension(4)     :: dNxq, dNyq ! Physical Q1 corner-basis gradients at the QP [L-1 ~> m-1]
   real, dimension(8)     :: gsx, gsy   ! Physical mode gradients at the QP [nondim]
   real :: b1, b2, b3, b4               ! Corner-basis weights at the QP [nondim]
   real :: mS, mN, mW, mE               ! Marginal edge weights [nondim]
@@ -8401,15 +8427,15 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
       gy = (daeta(t) - (sgn * dfeta(t))) / d
 
       ! --- Mode shapes and their physical gradients at this QP. ---
-      call cutfem_ridge_shapes(nmodes, beta(:,k,t), psi_qp, gx, gy, dNxi(:,t), dNeta(:,t), &
-                               a, d, shp, gsx, gsy)
+      call cutfem_q1_grads(beta(:,k,t), a, d, dNxq, dNyq)
+      call cutfem_ridge_shapes(nmodes, beta(:,k,t), psi_qp, gx, gy, dNxq, dNyq, shp, gsx, gsy)
 
       ! --- Membrane (viscous) coupling, all QPs. SSA bilinear form; see CG_action. Row 2m-1 is
       !     mode m acting as a u-field shape, row 2m as a v-field shape. ---
       jvisc = jac * visc_qp
       do m=1,nmodes
         do c=1,4
-          dNx = dNxi(c,t) / a ; dNy = dNeta(c,t) / d
+          dNx = dNxq(c) ; dNy = dNyq(c)
           KaU(2*m-1,c)   = KaU(2*m-1,c)   + (jvisc * cutfem_mem_couple(1, gsx(m), gsy(m), 1, dNx, dNy))
           KaU(2*m-1,c+4) = KaU(2*m-1,c+4) + (jvisc * cutfem_mem_couple(1, gsx(m), gsy(m), 2, dNx, dNy))
           KaU(2*m,  c)   = KaU(2*m,  c)   + (jvisc * cutfem_mem_couple(2, gsx(m), gsy(m), 1, dNx, dNy))
@@ -8438,7 +8464,7 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
           Gm(2*m  ) = (tw_s * gsx(m)) + (tw_y * gsy(m))
         enddo
         do c=1,4
-          dNx = dNxi(c,t) / a ; dNy = dNeta(c,t) / d
+          dNx = dNxq(c) ; dNy = dNyq(c)
           Gc(c)   = (tw_x * dNx) + (tw_s * dNy)
           Gc(c+4) = (tw_s * dNx) + (tw_y * dNy)
         enddo
@@ -8768,6 +8794,7 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
   real, dimension(8,8)   :: KaU            ! Ridge-to-std stiffness [R L3 Z T-1]
   real, dimension(8,8)   :: Kaa, Kaa_f     ! Ridge self-stiffness and its Cholesky working copy
   real, dimension(8)     :: shp, gsx, gsy  ! Mode shapes [Z ~> m] and their gradients [nondim]
+  real, dimension(4)     :: dNxq, dNyq ! Physical Q1 corner-basis gradients at the QP [L-1 ~> m-1]
   real, dimension(2,2)   :: Kaa_inv        ! Inverse ridge self-stiffness (single-mode path)
   real, dimension(8)     :: tvec, svec     ! Probe intermediates
   real :: b1, b2, b3, b4, mS, mN, mW, mE, a, d, jac, jvisc
@@ -8871,12 +8898,12 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
         gx = (daxi(t)  - (sgn * dfxi(t)))  / a
         gy = (daeta(t) - (sgn * dfeta(t))) / d
 
-        call cutfem_ridge_shapes(nmodes, beta(:,k,t), psi_qp, gx, gy, dNxi(:,t), dNeta(:,t), &
-                                 a, d, shp, gsx, gsy)
+        call cutfem_q1_grads(beta(:,k,t), a, d, dNxq, dNyq)
+        call cutfem_ridge_shapes(nmodes, beta(:,k,t), psi_qp, gx, gy, dNxq, dNyq, shp, gsx, gsy)
         jvisc = jac * visc_qp
         do m=1,nmodes
           do c=1,4
-            dNx = dNxi(c,t) / a ; dNy = dNeta(c,t) / d
+            dNx = dNxq(c) ; dNy = dNyq(c)
             KaU(2*m-1,c)   = KaU(2*m-1,c)   + (jvisc * cutfem_mem_couple(1, gsx(m), gsy(m), 1, dNx, dNy))
             KaU(2*m-1,c+4) = KaU(2*m-1,c+4) + (jvisc * cutfem_mem_couple(1, gsx(m), gsy(m), 2, dNx, dNy))
             KaU(2*m,  c)   = KaU(2*m,  c)   + (jvisc * cutfem_mem_couple(2, gsx(m), gsy(m), 1, dNx, dNy))
@@ -9045,6 +9072,7 @@ subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, den
   real, dimension(8,8)   :: KaU            ! Ridge-to-std stiffness [R L3 Z T-1]
   real, dimension(8,8)   :: Kaa, Kaa_f     ! Ridge self-stiffness and its Cholesky working copy
   real, dimension(8)     :: shp, gsx, gsy  ! Mode shapes [Z ~> m] and their physical gradients [nondim]
+  real, dimension(4)     :: dNxq, dNyq ! Physical Q1 corner-basis gradients at the QP [L-1 ~> m-1]
   real, dimension(2,2)   :: Kaa_inv        ! Inverse ridge self-stiffness (single-mode path)
   real, dimension(8)     :: Fa, svec       ! Driving-stress projection F_a and Kaa^-1 F_a
   real, dimension(4)     :: Ucorr, Vcorr   ! Per-corner RHS correction [R L3 Z T-2]
@@ -9150,12 +9178,12 @@ subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, den
         gy = (daeta(t) - (sgn * dfeta(t))) / d
 
         ! --- Ridge stiffness (identical to cutfem_condense_sep2) ---
-        call cutfem_ridge_shapes(nmodes, beta(:,k,t), psi_qp, gx, gy, dNxi(:,t), dNeta(:,t), &
-                                 a, d, shp, gsx, gsy)
+        call cutfem_q1_grads(beta(:,k,t), a, d, dNxq, dNyq)
+        call cutfem_ridge_shapes(nmodes, beta(:,k,t), psi_qp, gx, gy, dNxq, dNyq, shp, gsx, gsy)
         jvisc = jac * visc_qp
         do m=1,nmodes
           do c=1,4
-            dNx = dNxi(c,t) / a ; dNy = dNeta(c,t) / d
+            dNx = dNxq(c) ; dNy = dNyq(c)
             KaU(2*m-1,c)   = KaU(2*m-1,c)   + (jvisc * cutfem_mem_couple(1, gsx(m), gsy(m), 1, dNx, dNy))
             KaU(2*m-1,c+4) = KaU(2*m-1,c+4) + (jvisc * cutfem_mem_couple(1, gsx(m), gsy(m), 2, dNx, dNy))
             KaU(2*m,  c)   = KaU(2*m,  c)   + (jvisc * cutfem_mem_couple(2, gsx(m), gsy(m), 1, dNx, dNy))
