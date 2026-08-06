@@ -475,6 +475,10 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! variation of the kink. Default 1.
   logical :: cutfem_sym_probe !< If true, run cutfem_symmetry_probe after each velocity solve and report
                             !! the worst mirror asymmetry of the ridge condensation. Diagnostic only.
+  logical :: cutfem_consistent_quad !< If true, re-integrate the standard membrane block on cut cells
+                            !! with the SEP2 sub-quadrature so that it, K_aU and K_aa all come from one
+                            !! bilinear form, which is what makes the condensed operator positive
+                            !! semi-definite.
   real, pointer, dimension(:,:) :: H_corner => NULL() !< Ice thickness interpolated to B-grid corners
                             !! with dual-cell Lagrange weights over the included cells only
                             !! (FV_SUBGRID_GL_* paths) [Z ~> m].
@@ -1565,6 +1569,16 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     if (CS%cutfem_gl_friction .and. .not. ((CS%cutfem_ridge_modes == 1) .or. &
         (CS%cutfem_ridge_modes == 2) .or. (CS%cutfem_ridge_modes == 4))) &
       call MOM_error(FATAL, "MOM_ice_shelf_dynamics: CUTFEM_RIDGE_MODES must be 1, 2 or 4.")
+    call get_param(param_file, mdl, "CUTFEM_CONSISTENT_QUAD", CS%cutfem_consistent_quad, &
+                 "If true, re-integrate the standard membrane block on CutFEM cut cells with the "//&
+                 "SEP2 sub-quadrature that the ridge blocks use, instead of leaving it on the 2x2 "//&
+                 "Gauss rule. The condensed operator K_uu - K_Ua K_aa^-1 K_aU is only guaranteed "//&
+                 "positive semi-definite when all three blocks are the discretization of one "//&
+                 "bilinear form on one quadrature; otherwise the subtracted term is not the Schur "//&
+                 "block of the thing it is subtracted from and can over-subtract, which shows up "//&
+                 "as an unstable transverse velocity once the enrichment is rich enough. Setting "//&
+                 "this false recovers the earlier mismatched behaviour for comparison.", &
+                 default=.true., do_not_log=.not.CS%cutfem_gl_friction)
     call get_param(param_file, mdl, "CUTFEM_SYMMETRY_PROBE", CS%cutfem_sym_probe, &
                  "If true, run a mirror-symmetry probe on the CutFEM ridge condensation after each "//&
                  "velocity solve and report the worst asymmetry. The probe drives "//&
@@ -8261,7 +8275,8 @@ end subroutine cutfem_ridge_shapes
 !! Symmetric by construction: the same K_aU multiplies on both sides of K_aa^-1.
 subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_curr, U_delta, V_delta, &
                                 ice_visc_c, fB_e, dxCv_S, dxCv_N, dyCu_W, dyCu_E, IareaT, &
-                                dens_ratio, Ucorr, Vcorr, bedc, use_newton, diag_only, h_visc_c)
+                                dens_ratio, Ucorr, Vcorr, bedc, use_newton, diag_only, h_visc_c, &
+                                quad_mismatch)
   type(ice_shelf_dyn_CS), intent(in) :: CS      !< Ice shelf control structure
   type(ocean_grid_type),  intent(in) :: G       !< The grid structure
   type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
@@ -8293,6 +8308,14 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
                                                 !! evaluated at each SEP2 quadrature point, which is
                                                 !! what K_uu uses and what the positive-definiteness
                                                 !! of the condensed operator requires.
+  real, optional,        intent(out) :: quad_mismatch !< If present, the largest entry of the
+                                                !! SEP2-minus-Gauss standard membrane block relative
+                                                !! to the largest entry of the Gauss block [nondim].
+                                                !! A self-test: for a strain-free probe cell the
+                                                !! viscosity is uniform and both rules integrate the
+                                                !! bilinear membrane exactly, so this must be at
+                                                !! roundoff. Anything larger means the Gauss block
+                                                !! assembled here does not reproduce CG_action's.
   logical, optional,      intent(in) :: use_newton !< If true, include the Newton drag and viscosity
                                                 !! tangents in K_aU and K_aa so the condensed correction
                                                 !! is part of the Jacobian rather than of the Picard
@@ -8317,6 +8340,14 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   real, dimension(8)     :: shp        ! Mode shape values at the QP [Z ~> m]
   real, dimension(4)     :: dNxq, dNyq ! Physical Q1 corner-basis gradients at the QP [L-1 ~> m-1]
   logical :: do_visc_qp                ! Evaluate Glen's law at each SEP2 QP rather than a cell mean
+  logical :: do_cons_quad              ! Re-integrate the standard membrane on the SEP2 quadrature
+  real, dimension(8,8) :: Kuu_sep      ! Standard membrane block on the SEP2 quadrature [R L4 Z T-1]
+  real, dimension(8,8) :: Kuu_gau      ! Standard membrane block on 2x2 Gauss, as CG_action builds it
+  real, dimension(4) :: pgx, pgy       ! Q1 gradients at a Gauss point [L-1 ~> m-1]
+  real, dimension(8) :: Gg             ! Newton strain contraction per DOF at a Gauss point [L-1 T-1]
+  real :: wg                           ! 2x2 Gauss weight times the metric, 0.25*Jac*IareaT [nondim]
+  real :: dsum, gsum                   ! Norms for the quadrature self-test [R L4 Z T-1]
+  integer :: qp, qpv, r                ! Gauss point, viscosity sample index, and DOF row
   real :: Visc_coef                    ! AGlen_visc^(-1/n_glen) at this cell [Pa-1 s-1]^(-1/n_g)
   real :: h_visc                       ! Thickness for the viscosity at the QP [Z ~> m]
   real :: ux_qp, uy_qp, vx_qp, vy_qp   ! Frozen strain rates at the QP [T-1 ~> s-1]
@@ -8413,6 +8444,10 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   nmodes = CS%cutfem_ridge_modes
 
   do_visc_qp = present(h_visc_c)
+  ! The standard membrane can only be re-integrated on the SEP2 rule if the viscosity is available
+  ! there, so the two switch together.
+  do_cons_quad = do_visc_qp .and. CS%cutfem_consistent_quad
+  Kuu_sep(:,:) = 0.0 ; Kuu_gau(:,:) = 0.0
   if (do_visc_qp) Visc_coef = (CS%AGlen_visc(i_elem,j_elem))**(-1./CS%n_glen)
   do_newton = .false.
   if (present(use_newton)) do_newton = use_newton
@@ -8507,6 +8542,36 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
         enddo
       enddo
 
+      ! --- Standard membrane on the SEP2 rule. This is the same bilinear form CG_action already
+      !     added with 2x2 Gauss; assembling it here as well lets the difference be applied below,
+      !     so that on a cut cell K_uu, K_aU and K_aa all come from one form on one quadrature.
+      !     That is what makes the Schur complement K_uu - K_Ua K_aa^-1 K_aU positive
+      !     semi-definite; without it the subtracted term is not the Schur block of the thing it
+      !     is subtracted from, and with eight amplitudes it can over-subtract. ---
+      if (do_cons_quad) then
+        do r=1,4
+          do c=1,4
+            Kuu_sep(r,c)     = Kuu_sep(r,c)     + &
+                (jvisc * cutfem_mem_couple(1, dNxq(r), dNyq(r), 1, dNxq(c), dNyq(c)))
+            Kuu_sep(r,c+4)   = Kuu_sep(r,c+4)   + &
+                (jvisc * cutfem_mem_couple(1, dNxq(r), dNyq(r), 2, dNxq(c), dNyq(c)))
+            Kuu_sep(r+4,c)   = Kuu_sep(r+4,c)   + &
+                (jvisc * cutfem_mem_couple(2, dNxq(r), dNyq(r), 1, dNxq(c), dNyq(c)))
+            Kuu_sep(r+4,c+4) = Kuu_sep(r+4,c+4) + &
+                (jvisc * cutfem_mem_couple(2, dNxq(r), dNyq(r), 2, dNxq(c), dNyq(c)))
+          enddo
+        enddo
+        if (do_newton_visc) then
+          do c=1,4
+            Gc(c)   = (tw_x * dNxq(c)) + (tw_s * dNyq(c))
+            Gc(c+4) = (tw_s * dNxq(c)) + (tw_y * dNyq(c))
+          enddo
+          do r=1,8 ; do c=1,8
+            Kuu_sep(r,c) = Kuu_sep(r,c) + ((jac * nvf_c) * (Gc(r)*Gc(c)))
+          enddo ; enddo
+        endif
+      endif
+
       ! --- Newton viscosity tangent: the symmetric rank-1 nvf * G(row) * G(col), the same form
       !     CG_action applies to the standard blocks. G contracts the frozen strain direction with
       !     each shape's own strain. Added to the Picard membrane block above; the sum is the
@@ -8597,6 +8662,56 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
     enddo
   enddo
 
+  ! Standard membrane on 2x2 Gauss, reproducing exactly what CG_action already added for this
+  ! cell, so that the difference below replaces it with the SEP2 version rather than double
+  ! counting. The 0.25 is the reference-square Gauss weight that CG_action applies when it folds
+  ! uret_qp into uret_b.
+  if (do_cons_quad) then
+    do qp=1,4
+      qpv = 1 ; if (CS%visc_qps == 4) qpv = qp
+      wg = 0.25 * (CS%Jac(qp,i_elem,j_elem) * IareaT)
+      do c=1,4
+        pgx(c) = CS%Phi(2*c-1,qp,i_elem,j_elem) ; pgy(c) = CS%Phi(2*c,qp,i_elem,j_elem)
+      enddo
+      do r=1,4 ; do c=1,4
+        Kuu_gau(r,c)     = Kuu_gau(r,c)     + &
+            ((wg*ice_visc_c(qpv)) * cutfem_mem_couple(1, pgx(r), pgy(r), 1, pgx(c), pgy(c)))
+        Kuu_gau(r,c+4)   = Kuu_gau(r,c+4)   + &
+            ((wg*ice_visc_c(qpv)) * cutfem_mem_couple(1, pgx(r), pgy(r), 2, pgx(c), pgy(c)))
+        Kuu_gau(r+4,c)   = Kuu_gau(r+4,c)   + &
+            ((wg*ice_visc_c(qpv)) * cutfem_mem_couple(2, pgx(r), pgy(r), 1, pgx(c), pgy(c)))
+        Kuu_gau(r+4,c+4) = Kuu_gau(r+4,c+4) + &
+            ((wg*ice_visc_c(qpv)) * cutfem_mem_couple(2, pgx(r), pgy(r), 2, pgx(c), pgy(c)))
+      enddo ; enddo
+      if (do_newton_visc) then
+        tw_x = (2.0*CS%newton_str_ux(i_elem,j_elem,qpv)) + CS%newton_str_vy(i_elem,j_elem,qpv)
+        tw_y = (2.0*CS%newton_str_vy(i_elem,j_elem,qpv)) + CS%newton_str_ux(i_elem,j_elem,qpv)
+        tw_s = 0.5 * CS%newton_str_sh(i_elem,j_elem,qpv)
+        do c=1,4
+          Gg(c)   = (tw_x * pgx(c)) + (tw_s * pgy(c))
+          Gg(c+4) = (tw_s * pgx(c)) + (tw_y * pgy(c))
+        enddo
+        do r=1,8 ; do c=1,8
+          Kuu_gau(r,c) = Kuu_gau(r,c) + &
+              ((wg * CS%newton_visc_factor(i_elem,j_elem,qpv)) * (Gg(r)*Gg(c)))
+        enddo ; enddo
+      endif
+    enddo
+    ! Self-test hook: on a strain-free cell the viscosity is uniform and both rules integrate the
+    ! bilinear membrane exactly, so the two blocks must agree to roundoff.
+    if (present(quad_mismatch)) then
+      dsum = 0.0 ; gsum = 0.0
+      do r=1,8 ; do c=1,8
+        dsum = max(dsum, abs(Kuu_sep(r,c) - Kuu_gau(r,c)))
+        gsum = max(gsum, abs(Kuu_gau(r,c)))
+      enddo ; enddo
+      quad_mismatch = 0.0
+      if (gsum > 0.0) quad_mismatch = dsum / gsum
+    endif
+  elseif (present(quad_mismatch)) then
+    quad_mismatch = 0.0
+  endif
+
   ! Tikhonov floor for sliver cuts, applied once and shared by the action and diagonal paths.
   nsys = 2*nmodes
   tr_Kaa = 0.0
@@ -8636,6 +8751,7 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
         dval = -(((KaU(1,col)*((Kaa_inv(1,1)*KaU(1,col)) + (Kaa_inv(1,2)*KaU(2,col)))) + &
                   (KaU(2,col)*((Kaa_inv(2,1)*KaU(1,col)) + (Kaa_inv(2,2)*KaU(2,col))))))
       endif
+      if (do_cons_quad) dval = dval + (Kuu_sep(col,col) - Kuu_gau(col,col))
       select case (col)
         case (1) ; Ucorr(1,1) = dval
         case (2) ; Ucorr(2,1) = dval
@@ -8676,6 +8792,13 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   do col=1,8
     dval = 0.0
     do m=1,nsys ; dval = dval - (KaU(m,col)*svec(m)) ; enddo
+    ! Replace CG_action's Gauss membrane for this cell with the SEP2 one.
+    if (do_cons_quad) then
+      do c=1,4
+        dval = dval + ((Kuu_sep(col,c) - Kuu_gau(col,c)) * duc(c))
+        dval = dval + ((Kuu_sep(col,c+4) - Kuu_gau(col,c+4)) * dvc(c))
+      enddo
+    endif
     select case (col)
       case (1) ; Ucorr(1,1) = dval
       case (2) ; Ucorr(2,1) = dval
@@ -8724,6 +8847,9 @@ subroutine cutfem_symmetry_probe(CS, G, US, dens_ratio)
   real :: xc, yc        ! Corner reference coordinates [nondim]
   real :: scal          ! Correction magnitude used to normalize the residual [R L3 Z T-2]
   real :: rns, rew      ! Worst relative north-south and east-west mirror residuals [nondim]
+  real :: rquad         ! Worst relative SEP2-minus-Gauss standard membrane mismatch [nondim]
+  real :: qm            ! Per-configuration value of the same [nondim]
+  real, dimension(2,2) :: Uz, Vz ! Discarded corrections from the strain-free quadrature probe
   real :: r1            ! Residual of the current comparison [nondim]
   real :: dx_S, dx_N, dy_W, dy_E ! Cell edge spacings of the probe cell [L ~> m]
   integer :: i, j, ia, io, c, ncut
@@ -8745,7 +8871,7 @@ subroutine cutfem_symmetry_probe(CS, G, US, dens_ratio)
   Ud(1,1) = 0.5*u0 ; Ud(2,1) = -0.2*u0 ; Ud(1,2) = 1.3*u0 ; Ud(2,2) = 0.8*u0
   Vd(1,1) = -0.7*u0 ; Vd(2,1) = 1.1*u0 ; Vd(1,2) = 0.2*u0 ; Vd(2,2) = -0.9*u0
 
-  rns = 0.0 ; rew = 0.0 ; ncut = 0
+  rns = 0.0 ; rew = 0.0 ; rquad = 0.0 ; ncut = 0
   dth = 4.0*atan(1.0) / 8.0   ! pi/8
 
   do ia=0,7 ; do io=1,9
@@ -8766,6 +8892,18 @@ subroutine cutfem_symmetry_probe(CS, G, US, dens_ratio)
         CS%fB_elem(i,j), dx_S, dx_N, dy_W, dy_E, G%IareaT(i,j), dens_ratio, Ur, Vr, h_visc_c=hv_cf)
     scal = max(maxval(abs(Ur)), maxval(abs(Vr)))
     if (scal <= 0.0) cycle
+
+    ! --- Quadrature self-test. With a rigid (strain-free) velocity the frozen strain rates vanish
+    !     at every quadrature point, so Glen's law returns the same regularized viscosity
+    !     everywhere, and both the SEP2 rule and 2x2 Gauss integrate the bilinear membrane exactly.
+    !     The two standard blocks must then agree to roundoff. A larger residual means the Gauss
+    !     block assembled inside cutfem_condense_sep2 does not reproduce the one CG_action adds,
+    !     in which case their difference is not a quadrature swap but an error. ---
+    Uc_m(:,:) = u0 ; Vc_m(:,:) = u0
+    call cutfem_condense_sep2(CS, G, US, i, j, fls, hc, Uc_m, Vc_m, Uc_m, Vc_m, &
+        CS%ice_visc(i,j,:), CS%fB_elem(i,j), dx_S, dx_N, dy_W, dy_E, G%IareaT(i,j), &
+        dens_ratio, Uz, Vz, h_visc_c=hv_cf, quad_mismatch=qm)
+    rquad = max(rquad, qm)
 
     ! --- North-south reflection: SW<->NW, SE<->NE; u unchanged, v negated; dxCv_S <-> dxCv_N. ---
     fls_m(1) = fls(3) ; fls_m(2) = fls(4) ; fls_m(3) = fls(1) ; fls_m(4) = fls(2)
@@ -8807,7 +8945,8 @@ subroutine cutfem_symmetry_probe(CS, G, US, dens_ratio)
   enddo ; enddo
 
   write(mesg,'("CutFEM symmetry probe (modes=",I1,", ",I3," cuts): max relative mirror residual '// &
-              'N-S ",ES10.3,", E-W ",ES10.3)') CS%cutfem_ridge_modes, ncut, rns, rew
+              'N-S ",ES10.3,", E-W ",ES10.3,"; quadrature self-test ",ES10.3)') &
+              CS%cutfem_ridge_modes, ncut, rns, rew, rquad
   call MOM_mesg(mesg)
 
 end subroutine cutfem_symmetry_probe
