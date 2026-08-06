@@ -1562,8 +1562,9 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "It carries no along-grounding-line variation, so it cannot represent a kink whose "//&
                  "strength changes along a curved or oblique grounding line.", &
                  default=1, do_not_log=.not.CS%cutfem_gl_friction)
-    if (CS%cutfem_gl_friction .and. (CS%cutfem_ridge_modes < 1 .or. CS%cutfem_ridge_modes > 2)) &
-      call MOM_error(FATAL, "MOM_ice_shelf_dynamics: CUTFEM_RIDGE_MODES must be 1 or 2.")
+    if (CS%cutfem_gl_friction .and. .not. ((CS%cutfem_ridge_modes == 1) .or. &
+        (CS%cutfem_ridge_modes == 2) .or. (CS%cutfem_ridge_modes == 4))) &
+      call MOM_error(FATAL, "MOM_ice_shelf_dynamics: CUTFEM_RIDGE_MODES must be 1, 2 or 4.")
     call get_param(param_file, mdl, "CUTFEM_SYMMETRY_PROBE", CS%cutfem_sym_probe, &
                  "If true, run a mirror-symmetry probe on the CutFEM ridge condensation after each "//&
                  "velocity solve and report the worst asymmetry. The probe drives "//&
@@ -8084,7 +8085,7 @@ pure real function cutfem_mem_couple(fi, px, py, fj, qx, qy)
   endif
 end function cutfem_mem_couple
 
-!> Solve the small symmetric positive-semi-definite system A x = b (n <= 4) by a modified
+!> Solve the small symmetric positive-semi-definite system A x = b (n <= 8) by a modified
 !! Cholesky. Used to condense the multi-mode CutFEM ridge (A = K_aa, n = 2*modes). A is
 !! overwritten with its Cholesky factor.
 !!
@@ -8098,15 +8099,15 @@ end function cutfem_mem_couple
 !! one: the condensed operator stays positive semi-definite and CG stays valid. The solution is a
 !! continuous function of A and b, so no cell-level switch is introduced into the operator.
 subroutine cutfem_spd_solve(n, A, floor_piv, b, x, n_floored)
-  integer,                intent(in)    :: n    !< System size (<= 4)
-  real, dimension(4,4),   intent(inout) :: A    !< SPD matrix; overwritten by its Cholesky factor
+  integer,                intent(in)    :: n    !< System size (<= 8)
+  real, dimension(8,8),   intent(inout) :: A    !< SPD matrix; overwritten by its Cholesky factor
   real,                   intent(in)    :: floor_piv !< Lower bound applied to each Cholesky pivot,
                                                 !! in the units of A's diagonal
-  real, dimension(4),     intent(in)    :: b    !< Right-hand side
-  real, dimension(4),     intent(out)   :: x    !< Solution
+  real, dimension(8),     intent(in)    :: b    !< Right-hand side
+  real, dimension(8),     intent(out)   :: x    !< Solution
   integer,                intent(out)   :: n_floored !< Number of pivots that hit floor_piv; 0 for a
                                                 !! well-conditioned block
-  real, dimension(4) :: y
+  real, dimension(8) :: y
   real :: s
   integer :: i, k, m
   x(:) = 0.0 ; n_floored = 0
@@ -8138,6 +8139,61 @@ subroutine cutfem_spd_solve(n, A, floor_piv, b, x, n_floored)
     x(i) = s / A(i,i)
   enddo
 end subroutine cutfem_spd_solve
+
+!> Evaluate the CutFEM ridge mode shapes and their physical gradients at one SEP2 quadrature point.
+!!
+!! The mode set is selected by CUTFEM_RIDGE_MODES:
+!!   1: {psi}                     one kink amplitude for the whole cell; no variation of the kink
+!!                                strength either across or along the interface.
+!!   2: {psi, psi*xi}             adds modulation in the grid-east direction only. Equals the nodal
+!!                                span for a straight grounding line normal to x, but carries no
+!!                                along-interface variation, and the basis does not map to itself
+!!                                under an east-west reflection, which makes the diagonal Tikhonov
+!!                                floor on K_aa basis-dependent.
+!!   4: {N_1 psi, ..., N_4 psi}   the nodal enrichment of Moes et al. (2003), their equation (14),
+!!                                restricted to one element: one amplitude per corner, so the kink
+!!                                strength varies bilinearly over the cell and therefore along the
+!!                                interface. This is the complete in-cell nodal span, it is
+!!                                rotation-complete, and it permutes under any reflection or
+!!                                90-degree rotation, so a diagonal regularization of K_aa is
+!!                                basis-invariant.
+!!
+!! The gradient of a nodal shape follows the product rule, grad(N_c psi) = psi grad(N_c) + N_c grad(psi).
+subroutine cutfem_ridge_shapes(nmodes, bqp, psi_qp, gx, gy, dNxi_t, dNeta_t, a, d, shp, gsx, gsy)
+  integer,            intent(in)  :: nmodes  !< Number of enrichment shapes (1, 2 or 4)
+  real, dimension(4), intent(in)  :: bqp     !< Corner-basis weights N_c at the QP [nondim]
+  real,               intent(in)  :: psi_qp  !< Ridge value at the QP [Z ~> m]
+  real,               intent(in)  :: gx      !< Physical ridge gradient, x [nondim]
+  real,               intent(in)  :: gy      !< Physical ridge gradient, y [nondim]
+  real, dimension(4), intent(in)  :: dNxi_t  !< d(N_c)/dxi on this parent triangle [nondim]
+  real, dimension(4), intent(in)  :: dNeta_t !< d(N_c)/deta on this parent triangle [nondim]
+  real,               intent(in)  :: a       !< Interpolated cell-edge spacing in x at the QP [L ~> m]
+  real,               intent(in)  :: d       !< Interpolated cell-edge spacing in y at the QP [L ~> m]
+  real, dimension(8), intent(out) :: shp     !< Mode shape values [Z ~> m]
+  real, dimension(8), intent(out) :: gsx     !< Physical mode gradients, x [nondim]
+  real, dimension(8), intent(out) :: gsy     !< Physical mode gradients, y [nondim]
+
+  real :: mu           ! East reference coordinate xi at the QP [nondim]
+  real :: dmu_dx, dmu_dy ! Physical gradient of xi [L-1 ~> m-1]
+  integer :: m
+
+  shp(:) = 0.0 ; gsx(:) = 0.0 ; gsy(:) = 0.0
+  if (nmodes == 4) then
+    do m=1,4
+      shp(m) = bqp(m) * psi_qp
+      gsx(m) = (bqp(m) * gx) + (psi_qp * (dNxi_t(m) / a))
+      gsy(m) = (bqp(m) * gy) + (psi_qp * (dNeta_t(m) / d))
+    enddo
+  else
+    shp(1) = psi_qp ; gsx(1) = gx ; gsy(1) = gy
+    if (nmodes == 2) then
+      mu = bqp(2) + bqp(4)
+      dmu_dx = (dNxi_t(2) + dNxi_t(4)) / a ; dmu_dy = (dNeta_t(2) + dNeta_t(4)) / d
+      shp(2) = psi_qp * mu
+      gsx(2) = (mu * gx) + (psi_qp * dmu_dx) ; gsy(2) = (mu * gy) + (psi_qp * dmu_dy)
+    endif
+  endif
+end subroutine cutfem_ridge_shapes
 
 !> CutFEM ridge-enrichment static-condensation correction for one SEP2 cut cell.
 !!
@@ -8206,8 +8262,11 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   real, dimension(4,4)   :: dNxi, dNeta   ! P1 reference gradient of corner basis c per triangle [nondim]
   real, dimension(4)     :: absfls     ! |fls| at corners [Z ~> m]
   real, dimension(4)     :: uc, vc, duc, dvc ! Corner frozen velocities and search directions [L T-1]
-  real, dimension(4,8)   :: KaU        ! Ridge-to-std stiffness: rows (a1x,a1y,a2x,a2y), cols (u1..4,v1..4)
-  real, dimension(4,4)   :: Kaa        ! Ridge self-stiffness (up to 2 modes x 2 components)
+  real, dimension(8,8)   :: KaU        ! Ridge-to-std stiffness: row 2m-1/2m is mode m as a u/v-field
+                                       ! shape; cols are (u1..4, v1..4) [R L4 Z T-1]
+  real, dimension(8,8)   :: Kaa        ! Ridge self-stiffness, 2*nmodes square [R L4 Z T-1]
+  real, dimension(8)     :: shp        ! Mode shape values at the QP [Z ~> m]
+  real, dimension(8)     :: gsx, gsy   ! Physical mode gradients at the QP [nondim]
   real :: b1, b2, b3, b4               ! Corner-basis weights at the QP [nondim]
   real :: mS, mN, mW, mE               ! Marginal edge weights [nondim]
   real :: a, d                         ! Interpolated cell-edge spacings at the QP [L ~> m]
@@ -8217,9 +8276,6 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   real :: fls_loc                      ! P1 flotation deficit at the QP [Z ~> m]
   real :: psi_qp                       ! Ridge value at the QP [Z ~> m]
   real :: gx, gy                       ! Physical ridge gradient at the QP [nondim]
-  real :: mu, dmu_dx, dmu_dy           ! East reference coordinate xi and its physical gradient [nondim],[L-1]
-  real :: psi2, g2x, g2y               ! Second-mode (psi*xi) value and physical gradient [Z ~> m],[nondim]
-  real :: bcw2                         ! Second-mode drag basis weight [Z ~> m]
   real :: dNx, dNy                     ! Physical corner-basis gradient at the QP [L-1 ~> m-1]
   real :: sgn                          ! +1 grounded side, -1 floating side [nondim]
   real :: bcw                          ! Ridge basis value weight beta-independent (psi_qp) [Z ~> m]
@@ -8230,13 +8286,13 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   logical :: do_dg_local, do_coulomb   ! DG-mode (bedc present) and Coulomb-sliding flags
   real :: det                          ! 2x2 determinant of Kaa (single-mode path)
   real, dimension(2,2) :: Kaa_inv      ! Inverse ridge self-stiffness (single-mode path)
-  real, dimension(4,4) :: Kaa_f        ! Working copy of Kaa for the multi-mode Cholesky solve
-  real, dimension(4) :: tvec, svec     ! K_aU*U_delta and K_aa^-1*that
+  real, dimension(8,8) :: Kaa_f        ! Working copy of Kaa for the multi-mode Cholesky solve
+  real, dimension(8) :: tvec, svec     ! K_aU*U_delta and K_aa^-1*that
   real :: reg_diag                     ! Absolute Tikhonov added to Kaa diagonal
-  real, dimension(4) :: Gm             ! Newton viscosity strain contraction per ridge row [L-1 T-1]
+  real, dimension(8) :: Gm             ! Newton viscosity strain contraction per ridge row [L-1 T-1]
   real, dimension(8) :: Gc             ! Newton viscosity strain contraction per nodal column [L-1 T-1]
-  real, dimension(4) :: psim           ! Ridge shape value per row (psi or psi*xi) [Z ~> m]
-  real, dimension(4) :: uvm            ! Frozen velocity component matching each row [L T-1 ~> m s-1]
+  real, dimension(8) :: psim           ! Ridge shape value per row [Z ~> m]
+  real, dimension(8) :: uvm            ! Frozen velocity component matching each row [L T-1 ~> m s-1]
   real :: nvf_c                        ! Cell-mean Newton viscosity tangent factor [R L4 Z T]
   real :: strx_c, stry_c, strsh_c      ! Cell-mean Newton strain rates [T-1 ~> s-1]
   real :: tw_x, tw_y, tw_s             ! Strain-direction weights 2ex+ey, 2ey+ex, esh/2 [T-1 ~> s-1]
@@ -8245,7 +8301,7 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   logical :: do_newton                 ! Include the Newton drag tangent
   logical :: do_newton_visc            ! Include the Newton viscosity tangent
   logical :: do_diag                   ! Return the Schur diagonal rather than its action
-  real, dimension(4) :: rhs            ! One column of K_aU, for the diagonal path
+  real, dimension(8) :: rhs            ! One column of K_aU, for the diagonal path
   real :: piv_floor                    ! Conditioning floor on the Cholesky pivots [R L4 Z T-1]
   real :: det_min                      ! Roundoff-scale floor on the 2x2 determinant [(R L4 Z T-1)2]
   real :: dval                         ! One entry of the Schur diagonal [R L2 Z T-1]
@@ -8253,6 +8309,8 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   integer :: m, n                      ! Ridge row indices
   integer :: nmodes                    ! 1 (psi) or 2 (psi, psi*xi)
   integer :: n_floored                 ! Number of conditioning-floor hits in the condensation solve
+  integer :: nsys                      ! Size of the ridge system, 2*nmodes
+  real :: tr_Kaa                       ! Trace of the unregularized ridge self-stiffness [R L4 Z T-1]
   integer :: t, k, c
 
   Ucorr(:,:) = 0.0 ; Vcorr(:,:) = 0.0
@@ -8342,59 +8400,43 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
       gx = (daxi(t)  - (sgn * dfxi(t)))  / a
       gy = (daeta(t) - (sgn * dfeta(t))) / d
 
-      ! --- Membrane (viscous) coupling, all QPs. SSA bilinear form; see CG_action. ---
-      ! Ridge test a_x is a u-field mode with gradient (gx,gy); a_y a v-field mode.
-      do c=1,4
-        dNx = dNxi(c,t) / a ; dNy = dNeta(c,t) / d
-        ! test a_x (u-field) : trial u_c, v_c
-        KaU(1,c)   = KaU(1,c)   + (jac*visc_qp) * ((4.0*dNx*gx) + (dNy*gy))
-        KaU(1,c+4) = KaU(1,c+4) + (jac*visc_qp) * ((2.0*dNy*gx) + (dNx*gy))
-        ! test a_y (v-field) : trial u_c, v_c
-        KaU(2,c)   = KaU(2,c)   + (jac*visc_qp) * ((dNy*gx) + (2.0*dNx*gy))
-        KaU(2,c+4) = KaU(2,c+4) + (jac*visc_qp) * ((dNx*gx) + (4.0*dNy*gy))
-      enddo
-      Kaa(1,1) = Kaa(1,1) + (jac*visc_qp) * ((4.0*gx*gx) + (gy*gy))
-      Kaa(2,2) = Kaa(2,2) + (jac*visc_qp) * ((gx*gx) + (4.0*gy*gy))
-      Kaa(1,2) = Kaa(1,2) + (jac*visc_qp) * (3.0*gx*gy)
+      ! --- Mode shapes and their physical gradients at this QP. ---
+      call cutfem_ridge_shapes(nmodes, beta(:,k,t), psi_qp, gx, gy, dNxi(:,t), dNeta(:,t), &
+                               a, d, shp, gsx, gsy)
 
-      ! --- Second mode psi2 = psi*xi (xi = east reference coord = N_SE + N_NE), membrane part. ---
-      if (nmodes == 2) then
-        jvisc = jac*visc_qp
-        mu = b2 + b4
-        dmu_dx = (dNxi(2,t) + dNxi(4,t)) / a ; dmu_dy = (dNeta(2,t) + dNeta(4,t)) / d
-        psi2 = psi_qp * mu
-        g2x = (mu*gx) + (psi_qp*dmu_dx) ; g2y = (mu*gy) + (psi_qp*dmu_dy)
+      ! --- Membrane (viscous) coupling, all QPs. SSA bilinear form; see CG_action. Row 2m-1 is
+      !     mode m acting as a u-field shape, row 2m as a v-field shape. ---
+      jvisc = jac * visc_qp
+      do m=1,nmodes
         do c=1,4
           dNx = dNxi(c,t) / a ; dNy = dNeta(c,t) / d
-          KaU(3,c)   = KaU(3,c)   + jvisc * cutfem_mem_couple(1, g2x, g2y, 1, dNx, dNy)
-          KaU(3,c+4) = KaU(3,c+4) + jvisc * cutfem_mem_couple(1, g2x, g2y, 2, dNx, dNy)
-          KaU(4,c)   = KaU(4,c)   + jvisc * cutfem_mem_couple(2, g2x, g2y, 1, dNx, dNy)
-          KaU(4,c+4) = KaU(4,c+4) + jvisc * cutfem_mem_couple(2, g2x, g2y, 2, dNx, dNy)
+          KaU(2*m-1,c)   = KaU(2*m-1,c)   + (jvisc * cutfem_mem_couple(1, gsx(m), gsy(m), 1, dNx, dNy))
+          KaU(2*m-1,c+4) = KaU(2*m-1,c+4) + (jvisc * cutfem_mem_couple(1, gsx(m), gsy(m), 2, dNx, dNy))
+          KaU(2*m,  c)   = KaU(2*m,  c)   + (jvisc * cutfem_mem_couple(2, gsx(m), gsy(m), 1, dNx, dNy))
+          KaU(2*m,  c+4) = KaU(2*m,  c+4) + (jvisc * cutfem_mem_couple(2, gsx(m), gsy(m), 2, dNx, dNy))
         enddo
-        ! mode-2 self block
-        Kaa(3,3) = Kaa(3,3) + jvisc * cutfem_mem_couple(1, g2x, g2y, 1, g2x, g2y)
-        Kaa(4,4) = Kaa(4,4) + jvisc * cutfem_mem_couple(2, g2x, g2y, 2, g2x, g2y)
-        Kaa(3,4) = Kaa(3,4) + jvisc * cutfem_mem_couple(1, g2x, g2y, 2, g2x, g2y)
-        ! mode1-mode2 cross block
-        Kaa(1,3) = Kaa(1,3) + jvisc * cutfem_mem_couple(1, gx, gy, 1, g2x, g2y)
-        Kaa(1,4) = Kaa(1,4) + jvisc * cutfem_mem_couple(1, gx, gy, 2, g2x, g2y)
-        Kaa(2,3) = Kaa(2,3) + jvisc * cutfem_mem_couple(2, gx, gy, 1, g2x, g2y)
-        Kaa(2,4) = Kaa(2,4) + jvisc * cutfem_mem_couple(2, gx, gy, 2, g2x, g2y)
-      endif
+        do n=1,nmodes
+          Kaa(2*m-1,2*n-1) = Kaa(2*m-1,2*n-1) + &
+              (jvisc * cutfem_mem_couple(1, gsx(m), gsy(m), 1, gsx(n), gsy(n)))
+          Kaa(2*m-1,2*n  ) = Kaa(2*m-1,2*n  ) + &
+              (jvisc * cutfem_mem_couple(1, gsx(m), gsy(m), 2, gsx(n), gsy(n)))
+          Kaa(2*m,  2*n-1) = Kaa(2*m,  2*n-1) + &
+              (jvisc * cutfem_mem_couple(2, gsx(m), gsy(m), 1, gsx(n), gsy(n)))
+          Kaa(2*m,  2*n  ) = Kaa(2*m,  2*n  ) + &
+              (jvisc * cutfem_mem_couple(2, gsx(m), gsy(m), 2, gsx(n), gsy(n)))
+        enddo
+      enddo
 
       ! --- Newton viscosity tangent: the symmetric rank-1 nvf * G(row) * G(col), the same form
       !     CG_action applies to the standard blocks. G contracts the frozen strain direction with
-      !     each shape's own strain, so a u-field shape with gradient (px,py) has G = tw_x*px +
-      !     tw_s*py and a v-field shape has G = tw_s*px + tw_y*py. Added to the Picard membrane
-      !     block above; the sum is the Hessian of the (convex) Glen dissipation potential and so
-      !     remains positive semi-definite even though this rank-1 piece alone is negative. ---
+      !     each shape's own strain. Added to the Picard membrane block above; the sum is the
+      !     Hessian of the (convex) Glen dissipation potential and so remains positive
+      !     semi-definite even though this rank-1 piece alone is negative. ---
       if (do_newton_visc) then
-        Gm(1) = (tw_x * gx) + (tw_s * gy)
-        Gm(2) = (tw_s * gx) + (tw_y * gy)
-        if (nmodes == 2) then
-          Gm(3) = (tw_x * g2x) + (tw_s * g2y)
-          Gm(4) = (tw_s * g2x) + (tw_y * g2y)
-        endif
+        do m=1,nmodes
+          Gm(2*m-1) = (tw_x * gsx(m)) + (tw_s * gsy(m))
+          Gm(2*m  ) = (tw_s * gsx(m)) + (tw_y * gsy(m))
+        enddo
         do c=1,4
           dNx = dNxi(c,t) / a ; dNy = dNeta(c,t) / d
           Gc(c)   = (tw_x * dNx) + (tw_s * dNy)
@@ -8403,7 +8445,7 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
         jnvf = jac * nvf_c
         do m=1,2*nmodes
           do c=1,8 ; KaU(m,c) = KaU(m,c) + (jnvf * (Gm(m)*Gc(c))) ; enddo
-          do n=m,2*nmodes ; Kaa(m,n) = Kaa(m,n) + (jnvf * (Gm(m)*Gm(n))) ; enddo
+          do n=1,2*nmodes ; Kaa(m,n) = Kaa(m,n) + (jnvf * (Gm(m)*Gm(n))) ; enddo
         enddo
       endif
 
@@ -8436,24 +8478,19 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
         call compute_basal_coef(unorm2_loc, coef_prefactor, min_trac_area, fB_local, &
             CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, do_newton, &
             basal_coef_loc, drag_newt_loc)
-        bcw = jac * basal_coef_loc * psi_qp
-        do c=1,4
-          KaU(1,c)   = KaU(1,c)   + (bcw * beta(c,k,t))  ! a_x <- u_c drag
-          KaU(2,c+4) = KaU(2,c+4) + (bcw * beta(c,k,t))  ! a_y <- v_c drag
-        enddo
-        Kaa(1,1) = Kaa(1,1) + (jac * basal_coef_loc * (psi_qp*psi_qp))
-        Kaa(2,2) = Kaa(2,2) + (jac * basal_coef_loc * (psi_qp*psi_qp))
-        if (nmodes == 2) then
-          bcw2 = jac * basal_coef_loc * psi2   ! psi2 was set in the membrane block above
+        ! Picard drag: T = basal_coef*I, so each mode couples to the nodal shapes through its
+        ! own value and the corner weight, with no x-y cross term.
+        do m=1,nmodes
+          bcw = (jac * basal_coef_loc) * shp(m)
           do c=1,4
-            KaU(3,c)   = KaU(3,c)   + (bcw2 * beta(c,k,t))
-            KaU(4,c+4) = KaU(4,c+4) + (bcw2 * beta(c,k,t))
+            KaU(2*m-1,c)   = KaU(2*m-1,c)   + (bcw * beta(c,k,t))
+            KaU(2*m,  c+4) = KaU(2*m,  c+4) + (bcw * beta(c,k,t))
           enddo
-          Kaa(3,3) = Kaa(3,3) + (jac * basal_coef_loc * (psi2*psi2))
-          Kaa(4,4) = Kaa(4,4) + (jac * basal_coef_loc * (psi2*psi2))
-          Kaa(1,3) = Kaa(1,3) + (jac * basal_coef_loc * (psi_qp*psi2)) ! mode1-mode2 x-x drag
-          Kaa(2,4) = Kaa(2,4) + (jac * basal_coef_loc * (psi_qp*psi2)) ! mode1-mode2 y-y drag
-        endif
+          do n=1,nmodes
+            Kaa(2*m-1,2*n-1) = Kaa(2*m-1,2*n-1) + ((jac * basal_coef_loc) * (shp(m)*shp(n)))
+            Kaa(2*m,  2*n  ) = Kaa(2*m,  2*n  ) + ((jac * basal_coef_loc) * (shp(m)*shp(n)))
+          enddo
+        enddo
 
         ! Newton drag tangent. The pointwise Jacobian is T = basal_coef*I + drag_newt*(u^k (x) u^k);
         ! the isotropic part is the Picard block above, so only the outer product is added here. It
@@ -8462,18 +8499,16 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
         ! n_basal_fric*basal_coef), so K_aa stays positive semi-definite.
         if (do_newton) then
           dnw = jac * drag_newt_loc
-          psim(1) = psi_qp ; psim(2) = psi_qp
-          uvm(1)  = u_curr_loc ; uvm(2) = v_curr_loc
-          if (nmodes == 2) then
-            psim(3) = psi2 ; psim(4) = psi2
-            uvm(3)  = u_curr_loc ; uvm(4) = v_curr_loc
-          endif
+          do m=1,nmodes
+            uvm(2*m-1) = u_curr_loc ; uvm(2*m) = v_curr_loc
+            psim(2*m-1) = shp(m) ; psim(2*m) = shp(m)
+          enddo
           do m=1,2*nmodes
             do c=1,4
               KaU(m,c)   = KaU(m,c)   + ((dnw * (psim(m)*uvm(m))) * (beta(c,k,t)*u_curr_loc))
               KaU(m,c+4) = KaU(m,c+4) + ((dnw * (psim(m)*uvm(m))) * (beta(c,k,t)*v_curr_loc))
             enddo
-            do n=m,2*nmodes
+            do n=1,2*nmodes
               Kaa(m,n) = Kaa(m,n) + ((dnw * (psim(m)*uvm(m))) * (psim(n)*uvm(n)))
             enddo
           enddo
@@ -8482,24 +8517,15 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
     enddo
   enddo
 
-  ! Symmetrize the assembled ridge self-stiffness (only the upper triangle was accumulated).
-  Kaa(2,1) = Kaa(1,2)
-  if (nmodes == 2) then
-    Kaa(3,1) = Kaa(1,3) ; Kaa(3,2) = Kaa(2,3)
-    Kaa(4,1) = Kaa(1,4) ; Kaa(4,2) = Kaa(2,4) ; Kaa(4,3) = Kaa(3,4)
-  endif
-
   ! Tikhonov floor for sliver cuts, applied once and shared by the action and diagonal paths.
-  if (nmodes == 2) then
-    reg_diag = CS%cutfem_ridge_reg * (((Kaa(1,1) + Kaa(2,2)) + (Kaa(3,3) + Kaa(4,4))))
-  else
-    reg_diag = CS%cutfem_ridge_reg * (Kaa(1,1) + Kaa(2,2))
-  endif
-  do c=1,2*nmodes ; Kaa(c,c) = Kaa(c,c) + reg_diag ; enddo
+  nsys = 2*nmodes
+  tr_Kaa = 0.0
+  do c=1,nsys ; tr_Kaa = tr_Kaa + Kaa(c,c) ; enddo
+  reg_diag = CS%cutfem_ridge_reg * tr_Kaa
+  do c=1,nsys ; Kaa(c,c) = Kaa(c,c) + reg_diag ; enddo
+  piv_floor = cutfem_cond_floor * (tr_Kaa + (real(nsys) * reg_diag))
 
-  if (nmodes == 2) then
-    piv_floor = cutfem_cond_floor * (((Kaa(1,1) + Kaa(2,2)) + (Kaa(3,3) + Kaa(4,4))))
-  else
+  if (nsys == 2) then
     ! Single mode: the explicit 2x2 inverse. The determinant is floored at the same roundoff scale
     ! the Cholesky pivots are, and for the same reason: it is a difference of nearly equal numbers
     ! once the modes degenerate, so it can come out wrong or negative. Flooring it only shrinks
@@ -8520,12 +8546,12 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
     ! One small solve per nodal column. This path runs once per outer iterate in matrix_diagonal,
     ! not inside the CG loop, so re-factorizing per column is not worth avoiding.
     do col=1,8
-      if (nmodes == 2) then
+      if (nsys > 2) then
         Kaa_f(:,:) = Kaa(:,:)
-        do m=1,4 ; rhs(m) = KaU(m,col) ; enddo
-        call cutfem_spd_solve(4, Kaa_f, piv_floor, rhs, svec, n_floored)
-        dval = -(((KaU(1,col)*svec(1)) + (KaU(2,col)*svec(2))) + &
-                 ((KaU(3,col)*svec(3)) + (KaU(4,col)*svec(4))))
+        do m=1,nsys ; rhs(m) = KaU(m,col) ; enddo
+        call cutfem_spd_solve(nsys, Kaa_f, piv_floor, rhs, svec, n_floored)
+        dval = 0.0
+        do m=1,nsys ; dval = dval - (KaU(m,col)*svec(m)) ; enddo
       else
         dval = -(((KaU(1,col)*((Kaa_inv(1,1)*KaU(1,col)) + (Kaa_inv(1,2)*KaU(2,col)))) + &
                   (KaU(2,col)*((Kaa_inv(2,1)*KaU(1,col)) + (Kaa_inv(2,2)*KaU(2,col))))))
@@ -8548,23 +8574,16 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   ! summation grouping, which is kept as it was so that each CUTFEM_RIDGE_MODES setting stays
   ! bitwise identical to the code before these options were added.
   tvec(:) = 0.0
-  if (nmodes == 1) then
+  do m=1,nsys
     do c=1,4
-      tvec(1) = tvec(1) + (KaU(1,c)*duc(c)) + (KaU(1,c+4)*dvc(c))
-      tvec(2) = tvec(2) + (KaU(2,c)*duc(c)) + (KaU(2,c+4)*dvc(c))
+      tvec(m) = tvec(m) + ((KaU(m,c)*duc(c)) + (KaU(m,c+4)*dvc(c)))
     enddo
-  else
-    do c=1,4
-      do k=1,4
-        tvec(c) = tvec(c) + ((KaU(c,k)*duc(k)) + (KaU(c,k+4)*dvc(k)))
-      enddo
-    enddo
-  endif
+  enddo
 
   svec(:) = 0.0
-  if (nmodes == 2) then
+  if (nsys > 2) then
     Kaa_f(:,:) = Kaa(:,:)
-    call cutfem_spd_solve(4, Kaa_f, piv_floor, tvec, svec, n_floored)
+    call cutfem_spd_solve(nsys, Kaa_f, piv_floor, tvec, svec, n_floored)
   else
     ! Schur correction on the search direction: corr = -K_aU^T (K_aa^-1 (K_aU U_delta)).
     svec(1) = (Kaa_inv(1,1)*tvec(1)) + (Kaa_inv(1,2)*tvec(2))
@@ -8574,14 +8593,20 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
 
   ! Scatter the Schur correction to the corner DOFs: corr(col) = -sum_m KaU(m,col)*svec(m).
   ! corner order SW,SE,NW,NE -> (2,2) layout (1,1),(2,1),(1,2),(2,2)
-  Ucorr(1,1) = -((((KaU(1,1)*svec(1)) + (KaU(2,1)*svec(2))) + ((KaU(3,1)*svec(3)) + (KaU(4,1)*svec(4)))))
-  Ucorr(2,1) = -((((KaU(1,2)*svec(1)) + (KaU(2,2)*svec(2))) + ((KaU(3,2)*svec(3)) + (KaU(4,2)*svec(4)))))
-  Ucorr(1,2) = -((((KaU(1,3)*svec(1)) + (KaU(2,3)*svec(2))) + ((KaU(3,3)*svec(3)) + (KaU(4,3)*svec(4)))))
-  Ucorr(2,2) = -((((KaU(1,4)*svec(1)) + (KaU(2,4)*svec(2))) + ((KaU(3,4)*svec(3)) + (KaU(4,4)*svec(4)))))
-  Vcorr(1,1) = -((((KaU(1,5)*svec(1)) + (KaU(2,5)*svec(2))) + ((KaU(3,5)*svec(3)) + (KaU(4,5)*svec(4)))))
-  Vcorr(2,1) = -((((KaU(1,6)*svec(1)) + (KaU(2,6)*svec(2))) + ((KaU(3,6)*svec(3)) + (KaU(4,6)*svec(4)))))
-  Vcorr(1,2) = -((((KaU(1,7)*svec(1)) + (KaU(2,7)*svec(2))) + ((KaU(3,7)*svec(3)) + (KaU(4,7)*svec(4)))))
-  Vcorr(2,2) = -((((KaU(1,8)*svec(1)) + (KaU(2,8)*svec(2))) + ((KaU(3,8)*svec(3)) + (KaU(4,8)*svec(4)))))
+  do col=1,8
+    dval = 0.0
+    do m=1,nsys ; dval = dval - (KaU(m,col)*svec(m)) ; enddo
+    select case (col)
+      case (1) ; Ucorr(1,1) = dval
+      case (2) ; Ucorr(2,1) = dval
+      case (3) ; Ucorr(1,2) = dval
+      case (4) ; Ucorr(2,2) = dval
+      case (5) ; Vcorr(1,1) = dval
+      case (6) ; Vcorr(2,1) = dval
+      case (7) ; Vcorr(1,2) = dval
+      case (8) ; Vcorr(2,2) = dval
+    end select
+  enddo
 
 end subroutine cutfem_condense_sep2
 
@@ -8740,13 +8765,13 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
   logical, dimension(7,4) :: qpg           ! Grounded state per (QP, triangle)
   real, dimension(4)     :: dfxi, dfeta, daxi, daeta ! P1 gradients of fls and |fls| per triangle [Z]
   real, dimension(4,4)   :: dNxi, dNeta    ! P1 gradient of corner basis per triangle [nondim]
-  real, dimension(4,8)   :: KaU            ! Ridge-to-std stiffness [R L3 Z T-1]
-  real, dimension(4,4)   :: Kaa, Kaa_f     ! Ridge self-stiffness and its Cholesky working copy
+  real, dimension(8,8)   :: KaU            ! Ridge-to-std stiffness [R L3 Z T-1]
+  real, dimension(8,8)   :: Kaa, Kaa_f     ! Ridge self-stiffness and its Cholesky working copy
+  real, dimension(8)     :: shp, gsx, gsy  ! Mode shapes [Z ~> m] and their gradients [nondim]
   real, dimension(2,2)   :: Kaa_inv        ! Inverse ridge self-stiffness (single-mode path)
-  real, dimension(4)     :: tvec, svec     ! Probe intermediates
+  real, dimension(8)     :: tvec, svec     ! Probe intermediates
   real :: b1, b2, b3, b4, mS, mN, mW, mE, a, d, jac, jvisc
   real :: visc_qp, fls_loc, psi_qp, gx, gy, dNx, dNy, sgn, bcw
-  real :: mu, dmu_dx, dmu_dy, psi2, g2x, g2y, bcw2 ! Second-mode (psi*xi) quantities
   real :: coef_prefactor, min_trac_area, eps_vel2
   real :: u_curr_loc, v_curr_loc, unorm2_loc, basal_coef_loc, drag_newt_loc
   real :: hloc, bed_sub, fB_local, fB_e
@@ -8755,7 +8780,9 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
   logical :: do_DG, fv_sub_fric, do_coulomb
   integer :: i, j, is, ie, js, je, t, k, c, nmodes
   integer :: n_floored  ! Number of conditioning-floor hits in the condensation solve
-  real :: det_min       ! Roundoff-scale floor on the 2x2 determinant [(R L4 Z T-1)2]
+  integer :: nsys, m, n ! Ridge system size 2*nmodes, and mode row indices
+  real :: tr_Kaa        ! Trace of the unregularized ridge self-stiffness [R L4 Z T-1]
+  real :: piv_floor     ! Conditioning floor on the Cholesky pivots [R L4 Z T-1]
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
   Sg(:,:) = 0.0 ; Seff(:,:) = 0.0 ; Sall(:,:) = 0.0
@@ -8844,94 +8871,45 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
         gx = (daxi(t)  - (sgn * dfxi(t)))  / a
         gy = (daeta(t) - (sgn * dfeta(t))) / d
 
-        do c=1,4
-          dNx = dNxi(c,t) / a ; dNy = dNeta(c,t) / d
-          KaU(1,c)   = KaU(1,c)   + (jac*visc_qp) * ((4.0*dNx*gx) + (dNy*gy))
-          KaU(1,c+4) = KaU(1,c+4) + (jac*visc_qp) * ((2.0*dNy*gx) + (dNx*gy))
-          KaU(2,c)   = KaU(2,c)   + (jac*visc_qp) * ((dNy*gx) + (2.0*dNx*gy))
-          KaU(2,c+4) = KaU(2,c+4) + (jac*visc_qp) * ((dNx*gx) + (4.0*dNy*gy))
-        enddo
-        Kaa(1,1) = Kaa(1,1) + (jac*visc_qp) * ((4.0*gx*gx) + (gy*gy))
-        Kaa(2,2) = Kaa(2,2) + (jac*visc_qp) * ((gx*gx) + (4.0*gy*gy))
-        Kaa(1,2) = Kaa(1,2) + (jac*visc_qp) * (3.0*gx*gy)
-        kaa_mem_tr = kaa_mem_tr + ((jac*visc_qp) * (5.0*((gx*gx) + (gy*gy))))
-        if (nmodes == 2) then
-          jvisc = jac*visc_qp
-          mu = b2 + b4
-          dmu_dx = (dNxi(2,t) + dNxi(4,t)) / a ; dmu_dy = (dNeta(2,t) + dNeta(4,t)) / d
-          psi2 = psi_qp * mu
-          g2x = (mu*gx) + (psi_qp*dmu_dx) ; g2y = (mu*gy) + (psi_qp*dmu_dy)
+        call cutfem_ridge_shapes(nmodes, beta(:,k,t), psi_qp, gx, gy, dNxi(:,t), dNeta(:,t), &
+                                 a, d, shp, gsx, gsy)
+        jvisc = jac * visc_qp
+        do m=1,nmodes
           do c=1,4
             dNx = dNxi(c,t) / a ; dNy = dNeta(c,t) / d
-            KaU(3,c)   = KaU(3,c)   + jvisc * cutfem_mem_couple(1, g2x, g2y, 1, dNx, dNy)
-            KaU(3,c+4) = KaU(3,c+4) + jvisc * cutfem_mem_couple(1, g2x, g2y, 2, dNx, dNy)
-            KaU(4,c)   = KaU(4,c)   + jvisc * cutfem_mem_couple(2, g2x, g2y, 1, dNx, dNy)
-            KaU(4,c+4) = KaU(4,c+4) + jvisc * cutfem_mem_couple(2, g2x, g2y, 2, dNx, dNy)
+            KaU(2*m-1,c)   = KaU(2*m-1,c)   + (jvisc * cutfem_mem_couple(1, gsx(m), gsy(m), 1, dNx, dNy))
+            KaU(2*m-1,c+4) = KaU(2*m-1,c+4) + (jvisc * cutfem_mem_couple(1, gsx(m), gsy(m), 2, dNx, dNy))
+            KaU(2*m,  c)   = KaU(2*m,  c)   + (jvisc * cutfem_mem_couple(2, gsx(m), gsy(m), 1, dNx, dNy))
+            KaU(2*m,  c+4) = KaU(2*m,  c+4) + (jvisc * cutfem_mem_couple(2, gsx(m), gsy(m), 2, dNx, dNy))
           enddo
-          Kaa(3,3) = Kaa(3,3) + jvisc * cutfem_mem_couple(1, g2x, g2y, 1, g2x, g2y)
-          Kaa(4,4) = Kaa(4,4) + jvisc * cutfem_mem_couple(2, g2x, g2y, 2, g2x, g2y)
-          Kaa(3,4) = Kaa(3,4) + jvisc * cutfem_mem_couple(1, g2x, g2y, 2, g2x, g2y)
-          Kaa(1,3) = Kaa(1,3) + jvisc * cutfem_mem_couple(1, gx, gy, 1, g2x, g2y)
-          Kaa(1,4) = Kaa(1,4) + jvisc * cutfem_mem_couple(1, gx, gy, 2, g2x, g2y)
-          Kaa(2,3) = Kaa(2,3) + jvisc * cutfem_mem_couple(2, gx, gy, 1, g2x, g2y)
-          Kaa(2,4) = Kaa(2,4) + jvisc * cutfem_mem_couple(2, gx, gy, 2, g2x, g2y)
-          kaa_mem_tr = kaa_mem_tr + (jvisc * (cutfem_mem_couple(1, g2x, g2y, 1, g2x, g2y) + &
-                                              cutfem_mem_couple(2, g2x, g2y, 2, g2x, g2y)))
-        endif
-
-        ! Basal drag coupling: grounded QPs feed the ridge; all QPs feed m_all normalizer.
-        u_curr_loc = ((b1*uc(1)) + (b4*uc(4))) + ((b2*uc(2)) + (b3*uc(3)))
-        v_curr_loc = ((b1*vc(1)) + (b4*vc(4))) + ((b2*vc(2)) + (b3*vc(3)))
-        unorm2_loc = ((u_curr_loc**2) + (v_curr_loc**2)) + eps_vel2
-        if (do_coulomb) then
-          hloc = ((b1*hc(1)) + (b4*hc(4))) + ((b2*hc(2)) + (b3*hc(3)))
-          if (do_DG) then
-            hloc = max(hloc, CS%min_h_shelf)
-            bed_sub = ((b1*bedc(1)) + (b4*bedc(4))) + ((b2*bedc(2)) + (b3*bedc(3)))
-            fB_local = compute_fB_local(hloc, bed_sub, rho_oi_ratio, rho_ice_g_LtoZ, &
-                CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
-                CS%CF_PostPeak, CS%n_basal_fric)
-          else
-            fB_local = compute_fB_from_N( &
-                subgrid_effective_pressure(fls_loc, hloc, dens_ratio, rho_ocean_g_LtoZ), &
-                CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
-                CS%CF_PostPeak, CS%n_basal_fric)
-          endif
-        else
-          fB_local = fB_e
-        endif
-        call compute_basal_coef(unorm2_loc, coef_prefactor, min_trac_area, fB_local, &
-            CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .false., &
-            basal_coef_loc, drag_newt_loc)
-
-        ! Actual-velocity x-drag force delivered to each corner: m_all over all QPs (the "fully
-        ! grounded" reference), m_g over grounded QPs (the leaked force). Velocity-weighted so the
-        ! ridge's effect on the true kinked flow shows up (a rigid probe only sees the row sum).
-        do c=1,4
-          m_all(c) = m_all(c) + ((jac * basal_coef_loc * beta(c,k,t)) * u_curr_loc)
+          do n=1,nmodes
+            Kaa(2*m-1,2*n-1) = Kaa(2*m-1,2*n-1) + &
+                (jvisc * cutfem_mem_couple(1, gsx(m), gsy(m), 1, gsx(n), gsy(n)))
+            Kaa(2*m-1,2*n  ) = Kaa(2*m-1,2*n  ) + &
+                (jvisc * cutfem_mem_couple(1, gsx(m), gsy(m), 2, gsx(n), gsy(n)))
+            Kaa(2*m,  2*n-1) = Kaa(2*m,  2*n-1) + &
+                (jvisc * cutfem_mem_couple(2, gsx(m), gsy(m), 1, gsx(n), gsy(n)))
+            Kaa(2*m,  2*n  ) = Kaa(2*m,  2*n  ) + &
+                (jvisc * cutfem_mem_couple(2, gsx(m), gsy(m), 2, gsx(n), gsy(n)))
+          enddo
+          kaa_mem_tr = kaa_mem_tr + &
+              (jvisc * (cutfem_mem_couple(1, gsx(m), gsy(m), 1, gsx(m), gsy(m)) + &
+                        cutfem_mem_couple(2, gsx(m), gsy(m), 2, gsx(m), gsy(m))))
         enddo
+
         if (qpg(k,t)) then
-          bcw = jac * basal_coef_loc * psi_qp
-          do c=1,4
-            KaU(1,c)   = KaU(1,c)   + (bcw * beta(c,k,t))
-            KaU(2,c+4) = KaU(2,c+4) + (bcw * beta(c,k,t))
-            m_g(c) = m_g(c) + ((jac * basal_coef_loc * beta(c,k,t)) * u_curr_loc)
-          enddo
-          Kaa(1,1) = Kaa(1,1) + (jac * basal_coef_loc * (psi_qp*psi_qp))
-          Kaa(2,2) = Kaa(2,2) + (jac * basal_coef_loc * (psi_qp*psi_qp))
-          kaa_drag_tr = kaa_drag_tr + (2.0 * (jac * basal_coef_loc * (psi_qp*psi_qp)))
-          if (nmodes == 2) then
-            bcw2 = jac * basal_coef_loc * psi2
+          do m=1,nmodes
+            bcw = (jac * basal_coef_loc) * shp(m)
             do c=1,4
-              KaU(3,c)   = KaU(3,c)   + (bcw2 * beta(c,k,t))
-              KaU(4,c+4) = KaU(4,c+4) + (bcw2 * beta(c,k,t))
+              KaU(2*m-1,c)   = KaU(2*m-1,c)   + (bcw * beta(c,k,t))
+              KaU(2*m,  c+4) = KaU(2*m,  c+4) + (bcw * beta(c,k,t))
             enddo
-            Kaa(3,3) = Kaa(3,3) + (jac * basal_coef_loc * (psi2*psi2))
-            Kaa(4,4) = Kaa(4,4) + (jac * basal_coef_loc * (psi2*psi2))
-            Kaa(1,3) = Kaa(1,3) + (jac * basal_coef_loc * (psi_qp*psi2))
-            Kaa(2,4) = Kaa(2,4) + (jac * basal_coef_loc * (psi_qp*psi2))
-            kaa_drag_tr = kaa_drag_tr + (2.0 * (jac * basal_coef_loc * (psi2*psi2)))
-          endif
+            do n=1,nmodes
+              Kaa(2*m-1,2*n-1) = Kaa(2*m-1,2*n-1) + ((jac * basal_coef_loc) * (shp(m)*shp(n)))
+              Kaa(2*m,  2*n  ) = Kaa(2*m,  2*n  ) + ((jac * basal_coef_loc) * (shp(m)*shp(n)))
+            enddo
+            kaa_drag_tr = kaa_drag_tr + (2.0 * ((jac * basal_coef_loc) * (shp(m)*shp(m))))
+          enddo
         endif
       enddo
     enddo
@@ -8943,44 +8921,39 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
     ! ridge's true contribution to the force balance at the solution (a rigid u=1 probe undercounts it).
     Uc_rig(:) = 0.0
     tvec(:) = 0.0
-    do c=1,4
-      do k=1,2*nmodes
-        tvec(k) = tvec(k) + ((KaU(k,c)*uc(c)) + (KaU(k,c+4)*vc(c)))
+    nsys = 2*nmodes
+    do m=1,nsys
+      do c=1,4
+        tvec(m) = tvec(m) + ((KaU(m,c)*uc(c)) + (KaU(m,c+4)*vc(c)))
       enddo
     enddo
-    Kaa(2,1) = Kaa(1,2)
-    if (nmodes == 2) then
-      Kaa(3,1) = Kaa(1,3) ; Kaa(3,2) = Kaa(2,3)
-      Kaa(4,1) = Kaa(1,4) ; Kaa(4,2) = Kaa(2,4) ; Kaa(4,3) = Kaa(3,4)
-    endif
 
     svec(:) = 0.0
-    if (nmodes == 2) then
+    tr_Kaa = 0.0
+    do c=1,nsys ; tr_Kaa = tr_Kaa + Kaa(c,c) ; enddo
+    reg_diag = CS%cutfem_ridge_reg * tr_Kaa
+    do c=1,nsys ; Kaa(c,c) = Kaa(c,c) + reg_diag ; enddo
+    piv_floor = cutfem_cond_floor * (tr_Kaa + (real(nsys) * reg_diag))
+    n_floored = 0
+    if (nsys > 2) then
       Kaa_f(:,:) = Kaa(:,:)
-      reg_diag = CS%cutfem_ridge_reg * (((Kaa(1,1) + Kaa(2,2)) + (Kaa(3,3) + Kaa(4,4))))
-      do c=1,4 ; Kaa_f(c,c) = Kaa_f(c,c) + reg_diag ; enddo
-      call cutfem_spd_solve(4, Kaa_f, cutfem_cond_floor * &
-                            (((Kaa_f(1,1) + Kaa_f(2,2)) + (Kaa_f(3,3) + Kaa_f(4,4)))), &
-                            tvec, svec, n_floored)
+      call cutfem_spd_solve(nsys, Kaa_f, piv_floor, tvec, svec, n_floored)
     else
-      reg_diag = CS%cutfem_ridge_reg * (Kaa(1,1) + Kaa(2,2))
-      Kaa(1,1) = Kaa(1,1) + reg_diag ; Kaa(2,2) = Kaa(2,2) + reg_diag
       det = (Kaa(1,1)*Kaa(2,2)) - (Kaa(1,2)*Kaa(2,1))
-      det_min = (cutfem_cond_floor * (Kaa(1,1) + Kaa(2,2)))**2
-      if (det < det_min) then
-        det = det_min ; n_floored = 1
+      if (det < piv_floor**2) then
+        det = piv_floor**2 ; n_floored = 1
       endif
       Kaa_inv(1,1) =  Kaa(2,2)/det ; Kaa_inv(2,2) =  Kaa(1,1)/det
       Kaa_inv(1,2) = -Kaa(1,2)/det ; Kaa_inv(2,1) = -Kaa(2,1)/det
       svec(1) = (Kaa_inv(1,1)*tvec(1)) + (Kaa_inv(1,2)*tvec(2))
       svec(2) = (Kaa_inv(2,1)*tvec(1)) + (Kaa_inv(2,2)*tvec(2))
-      svec(3) = 0.0 ; svec(4) = 0.0
     endif
     ! The production solve in cutfem_condense_sep2 assembles the same K_aa from the same frozen
     ! state, so this count is the one it hits too.
     CS%fg_cut_floored(i,j) = real(n_floored)
+    Uc_rig(:) = 0.0
     do c=1,4
-      Uc_rig(c) = -((((KaU(1,c)*svec(1)) + (KaU(2,c)*svec(2))) + ((KaU(3,c)*svec(3)) + (KaU(4,c)*svec(4)))))
+      do m=1,nsys ; Uc_rig(c) = Uc_rig(c) - (KaU(m,c)*svec(m)) ; enddo
     enddo
 
     ! Scatter corner masses to the four nodes (SW,SE,NW,NE) = (i-1,j-1),(i,j-1),(i-1,j),(i,j).
@@ -9037,14 +9010,14 @@ subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, den
   real, dimension(4)     :: dhxi, dheta    ! P1 gradient of corner thickness per triangle [Z ~> m]
   real, dimension(4)     :: dbxi, dbeta    ! P1 gradient of corner bed per triangle (DG) [Z ~> m]
   real, dimension(4,4)   :: dNxi, dNeta    ! P1 gradient of corner basis per triangle [nondim]
-  real, dimension(4,8)   :: KaU            ! Ridge-to-std stiffness [R L3 Z T-1]
-  real, dimension(4,4)   :: Kaa, Kaa_f     ! Ridge self-stiffness and its Cholesky working copy
+  real, dimension(8,8)   :: KaU            ! Ridge-to-std stiffness [R L3 Z T-1]
+  real, dimension(8,8)   :: Kaa, Kaa_f     ! Ridge self-stiffness and its Cholesky working copy
+  real, dimension(8)     :: shp, gsx, gsy  ! Mode shapes [Z ~> m] and their physical gradients [nondim]
   real, dimension(2,2)   :: Kaa_inv        ! Inverse ridge self-stiffness (single-mode path)
-  real, dimension(4)     :: Fa, svec       ! Driving-stress projection F_a and Kaa^-1 F_a
+  real, dimension(8)     :: Fa, svec       ! Driving-stress projection F_a and Kaa^-1 F_a
   real, dimension(4)     :: Ucorr, Vcorr   ! Per-corner RHS correction [R L3 Z T-2]
   real :: b1, b2, b3, b4, mS, mN, mW, mE, a, d, jac, weight, jvisc
   real :: visc_qp, fls_loc, psi_qp, gx, gy, dNx, dNy, sgn, bcw
-  real :: mu, dmu_dx, dmu_dy, psi2, g2x, g2y, bcw2 ! Second-mode (psi*xi) quantities
   real :: coef_prefactor, min_trac_area, eps_vel2, fB_e
   real :: u_curr_loc, v_curr_loc, unorm2_loc, basal_coef_loc, drag_newt_loc
   real :: dhdx_gp, dhdy_gp, dfdx_gp, dfdy_gp, dbdx_gp, dbdy_gp, dsdx_gp, dsdy_gp, fx_gp, fy_gp
@@ -9054,7 +9027,10 @@ subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, den
   logical :: do_DG, do_coulomb
   integer :: i, j, is, ie, js, je, t, k, c, nmodes
   integer :: n_floored  ! Number of conditioning-floor hits in the condensation solve
-  real :: det_min       ! Roundoff-scale floor on the 2x2 determinant [(R L4 Z T-1)2]
+  integer :: nsys       ! Ridge system size, 2*nmodes
+  integer :: m, n       ! Mode row indices
+  real :: tr_Kaa        ! Trace of the unregularized ridge self-stiffness [R L4 Z T-1]
+  real :: piv_floor     ! Conditioning floor on the Cholesky pivots [R L4 Z T-1]
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
   rho = CS%density_ice ; grav = CS%g_Earth
@@ -9142,37 +9118,28 @@ subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, den
         gy = (daeta(t) - (sgn * dfeta(t))) / d
 
         ! --- Ridge stiffness (identical to cutfem_condense_sep2) ---
-        do c=1,4
-          dNx = dNxi(c,t) / a ; dNy = dNeta(c,t) / d
-          KaU(1,c)   = KaU(1,c)   + (jac*visc_qp) * ((4.0*dNx*gx) + (dNy*gy))
-          KaU(1,c+4) = KaU(1,c+4) + (jac*visc_qp) * ((2.0*dNy*gx) + (dNx*gy))
-          KaU(2,c)   = KaU(2,c)   + (jac*visc_qp) * ((dNy*gx) + (2.0*dNx*gy))
-          KaU(2,c+4) = KaU(2,c+4) + (jac*visc_qp) * ((dNx*gx) + (4.0*dNy*gy))
-        enddo
-        Kaa(1,1) = Kaa(1,1) + (jac*visc_qp) * ((4.0*gx*gx) + (gy*gy))
-        Kaa(2,2) = Kaa(2,2) + (jac*visc_qp) * ((gx*gx) + (4.0*gy*gy))
-        Kaa(1,2) = Kaa(1,2) + (jac*visc_qp) * (3.0*gx*gy)
-        if (nmodes == 2) then
-          jvisc = jac*visc_qp
-          mu = b2 + b4
-          dmu_dx = (dNxi(2,t) + dNxi(4,t)) / a ; dmu_dy = (dNeta(2,t) + dNeta(4,t)) / d
-          psi2 = psi_qp * mu
-          g2x = (mu*gx) + (psi_qp*dmu_dx) ; g2y = (mu*gy) + (psi_qp*dmu_dy)
+        call cutfem_ridge_shapes(nmodes, beta(:,k,t), psi_qp, gx, gy, dNxi(:,t), dNeta(:,t), &
+                                 a, d, shp, gsx, gsy)
+        jvisc = jac * visc_qp
+        do m=1,nmodes
           do c=1,4
             dNx = dNxi(c,t) / a ; dNy = dNeta(c,t) / d
-            KaU(3,c)   = KaU(3,c)   + jvisc * cutfem_mem_couple(1, g2x, g2y, 1, dNx, dNy)
-            KaU(3,c+4) = KaU(3,c+4) + jvisc * cutfem_mem_couple(1, g2x, g2y, 2, dNx, dNy)
-            KaU(4,c)   = KaU(4,c)   + jvisc * cutfem_mem_couple(2, g2x, g2y, 1, dNx, dNy)
-            KaU(4,c+4) = KaU(4,c+4) + jvisc * cutfem_mem_couple(2, g2x, g2y, 2, dNx, dNy)
+            KaU(2*m-1,c)   = KaU(2*m-1,c)   + (jvisc * cutfem_mem_couple(1, gsx(m), gsy(m), 1, dNx, dNy))
+            KaU(2*m-1,c+4) = KaU(2*m-1,c+4) + (jvisc * cutfem_mem_couple(1, gsx(m), gsy(m), 2, dNx, dNy))
+            KaU(2*m,  c)   = KaU(2*m,  c)   + (jvisc * cutfem_mem_couple(2, gsx(m), gsy(m), 1, dNx, dNy))
+            KaU(2*m,  c+4) = KaU(2*m,  c+4) + (jvisc * cutfem_mem_couple(2, gsx(m), gsy(m), 2, dNx, dNy))
           enddo
-          Kaa(3,3) = Kaa(3,3) + jvisc * cutfem_mem_couple(1, g2x, g2y, 1, g2x, g2y)
-          Kaa(4,4) = Kaa(4,4) + jvisc * cutfem_mem_couple(2, g2x, g2y, 2, g2x, g2y)
-          Kaa(3,4) = Kaa(3,4) + jvisc * cutfem_mem_couple(1, g2x, g2y, 2, g2x, g2y)
-          Kaa(1,3) = Kaa(1,3) + jvisc * cutfem_mem_couple(1, gx, gy, 1, g2x, g2y)
-          Kaa(1,4) = Kaa(1,4) + jvisc * cutfem_mem_couple(1, gx, gy, 2, g2x, g2y)
-          Kaa(2,3) = Kaa(2,3) + jvisc * cutfem_mem_couple(2, gx, gy, 1, g2x, g2y)
-          Kaa(2,4) = Kaa(2,4) + jvisc * cutfem_mem_couple(2, gx, gy, 2, g2x, g2y)
-        endif
+          do n=1,nmodes
+            Kaa(2*m-1,2*n-1) = Kaa(2*m-1,2*n-1) + &
+                (jvisc * cutfem_mem_couple(1, gsx(m), gsy(m), 1, gsx(n), gsy(n)))
+            Kaa(2*m-1,2*n  ) = Kaa(2*m-1,2*n  ) + &
+                (jvisc * cutfem_mem_couple(1, gsx(m), gsy(m), 2, gsx(n), gsy(n)))
+            Kaa(2*m,  2*n-1) = Kaa(2*m,  2*n-1) + &
+                (jvisc * cutfem_mem_couple(2, gsx(m), gsy(m), 1, gsx(n), gsy(n)))
+            Kaa(2*m,  2*n  ) = Kaa(2*m,  2*n  ) + &
+                (jvisc * cutfem_mem_couple(2, gsx(m), gsy(m), 2, gsx(n), gsy(n)))
+          enddo
+        enddo
         hloc = ((b1*hc(1)) + (b4*hc(4))) + ((b2*hc(2)) + (b3*hc(3)))
         if (qpg(k,t)) then
           u_curr_loc = ((b1*uc(1)) + (b4*uc(4))) + ((b2*uc(2)) + (b3*uc(3)))
@@ -9197,24 +9164,17 @@ subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, den
           call compute_basal_coef(unorm2_loc, coef_prefactor, min_trac_area, fB_local, &
               CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .false., &
               basal_coef_loc, drag_newt_loc)
-          bcw = jac * basal_coef_loc * psi_qp
-          do c=1,4
-            KaU(1,c)   = KaU(1,c)   + (bcw * beta(c,k,t))
-            KaU(2,c+4) = KaU(2,c+4) + (bcw * beta(c,k,t))
-          enddo
-          Kaa(1,1) = Kaa(1,1) + (jac * basal_coef_loc * (psi_qp*psi_qp))
-          Kaa(2,2) = Kaa(2,2) + (jac * basal_coef_loc * (psi_qp*psi_qp))
-          if (nmodes == 2) then
-            bcw2 = jac * basal_coef_loc * psi2
+          do m=1,nmodes
+            bcw = (jac * basal_coef_loc) * shp(m)
             do c=1,4
-              KaU(3,c)   = KaU(3,c)   + (bcw2 * beta(c,k,t))
-              KaU(4,c+4) = KaU(4,c+4) + (bcw2 * beta(c,k,t))
+              KaU(2*m-1,c)   = KaU(2*m-1,c)   + (bcw * beta(c,k,t))
+              KaU(2*m,  c+4) = KaU(2*m,  c+4) + (bcw * beta(c,k,t))
             enddo
-            Kaa(3,3) = Kaa(3,3) + (jac * basal_coef_loc * (psi2*psi2))
-            Kaa(4,4) = Kaa(4,4) + (jac * basal_coef_loc * (psi2*psi2))
-            Kaa(1,3) = Kaa(1,3) + (jac * basal_coef_loc * (psi_qp*psi2))
-            Kaa(2,4) = Kaa(2,4) + (jac * basal_coef_loc * (psi_qp*psi2))
-          endif
+            do n=1,nmodes
+              Kaa(2*m-1,2*n-1) = Kaa(2*m-1,2*n-1) + ((jac * basal_coef_loc) * (shp(m)*shp(n)))
+              Kaa(2*m,  2*n  ) = Kaa(2*m,  2*n  ) + ((jac * basal_coef_loc) * (shp(m)*shp(n)))
+            enddo
+          enddo
         endif
 
         ! --- Driving-stress projection F_a = sum weight*psi*(-rho g H grad S), one-sided grad S. ---
@@ -9247,49 +9207,42 @@ subroutine cutfem_taud_ridge_rhs(CS, ISS, G, US, u_shlf, v_shlf, RHSu, RHSv, den
           endif
           fx_gp = -rgHe * dsdx_gp ; fy_gp = -rgHe * dsdy_gp
         endif
-        Fa(1) = Fa(1) + ((weight * psi_qp) * fx_gp)
-        Fa(2) = Fa(2) + ((weight * psi_qp) * fy_gp)
-        if (nmodes == 2) then
-          Fa(3) = Fa(3) + ((weight * psi2) * fx_gp)
-          Fa(4) = Fa(4) + ((weight * psi2) * fy_gp)
-        endif
+        do m=1,nmodes
+          Fa(2*m-1) = Fa(2*m-1) + ((weight * shp(m)) * fx_gp)
+          Fa(2*m  ) = Fa(2*m  ) + ((weight * shp(m)) * fy_gp)
+        enddo
       enddo
     enddo
 
-    Kaa(2,1) = Kaa(1,2)
-    if (nmodes == 2) then
-      Kaa(3,1) = Kaa(1,3) ; Kaa(3,2) = Kaa(2,3)
-      Kaa(4,1) = Kaa(1,4) ; Kaa(4,2) = Kaa(2,4) ; Kaa(4,3) = Kaa(3,4)
-    endif
-
     svec(:) = 0.0
-    ! Same conditioning floor as cutfem_condense_sep2, so the operator and the right-hand side
-    ! always invert the same K_aa in a given cell.
-    if (nmodes == 2) then
+    ! Same regularization and conditioning floor as cutfem_condense_sep2, so the operator and the
+    ! right-hand side always invert the same K_aa in a given cell.
+    nsys = 2*nmodes
+    tr_Kaa = 0.0
+    do c=1,nsys ; tr_Kaa = tr_Kaa + Kaa(c,c) ; enddo
+    reg_diag = CS%cutfem_ridge_reg * tr_Kaa
+    do c=1,nsys ; Kaa(c,c) = Kaa(c,c) + reg_diag ; enddo
+    piv_floor = cutfem_cond_floor * (tr_Kaa + (real(nsys) * reg_diag))
+    if (nsys > 2) then
       Kaa_f(:,:) = Kaa(:,:)
-      reg_diag = CS%cutfem_ridge_reg * (((Kaa(1,1) + Kaa(2,2)) + (Kaa(3,3) + Kaa(4,4))))
-      do c=1,4 ; Kaa_f(c,c) = Kaa_f(c,c) + reg_diag ; enddo
-      call cutfem_spd_solve(4, Kaa_f, cutfem_cond_floor * &
-                            (((Kaa_f(1,1) + Kaa_f(2,2)) + (Kaa_f(3,3) + Kaa_f(4,4)))), &
-                            Fa, svec, n_floored)
+      call cutfem_spd_solve(nsys, Kaa_f, piv_floor, Fa, svec, n_floored)
     else
-      reg_diag = CS%cutfem_ridge_reg * (Kaa(1,1) + Kaa(2,2))
-      Kaa(1,1) = Kaa(1,1) + reg_diag ; Kaa(2,2) = Kaa(2,2) + reg_diag
       det = (Kaa(1,1)*Kaa(2,2)) - (Kaa(1,2)*Kaa(2,1))
-      det_min = (cutfem_cond_floor * (Kaa(1,1) + Kaa(2,2)))**2
-      det = max(det, det_min)
+      det = max(det, piv_floor**2)
       Kaa_inv(1,1) =  Kaa(2,2)/det ; Kaa_inv(2,2) =  Kaa(1,1)/det
       Kaa_inv(1,2) = -Kaa(1,2)/det ; Kaa_inv(2,1) = -Kaa(2,1)/det
       ! RHS correction G = -K_aU^T (Kaa^-1 F_a).
       svec(1) = (Kaa_inv(1,1)*Fa(1)) + (Kaa_inv(1,2)*Fa(2))
       svec(2) = (Kaa_inv(2,1)*Fa(1)) + (Kaa_inv(2,2)*Fa(2))
-      svec(3) = 0.0 ; svec(4) = 0.0
     endif
 
     ! RHS correction G(col) = -sum_m KaU(m,col)*svec(m).
+    Ucorr(:) = 0.0 ; Vcorr(:) = 0.0
     do c=1,4
-      Ucorr(c) = -((((KaU(1,c)*svec(1))   + (KaU(2,c)*svec(2)))   + ((KaU(3,c)*svec(3))   + (KaU(4,c)*svec(4)))))
-      Vcorr(c) = -((((KaU(1,c+4)*svec(1)) + (KaU(2,c+4)*svec(2))) + ((KaU(3,c+4)*svec(3)) + (KaU(4,c+4)*svec(4)))))
+      do m=1,nsys
+        Ucorr(c) = Ucorr(c) - (KaU(m,c)*svec(m))
+        Vcorr(c) = Vcorr(c) - (KaU(m,c+4)*svec(m))
+      enddo
     enddo
 
     ! Scatter to the four nodes (SW,SE,NW,NE) = (I-1,J-1),(I,J-1),(I-1,J),(I,J).
