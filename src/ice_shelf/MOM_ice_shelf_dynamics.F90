@@ -8276,7 +8276,7 @@ end subroutine cutfem_ridge_shapes
 subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_curr, U_delta, V_delta, &
                                 ice_visc_c, fB_e, dxCv_S, dxCv_N, dyCu_W, dyCu_E, IareaT, &
                                 dens_ratio, Ucorr, Vcorr, bedc, use_newton, diag_only, h_visc_c, &
-                                quad_mismatch, quad_swap)
+                                quad_mismatch, quad_swap, patch_resid)
   type(ice_shelf_dyn_CS), intent(in) :: CS      !< Ice shelf control structure
   type(ocean_grid_type),  intent(in) :: G       !< The grid structure
   type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
@@ -8308,6 +8308,14 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
                                                 !! evaluated at each SEP2 quadrature point, which is
                                                 !! what K_uu uses and what the positive-definiteness
                                                 !! of the condensed operator requires.
+  real, optional,        intent(out) :: patch_resid !< If present, the worst over modes of
+                                                !! |mean of grad(psi_m) over the cell| divided by the
+                                                !! largest |grad(psi_m)| at any quadrature point
+                                                !! [nondim]. This is the patch-test condition for an
+                                                !! element-local enrichment: the enhanced strain must
+                                                !! be L2-orthogonal to constant stress, which for the
+                                                !! membrane means the integral of grad(psi_m) over the
+                                                !! element vanishes. Zero means the condition holds.
   logical, optional,      intent(in) :: quad_swap !< Overrides CUTFEM_CONSISTENT_QUAD for this call.
                                                 !! The symmetry probe sets it false for its mirror
                                                 !! tests, because the Gauss block reads CS%Phi and
@@ -8348,6 +8356,10 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   real, dimension(4)     :: dNxq, dNyq ! Physical Q1 corner-basis gradients at the QP [L-1 ~> m-1]
   logical :: do_visc_qp                ! Evaluate Glen's law at each SEP2 QP rather than a cell mean
   logical :: do_cons_quad              ! Re-integrate the standard membrane on the SEP2 quadrature
+  logical :: do_patch                  ! Accumulate the patch-test integral of grad(psi_m)
+  real, dimension(8) :: igx, igy       ! Integral of grad(psi_m) over the cell [nondim]
+  real, dimension(8) :: gmax           ! Largest |grad(psi_m)| at any QP [nondim]
+  real :: wsum                         ! Sum of the QP weights, the cell measure [nondim]
   real, dimension(8,8) :: Kuu_sep      ! Standard membrane block on the SEP2 quadrature [R L4 Z T-1]
   real, dimension(8,8) :: Kuu_gau      ! Standard membrane block on 2x2 Gauss, as CG_action builds it
   real, dimension(4) :: pgx, pgy       ! Q1 gradients at a Gauss point [L-1 ~> m-1]
@@ -8408,6 +8420,10 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   integer :: t, k, c
 
   Ucorr(:,:) = 0.0 ; Vcorr(:,:) = 0.0
+  do_patch = present(patch_resid)
+  if (do_patch) then
+    patch_resid = 0.0 ; igx(:) = 0.0 ; igy(:) = 0.0 ; gmax(:) = 0.0 ; wsum = 0.0
+  endif
 
   ! The ridge vanishes identically on a cell whose corner deficits all share a sign, because then
   ! sum_c |fls_c| N_c = |sum_c fls_c N_c|. Returning zero here, rather than excluding such cells
@@ -8504,6 +8520,21 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
       ! --- Mode shapes and their physical gradients at this QP. ---
       call cutfem_q1_grads(beta(:,k,t), a, d, dNxq, dNyq)
       call cutfem_ridge_shapes(nmodes, beta(:,k,t), psi_qp, gx, gy, dNxq, dNyq, shp, gsx, gsy)
+
+      ! Patch-test integral. An element-local enrichment is a nonconforming element, and Irons'
+      ! criterion for those is that a constant-stress state be reproduced exactly. For the membrane
+      ! that reduces to the enhanced strain being orthogonal to constant stress, i.e. the integral
+      ! of grad(psi_m) over the element vanishing. The ridge satisfies it for a grid-aligned cut
+      ! with the single mode, where the contributions from the two crossed edges cancel, but the
+      ! nodal weighting of CUTFEM_RIDGE_MODES=4 breaks that cancellation, so this is expected to be
+      ! nonzero there and is worth measuring rather than assuming.
+      if (do_patch) then
+        wsum = wsum + jac
+        do m=1,nmodes
+          igx(m) = igx(m) + (jac * gsx(m)) ; igy(m) = igy(m) + (jac * gsy(m))
+          gmax(m) = max(gmax(m), sqrt((gsx(m)**2) + (gsy(m)**2)))
+        enddo
+      endif
 
       ! Glen's law at this quadrature point, from the frozen corner velocities and the same Q1
       ! gradients the standard block uses. Falls back to the cell mean set above when the caller
@@ -8669,6 +8700,13 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
       endif
     enddo
   enddo
+
+  if (do_patch .and. (wsum > 0.0)) then
+    do m=1,nmodes
+      if (gmax(m) > 0.0) patch_resid = max(patch_resid, &
+          sqrt(((igx(m)/wsum)**2) + ((igy(m)/wsum)**2)) / gmax(m))
+    enddo
+  endif
 
   ! Standard membrane on 2x2 Gauss, reproducing exactly what CG_action already added for this
   ! cell, so that the difference below replaces it with the SEP2 version rather than double
@@ -8857,6 +8895,8 @@ subroutine cutfem_symmetry_probe(CS, G, US, dens_ratio)
   real :: rns, rew      ! Worst relative north-south and east-west mirror residuals [nondim]
   real :: rquad         ! Worst relative SEP2-minus-Gauss standard membrane mismatch [nondim]
   real :: qm            ! Per-configuration value of the same [nondim]
+  real :: rpatch        ! Worst patch-test residual over the swept cuts [nondim]
+  real :: pr            ! Per-configuration value of the same [nondim]
   real, dimension(2,2) :: Uz, Vz ! Discarded corrections from the strain-free quadrature probe
   real :: visc_rigid, nvf_rigid  ! Glen's law at zero strain [R L4 Z T-1], [R L4 Z T]
   real, dimension(CS%visc_qps) :: visc_c_rigid ! That value at every viscosity sample [R L4 Z T-1]
@@ -8881,7 +8921,7 @@ subroutine cutfem_symmetry_probe(CS, G, US, dens_ratio)
   Ud(1,1) = 0.5*u0 ; Ud(2,1) = -0.2*u0 ; Ud(1,2) = 1.3*u0 ; Ud(2,2) = 0.8*u0
   Vd(1,1) = -0.7*u0 ; Vd(2,1) = 1.1*u0 ; Vd(1,2) = 0.2*u0 ; Vd(2,2) = -0.9*u0
 
-  rns = 0.0 ; rew = 0.0 ; rquad = 0.0 ; ncut = 0
+  rns = 0.0 ; rew = 0.0 ; rquad = 0.0 ; rpatch = 0.0 ; ncut = 0
   dth = 4.0*atan(1.0) / 8.0   ! pi/8
 
   do ia=0,7 ; do io=1,9
@@ -8899,7 +8939,9 @@ subroutine cutfem_symmetry_probe(CS, G, US, dens_ratio)
     ncut = ncut + 1
 
     call cutfem_condense_sep2(CS, G, US, i, j, fls, hc, Uc, Vc, Ud, Vd, CS%ice_visc(i,j,:), &
-        CS%fB_elem(i,j), dx_S, dx_N, dy_W, dy_E, G%IareaT(i,j), dens_ratio, Ur, Vr, h_visc_c=hv_cf)
+        CS%fB_elem(i,j), dx_S, dx_N, dy_W, dy_E, G%IareaT(i,j), dens_ratio, Ur, Vr, &
+        h_visc_c=hv_cf, quad_swap=.false., patch_resid=pr)
+    rpatch = max(rpatch, pr)
     scal = max(maxval(abs(Ur)), maxval(abs(Vr)))
     if (scal <= 0.0) cycle
 
@@ -8934,7 +8976,7 @@ subroutine cutfem_symmetry_probe(CS, G, US, dens_ratio)
     enddo
     call cutfem_condense_sep2(CS, G, US, i, j, fls_m, hc_m, Uc_m, Vc_m, Ud_m, Vd_m, &
         CS%ice_visc(i,j,:), CS%fB_elem(i,j), dx_N, dx_S, dy_W, dy_E, G%IareaT(i,j), &
-        dens_ratio, Um, Vm, h_visc_c=hv_cf)
+        dens_ratio, Um, Vm, h_visc_c=hv_cf, quad_swap=.false.)
     do c=1,2
       r1 = abs(Um(c,1) - Ur(c,2)) ; rns = max(rns, r1/scal)
       r1 = abs(Um(c,2) - Ur(c,1)) ; rns = max(rns, r1/scal)
@@ -8953,7 +8995,7 @@ subroutine cutfem_symmetry_probe(CS, G, US, dens_ratio)
     enddo
     call cutfem_condense_sep2(CS, G, US, i, j, fls_m, hc_m, Uc_m, Vc_m, Ud_m, Vd_m, &
         CS%ice_visc(i,j,:), CS%fB_elem(i,j), dx_S, dx_N, dy_E, dy_W, G%IareaT(i,j), &
-        dens_ratio, Um, Vm, h_visc_c=hv_cf)
+        dens_ratio, Um, Vm, h_visc_c=hv_cf, quad_swap=.false.)
     do c=1,2
       r1 = abs(Um(1,c) + Ur(2,c)) ; rew = max(rew, r1/scal)
       r1 = abs(Um(2,c) + Ur(1,c)) ; rew = max(rew, r1/scal)
@@ -8962,9 +9004,9 @@ subroutine cutfem_symmetry_probe(CS, G, US, dens_ratio)
     enddo
   enddo ; enddo
 
-  write(mesg,'("CutFEM symmetry probe (modes=",I1,", ",I3," cuts): max relative mirror residual '// &
-              'N-S ",ES10.3,", E-W ",ES10.3,"; quadrature self-test ",ES10.3)') &
-              CS%cutfem_ridge_modes, ncut, rns, rew, rquad
+  write(mesg,'("CutFEM probe (modes=",I1,", ",I3," cuts): mirror N-S ",ES10.3,", E-W ",ES10.3, '// &
+              '"; quadrature ",ES10.3,"; patch test ",ES10.3)') &
+              CS%cutfem_ridge_modes, ncut, rns, rew, rquad, rpatch
   call MOM_mesg(mesg)
 
 end subroutine cutfem_symmetry_probe
