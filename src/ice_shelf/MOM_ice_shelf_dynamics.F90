@@ -6278,6 +6278,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   real, dimension(2,2) :: Usub, Vsub  ! Subgrid nodal contributions to basal traction [R L3 Z T-2 ~> kg m s-2]
   real, dimension(2,2) :: Ucorr, Vcorr ! CutFEM ridge condensation correction to the nodal action [R L3 Z T-2]
   logical :: cf_corners_ok             ! True if all four corner flotation values are usable (FV path only)
+  real, dimension(4)   :: hv_cf        ! Corner thickness the ridge viscosity is evaluated on [Z ~> m]
   real, dimension(4)   :: fls_cf       ! Corner flotation deficit for the CutFEM ridge, SW,SE,NW,NE [Z ~> m]
   real, dimension(4)   :: hc_cf        ! Corner thickness for the CutFEM ridge, SW,SE,NW,NE [Z ~> m]
   real, dimension(4)   :: bedc_cf      ! Corner bed elevation for the CutFEM ridge (DG mode), SW,SE,NW,NE [Z ~> m]
@@ -6588,6 +6589,16 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
         cf_corners_ok = ((CS%corner_valid(I-1,J-1) .and. CS%corner_valid(I,J-1)) .and. &
                          (CS%corner_valid(I-1,J  ) .and. CS%corner_valid(I,J  )))
       if (CS%cutfem_gl_friction .and. (fv_sub_fric .or. do_DG) .and. cf_corners_ok) then
+        ! Thickness the ridge viscosity is evaluated on: the same field calc_shelf_visc uses, which
+        ! is the DG nodal thickness on the DG path and the cell mean otherwise. Read h_nodal
+        ! directly rather than through hgate, which is the flotation classifier and coincides with
+        ! h_nodal only while DG_GL_GATE_CONTINUOUS is off.
+        if (do_DG) then
+          hv_cf(1) = CS%h_nodal(i,j,1,1) ; hv_cf(2) = CS%h_nodal(i,j,2,1)
+          hv_cf(3) = CS%h_nodal(i,j,1,2) ; hv_cf(4) = CS%h_nodal(i,j,2,2)
+        else
+          hv_cf(:) = h_shelf(i,j)
+        endif
         if (fv_sub_fric) then
           ! Corner thickness and the SAME flotation-deficit field the drag block used.
           hc_cf(1)  = CS%H_corner(I-1,J-1)   ; hc_cf(2)  = CS%H_corner(I,J-1)
@@ -6599,7 +6610,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
               u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
               CS%ice_visc(i,j,:), fB_e, G%dxCv(i,j-1), G%dxCv(i,j), &
               G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr, &
-              use_newton=use_newton)
+              use_newton=use_newton, h_visc_c=hv_cf)
         else  ! do_DG: bed and (unclamped) nodal thickness define the partition, matching
               ! the DG branch of CG_action_sep2_basal (fls = r*h_nodal - bed, no min_h clamp).
           hc_cf(1)  = hgate(i,j,1,1) ; hc_cf(2)  = hgate(i,j,2,1)
@@ -6612,7 +6623,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
               u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
               CS%ice_visc(i,j,:), fB_e, G%dxCv(i,j-1), G%dxCv(i,j), &
               G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr, bedc=bedc_cf, &
-              use_newton=use_newton)
+              use_newton=use_newton, h_visc_c=hv_cf)
         endif
         if (umask(I-1,J-1) == 1) uret_b(I-1,J-1,4) = uret_b(I-1,J-1,4) + Ucorr(1,1)
         if (umask(I-1,J  ) == 1) uret_b(I-1,J  ,2) = uret_b(I-1,J  ,2) + Ucorr(1,2)
@@ -7144,6 +7155,7 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
   real, dimension(2,2) :: Ucorr, Vcorr    ! Per-element CutFEM diagonal correction [R L2 Z T-1 ~> kg s-1]
   real, dimension(4)   :: fls_cf, hc_cf, bedc_cf ! Corner flotation deficit, thickness and bed for the
                          ! CutFEM ridge, SW,SE,NW,NE [Z ~> m]
+  real, dimension(4)   :: hv_cf   ! Corner thickness the ridge viscosity is evaluated on [Z ~> m]
   logical :: cf_corners_ok ! True if all four corner flotation values are usable (FV path only)
   logical :: do_newton_visc  ! Whether to apply viscosity-related Newton tangent stiffness corrections
   logical :: visc_qp4
@@ -7422,6 +7434,12 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
       cf_corners_ok = ((CS%corner_valid(I-1,J-1) .and. CS%corner_valid(I,J-1)) .and. &
                        (CS%corner_valid(I-1,J  ) .and. CS%corner_valid(I,J  )))
     if (CS%cutfem_gl_friction .and. (fv_sub_fric .or. do_DG) .and. cf_corners_ok) then
+      if (do_DG) then
+        hv_cf(1) = CS%h_nodal(i,j,1,1) ; hv_cf(2) = CS%h_nodal(i,j,2,1)
+        hv_cf(3) = CS%h_nodal(i,j,1,2) ; hv_cf(4) = CS%h_nodal(i,j,2,2)
+      else
+        hv_cf(:) = h_shelf(i,j)
+      endif
       if (fv_sub_fric) then
         hc_cf(1)  = CS%H_corner(I-1,J-1)   ; hc_cf(2)  = CS%H_corner(I,J-1)
         hc_cf(3)  = CS%H_corner(I-1,J  )   ; hc_cf(4)  = CS%H_corner(I,J  )
@@ -7432,7 +7450,7 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
             u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
             CS%ice_visc(i,j,:), fB_e, G%dxCv(i,j-1), G%dxCv(i,j), &
             G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr, &
-            use_newton=CS%doing_newton, diag_only=.true.)
+            use_newton=CS%doing_newton, diag_only=.true., h_visc_c=hv_cf)
       else
         hc_cf(1)  = hgate(i,j,1,1) ; hc_cf(2)  = hgate(i,j,2,1)
         hc_cf(3)  = hgate(i,j,1,2) ; hc_cf(4)  = hgate(i,j,2,2)
@@ -7444,7 +7462,7 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
             u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
             CS%ice_visc(i,j,:), fB_e, G%dxCv(i,j-1), G%dxCv(i,j), &
             G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), dens_ratio, Ucorr, Vcorr, &
-            bedc=bedc_cf, use_newton=CS%doing_newton, diag_only=.true.)
+            bedc=bedc_cf, use_newton=CS%doing_newton, diag_only=.true., h_visc_c=hv_cf)
       endif
       if (CS%umask(I-1,J-1)==1) cut_du(I-1,J-1) = cut_du(I-1,J-1) + Ucorr(1,1)
       if (CS%umask(I  ,J-1)==1) cut_du(I  ,J-1) = cut_du(I  ,J-1) + Ucorr(2,1)
@@ -8243,7 +8261,7 @@ end subroutine cutfem_ridge_shapes
 !! Symmetric by construction: the same K_aU multiplies on both sides of K_aa^-1.
 subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_curr, U_delta, V_delta, &
                                 ice_visc_c, fB_e, dxCv_S, dxCv_N, dyCu_W, dyCu_E, IareaT, &
-                                dens_ratio, Ucorr, Vcorr, bedc, use_newton, diag_only)
+                                dens_ratio, Ucorr, Vcorr, bedc, use_newton, diag_only, h_visc_c)
   type(ice_shelf_dyn_CS), intent(in) :: CS      !< Ice shelf control structure
   type(ocean_grid_type),  intent(in) :: G       !< The grid structure
   type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
@@ -8269,6 +8287,12 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   real, dimension(4), optional, intent(in) :: bedc !< Corner bed elevation, SW,SE,NW,NE [Z ~> m]. Present
                                                 !! selects DG mode (Coulomb fB from h and bed); absent
                                                 !! selects FV-subgrid mode (fB from the flotation deficit).
+  real, dimension(4), optional, intent(in) :: h_visc_c !< Corner thickness to use for the viscosity,
+                                                !! SW,SE,NW,NE [Z ~> m]. Present switches the ridge
+                                                !! blocks from a cell-mean viscosity to Glen's law
+                                                !! evaluated at each SEP2 quadrature point, which is
+                                                !! what K_uu uses and what the positive-definiteness
+                                                !! of the condensed operator requires.
   logical, optional,      intent(in) :: use_newton !< If true, include the Newton drag and viscosity
                                                 !! tangents in K_aU and K_aa so the condensed correction
                                                 !! is part of the Jacobian rather than of the Picard
@@ -8292,6 +8316,12 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   real, dimension(8,8)   :: Kaa        ! Ridge self-stiffness, 2*nmodes square [R L4 Z T-1]
   real, dimension(8)     :: shp        ! Mode shape values at the QP [Z ~> m]
   real, dimension(4)     :: dNxq, dNyq ! Physical Q1 corner-basis gradients at the QP [L-1 ~> m-1]
+  logical :: do_visc_qp                ! Evaluate Glen's law at each SEP2 QP rather than a cell mean
+  real :: Visc_coef                    ! AGlen_visc^(-1/n_glen) at this cell [Pa-1 s-1]^(-1/n_g)
+  real :: h_visc                       ! Thickness for the viscosity at the QP [Z ~> m]
+  real :: ux_qp, uy_qp, vx_qp, vy_qp   ! Frozen strain rates at the QP [T-1 ~> s-1]
+  real :: visc_pt                      ! Viscosity at the QP [R L4 Z T-1]
+  real :: nvf_pt                       ! Newton viscosity tangent factor at the QP [R L4 Z T]
   real, dimension(8)     :: gsx, gsy   ! Physical mode gradients at the QP [nondim]
   real :: b1, b2, b3, b4               ! Corner-basis weights at the QP [nondim]
   real :: mS, mN, mW, mE               ! Marginal edge weights [nondim]
@@ -8382,6 +8412,8 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   visc_qp = visc_qp / real(CS%visc_qps)
   nmodes = CS%cutfem_ridge_modes
 
+  do_visc_qp = present(h_visc_c)
+  if (do_visc_qp) Visc_coef = (CS%AGlen_visc(i_elem,j_elem))**(-1./CS%n_glen)
   do_newton = .false.
   if (present(use_newton)) do_newton = use_newton
   do_diag = .false.
@@ -8429,6 +8461,28 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
       ! --- Mode shapes and their physical gradients at this QP. ---
       call cutfem_q1_grads(beta(:,k,t), a, d, dNxq, dNyq)
       call cutfem_ridge_shapes(nmodes, beta(:,k,t), psi_qp, gx, gy, dNxq, dNyq, shp, gsx, gsy)
+
+      ! Glen's law at this quadrature point, from the frozen corner velocities and the same Q1
+      ! gradients the standard block uses. Falls back to the cell mean set above when the caller
+      ! does not supply a thickness, which keeps the older behaviour available.
+      if (do_visc_qp) then
+        ux_qp = 0.0 ; uy_qp = 0.0 ; vx_qp = 0.0 ; vy_qp = 0.0
+        do c=1,4
+          ux_qp = ux_qp + (dNxq(c)*uc(c)) ; uy_qp = uy_qp + (dNyq(c)*uc(c))
+          vx_qp = vx_qp + (dNxq(c)*vc(c)) ; vy_qp = vy_qp + (dNyq(c)*vc(c))
+        enddo
+        h_visc = ((beta(1,k,t)*h_visc_c(1)) + (beta(4,k,t)*h_visc_c(4))) + &
+                 ((beta(2,k,t)*h_visc_c(2)) + (beta(3,k,t)*h_visc_c(3)))
+        h_visc = max(h_visc, CS%min_h_shelf)
+        call shelf_visc_point(ux_qp, uy_qp, vx_qp, vy_qp, G%areaT(i_elem,j_elem) * h_visc, &
+            Visc_coef, CS%n_glen, CS%eps_glen_min, CS%min_ice_visc, US%s_to_T, US%Pa_to_RL2_T2, &
+            visc_pt, nvf_pt)
+        visc_qp = visc_pt
+        if (do_newton_visc) then
+          tw_x = (2.0*ux_qp) + vy_qp ; tw_y = (2.0*vy_qp) + ux_qp ; tw_s = 0.5*(uy_qp + vx_qp)
+          nvf_c = nvf_pt
+        endif
+      endif
 
       ! --- Membrane (viscous) coupling, all QPs. SSA bilinear form; see CG_action. Row 2m-1 is
       !     mode m acting as a u-field shape, row 2m as a v-field shape. ---
@@ -8659,6 +8713,7 @@ subroutine cutfem_symmetry_probe(CS, G, US, dens_ratio)
   real,                   intent(in) :: dens_ratio !< Ice/water density ratio [nondim]
 
   real, dimension(4)   :: fls, hc, fls_m, hc_m   ! Corner deficit and thickness, SW,SE,NW,NE [Z ~> m]
+  real, dimension(4)   :: hv_cf                   ! Corner thickness for the ridge viscosity [Z ~> m]
   real, dimension(2,2) :: Uc, Vc, Ud, Vd         ! Frozen and search-direction velocities [L T-1 ~> m s-1]
   real, dimension(2,2) :: Uc_m, Vc_m, Ud_m, Vd_m ! Their mirrored counterparts [L T-1 ~> m s-1]
   real, dimension(2,2) :: Ur, Vr, Um, Vm         ! Reference and mirrored corrections [R L3 Z T-2]
@@ -8683,6 +8738,7 @@ subroutine cutfem_symmetry_probe(CS, G, US, dens_ratio)
   h0 = 1000.0 * US%m_to_Z
   u0 = 100.0 * US%m_s_to_L_T / (365.0*86400.0)
   hc(:) = h0
+  hv_cf(:) = h0
   ! A deliberately asymmetric velocity so that a mirror is a real test rather than a no-op.
   Uc(1,1) = u0 ; Uc(2,1) = 1.7*u0 ; Uc(1,2) = 0.6*u0 ; Uc(2,2) = 2.3*u0
   Vc(1,1) = 0.3*u0 ; Vc(2,1) = -0.4*u0 ; Vc(1,2) = 0.9*u0 ; Vc(2,2) = -1.1*u0
@@ -8707,7 +8763,7 @@ subroutine cutfem_symmetry_probe(CS, G, US, dens_ratio)
     ncut = ncut + 1
 
     call cutfem_condense_sep2(CS, G, US, i, j, fls, hc, Uc, Vc, Ud, Vd, CS%ice_visc(i,j,:), &
-        CS%fB_elem(i,j), dx_S, dx_N, dy_W, dy_E, G%IareaT(i,j), dens_ratio, Ur, Vr)
+        CS%fB_elem(i,j), dx_S, dx_N, dy_W, dy_E, G%IareaT(i,j), dens_ratio, Ur, Vr, h_visc_c=hv_cf)
     scal = max(maxval(abs(Ur)), maxval(abs(Vr)))
     if (scal <= 0.0) cycle
 
@@ -8722,7 +8778,7 @@ subroutine cutfem_symmetry_probe(CS, G, US, dens_ratio)
     enddo
     call cutfem_condense_sep2(CS, G, US, i, j, fls_m, hc_m, Uc_m, Vc_m, Ud_m, Vd_m, &
         CS%ice_visc(i,j,:), CS%fB_elem(i,j), dx_N, dx_S, dy_W, dy_E, G%IareaT(i,j), &
-        dens_ratio, Um, Vm)
+        dens_ratio, Um, Vm, h_visc_c=hv_cf)
     do c=1,2
       r1 = abs(Um(c,1) - Ur(c,2)) ; rns = max(rns, r1/scal)
       r1 = abs(Um(c,2) - Ur(c,1)) ; rns = max(rns, r1/scal)
@@ -8741,7 +8797,7 @@ subroutine cutfem_symmetry_probe(CS, G, US, dens_ratio)
     enddo
     call cutfem_condense_sep2(CS, G, US, i, j, fls_m, hc_m, Uc_m, Vc_m, Ud_m, Vd_m, &
         CS%ice_visc(i,j,:), CS%fB_elem(i,j), dx_S, dx_N, dy_E, dy_W, G%IareaT(i,j), &
-        dens_ratio, Um, Vm)
+        dens_ratio, Um, Vm, h_visc_c=hv_cf)
     do c=1,2
       r1 = abs(Um(1,c) + Ur(2,c)) ; rew = max(rew, r1/scal)
       r1 = abs(Um(2,c) + Ur(1,c)) ; rew = max(rew, r1/scal)
