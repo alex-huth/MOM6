@@ -310,8 +310,14 @@ type, public :: ice_shelf_dyn_CS ; private
                                !! is the direct measure of what shared (nodal) amplitudes would remove.
   real, pointer, dimension(:,:) :: fg_cut_tear_abs => NULL() !< The same jump, unnormalized [L T-1 ~> m s-1],
                                !! for comparison against the velocity scale.
+  real, pointer, dimension(:,:) :: fg_cut_tear_shape => NULL() !< The other half of the jump [nondim]: the part
+                               !! from the level set being double valued at the shared nodes, which on the DG
+                               !! path it is because h_nodal is broken across faces. Shared amplitudes would
+                               !! not remove this, so it does not speak to the block-PCG question; a face
+                               !! penalty on the enrichment jump would.
   real, allocatable, dimension(:,:,:) :: cutfem_amp !< Condensed ridge amplitudes at the converged velocity,
-                               !! (2*modes, i, j) [L T-1 ~> m s-1]; kept only for the tear diagnostic.
+                               !! (2*modes, i, j) [L T-1 Z-1 ~> s-1]; they multiply psi, which carries the
+                               !! length, to give a velocity. Kept only for the tear diagnostic.
   real, allocatable, dimension(:,:,:) :: cutfem_fls_c !< Corner flotation deficit used by the ridge in each
                                !! cut cell, SW,SE,NW,NE (4, i, j) [Z ~> m]; kept for the tear diagnostic.
   real, allocatable, dimension(:,:) :: cutfem_cut_mask !< 1 where the tear diagnostic has valid stored data
@@ -858,7 +864,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_ground_frac = -1, id_basal_tr_dfrac = -1, id_col_thick = -1, id_OD_av = -1, &
              id_f_ground_cell = -1, id_f_ground_node = -1, &
              id_fg_cut_naive = -1, id_fg_cut_eff = -1, id_fg_cut_memfrac = -1, id_fg_cut_floored = -1, &
-             id_fg_cut_tear = -1, id_fg_cut_tear_abs = -1, &
+             id_fg_cut_tear = -1, id_fg_cut_tear_abs = -1, id_fg_cut_tear_shape = -1, &
              id_u_mask = -1, id_v_mask = -1, id_ufb_mask =-1, id_vfb_mask = -1, id_t_mask = -1, &
              id_sx_shelf = -1, id_sy_shelf = -1, id_surf_slope_mag_shelf, &
              id_duHdx = -1, id_dvHdy = -1, id_fluxdiv = -1, &
@@ -1112,6 +1118,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%fg_cut_floored(isd:ied,jsd:jed), source=0.0)
     allocate(CS%fg_cut_tear(isd:ied,jsd:jed), source=0.0)
     allocate(CS%fg_cut_tear_abs(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%fg_cut_tear_shape(isd:ied,jsd:jed), source=0.0)
     allocate(CS%cutfem_amp(8,isd:ied,jsd:jed), source=0.0)
     allocate(CS%cutfem_fls_c(4,isd:ied,jsd:jed), source=0.0)
     allocate(CS%cutfem_cut_mask(isd:ied,jsd:jed), source=0.0)
@@ -2239,6 +2246,12 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     CS%id_fg_cut_tear_abs = register_diag_field('ice_shelf_model','fg_cut_tear_abs',CS%diag%axesT1, &
        Time, 'CutFEM diagnostic: the same enrichment jump, unnormalized, for comparison against '//&
        'the velocity scale', 'm s-1', conversion=US%L_T_to_m_s)
+    CS%id_fg_cut_tear_shape = register_diag_field('ice_shelf_model','fg_cut_tear_shape', &
+       CS%diag%axesT1, Time, 'CutFEM diagnostic: the part of the enrichment jump coming from the '//&
+       'level set being double valued at the shared nodes, which on the DG path it is because '//&
+       'h_nodal is broken across faces. Shared nodal amplitudes would not remove this; a face '//&
+       'penalty on the enrichment jump would. Compare against fg_cut_tear, which is the amplitude '//&
+       'part', 'none')
     CS%id_col_thick = register_diag_field('ice_shelf_model','col_thick',CS%diag%axesT1, Time, &
        'ocean column thickness passed to ice model', 'm', conversion=US%Z_to_m)
     CS%id_visc_shelf = register_diag_field('ice_shelf_model','ice_visc',CS%diag%axesT1, Time, &
@@ -2856,6 +2869,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
     if (CS%id_fg_cut_floored > 0) call post_data(CS%id_fg_cut_floored, CS%fg_cut_floored, CS%diag)
     if (CS%id_fg_cut_tear > 0) call post_data(CS%id_fg_cut_tear, CS%fg_cut_tear, CS%diag)
     if (CS%id_fg_cut_tear_abs > 0) call post_data(CS%id_fg_cut_tear_abs, CS%fg_cut_tear_abs, CS%diag)
+    if (CS%id_fg_cut_tear_shape > 0) &
+      call post_data(CS%id_fg_cut_tear_shape, CS%fg_cut_tear_shape, CS%diag)
     if (CS%id_basal_tr_dfrac > 0) call post_data(CS%id_basal_tr_dfrac, CS%basal_tr_dfrac, CS%diag)
     if (CS%id_OD_av >0) call post_data(CS%id_OD_av, CS%OD_av,CS%diag)
     if (CS%id_visc_shelf > 0) then
@@ -4110,7 +4125,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   ! CutFEM nodal grounded-drag-fraction diagnostic on the converged velocity (leak vs. leak-after-ridge).
   if (CS%cutfem_gl_friction .and. ((CS%id_fg_cut_naive > 0) .or. (CS%id_fg_cut_eff > 0) .or. &
       (CS%id_fg_cut_memfrac > 0) .or. (CS%id_fg_cut_floored > 0) .or. &
-      (CS%id_fg_cut_tear > 0) .or. (CS%id_fg_cut_tear_abs > 0))) &
+      (CS%id_fg_cut_tear > 0) .or. (CS%id_fg_cut_tear_abs > 0) .or. (CS%id_fg_cut_tear_shape > 0))) &
     call cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, rhoi_rhow)
   if (CS%cutfem_gl_friction .and. CS%cutfem_sym_probe) call cutfem_symmetry_probe(CS, G, US, rhoi_rhow)
 
@@ -9163,7 +9178,10 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
   real, dimension(2) :: ue_f, ve_f ! Enriched velocity at the midpoint from each side [L T-1]
   real, dimension(4) :: bmid      ! Corner-basis weights at the face midpoint [nondim]
   real, dimension(4) :: zero4 = 0.0 ! Unused gradient slots for the value-only shape call
-  real :: tear_rel, tear_abs, jump_f, scal_f ! Tear metrics [nondim], [L T-1 ~> m s-1]
+  real :: tear_rel, tear_abs, tear_shp, scal_f ! Tear metrics [nondim], [L T-1 ~> m s-1]
+  real :: jump_amp, jump_shp        ! Amplitude and shape parts of the jump [L T-1 ~> m s-1]
+  real :: psi_bar, abar_x, abar_y   ! Face-mean ridge value [Z ~> m] and effective amplitude [L T-1 Z-1]
+  real, dimension(2) :: ae_x, ae_y  ! Effective amplitude from each side [L T-1 Z-1]
   real :: tr_Kaa        ! Trace of the unregularized ridge self-stiffness [R L4 Z T-1]
   real :: piv_floor     ! Conditioning floor on the Cholesky pivots [R L4 Z T-1]
 
@@ -9171,7 +9189,7 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
   Sg(:,:) = 0.0 ; Seff(:,:) = 0.0 ; Sall(:,:) = 0.0
   CS%fg_cut_memfrac(:,:) = 0.0
   CS%fg_cut_floored(:,:) = 0.0
-  CS%fg_cut_tear(:,:) = 0.0 ; CS%fg_cut_tear_abs(:,:) = 0.0
+  CS%fg_cut_tear(:,:) = 0.0 ; CS%fg_cut_tear_abs(:,:) = 0.0 ; CS%fg_cut_tear_shape(:,:) = 0.0
   CS%cutfem_cut_mask(:,:) = 0.0
   nmodes = CS%cutfem_ridge_modes
 
@@ -9398,7 +9416,7 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
   ! face midpoint, since psi vanishes at the nodes and the jump there is identically zero. ---
   do j=js,je ; do i=is,ie
     if (CS%cutfem_cut_mask(i,j) < 0.5) cycle
-    tear_rel = 0.0 ; tear_abs = 0.0
+    tear_rel = 0.0 ; tear_abs = 0.0 ; tear_shp = 0.0
     do fside=1,2
       if (fside == 1) then                 ! north face of (i,j), shared with (i,j+1)
         ii = i ; jj = j+1
@@ -9422,24 +9440,42 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
         else
           bmid(cR(1)) = 0.5 ; bmid(cR(2)) = 0.5
         endif
-        call cutfem_ridge_shapes(nmodes, bmid, psi_f(side), 0.0, 0.0, zero4, zero4, shp, gsx, gsy)
-        ue_f(side) = 0.0 ; ve_f(side) = 0.0
+        ! Every mode shape is proportional to psi, so the enrichment at the midpoint factors as
+        ! psi times an effective amplitude. Evaluating the shapes with psi = 1 extracts that factor
+        ! and lets the jump be split exactly.
+        call cutfem_ridge_shapes(nmodes, bmid, 1.0, 0.0, 0.0, zero4, zero4, shp, gsx, gsy)
+        ae_x(side) = 0.0 ; ae_y(side) = 0.0
         do m=1,nmodes
           if (side == 1) then
-            ue_f(side) = ue_f(side) + (CS%cutfem_amp(2*m-1,i,j) * shp(m))
-            ve_f(side) = ve_f(side) + (CS%cutfem_amp(2*m,  i,j) * shp(m))
+            ae_x(side) = ae_x(side) + (CS%cutfem_amp(2*m-1,i,j) * shp(m))
+            ae_y(side) = ae_y(side) + (CS%cutfem_amp(2*m,  i,j) * shp(m))
           else
-            ue_f(side) = ue_f(side) + (CS%cutfem_amp(2*m-1,ii,jj) * shp(m))
-            ve_f(side) = ve_f(side) + (CS%cutfem_amp(2*m,  ii,jj) * shp(m))
+            ae_x(side) = ae_x(side) + (CS%cutfem_amp(2*m-1,ii,jj) * shp(m))
+            ae_y(side) = ae_y(side) + (CS%cutfem_amp(2*m,  ii,jj) * shp(m))
           endif
         enddo
+        ue_f(side) = psi_f(side) * ae_x(side) ; ve_f(side) = psi_f(side) * ae_y(side)
       enddo
-      jump_f = sqrt(((ue_f(1)-ue_f(2))**2) + ((ve_f(1)-ve_f(2))**2))
+
+      ! Exact split of the jump. With u_enr = psi * a_eff on each side,
+      !   psi_L a_L - psi_R a_R = psibar (a_L - a_R) + (psi_L - psi_R) abar,
+      ! the first term being the amplitude difference that shared nodal degrees of freedom would
+      ! remove, and the second the level set itself being double valued at the shared nodes, which
+      ! on the DG path it is because h_nodal is broken across faces. Sharing amplitudes does nothing
+      ! about the second, so only the first speaks to whether the block-PCG route is needed.
+      psi_bar = 0.5*(psi_f(1) + psi_f(2))
+      abar_x  = 0.5*(ae_x(1) + ae_x(2)) ; abar_y = 0.5*(ae_y(1) + ae_y(2))
+      jump_amp = abs(psi_bar) * sqrt(((ae_x(1)-ae_x(2))**2) + ((ae_y(1)-ae_y(2))**2))
+      jump_shp = abs(psi_f(1) - psi_f(2)) * sqrt((abar_x**2) + (abar_y**2))
       scal_f = max(sqrt((ue_f(1)**2) + (ve_f(1)**2)), sqrt((ue_f(2)**2) + (ve_f(2)**2)))
-      tear_abs = max(tear_abs, jump_f)
-      if (scal_f > 0.0) tear_rel = max(tear_rel, jump_f/scal_f)
+      tear_abs = max(tear_abs, jump_amp)
+      if (scal_f > 0.0) then
+        tear_rel = max(tear_rel, jump_amp/scal_f)
+        tear_shp = max(tear_shp, jump_shp/scal_f)
+      endif
     enddo
     CS%fg_cut_tear(i,j) = tear_rel ; CS%fg_cut_tear_abs(i,j) = tear_abs
+    CS%fg_cut_tear_shape(i,j) = tear_shp
   enddo ; enddo
 
   CS%fg_cut_naive(:,:) = 0.0 ; CS%fg_cut_eff(:,:) = 0.0
