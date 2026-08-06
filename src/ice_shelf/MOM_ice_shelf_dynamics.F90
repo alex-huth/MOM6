@@ -301,6 +301,20 @@ type, public :: ice_shelf_dyn_CS ; private
                                !! Near 0 => the ridge amplitude is drag-limited (removal is shape/rank-set,
                                !! more modes could help); near 1 => membrane (viscosity) dominates and damps
                                !! the kink, so the modest leak removal is largely physical [nondim].
+  real, pointer, dimension(:,:) :: fg_cut_tear => NULL() !< Diagnostic: the jump in the CutFEM enrichment
+                               !! across a cut cell's faces, at the face midpoints, relative to the larger of
+                               !! the two one-sided enrichment values [nondim]. The amplitudes are element
+                               !! local, so the enriched velocity is discontinuous between neighbouring cut
+                               !! cells; this measures how much. It is zero by symmetry for a straight,
+                               !! grid-aligned grounding line and grows with curvature and obliquity, so it
+                               !! is the direct measure of what shared (nodal) amplitudes would remove.
+  real, pointer, dimension(:,:) :: fg_cut_tear_abs => NULL() !< The same jump, unnormalized [L T-1 ~> m s-1],
+                               !! for comparison against the velocity scale.
+  real, allocatable, dimension(:,:,:) :: cutfem_amp !< Condensed ridge amplitudes at the converged velocity,
+                               !! (2*modes, i, j) [L T-1 ~> m s-1]; kept only for the tear diagnostic.
+  real, allocatable, dimension(:,:,:) :: cutfem_fls_c !< Corner flotation deficit used by the ridge in each
+                               !! cut cell, SW,SE,NW,NE (4, i, j) [Z ~> m]; kept for the tear diagnostic.
+  real, allocatable, dimension(:,:) :: cutfem_cut_mask !< 1 where the tear diagnostic has valid stored data
   real, pointer, dimension(:,:) :: fg_cut_floored => NULL() !< Diagnostic: number of conditioning-floor hits in
                                !! the CutFEM ridge condensation solve in each cut cell [nondim]. 0 in a
                                !! well-conditioned cell; 1 to 2*CUTFEM_RIDGE_MODES where K_aa degenerated and a
@@ -844,6 +858,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_ground_frac = -1, id_basal_tr_dfrac = -1, id_col_thick = -1, id_OD_av = -1, &
              id_f_ground_cell = -1, id_f_ground_node = -1, &
              id_fg_cut_naive = -1, id_fg_cut_eff = -1, id_fg_cut_memfrac = -1, id_fg_cut_floored = -1, &
+             id_fg_cut_tear = -1, id_fg_cut_tear_abs = -1, &
              id_u_mask = -1, id_v_mask = -1, id_ufb_mask =-1, id_vfb_mask = -1, id_t_mask = -1, &
              id_sx_shelf = -1, id_sy_shelf = -1, id_surf_slope_mag_shelf, &
              id_duHdx = -1, id_dvHdy = -1, id_fluxdiv = -1, &
@@ -1095,6 +1110,11 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%fg_cut_eff(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%fg_cut_memfrac(isd:ied,jsd:jed), source=0.0)
     allocate(CS%fg_cut_floored(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%fg_cut_tear(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%fg_cut_tear_abs(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%cutfem_amp(8,isd:ied,jsd:jed), source=0.0)
+    allocate(CS%cutfem_fls_c(4,isd:ied,jsd:jed), source=0.0)
+    allocate(CS%cutfem_cut_mask(isd:ied,jsd:jed), source=0.0)
     allocate(CS%H_corner(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%fls_corner(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%corner_valid(IsdB:IedB,JsdB:JedB), source=.false.)
@@ -2210,6 +2230,15 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
        'pivot (or the 2x2 determinant) had to be floored because psi*xi degenerated against psi, '//&
        'which happens as the cut approaches a cell face. Nonzero only when CUTFEM_GL_FRICTION is '//&
        'set', 'none')
+    CS%id_fg_cut_tear = register_diag_field('ice_shelf_model','fg_cut_tear',CS%diag%axesT1, Time, &
+       'CutFEM diagnostic: jump in the enrichment across a cut cell face, at the face midpoint, '//&
+       'relative to the larger one-sided value. The ridge amplitudes are element local, so the '//&
+       'enriched velocity is discontinuous between neighbouring cut cells. Zero by symmetry for a '//&
+       'straight grid-aligned grounding line; grows with curvature and obliquity. This is what '//&
+       'shared nodal amplitudes would remove. Nonzero only when CUTFEM_GL_FRICTION is set', 'none')
+    CS%id_fg_cut_tear_abs = register_diag_field('ice_shelf_model','fg_cut_tear_abs',CS%diag%axesT1, &
+       Time, 'CutFEM diagnostic: the same enrichment jump, unnormalized, for comparison against '//&
+       'the velocity scale', 'm s-1', conversion=US%L_T_to_m_s)
     CS%id_col_thick = register_diag_field('ice_shelf_model','col_thick',CS%diag%axesT1, Time, &
        'ocean column thickness passed to ice model', 'm', conversion=US%Z_to_m)
     CS%id_visc_shelf = register_diag_field('ice_shelf_model','ice_visc',CS%diag%axesT1, Time, &
@@ -2825,6 +2854,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
     if (CS%id_fg_cut_eff > 0) call post_data(CS%id_fg_cut_eff, CS%fg_cut_eff, CS%diag)
     if (CS%id_fg_cut_memfrac > 0) call post_data(CS%id_fg_cut_memfrac, CS%fg_cut_memfrac, CS%diag)
     if (CS%id_fg_cut_floored > 0) call post_data(CS%id_fg_cut_floored, CS%fg_cut_floored, CS%diag)
+    if (CS%id_fg_cut_tear > 0) call post_data(CS%id_fg_cut_tear, CS%fg_cut_tear, CS%diag)
+    if (CS%id_fg_cut_tear_abs > 0) call post_data(CS%id_fg_cut_tear_abs, CS%fg_cut_tear_abs, CS%diag)
     if (CS%id_basal_tr_dfrac > 0) call post_data(CS%id_basal_tr_dfrac, CS%basal_tr_dfrac, CS%diag)
     if (CS%id_OD_av >0) call post_data(CS%id_OD_av, CS%OD_av,CS%diag)
     if (CS%id_visc_shelf > 0) then
@@ -4078,7 +4109,8 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
   ! CutFEM nodal grounded-drag-fraction diagnostic on the converged velocity (leak vs. leak-after-ridge).
   if (CS%cutfem_gl_friction .and. ((CS%id_fg_cut_naive > 0) .or. (CS%id_fg_cut_eff > 0) .or. &
-      (CS%id_fg_cut_memfrac > 0) .or. (CS%id_fg_cut_floored > 0))) &
+      (CS%id_fg_cut_memfrac > 0) .or. (CS%id_fg_cut_floored > 0) .or. &
+      (CS%id_fg_cut_tear > 0) .or. (CS%id_fg_cut_tear_abs > 0))) &
     call cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, rhoi_rhow)
   if (CS%cutfem_gl_friction .and. CS%cutfem_sym_probe) call cutfem_symmetry_probe(CS, G, US, rhoi_rhow)
 
@@ -9124,6 +9156,14 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
   integer :: i, j, is, ie, js, je, t, k, c, nmodes
   integer :: n_floored  ! Number of conditioning-floor hits in the condensation solve
   integer :: nsys, m, n ! Ridge system size 2*nmodes, and mode row indices
+  integer :: fside, side, ii, jj ! Face selector, side selector, and neighbour indices
+  integer, dimension(2) :: cL, cR ! Local corner ids of the shared face on each side
+  real, dimension(2) :: fl2       ! The face's two corner deficits [Z ~> m]
+  real, dimension(2) :: psi_f     ! Ridge at the face midpoint from each side [Z ~> m]
+  real, dimension(2) :: ue_f, ve_f ! Enriched velocity at the midpoint from each side [L T-1]
+  real, dimension(4) :: bmid      ! Corner-basis weights at the face midpoint [nondim]
+  real, dimension(4) :: zero4 = 0.0 ! Unused gradient slots for the value-only shape call
+  real :: tear_rel, tear_abs, jump_f, scal_f ! Tear metrics [nondim], [L T-1 ~> m s-1]
   real :: tr_Kaa        ! Trace of the unregularized ridge self-stiffness [R L4 Z T-1]
   real :: piv_floor     ! Conditioning floor on the Cholesky pivots [R L4 Z T-1]
 
@@ -9131,6 +9171,8 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
   Sg(:,:) = 0.0 ; Seff(:,:) = 0.0 ; Sall(:,:) = 0.0
   CS%fg_cut_memfrac(:,:) = 0.0
   CS%fg_cut_floored(:,:) = 0.0
+  CS%fg_cut_tear(:,:) = 0.0 ; CS%fg_cut_tear_abs(:,:) = 0.0
+  CS%cutfem_cut_mask(:,:) = 0.0
   nmodes = CS%cutfem_ridge_modes
 
   do_DG = CS%use_DG_thickness
@@ -9326,6 +9368,12 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
     ! The production solve in cutfem_condense_sep2 assembles the same K_aa from the same frozen
     ! state, so this count is the one it hits too.
     CS%fg_cut_floored(i,j) = real(n_floored)
+    ! Keep what the tear pass needs: the condensed amplitudes at the converged velocity, and the
+    ! corner deficits that define this cell's ridge. Both are cell local, which is the point.
+    CS%cutfem_amp(:,i,j) = 0.0
+    do m=1,nsys ; CS%cutfem_amp(m,i,j) = -svec(m) ; enddo
+    CS%cutfem_fls_c(:,i,j) = fls(:)
+    CS%cutfem_cut_mask(i,j) = 1.0
     Uc_rig(:) = 0.0
     do c=1,4
       do m=1,nsys ; Uc_rig(c) = Uc_rig(c) - (KaU(m,c)*svec(m)) ; enddo
@@ -9340,6 +9388,58 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
     Seff(i-1,j)  = Seff(i-1,j)  + (m_g(3) + Uc_rig(3))
     Sg(i,j)      = Sg(i,j)      + m_g(4) ; Sall(i,j)     = Sall(i,j)     + m_all(4)
     Seff(i,j)    = Seff(i,j)    + (m_g(4) + Uc_rig(4))
+  enddo ; enddo
+
+  ! --- Tear pass. The enrichment is element local, so on a face shared by two cut cells the
+  ! enriched velocity is double valued. The shape itself is single valued on a face when the two
+  ! cells agree on the corner deficits there, which they do on the FV path; on the DG path the
+  ! broken thickness makes them differ, and that is part of the tear too, so both sides are
+  ! evaluated from their own stored data rather than assuming a common shape. Evaluated at the
+  ! face midpoint, since psi vanishes at the nodes and the jump there is identically zero. ---
+  do j=js,je ; do i=is,ie
+    if (CS%cutfem_cut_mask(i,j) < 0.5) cycle
+    tear_rel = 0.0 ; tear_abs = 0.0
+    do fside=1,2
+      if (fside == 1) then                 ! north face of (i,j), shared with (i,j+1)
+        ii = i ; jj = j+1
+        cL(1) = 3 ; cL(2) = 4 ; cR(1) = 1 ; cR(2) = 2
+      else                                 ! east face of (i,j), shared with (i+1,j)
+        ii = i+1 ; jj = j
+        cL(1) = 2 ; cL(2) = 4 ; cR(1) = 1 ; cR(2) = 3
+      endif
+      if (CS%cutfem_cut_mask(ii,jj) < 0.5) cycle
+      do side=1,2
+        if (side == 1) then
+          fl2(1) = CS%cutfem_fls_c(cL(1),i,j)  ; fl2(2) = CS%cutfem_fls_c(cL(2),i,j)
+        else
+          fl2(1) = CS%cutfem_fls_c(cR(1),ii,jj) ; fl2(2) = CS%cutfem_fls_c(cR(2),ii,jj)
+        endif
+        ! Ridge restricted to the face, at its midpoint: the two endpoint values carry weight 1/2.
+        psi_f(side) = (0.5*abs(fl2(1)) + 0.5*abs(fl2(2))) - abs(0.5*fl2(1) + 0.5*fl2(2))
+        bmid(:) = 0.0
+        if (side == 1) then
+          bmid(cL(1)) = 0.5 ; bmid(cL(2)) = 0.5
+        else
+          bmid(cR(1)) = 0.5 ; bmid(cR(2)) = 0.5
+        endif
+        call cutfem_ridge_shapes(nmodes, bmid, psi_f(side), 0.0, 0.0, zero4, zero4, shp, gsx, gsy)
+        ue_f(side) = 0.0 ; ve_f(side) = 0.0
+        do m=1,nmodes
+          if (side == 1) then
+            ue_f(side) = ue_f(side) + (CS%cutfem_amp(2*m-1,i,j) * shp(m))
+            ve_f(side) = ve_f(side) + (CS%cutfem_amp(2*m,  i,j) * shp(m))
+          else
+            ue_f(side) = ue_f(side) + (CS%cutfem_amp(2*m-1,ii,jj) * shp(m))
+            ve_f(side) = ve_f(side) + (CS%cutfem_amp(2*m,  ii,jj) * shp(m))
+          endif
+        enddo
+      enddo
+      jump_f = sqrt(((ue_f(1)-ue_f(2))**2) + ((ve_f(1)-ve_f(2))**2))
+      scal_f = max(sqrt((ue_f(1)**2) + (ve_f(1)**2)), sqrt((ue_f(2)**2) + (ve_f(2)**2)))
+      tear_abs = max(tear_abs, jump_f)
+      if (scal_f > 0.0) tear_rel = max(tear_rel, jump_f/scal_f)
+    enddo
+    CS%fg_cut_tear(i,j) = tear_rel ; CS%fg_cut_tear_abs(i,j) = tear_abs
   enddo ; enddo
 
   CS%fg_cut_naive(:,:) = 0.0 ; CS%fg_cut_eff(:,:) = 0.0
