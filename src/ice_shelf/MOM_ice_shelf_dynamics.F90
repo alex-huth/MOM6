@@ -459,6 +459,8 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! equals the nodal enrichment span {N_up*psi, N_down*psi} only for a
                             !! straight, grid-aligned grounding line; it carries no along-grounding-line
                             !! variation of the kink. Default 1.
+  logical :: cutfem_sym_probe !< If true, run cutfem_symmetry_probe after each velocity solve and report
+                            !! the worst mirror asymmetry of the ridge condensation. Diagnostic only.
   real, pointer, dimension(:,:) :: H_corner => NULL() !< Ice thickness interpolated to B-grid corners
                             !! with dual-cell Lagrange weights over the included cells only
                             !! (FV_SUBGRID_GL_* paths) [Z ~> m].
@@ -1548,6 +1550,16 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  default=1, do_not_log=.not.CS%cutfem_gl_friction)
     if (CS%cutfem_gl_friction .and. (CS%cutfem_ridge_modes < 1 .or. CS%cutfem_ridge_modes > 2)) &
       call MOM_error(FATAL, "MOM_ice_shelf_dynamics: CUTFEM_RIDGE_MODES must be 1 or 2.")
+    call get_param(param_file, mdl, "CUTFEM_SYMMETRY_PROBE", CS%cutfem_sym_probe, &
+                 "If true, run a mirror-symmetry probe on the CutFEM ridge condensation after each "//&
+                 "velocity solve and report the worst asymmetry. The probe drives "//&
+                 "cutfem_condense_sep2 with synthetic cuts swept over angle and offset, then repeats "//&
+                 "with the inputs mirrored north-south and east-west; the condensed correction must "//&
+                 "mirror exactly (the enrichment span is invariant under either reflection for both "//&
+                 "CUTFEM_RIDGE_MODES settings, and the Schur complement depends only on the span). "//&
+                 "A residual well above roundoff localizes a genuine asymmetry in the SEP2 partition "//&
+                 "or in the ridge assembly. Diagnostic only; does not change answers.", &
+                 default=.false., do_not_log=.not.CS%cutfem_gl_friction)
     if (CS%cutfem_gl_friction) then
       if (.not. CS%GL_regularize) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
                  "CUTFEM_GL_FRICTION enriches the sub-cell grounding-line partition and requires "//&
@@ -4022,6 +4034,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   if (CS%cutfem_gl_friction .and. ((CS%id_fg_cut_naive > 0) .or. (CS%id_fg_cut_eff > 0) .or. &
       (CS%id_fg_cut_memfrac > 0) .or. (CS%id_fg_cut_fallback > 0))) &
     call cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, rhoi_rhow)
+  if (CS%cutfem_gl_friction .and. CS%cutfem_sym_probe) call cutfem_symmetry_probe(CS, G, US, rhoi_rhow)
 
 end subroutine ice_shelf_solve_outer
 
@@ -8320,6 +8333,126 @@ subroutine cutfem_condense_sep2(CS, G, US, i_elem, j_elem, fls, hc, U_curr, V_cu
   Vcorr(2,2) = -((((KaU(1,8)*svec(1)) + (KaU(2,8)*svec(2))) + ((KaU(3,8)*svec(3)) + (KaU(4,8)*svec(4)))))
 
 end subroutine cutfem_condense_sep2
+
+!> Mirror-symmetry probe for the CutFEM ridge condensation.
+!!
+!! The condensed correction -K_Ua Kaa^-1 K_aU depends only on the SPAN of the enrichment shapes,
+!! not on the basis used for them (a change of basis T maps Kaa -> T^T Kaa T and K_aU -> T^T K_aU,
+!! which leaves the Schur complement unchanged). Under a north-south reflection the span of
+!! {psi} and of {psi, psi*xi} both map to themselves (xi is unaffected by y), and under an
+!! east-west reflection {psi, psi*xi} maps to {psi, psi*(1-xi)}, the same span. So for BOTH
+!! CUTFEM_RIDGE_MODES settings the condensed correction must mirror exactly when the inputs are
+!! mirrored. (This is not true of a 90-degree rotation, which maps {psi, psi*xi} to
+!! {psi, psi*eta}: CUTFEM_RIDGE_MODES=2 is genuinely not rotation invariant.)
+!!
+!! The probe drives cutfem_condense_sep2 with synthetic straight cuts swept over angle and offset,
+!! using the metrics and frozen coefficients of one real cell, and reports the worst relative
+!! violation of those two identities. A residual at roundoff (~1e-15) means the routine is
+!! symmetric and any y-dependence seen in a run comes from elsewhere; a residual well above
+!! roundoff localizes a genuine asymmetry in the SEP2 partition or the ridge assembly.
+subroutine cutfem_symmetry_probe(CS, G, US, dens_ratio)
+  type(ice_shelf_dyn_CS), intent(in) :: CS   !< Ice shelf control structure
+  type(ocean_grid_type),  intent(in) :: G    !< The grid structure
+  type(unit_scale_type),  intent(in) :: US   !< Unit conversion factors
+  real,                   intent(in) :: dens_ratio !< Ice/water density ratio [nondim]
+
+  real, dimension(4)   :: fls, hc, fls_m, hc_m   ! Corner deficit and thickness, SW,SE,NW,NE [Z ~> m]
+  real, dimension(2,2) :: Uc, Vc, Ud, Vd         ! Frozen and search-direction velocities [L T-1 ~> m s-1]
+  real, dimension(2,2) :: Uc_m, Vc_m, Ud_m, Vd_m ! Their mirrored counterparts [L T-1 ~> m s-1]
+  real, dimension(2,2) :: Ur, Vr, Um, Vm         ! Reference and mirrored corrections [R L3 Z T-2]
+  real :: h0            ! Probe thickness [Z ~> m]
+  real :: u0            ! Probe velocity scale [L T-1 ~> m s-1]
+  real :: th, dth       ! Cut normal angle and its sweep increment [radians]
+  real :: off           ! Cut offset along the normal, in cell fractions [nondim]
+  real :: xc, yc        ! Corner reference coordinates [nondim]
+  real :: scal          ! Correction magnitude used to normalize the residual [R L3 Z T-2]
+  real :: rns, rew      ! Worst relative north-south and east-west mirror residuals [nondim]
+  real :: r1            ! Residual of the current comparison [nondim]
+  real :: dx_S, dx_N, dy_W, dy_E ! Cell edge spacings of the probe cell [L ~> m]
+  integer :: i, j, ia, io, c, ncut
+  character(len=256) :: mesg
+
+  ! Use the first computational cell for metrics and frozen coefficients; the identities under test
+  ! hold cell by cell, so any cell with a valid viscosity will do.
+  i = G%isc ; j = G%jsc
+  dx_S = G%dxCv(i,j-1) ; dx_N = G%dxCv(i,j)
+  dy_W = G%dyCu(i-1,j) ; dy_E = G%dyCu(i,j)
+
+  h0 = 1000.0 * US%m_to_Z
+  u0 = 100.0 * US%m_s_to_L_T / (365.0*86400.0)
+  hc(:) = h0
+  ! A deliberately asymmetric velocity so that a mirror is a real test rather than a no-op.
+  Uc(1,1) = u0 ; Uc(2,1) = 1.7*u0 ; Uc(1,2) = 0.6*u0 ; Uc(2,2) = 2.3*u0
+  Vc(1,1) = 0.3*u0 ; Vc(2,1) = -0.4*u0 ; Vc(1,2) = 0.9*u0 ; Vc(2,2) = -1.1*u0
+  Ud(1,1) = 0.5*u0 ; Ud(2,1) = -0.2*u0 ; Ud(1,2) = 1.3*u0 ; Ud(2,2) = 0.8*u0
+  Vd(1,1) = -0.7*u0 ; Vd(2,1) = 1.1*u0 ; Vd(1,2) = 0.2*u0 ; Vd(2,2) = -0.9*u0
+
+  rns = 0.0 ; rew = 0.0 ; ncut = 0
+  dth = 4.0*atan(1.0) / 8.0   ! pi/8
+
+  do ia=0,7 ; do io=1,9
+    th = real(ia) * dth
+    off = 0.1 * real(io)
+    ! Straight cut: fls_c = h0 * (n.x_c - off), corners SW,SE,NW,NE at (0,0),(1,0),(0,1),(1,1).
+    do c=1,4
+      xc = 0.0 ; yc = 0.0
+      if ((c == 2) .or. (c == 4)) xc = 1.0
+      if ((c == 3) .or. (c == 4)) yc = 1.0
+      fls(c) = h0 * (((xc*cos(th)) + (yc*sin(th))) - off)
+    enddo
+    ! Skip uncut configurations; there is nothing to condense.
+    if ((minval(fls) >= 0.0) .or. (maxval(fls) <= 0.0)) cycle
+    ncut = ncut + 1
+
+    call cutfem_condense_sep2(CS, G, US, i, j, fls, hc, Uc, Vc, Ud, Vd, CS%ice_visc(i,j,:), &
+        CS%fB_elem(i,j), dx_S, dx_N, dy_W, dy_E, G%IareaT(i,j), dens_ratio, Ur, Vr)
+    scal = max(maxval(abs(Ur)), maxval(abs(Vr)))
+    if (scal <= 0.0) cycle
+
+    ! --- North-south reflection: SW<->NW, SE<->NE; u unchanged, v negated; dxCv_S <-> dxCv_N. ---
+    fls_m(1) = fls(3) ; fls_m(2) = fls(4) ; fls_m(3) = fls(1) ; fls_m(4) = fls(2)
+    hc_m(1)  = hc(3)  ; hc_m(2)  = hc(4)  ; hc_m(3)  = hc(1)  ; hc_m(4)  = hc(2)
+    do c=1,2
+      Uc_m(c,1) =  Uc(c,2) ; Uc_m(c,2) =  Uc(c,1)
+      Vc_m(c,1) = -Vc(c,2) ; Vc_m(c,2) = -Vc(c,1)
+      Ud_m(c,1) =  Ud(c,2) ; Ud_m(c,2) =  Ud(c,1)
+      Vd_m(c,1) = -Vd(c,2) ; Vd_m(c,2) = -Vd(c,1)
+    enddo
+    call cutfem_condense_sep2(CS, G, US, i, j, fls_m, hc_m, Uc_m, Vc_m, Ud_m, Vd_m, &
+        CS%ice_visc(i,j,:), CS%fB_elem(i,j), dx_N, dx_S, dy_W, dy_E, G%IareaT(i,j), &
+        dens_ratio, Um, Vm)
+    do c=1,2
+      r1 = abs(Um(c,1) - Ur(c,2)) ; rns = max(rns, r1/scal)
+      r1 = abs(Um(c,2) - Ur(c,1)) ; rns = max(rns, r1/scal)
+      r1 = abs(Vm(c,1) + Vr(c,2)) ; rns = max(rns, r1/scal)
+      r1 = abs(Vm(c,2) + Vr(c,1)) ; rns = max(rns, r1/scal)
+    enddo
+
+    ! --- East-west reflection: SW<->SE, NW<->NE; u negated, v unchanged; dyCu_W <-> dyCu_E. ---
+    fls_m(1) = fls(2) ; fls_m(2) = fls(1) ; fls_m(3) = fls(4) ; fls_m(4) = fls(3)
+    hc_m(1)  = hc(2)  ; hc_m(2)  = hc(1)  ; hc_m(3)  = hc(4)  ; hc_m(4)  = hc(3)
+    do c=1,2
+      Uc_m(1,c) = -Uc(2,c) ; Uc_m(2,c) = -Uc(1,c)
+      Vc_m(1,c) =  Vc(2,c) ; Vc_m(2,c) =  Vc(1,c)
+      Ud_m(1,c) = -Ud(2,c) ; Ud_m(2,c) = -Ud(1,c)
+      Vd_m(1,c) =  Vd(2,c) ; Vd_m(2,c) =  Vd(1,c)
+    enddo
+    call cutfem_condense_sep2(CS, G, US, i, j, fls_m, hc_m, Uc_m, Vc_m, Ud_m, Vd_m, &
+        CS%ice_visc(i,j,:), CS%fB_elem(i,j), dx_S, dx_N, dy_E, dy_W, G%IareaT(i,j), &
+        dens_ratio, Um, Vm)
+    do c=1,2
+      r1 = abs(Um(1,c) + Ur(2,c)) ; rew = max(rew, r1/scal)
+      r1 = abs(Um(2,c) + Ur(1,c)) ; rew = max(rew, r1/scal)
+      r1 = abs(Vm(1,c) - Vr(2,c)) ; rew = max(rew, r1/scal)
+      r1 = abs(Vm(2,c) - Vr(1,c)) ; rew = max(rew, r1/scal)
+    enddo
+  enddo ; enddo
+
+  write(mesg,'("CutFEM symmetry probe (modes=",I1,", ",I3," cuts): max relative mirror residual '// &
+              'N-S ",ES10.3,", E-W ",ES10.3)') CS%cutfem_ridge_modes, ncut, rns, rew
+  call MOM_mesg(mesg)
+
+end subroutine cutfem_symmetry_probe
 
 !> Diagnostic: per-node grounded basal-drag x-force fraction in CutFEM cut cells, both the naive
 !! (un-cut consistent assembly) value and the effective value after the ridge condensation, all
