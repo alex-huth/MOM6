@@ -894,6 +894,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_dg_art_visc_allow_u = -1, id_dg_art_visc_allow_v = -1, &
              id_dg_art_visc_cell_scale = -1, &
              id_dg_slow_idle_face_u = -1, id_dg_slow_idle_face_v = -1, &
+             id_gl_split_face_u = -1, id_gl_split_face_v = -1, &
              id_h_jump_face_u = -1, id_h_jump_face_v = -1, &
              id_s_jump_face_u = -1, id_s_jump_face_v = -1, &
              id_s_jump_face_u_rel = -1, id_s_jump_face_v_rel = -1, &
@@ -2399,6 +2400,20 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          CS%diag%axesCv1, Time, &
          'DG(1) broken-Q1 thickness jump across v-faces (max |[h]| over the 2 face nodes).', &
          'm', conversion=US%Z_to_m)
+      CS%id_gl_split_face_u = register_diag_field('ice_shelf_model','gl_split_face_u', &
+         CS%diag%axesCu1, Time, &
+         'Number of the 2 u-face nodes (0, 1 or 2) at which the two adjacent cells disagree '//&
+         'on the sign of the flotation deficit r*h - bed. compute_ground_frac reads each '//&
+         'cell own broken-Q1 h_nodal at the shared node, so that deficit is double valued '//&
+         'and a node can be grounded for one cell and floating for the other. Each such '//&
+         'node makes both cells report 0 < ice_ground_frac < 1, widening the apparent '//&
+         'grounding-line band to two cells where the flotation contour crosses once, and it '//&
+         'also splits the basal-friction assembly at that node. Identically zero under '//&
+         'DG_GL_GATE_CONTINUOUS, which gates on the node-averaged h_flot instead.', &
+         'nondim')
+      CS%id_gl_split_face_v = register_diag_field('ice_shelf_model','gl_split_face_v', &
+         CS%diag%axesCv1, Time, &
+         'As gl_split_face_u but on v-faces.', 'nondim')
       CS%id_s_jump_face_u = register_diag_field('ice_shelf_model','s_jump_face_u', &
          CS%diag%axesCu1, Time, &
          'DG(1) surface-elevation jump across u-faces (max |[s]| over the 2 face nodes, '//&
@@ -2810,6 +2825,9 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
   real, dimension(SZDI_(G),SZDJB_(G)) :: hjump_fv_sgn ! signed v-face [h] = mean(h_plus - h_minus) [Z ~> m]
   real, dimension(SZDI_(G),SZDJB_(G)) :: sjump_fv_sgn ! signed v-face [s] = mean(s_plus - s_minus) [Z ~> m]
   real, dimension(SZDI_(G),SZDJB_(G)) :: un_fv    ! per-v-face |v.n| [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: glsplit_fu ! u-face nodes whose two sides disagree on
+                                                    ! the sign of the flotation deficit [nondim]
+  real, dimension(SZDI_(G),SZDJB_(G)) :: glsplit_fv ! As glsplit_fu but on v-faces [nondim]
   real, dimension(SZDIB_(G),SZDJ_(G)) :: eps_fu   ! per-u-face eps_e [T-1 ~> s-1]
   real, dimension(SZDI_(G),SZDJB_(G)) :: eps_fv   ! per-v-face eps_e [T-1 ~> s-1]
   real :: u_mn_d, v_mn_d, u_pl_d, v_pl_d ! Side-averaged velocities for eps_e [L T-1 ~> m s-1]
@@ -3116,6 +3134,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
     if ((CS%id_h_jump_face_u > 0 .or. CS%id_h_jump_face_v > 0 .or. &
          CS%id_s_jump_face_u > 0 .or. CS%id_s_jump_face_v > 0 .or. &
          CS%id_s_jump_face_u_rel > 0 .or. CS%id_s_jump_face_v_rel > 0 .or. &
+         CS%id_gl_split_face_u > 0 .or. CS%id_gl_split_face_v > 0 .or. &
          CS%id_un_face_u > 0 .or. CS%id_un_face_v > 0) .and. associated(CS%h_nodal)) then
       ! Per-face inter-element jump of the broken-Q1 thickness, split onto u-faces
       ! (Cu) and v-faces (Cv) and reported in both thickness [h] and surface
@@ -3129,6 +3148,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       rr = CS%density_ice / CS%density_ocean_avg
       hjump_fu(:,:) = 0.0 ; sjump_fu(:,:) = 0.0 ; sjump_fu_rel(:,:) = 0.0 ; un_fu(:,:) = 0.0
       hjump_fu_sgn(:,:) = 0.0 ; sjump_fu_sgn(:,:) = 0.0
+      glsplit_fu(:,:) = 0.0 ; glsplit_fv(:,:) = 0.0
       hjump_fv(:,:) = 0.0 ; sjump_fv(:,:) = 0.0 ; sjump_fv_rel(:,:) = 0.0 ; un_fv(:,:) = 0.0
       hjump_fv_sgn(:,:) = 0.0 ; sjump_fv_sgn(:,:) = 0.0
       ! u-faces: minus side = west cell (I,j) east edge, plus side = east cell
@@ -3147,6 +3167,16 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         sjump_fu(I,j) = max(abs(s_m1-s_p1), abs(s_m2-s_p2))
         hjump_fu_sgn(I,j) = 0.5*((h_p1 - h_m1) + (h_p2 - h_m2))
         sjump_fu_sgn(I,j) = 0.5*((s_p1 - s_m1) + (s_p2 - s_m2))
+        ! Flotation-split count. compute_ground_frac reads each cell's own h_nodal at the
+        ! shared node, so the deficit r*h - bed there is double valued and the two cells can
+        ! classify the same physical node differently. Every such node makes both cells look
+        ! like grounding-line cells, widening the 0 < ground_frac < 1 band to two cells even
+        ! where the flotation contour crosses once. Zero by construction under
+        ! DG_GL_GATE_CONTINUOUS, which replaces h_nodal by the node-averaged h_flot.
+        if ((rr*h_m1 - bed1 > 0.0) .neqv. (rr*h_p1 - bed1 > 0.0)) &
+          glsplit_fu(I,j) = glsplit_fu(I,j) + 1.0
+        if ((rr*h_m2 - bed2 > 0.0) .neqv. (rr*h_p2 - bed2 > 0.0)) &
+          glsplit_fu(I,j) = glsplit_fu(I,j) + 1.0
         Hbar_face_avg = max(CS%min_h_shelf, 0.125*( &
           (CS%h_nodal(I  ,j,1,1) + CS%h_nodal(I  ,j,2,1)) + &
           (CS%h_nodal(I  ,j,1,2) + CS%h_nodal(I  ,j,2,2)) + &
@@ -3171,6 +3201,11 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         sjump_fv(i,J) = max(abs(s_m1-s_p1), abs(s_m2-s_p2))
         hjump_fv_sgn(i,J) = 0.5*((h_p1 - h_m1) + (h_p2 - h_m2))
         sjump_fv_sgn(i,J) = 0.5*((s_p1 - s_m1) + (s_p2 - s_m2))
+        ! Flotation-split count; see the u-face branch above.
+        if ((rr*h_m1 - bed1 > 0.0) .neqv. (rr*h_p1 - bed1 > 0.0)) &
+          glsplit_fv(i,J) = glsplit_fv(i,J) + 1.0
+        if ((rr*h_m2 - bed2 > 0.0) .neqv. (rr*h_p2 - bed2 > 0.0)) &
+          glsplit_fv(i,J) = glsplit_fv(i,J) + 1.0
         Hbar_face_avg = max(CS%min_h_shelf, 0.125*( &
           (CS%h_nodal(i,J  ,1,1) + CS%h_nodal(i,J  ,2,1)) + &
           (CS%h_nodal(i,J  ,1,2) + CS%h_nodal(i,J  ,2,2)) + &
@@ -3179,6 +3214,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         sjump_fv_rel(i,J) = sjump_fv(i,J) / Hbar_face_avg
         un_fv(i,J) = abs(0.5*(CS%v_shelf(i-1,J) + CS%v_shelf(i,J)))
       enddo ; enddo
+      if (CS%id_gl_split_face_u > 0) call post_data(CS%id_gl_split_face_u, glsplit_fu, CS%diag)
+      if (CS%id_gl_split_face_v > 0) call post_data(CS%id_gl_split_face_v, glsplit_fv, CS%diag)
       if (CS%id_h_jump_face_u > 0) call post_data(CS%id_h_jump_face_u, hjump_fu, CS%diag)
       if (CS%id_h_jump_face_v > 0) call post_data(CS%id_h_jump_face_v, hjump_fv, CS%diag)
       if (CS%id_s_jump_face_u > 0) call post_data(CS%id_s_jump_face_u, sjump_fu, CS%diag)
