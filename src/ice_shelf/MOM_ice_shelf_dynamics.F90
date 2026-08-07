@@ -275,6 +275,14 @@ type, public :: ice_shelf_dyn_CS ; private
   real, pointer, dimension(:,:) :: OD_rt => NULL()         !< A running total for calculating OD_av [Z ~> m].
   real, pointer, dimension(:,:) :: ground_frac_rt => NULL() !< A running total for calculating ground_frac.
   real, pointer, dimension(:,:) :: OD_av => NULL()         !< The time average open ocean depth [Z ~> m].
+  real, pointer, dimension(:,:) :: gf_branch => NULL()     !< Which branch of compute_ground_frac last wrote
+                                                       !! ground_frac in this cell [nondim]: 0 = not written by
+                                                       !! compute_ground_frac, 1 = all-grounded early out,
+                                                       !! 2 = all-floating early out, 3 = SEP2 fraction,
+                                                       !! 4 = sub-IP sampled fraction. Diagnostic only.
+  real, pointer, dimension(:,:) :: gf_fls_min => NULL()    !< Min over the 4 corners of the flotation deficit
+                                                       !! r*h - bed as compute_ground_frac formed it [Z ~> m].
+  real, pointer, dimension(:,:) :: gf_fls_max => NULL()    !< As gf_fls_min but the max over the 4 corners [Z ~> m].
   real, pointer, dimension(:,:) :: ground_frac => NULL()   !< Fraction of the time a cell is "exposed", i.e. the column
                                !! thickness is below a threshold and interacting with the rock [nondim].  When this
                                !! is 1, the ice-shelf is grounded
@@ -894,6 +902,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_dg_art_visc_allow_u = -1, id_dg_art_visc_allow_v = -1, &
              id_dg_art_visc_cell_scale = -1, &
              id_dg_slow_idle_face_u = -1, id_dg_slow_idle_face_v = -1, &
+             id_gf_branch = -1, id_gf_fls_min = -1, id_gf_fls_max = -1, &
              id_gl_split_face_u = -1, id_gl_split_face_v = -1, &
              id_h_jump_face_u = -1, id_h_jump_face_v = -1, &
              id_s_jump_face_u = -1, id_s_jump_face_v = -1, &
@@ -1111,6 +1120,9 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%area_node(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%OD_av(isd:ied,jsd:jed), source=0.0)
     allocate(CS%ground_frac(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%gf_branch(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%gf_fls_min(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%gf_fls_max(isd:ied,jsd:jed), source=0.0)
     allocate(CS%f_ground_node(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%f_ground_cell(isd:ied,jsd:jed), source=0.0)
     allocate(CS%fg_cut_naive(IsdB:IedB,JsdB:JedB), source=0.0)
@@ -2202,6 +2214,24 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     CS%id_ground_frac = register_diag_field('ice_shelf_model','ice_ground_frac',CS%diag%axesT1, Time, &
        'fraction of cell that is grounded; under GL_regularize this is the fraction of '//&
        'sub-cell quadrature points whose draft sits below the bed', 'none')
+    CS%id_gf_branch = register_diag_field('ice_shelf_model','ice_gf_branch',CS%diag%axesT1, Time, &
+       'Which branch of compute_ground_frac last wrote ice_ground_frac in this cell: '//&
+       '0 = compute_ground_frac did not write it (GL_regularize off, hmask not 1 or 3, or the '//&
+       'cell is outside the compute domain), so the posted ice_ground_frac is whatever an '//&
+       'earlier writer or an earlier step left there; 1 = all-grounded early out; '//&
+       '2 = all-floating early out; 3 = SEP2 Jacobian-weighted fraction; 4 = sub-IP sampled '//&
+       'fraction. Pair with ice_gf_fls_min/max to check the flotation deficits the routine '//&
+       'actually saw against the plotted h_nodal and bed_node.', 'none')
+    CS%id_gf_fls_min = register_diag_field('ice_shelf_model','ice_gf_fls_min',CS%diag%axesT1, Time, &
+       'Minimum over the 4 corners of the flotation deficit r*h - bed as compute_ground_frac '//&
+       'formed it, from that cell own gate thickness (h_nodal, or h_flot under '//&
+       'DG_GL_GATE_CONTINUOUS) and bed_node. Positive everywhere means fully grounded. Only '//&
+       'set where ice_gf_branch is nonzero.', 'm', conversion=US%Z_to_m)
+    CS%id_gf_fls_max = register_diag_field('ice_shelf_model','ice_gf_fls_max',CS%diag%axesT1, Time, &
+       'As ice_gf_fls_min but the maximum over the 4 corners. Non-positive everywhere means '//&
+       'fully floating, so a cell with ice_gf_fls_max <= 0 and ice_ground_frac > 0 has had its '//&
+       'grounded fraction set by something other than its own corner flotation test.', &
+       'm', conversion=US%Z_to_m)
     CS%id_basal_tr_dfrac = register_diag_field('ice_shelf_model','ice_basal_tr_dfrac',CS%diag%axesT1, Time, &
        'basal-traction smoothing anomaly: the effective traction fraction (mean over a cell '//&
        'sub-integration points of the DG_BASAL_TR_SCALE near-grounding-line traction scale phi) minus '//&
@@ -2879,6 +2909,12 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       call post_data(CS%id_surf_slope_mag_shelf, surf_slope, CS%diag)
     endif
     if (CS%id_ground_frac > 0) call post_data(CS%id_ground_frac, CS%ground_frac, CS%diag)
+    if (CS%id_gf_branch > 0 .and. associated(CS%gf_branch)) &
+        call post_data(CS%id_gf_branch, CS%gf_branch, CS%diag)
+    if (CS%id_gf_fls_min > 0 .and. associated(CS%gf_fls_min)) &
+        call post_data(CS%id_gf_fls_min, CS%gf_fls_min, CS%diag)
+    if (CS%id_gf_fls_max > 0 .and. associated(CS%gf_fls_max)) &
+        call post_data(CS%id_gf_fls_max, CS%gf_fls_max, CS%diag)
     if (CS%id_f_ground_cell > 0) call post_data(CS%id_f_ground_cell, CS%f_ground_cell, CS%diag)
     if (CS%id_f_ground_node > 0) call post_data(CS%id_f_ground_node, CS%f_ground_node, CS%diag)
     if (CS%id_fg_cut_naive > 0) call post_data(CS%id_fg_cut_naive, CS%fg_cut_naive, CS%diag)
@@ -10797,6 +10833,12 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
   thr_lo   = merge(0.0, -rhoi_rhow * CS%basal_tr_scale_w, tr_onesided)
   CS%basal_gate(:,:) = BG_SKIP
   CS%basal_tr_dfrac(:,:) = 0.0  ! nonzero only at near-GL band cells under active smoothing
+  ! Provenance diagnostics. Reset to "not written by this routine" so that any cell whose posted
+  ! ground_frac came from an earlier writer, an earlier step, or a skipped velocity update is
+  ! identifiable rather than having to be inferred from the state.
+  if (associated(CS%gf_branch)) then
+    CS%gf_branch(:,:) = 0.0 ; CS%gf_fls_min(:,:) = 0.0 ; CS%gf_fls_max(:,:) = 0.0
+  endif
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
 
   do j=jsc,jec ; do i=isc,iec
@@ -10848,6 +10890,9 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
                 max(fls_corners(1,2), fls_corners(2,2)))
     bed_min = min(min(bed_corners(1,1), bed_corners(2,1)), &
                   min(bed_corners(1,2), bed_corners(2,2)))
+    if (associated(CS%gf_fls_min)) then
+      CS%gf_fls_min(i,j) = d_min ; CS%gf_fls_max(i,j) = d_max
+    endif
     ! On the FV sub-element path the MIN_H_SHELF clamp is applied at cell centers before the
     ! interpolation, so there is no post-interpolation clamp that could raise a sub-point deficit and
     ! the plain sign test on the corner deficits is exact on its own.
@@ -10855,10 +10900,12 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
       if (d_min > 0.0) then
         CS%ground_frac(i,j) = 1.0 ; CS%basal_gate(i,j) = BG_FULL
         CS%xi_basal(i,j,:,:) = 0.0
+        if (associated(CS%gf_branch)) CS%gf_branch(i,j) = 1.0
         cycle
       elseif (d_max <= 0.0) then
         CS%ground_frac(i,j) = 0.0 ; CS%basal_gate(i,j) = BG_SKIP
         CS%xi_basal(i,j,:,:) = 1.0
+        if (associated(CS%gf_branch)) CS%gf_branch(i,j) = 2.0
         cycle
       endif
     ! Exact early-outs (bilinear extrema at the corners). Without smoothing these reproduce the
@@ -10870,20 +10917,24 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
       if (d_min > thr_full) then
         CS%ground_frac(i,j) = 1.0 ; CS%basal_gate(i,j) = BG_FULL
         CS%xi_basal(i,j,:,:) = 0.0
+        if (associated(CS%gf_branch)) CS%gf_branch(i,j) = 1.0
         cycle
       elseif ((d_max <= thr_lo) .and. ((rhoi_rhow*CS%min_h_shelf) - bed_min <= thr_lo)) then
         CS%ground_frac(i,j) = 0.0 ; CS%basal_gate(i,j) = BG_SKIP
         CS%xi_basal(i,j,:,:) = 1.0
+        if (associated(CS%gf_branch)) CS%gf_branch(i,j) = 2.0
         cycle
       endif
     else
       if (d_min > 0.0) then
         CS%ground_frac(i,j) = 1.0 ; CS%basal_gate(i,j) = BG_FULL
         CS%xi_basal(i,j,:,:) = 0.0
+        if (associated(CS%gf_branch)) CS%gf_branch(i,j) = 1.0
         cycle
       elseif ((d_max <= 0.0) .and. ((rhoi_rhow*CS%min_h_shelf) - bed_min <= 0.0)) then
         CS%ground_frac(i,j) = 0.0 ; CS%basal_gate(i,j) = BG_SKIP
         CS%xi_basal(i,j,:,:) = 1.0
+        if (associated(CS%gf_branch)) CS%gf_branch(i,j) = 2.0
         cycle
       endif
     endif
@@ -10937,6 +10988,7 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
       w_ground = (pg_gf(1) + pg_gf(3)) + (pg_gf(2) + pg_gf(4))
       w_total  = (pt_gf(1) + pt_gf(3)) + (pt_gf(2) + pt_gf(4))
       CS%ground_frac(i,j) = w_ground / w_total
+      if (associated(CS%gf_branch)) CS%gf_branch(i,j) = 3.0
       ! Role-grouped cross-triangle reduction: each corner takes each of the roles (A, B, farA,
       ! farB) exactly once over the 4 triangles (S=1, E=2, N=3, W=4), so under a rotation the
       ! corner and the triangles move together and the operand order is preserved. Same
@@ -11013,6 +11065,7 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
 
     ! Strict (unsmeared) grounded fraction for the diagnostic, unchanged by smoothing.
     CS%ground_frac(i,j) = real(n_grounded) / real(n_total)
+    if (associated(CS%gf_branch)) CS%gf_branch(i,j) = 4.0
     do ib=1,2 ; do ia=1,2
       CS%xi_basal(i,j,ia,ib) = xi_num(ia,ib) / xi_den(ia,ib)
     enddo ; enddo
@@ -12461,6 +12514,9 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_lim_phi))        deallocate(CS%dg_lim_phi)
   if (associated(CS%dg_lim_pk_factor))  deallocate(CS%dg_lim_pk_factor)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
+  if (associated(CS%gf_branch))  deallocate(CS%gf_branch)
+  if (associated(CS%gf_fls_min)) deallocate(CS%gf_fls_min)
+  if (associated(CS%gf_fls_max)) deallocate(CS%gf_fls_max)
   if (associated(CS%basal_gate)) deallocate(CS%basal_gate)
   if (associated(CS%basal_tr_dfrac)) deallocate(CS%basal_tr_dfrac)
   if (associated(CS%Jac)) deallocate(CS%Jac)
