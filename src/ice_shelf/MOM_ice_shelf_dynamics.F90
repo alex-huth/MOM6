@@ -17007,7 +17007,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: pen_Lam_F          ! Face coefficient of the slope penalty [L4 T-1]
   real :: gA_slp, gB_slp     ! Face-normal derivative of h on each side [Z L-1]
   real :: J_slp              ! Jump in that derivative across the face [Z L-1]
-  real :: dx_A_slp, dx_B_slp ! Face-normal width of each adjacent cell [L ~> m]
+  real :: dx_A_slp, dx_B_slp ! Face-normal extent of each adjacent cell at this node [L ~> m]
+  real :: dx_F_slp           ! Mean of the two, the face-normal length scale [L ~> m]
   real :: pen_A, pen_B       ! Nodal loads from the penalty [Z L2 T-1]
   integer :: bnode           ! Index of the node along the face (1 or 2)
   real :: S_K                ! Per-cell sum of face rates for the CFL bound [T-1]
@@ -17635,12 +17636,23 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     do j = jsc, jec ; do i = isc-1, iec
       if (CS%u_face_mask(i,j) == 4.0) cycle  ! Specified-flux face.
       if (.not. (hmask(i,j) == 1.0 .and. hmask(i+1,j) == 1.0)) cycle
-      dx_A_slp = G%dxT(i,j) ; dx_B_slp = G%dxT(i+1,j)
-      ! The two 1/dx factors of the variational form are kept explicit below so the
-      ! normalization survives a non-uniform grid; 48 is the 1-D uniform-grid constant
-      ! that makes pen_lam the decay rate of the alternating slope mode itself.
-      pen_Lam_F = (pen_lam / 48.0) * (G%dxCu(i,j)**3) * (0.5*G%dyCu(i,j))
       do bnode = 1, 2
+        ! Cell x-extent at THIS node row. init_nodal_DG_metric takes a cell's x-extent to
+        ! vary linearly from its south edge dxCv(i,j-1) to its north edge dxCv(i,j), and
+        ! the mass matrix, cell_mean_w, the SEP2 quadrature and cutfem_q1_grads all follow
+        ! that convention, so the nodal derivative must use the node row's own edge length
+        ! rather than a cell-centre width. On a lat-lon grid the two differ by the grid
+        ! convergence across one cell.
+        if (bnode == 1) then
+          dx_A_slp = G%dxCv(i,j-1) ; dx_B_slp = G%dxCv(i+1,j-1)
+        else
+          dx_A_slp = G%dxCv(i,j)   ; dx_B_slp = G%dxCv(i+1,j)
+        endif
+        ! The two 1/dx factors of the variational form are kept explicit below so the
+        ! normalization survives a non-uniform grid; 48 is the 1-D uniform-grid constant
+        ! that makes pen_lam the decay rate of the alternating slope mode itself.
+        dx_F_slp = 0.5*(dx_A_slp + dx_B_slp)
+        pen_Lam_F = (pen_lam / 48.0) * (dx_F_slp**3) * (0.5*G%dyCu(i,j))
         gA_slp = (h_nodal_in(i,  j,2,bnode) - h_nodal_in(i,  j,1,bnode)) / dx_A_slp
         gB_slp = (h_nodal_in(i+1,j,2,bnode) - h_nodal_in(i+1,j,1,bnode)) / dx_B_slp
         J_slp = gB_slp - gA_slp
@@ -17666,9 +17678,15 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     do j = jsc-1, jec ; do i = isc, iec
       if (CS%v_face_mask(i,j) == 4.0) cycle  ! Specified-flux face.
       if (.not. (hmask(i,j) == 1.0 .and. hmask(i,j+1) == 1.0)) cycle
-      dx_A_slp = G%dyT(i,j) ; dx_B_slp = G%dyT(i,j+1)
-      pen_Lam_F = (pen_lam / 48.0) * (G%dyCv(i,j)**3) * (0.5*G%dxCv(i,j))
       do bnode = 1, 2
+        ! Cell y-extent at this node column, west edge dyCu(i-1,j) to east edge dyCu(i,j).
+        if (bnode == 1) then
+          dx_A_slp = G%dyCu(i-1,j) ; dx_B_slp = G%dyCu(i-1,j+1)
+        else
+          dx_A_slp = G%dyCu(i,j)   ; dx_B_slp = G%dyCu(i,j+1)
+        endif
+        dx_F_slp = 0.5*(dx_A_slp + dx_B_slp)
+        pen_Lam_F = (pen_lam / 48.0) * (dx_F_slp**3) * (0.5*G%dxCv(i,j))
         gA_slp = (h_nodal_in(i,j,  bnode,2) - h_nodal_in(i,j,  bnode,1)) / dx_A_slp
         gB_slp = (h_nodal_in(i,j+1,bnode,2) - h_nodal_in(i,j+1,bnode,1)) / dx_B_slp
         J_slp = gB_slp - gA_slp
