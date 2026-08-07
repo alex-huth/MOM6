@@ -318,6 +318,13 @@ type, public :: ice_shelf_dyn_CS ; private
                                !! is the direct measure of what shared (nodal) amplitudes would remove.
   real, pointer, dimension(:,:) :: fg_cut_tear_abs => NULL() !< The same jump, unnormalized [L T-1 ~> m s-1],
                                !! for comparison against the velocity scale.
+  real, pointer, dimension(:,:) :: fg_cut_kappa => NULL() !< Ratio of the largest to the smallest
+                                                       !! Cholesky pivot of the diagonally scaled
+                                                       !! ridge block [nondim]; a proxy for the
+                                                       !! scaled condition number of Babuska and
+                                                       !! Banerjee (2012), which is the quantity
+                                                       !! that governs how much accuracy the solve
+                                                       !! loses. Max over the cell's solves.
   real, pointer, dimension(:,:) :: fg_cut_tear_shape => NULL() !< The other half of the jump [nondim]: the part
                                !! from the level set being double valued at the shared nodes, which on the DG
                                !! path it is because h_nodal is broken across faces. Shared amplitudes would
@@ -882,6 +889,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_f_ground_cell = -1, id_f_ground_node = -1, &
              id_fg_cut_naive = -1, id_fg_cut_eff = -1, id_fg_cut_memfrac = -1, id_fg_cut_floored = -1, &
              id_fg_cut_tear = -1, id_fg_cut_tear_abs = -1, id_fg_cut_tear_shape = -1, &
+             id_fg_cut_kappa = -1, &
              id_u_mask = -1, id_v_mask = -1, id_ufb_mask =-1, id_vfb_mask = -1, id_t_mask = -1, &
              id_sx_shelf = -1, id_sy_shelf = -1, id_surf_slope_mag_shelf, &
              id_duHdx = -1, id_dvHdy = -1, id_fluxdiv = -1, &
@@ -1141,6 +1149,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%fg_cut_tear(isd:ied,jsd:jed), source=0.0)
     allocate(CS%fg_cut_tear_abs(isd:ied,jsd:jed), source=0.0)
     allocate(CS%fg_cut_tear_shape(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%fg_cut_kappa(isd:ied,jsd:jed), source=0.0)
     allocate(CS%cutfem_amp(8,isd:ied,jsd:jed), source=0.0)
     allocate(CS%cutfem_fls_c(4,isd:ied,jsd:jed), source=0.0)
     allocate(CS%cutfem_cut_mask(isd:ied,jsd:jed), source=0.0)
@@ -2292,6 +2301,15 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
        'h_nodal is broken across faces. Shared nodal amplitudes would not remove this; a face '//&
        'penalty on the enrichment jump would. Compare against fg_cut_tear, which is the amplitude '//&
        'part', 'none')
+    CS%id_fg_cut_kappa = register_diag_field('ice_shelf_model','fg_cut_kappa', &
+       CS%diag%axesT1, Time, 'CutFEM diagnostic: ratio of the largest to the smallest Cholesky '//&
+       'pivot of the diagonally scaled ridge block, a proxy for the scaled condition number '//&
+       'kappa_2(D K_aa D) of Babuska and Banerjee (2012), which is the quantity that governs how '//&
+       'much accuracy the small dense solve loses. Because the solve is diagonally scaled, a value '//&
+       'that stays order 1 as the cut approaches a face means the 1/eps growth of the raw '//&
+       'amplitudes is a matter of basis scaling alone and needs no further stabilization; a value '//&
+       'that grows without bound means there is a genuine degeneracy that scaling cannot reach', &
+       'none')
     CS%id_col_thick = register_diag_field('ice_shelf_model','col_thick',CS%diag%axesT1, Time, &
        'ocean column thickness passed to ice model', 'm', conversion=US%Z_to_m)
     CS%id_visc_shelf = register_diag_field('ice_shelf_model','ice_visc',CS%diag%axesT1, Time, &
@@ -2934,6 +2952,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
     if (CS%id_fg_cut_tear_abs > 0) call post_data(CS%id_fg_cut_tear_abs, CS%fg_cut_tear_abs, CS%diag)
     if (CS%id_fg_cut_tear_shape > 0) &
       call post_data(CS%id_fg_cut_tear_shape, CS%fg_cut_tear_shape, CS%diag)
+    if (CS%id_fg_cut_kappa > 0 .and. associated(CS%fg_cut_kappa)) &
+      call post_data(CS%id_fg_cut_kappa, CS%fg_cut_kappa, CS%diag)
     if (CS%id_basal_tr_dfrac > 0) call post_data(CS%id_basal_tr_dfrac, CS%basal_tr_dfrac, CS%diag)
     if (CS%id_OD_av >0) call post_data(CS%id_OD_av, CS%OD_av,CS%diag)
     if (CS%id_visc_shelf > 0) then
@@ -8275,20 +8295,57 @@ end function cutfem_mem_couple
 !! A_eff >= A, hence A_eff^-1 <= A^-1 and the resulting Schur correction is smaller than the exact
 !! one: the condensed operator stays positive semi-definite and CG stays valid. The solution is a
 !! continuous function of A and b, so no cell-level switch is introduced into the operator.
-subroutine cutfem_spd_solve(n, A, floor_piv, b, x, n_floored)
+subroutine cutfem_spd_solve(n, A, floor_piv, b, x, n_floored, kappa_est)
   integer,                intent(in)    :: n    !< System size (<= 8)
-  real, dimension(8,8),   intent(inout) :: A    !< SPD matrix; overwritten by its Cholesky factor
+  real, dimension(8,8),   intent(inout) :: A    !< SPD matrix; overwritten by the Cholesky factor
+                                                !! of its diagonally scaled form
   real,                   intent(in)    :: floor_piv !< Lower bound applied to each Cholesky pivot,
                                                 !! in the units of A's diagonal
   real, dimension(8),     intent(in)    :: b    !< Right-hand side
   real, dimension(8),     intent(out)   :: x    !< Solution
   integer,                intent(out)   :: n_floored !< Number of pivots that hit floor_piv; 0 for a
                                                 !! well-conditioned block
+  real,         optional, intent(out)   :: kappa_est !< Ratio of the largest to the smallest Cholesky
+                                                !! pivot of the diagonally scaled matrix [nondim]: a
+                                                !! cheap proxy for its scaled condition number
   real, dimension(8) :: y
+  real, dimension(8) :: dsc  ! Diagonal scaling D_ii = A_ii^(-1/2) [units of A^(-1/2)]
+  real, dimension(8) :: bs   ! Scaled right-hand side D b
   real :: s
+  real :: tr_A               ! Trace of A before scaling, in A's own units
+  real :: floor_s            ! floor_piv expressed in the scaled frame [nondim]
+  real :: pmin, pmax         ! Smallest and largest Cholesky pivot of the scaled matrix [nondim]
   integer :: i, k, m
   x(:) = 0.0 ; n_floored = 0
-  ! Cholesky factor: A = L L^T, L lower-triangular stored in A.
+  if (present(kappa_est)) kappa_est = 1.0
+
+  ! Symmetric diagonal scaling, D_ii = A_ii^(-1/2), so the scaled matrix has a unit diagonal.
+  ! This is free in exact arithmetic: the Schur complement that this solve feeds is invariant
+  ! under any invertible change of enrichment basis, and a diagonal rescale is one of those
+  ! (K_aa -> T^T K_aa T, K_aU -> T^T K_aU leaves K_Ua K_aa^-1 K_aU unchanged). What it changes
+  ! is the floating-point behaviour. Babuska and Banerjee (2012, CMAME 201-204, 91-111) show
+  ! that the accuracy lost in solving a linear system tracks the SCALED condition number
+  ! kappa_2(D A D), not kappa_2(A), and every ridge amplitude carries a factor 1/eps of the
+  ! minority corner deficit, so the unscaled blocks span many orders of magnitude as the cut
+  ! approaches a face while the scaled ones do not. Note that this is the right instrument here
+  ! and a ghost penalty is not: the degeneracy cured by a ghost penalty (Burman 2010, CRAS 348,
+  ! 1217-1220, Lemma 3.1) is a basis function whose support has small intersection with the
+  ! physical domain, whereas the ridge is supported on the whole cell and only its height
+  ! vanishes.
+  tr_A = 0.0
+  do i=1,n ; tr_A = tr_A + A(i,i) ; enddo
+  do i=1,n
+    if (A(i,i) > 0.0) then ; dsc(i) = 1.0 / sqrt(A(i,i)) ; else ; dsc(i) = 1.0 ; endif
+  enddo
+  do k=1,n ; do i=1,n ; A(i,k) = (A(i,k) * dsc(i)) * dsc(k) ; enddo ; enddo
+  do i=1,n ; bs(i) = b(i) * dsc(i) ; enddo
+  ! The caller's floor is absolute, in the units of A's diagonal. In the scaled frame the unit
+  ! of the diagonal is 1, so the equivalent relative floor is that value over the mean diagonal.
+  floor_s = floor_piv
+  if (tr_A > 0.0) floor_s = (floor_piv * real(n)) / tr_A
+
+  pmin = huge(1.0) ; pmax = 0.0
+  ! Cholesky factor: D A D = L L^T, L lower-triangular stored in A.
   do i=1,n
     do k=1,i
       s = A(i,k)
@@ -8296,25 +8353,30 @@ subroutine cutfem_spd_solve(n, A, floor_piv, b, x, n_floored)
       if (k < i) then
         A(i,k) = s / A(k,k)
       else
-        if (s <= floor_piv) then
-          s = floor_piv ; n_floored = n_floored + 1
+        if (s <= floor_s) then
+          s = floor_s ; n_floored = n_floored + 1
         endif
+        pmin = min(pmin, s) ; pmax = max(pmax, s)
         A(i,k) = sqrt(s)
       endif
     enddo
   enddo
-  ! Forward solve L y = b.
+  if (present(kappa_est)) then
+    if (pmin > 0.0) kappa_est = pmax / pmin
+  endif
+  ! Forward solve L y = D b.
   do i=1,n
-    s = b(i)
+    s = bs(i)
     do m=1,i-1 ; s = s - (A(i,m)*y(m)) ; enddo
     y(i) = s / A(i,i)
   enddo
-  ! Back solve L^T x = y.
+  ! Back solve L^T z = y, then undo the scaling: A x = b with x = D z.
   do i=n,1,-1
     s = y(i)
     do m=i+1,n ; s = s - (A(m,i)*x(m)) ; enddo
     x(i) = s / A(i,i)
   enddo
+  do i=1,n ; x(i) = x(i) * dsc(i) ; enddo
 end subroutine cutfem_spd_solve
 
 !> Bilinear (Q1) shape-function gradients at a SEP2 quadrature point.
@@ -9264,6 +9326,7 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
   real :: jump_amp, jump_shp        ! Amplitude and shape parts of the jump [L T-1 ~> m s-1]
   real :: psi_bar, abar_x, abar_y   ! Face-mean ridge value [Z ~> m] and effective amplitude [L T-1 Z-1]
   real, dimension(2) :: ae_x, ae_y  ! Effective amplitude from each side [L T-1 Z-1]
+  real :: kappa_cell    ! Scaled-condition proxy returned by the ridge block solve [nondim]
   real :: tr_Kaa        ! Trace of the unregularized ridge self-stiffness [R L4 Z T-1]
   real :: piv_floor     ! Conditioning floor on the Cholesky pivots [R L4 Z T-1]
 
@@ -9272,6 +9335,7 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
   CS%fg_cut_memfrac(:,:) = 0.0
   CS%fg_cut_floored(:,:) = 0.0
   CS%fg_cut_tear(:,:) = 0.0 ; CS%fg_cut_tear_abs(:,:) = 0.0 ; CS%fg_cut_tear_shape(:,:) = 0.0
+  if (associated(CS%fg_cut_kappa)) CS%fg_cut_kappa(:,:) = 0.0
   CS%cutfem_cut_mask(:,:) = 0.0
   nmodes = CS%cutfem_ridge_modes
 
@@ -9454,7 +9518,8 @@ subroutine cutfem_diag_ground_fraction(CS, G, US, u_shlf, v_shlf, H_node, dens_r
     n_floored = 0
     if (nsys > 2) then
       Kaa_f(:,:) = Kaa(:,:)
-      call cutfem_spd_solve(nsys, Kaa_f, piv_floor, tvec, svec, n_floored)
+      call cutfem_spd_solve(nsys, Kaa_f, piv_floor, tvec, svec, n_floored, kappa_cell)
+      if (associated(CS%fg_cut_kappa)) CS%fg_cut_kappa(i,j) = kappa_cell
     else
       det = (Kaa(1,1)*Kaa(2,2)) - (Kaa(1,2)*Kaa(2,1))
       if (det < piv_floor**2) then
