@@ -680,6 +680,15 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! the strain-rate term (whose dx_perp already cancels).
                                   !! Non-positive (default) recovers the legacy advect_coef *
                                   !! |u_face|, whose damping timescale scales with dx_perp.
+  real :: dg1_slope_penalty       !< Coefficient of the DG(1) face slope penalty [nondim]. Zero
+                                  !! disables the term entirely (bitwise identical). The penalty
+                                  !! acts on the jump in the face-normal derivative of h, which is
+                                  !! the one grid-scale mode that the upwind flux and the
+                                  !! artificial viscosity are both blind to: both are proportional
+                                  !! to [h], and the mode in question is continuous across faces.
+  real :: dg1_slope_penalty_tau   !< Damping timescale of the DG(1) face slope penalty [T ~> s].
+                                  !! With DG1_SLOPE_PENALTY = 1 the grid-scale slope mode decays
+                                  !! at 1/TAU; the coefficient scales that rate linearly.
   real :: dg_art_visc_tau_floor   !< Absolute damping timescale for the DG(1) artificial
                                   !! viscosity [T ~> s]. When positive, dx_perp/tau_floor is
                                   !! added to u_eff, giving a jump-mode decay rate floor of
@@ -15408,6 +15417,30 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  units="m", default=-1.0, scale=US%m_to_L, &
                  do_not_log=(.not.CS%use_DG_thickness .or. CS%dg_art_visc_c_max == 0.0))
 
+  call get_param(param_file, mdl, "DG1_SLOPE_PENALTY", CS%dg1_slope_penalty, &
+                 "Coefficient of the DG(1) face slope penalty, which damps the jump in "//&
+                 "the face-normal derivative of the nodal thickness across interior "//&
+                 "faces. This is the one grid-scale mode no other term in the scheme can "//&
+                 "see: the upwind flux and the artificial viscosity are both proportional "//&
+                 "to the thickness jump [h], and the mode alternates the nodes while "//&
+                 "staying continuous across faces, so [h] is zero on it and every "//&
+                 "dissipative term vanishes while the consistent Q1 mass matrix weights "//&
+                 "it three times the cell mean. The penalty adds zero net mass to each "//&
+                 "cell -- it redistributes slope within a cell and never moves the cell "//&
+                 "mean -- so it cannot transport ice or move a grounding line by mass "//&
+                 "flux. It is zero to roundoff on a linear thickness field and O(dx^2) on "//&
+                 "a smooth one. Zero disables the term and is bitwise identical.", &
+                 units="nondim", default=0.0, do_not_log=.not.CS%use_DG_thickness)
+  call get_param(param_file, mdl, "DG1_SLOPE_PENALTY_TAU", CS%dg1_slope_penalty_tau, &
+                 "Damping timescale of the DG(1) face slope penalty. With "//&
+                 "DG1_SLOPE_PENALTY = 1 the grid-scale slope mode decays at 1/TAU, and "//&
+                 "the coefficient scales that rate linearly; the normalization is exact "//&
+                 "for a uniform grid and approximate otherwise. Explicit stability needs "//&
+                 "DG1_SLOPE_PENALTY * dt / TAU below about 2; the term self-limits at 0.5 "//&
+                 "so an over-large coefficient cannot destabilize the step.", &
+                 units="s", default=3.1536e7, scale=US%s_to_T, &
+                 do_not_log=(.not.CS%use_DG_thickness .or. CS%dg1_slope_penalty == 0.0))
+
   call get_param(param_file, mdl, "DG1_ART_VISC_TAU_FLOOR", CS%dg_art_visc_tau_floor, &
                  "Absolute damping timescale for the DG(1) artificial viscosity. When "//&
                  "positive, dx_perp/TAU_FLOOR is added to u_eff, so every active face has a "//&
@@ -16970,6 +17003,13 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   logical, dimension(SZDIB_(G),SZDJ_(G)) :: active_E
   logical, dimension(SZDI_(G),SZDJB_(G)) :: active_N
   real, dimension(SZDI_(G),SZDJ_(G))    :: cell_scale
+  real :: pen_lam            ! Slope-mode decay rate actually applied [T-1]
+  real :: pen_Lam_F          ! Face coefficient of the slope penalty [L4 T-1]
+  real :: gA_slp, gB_slp     ! Face-normal derivative of h on each side [Z L-1]
+  real :: J_slp              ! Jump in that derivative across the face [Z L-1]
+  real :: dx_A_slp, dx_B_slp ! Face-normal width of each adjacent cell [L ~> m]
+  real :: pen_A, pen_B       ! Nodal loads from the penalty [Z L2 T-1]
+  integer :: bnode           ! Index of the node along the face (1 or 2)
   real :: S_K                ! Per-cell sum of face rates for the CFL bound [T-1]
   integer :: i_lo, i_hi, j_lo, j_hi  ! One-sided clipping bounds for boundary strain
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_vol, rhs_face
@@ -17568,6 +17608,79 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         if (j+1 <= jec .and. hmask(i,j+1) == 1.0) then
           rhs_face(i,j+1,1,1) = rhs_face(i,j+1,1,1) - visc_flux_qp * t_co
           rhs_face(i,j+1,2,1) = rhs_face(i,j+1,2,1) - visc_flux_qp * t_face
+        endif
+      enddo
+    enddo ; enddo
+  endif
+
+  ! --- Face slope penalty (DG1_SLOPE_PENALTY). ---
+  ! Damps the jump in the face-normal derivative of h. Every other dissipative term in
+  ! the scheme -- the upwind flux and the artificial viscosity alike -- is proportional
+  ! to the thickness jump [h], so a grid-scale mode that alternates the NODES while
+  ! staying continuous across faces has [h] = 0 and is invisible to all of them, while
+  ! the consistent Q1 mass matrix (dx/6)[[2,1],[1,2]] gives its slope eigenvector mass
+  ! dx/6 against dx/2 for the cell mean, i.e. 3x amplification. Undamped and amplified.
+  ! This term sees it: h matches at the face but the slopes are equal and opposite, so
+  ! the derivative jump is twice the slope. On a linear field the jump is zero to
+  ! roundoff, and on a smooth one it is O(dx), making the term O(dx^2) and consistent.
+  if (CS%dg1_slope_penalty > 0.0) then
+    ! Decay rate of the alternating slope mode, self-limited so that an over-large
+    ! coefficient cannot break the explicit step. SSP-RK2 needs lam*dt < 2; capping at
+    ! 0.5 keeps a 4x margin and leaves room for both face directions to load one cell.
+    pen_lam = CS%dg1_slope_penalty / CS%dg1_slope_penalty_tau
+    if (pen_lam*dt > 0.5) pen_lam = 0.5 / dt
+
+    ! East faces. Both sides must be fully interior ice: at hmask 3 the nodal trace is
+    ! replaced by the boundary value, so its one-sided derivative is not the scheme's.
+    do j = jsc, jec ; do i = isc-1, iec
+      if (CS%u_face_mask(i,j) == 4.0) cycle  ! Specified-flux face.
+      if (.not. (hmask(i,j) == 1.0 .and. hmask(i+1,j) == 1.0)) cycle
+      dx_A_slp = G%dxT(i,j) ; dx_B_slp = G%dxT(i+1,j)
+      ! The two 1/dx factors of the variational form are kept explicit below so the
+      ! normalization survives a non-uniform grid; 48 is the 1-D uniform-grid constant
+      ! that makes pen_lam the decay rate of the alternating slope mode itself.
+      pen_Lam_F = (pen_lam / 48.0) * (G%dxCu(i,j)**3) * (0.5*G%dyCu(i,j))
+      do bnode = 1, 2
+        gA_slp = (h_nodal_in(i,  j,2,bnode) - h_nodal_in(i,  j,1,bnode)) / dx_A_slp
+        gB_slp = (h_nodal_in(i+1,j,2,bnode) - h_nodal_in(i+1,j,1,bnode)) / dx_B_slp
+        J_slp = gB_slp - gA_slp
+        pen_A = (pen_Lam_F * J_slp) / dx_A_slp
+        pen_B = (pen_Lam_F * J_slp) / dx_B_slp
+        ! Raise the A-side slope and lower the B-side one. The pair of loads on each
+        ! cell is equal and opposite, so the cell mean is untouched exactly (the mass
+        ! matrix satisfies M*1 = w, hence w^T M^-1 = 1^T and the mass tendency of a
+        ! cell is just the sum of its nodal loads). The penalty therefore cannot
+        ! transport ice or move a grounding line by mass flux; it only reshapes slope.
+        if (i >= isc) then
+          rhs_face(i,  j,1,bnode) = rhs_face(i,  j,1,bnode) - pen_A
+          rhs_face(i,  j,2,bnode) = rhs_face(i,  j,2,bnode) + pen_A
+        endif
+        if (i+1 <= iec) then
+          rhs_face(i+1,j,1,bnode) = rhs_face(i+1,j,1,bnode) + pen_B
+          rhs_face(i+1,j,2,bnode) = rhs_face(i+1,j,2,bnode) - pen_B
+        endif
+      enddo
+    enddo ; enddo
+
+    ! North faces.
+    do j = jsc-1, jec ; do i = isc, iec
+      if (CS%v_face_mask(i,j) == 4.0) cycle  ! Specified-flux face.
+      if (.not. (hmask(i,j) == 1.0 .and. hmask(i,j+1) == 1.0)) cycle
+      dx_A_slp = G%dyT(i,j) ; dx_B_slp = G%dyT(i,j+1)
+      pen_Lam_F = (pen_lam / 48.0) * (G%dyCv(i,j)**3) * (0.5*G%dxCv(i,j))
+      do bnode = 1, 2
+        gA_slp = (h_nodal_in(i,j,  bnode,2) - h_nodal_in(i,j,  bnode,1)) / dx_A_slp
+        gB_slp = (h_nodal_in(i,j+1,bnode,2) - h_nodal_in(i,j+1,bnode,1)) / dx_B_slp
+        J_slp = gB_slp - gA_slp
+        pen_A = (pen_Lam_F * J_slp) / dx_A_slp
+        pen_B = (pen_Lam_F * J_slp) / dx_B_slp
+        if (j >= jsc) then
+          rhs_face(i,j,  bnode,1) = rhs_face(i,j,  bnode,1) - pen_A
+          rhs_face(i,j,  bnode,2) = rhs_face(i,j,  bnode,2) + pen_A
+        endif
+        if (j+1 <= jec) then
+          rhs_face(i,j+1,bnode,1) = rhs_face(i,j+1,bnode,1) + pen_B
+          rhs_face(i,j+1,bnode,2) = rhs_face(i,j+1,bnode,2) - pen_B
         endif
       enddo
     enddo ; enddo
