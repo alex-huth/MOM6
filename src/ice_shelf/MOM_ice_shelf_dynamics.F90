@@ -352,6 +352,9 @@ type, public :: ice_shelf_dyn_CS ; private
   integer :: ice_only_melt_glp !< The grounding-line treatment of the prescribed ice-only basal
                             !! melt, one of MELT_GLP_FMP, MELT_GLP_FCMP, MELT_GLP_PMP or
                             !! MELT_GLP_NMP.
+  real :: ice_only_melt_scale !< A factor multiplying the whole prescribed ice-only basal melt
+                            !! profile, so 5.0 gives the high-melt experiments of Leguy et al.
+                            !! (2021) sec. 4.3 [nondim].
 
   logical :: gl_quad_friction !< If true, scale basal friction by an analytic nodal grounded
                             !! fraction (CS%f_ground_node) computed by the quadrant grounding-line
@@ -1335,6 +1338,17 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                         "'SEM2', but got '"//trim(melt_glp_str)//"'.")
     end select
     CS%dg_basal_source_sem2 = (CS%ice_only_melt_glp == MELT_GLP_SEM2)
+    call get_param(param_file, mdl, "ICE_ONLY_BASAL_MELT_SCALE", CS%ice_only_melt_scale, &
+                 "A factor multiplying the whole prescribed ice-only basal melt profile. The "//&
+                 "default of 1 gives the moderate-melt rate of Leguy et al. (2021) eq. 18, "//&
+                 "saturating at 30 m yr-1; 5 gives their high-melt experiments (sec. 4.3), "//&
+                 "saturating at 150 m yr-1. The scaling leaves the 50 m and 500 m ice-base "//&
+                 "depths at which the ramp starts and saturates unchanged, moving only the "//&
+                 "magnitude. Requires ICE_ONLY_BASAL_MELT.", &
+                 units="nondim", default=1.0, do_not_log=.not.CS%ice_only_basal_melt)
+    if (CS%ice_only_melt_scale < 0.0) call MOM_error(FATAL, &
+                 "MOM_ice_shelf_dynamics: ICE_ONLY_BASAL_MELT_SCALE must be non-negative; a "//&
+                 "negative value would turn the prescribed melt into freeze-on everywhere.")
     if (CS%ice_only_basal_melt .and. .not.solo_ice_sheet) call MOM_error(FATAL, &
                  "MOM_ice_shelf_dynamics: ICE_ONLY_BASAL_MELT is only meaningful for the ice-only "//&
                  "driver; in a coupled run the basal melt rate is supplied by the ocean.")
@@ -12670,7 +12684,8 @@ end function grounded_frac_cell
 !! The profile is a property of freely floating ice, so the draft is taken from flotation
 !! rather than from the bed: using the bed elevation would give grounded cells a melt rate set
 !! by how deep their bed is. How the rate is applied in cells that contain the grounding line
-!! is set by CS%ice_only_melt_glp; see the MELT_GLP_* parameters.
+!! is set by CS%ice_only_melt_glp; see the MELT_GLP_* parameters. The whole profile is scaled by
+!! CS%ice_only_melt_scale, which is 5 for the high-melt experiments of Leguy et al. sec. 4.3.
 !!
 !! This routine only fills ISS%water_flux. The thickness change, the melt-away handling and the
 !! DG source accumulation are all left to change_thickness_using_melt, so the ice-only path and
@@ -12700,6 +12715,12 @@ subroutine calc_prescribed_basal_melt(CS, ISS, G, US)
   d_min = 50.0 * US%m_to_Z
   d_max = 500.0 * US%m_to_Z
   m_max = (30.0 / (365.0*86400.0)) * US%m_to_Z * US%T_to_s
+  ! Leguy et al. (2021) sec. 4.3 repeats the whole experiment set with eq. 18 multiplied by 5.
+  ! Scaling the saturated rate scales the entire profile, since the ramp below is written as a
+  ! fraction of it: s*clamp((d-d_min)/(d_max-d_min), 0, 1)*m_max is the same curve with the
+  ! breakpoints at 50 m and 500 m untouched and only the magnitude moved. Applied as its own
+  ! multiply, and exactly 1.0 by default, so the default path is bitwise unchanged.
+  m_max = m_max * CS%ice_only_melt_scale
   I_d_range = 1.0 / (d_max - d_min)
 
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
