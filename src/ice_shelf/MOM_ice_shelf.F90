@@ -223,7 +223,7 @@ type, public :: ice_shelf_CS ; private
              id_u_ml = -1, id_v_ml = -1, id_sbdry = -1, &
              id_h_shelf = -1, id_dhdt_shelf = -1, id_h_mask = -1, id_frazil = -1, &
              id_surf_elev = -1, id_bathym = -1, &
-             id_area_shelf_h = -1, &
+             id_area_shelf_h = -1, id_smb_rate = -1, id_bmb_rate = -1, &
              id_ustar_shelf = -1, id_shelf_mass = -1, id_mass_flux = -1, &
              id_shelf_sfc_mass_flux = -1, &
              id_vaf = -1, id_g_adott = -1, id_f_adott = -1, id_adott = -1, &
@@ -1066,6 +1066,8 @@ subroutine shelf_calc_flux(sfc_state_in, fluxes_in, Time, time_step_in, CS)
   if (CS%id_dhdt_shelf > 0) call post_data(CS%id_dhdt_shelf, ISS%dhdt_shelf, CS%diag)
   if (CS%id_h_mask > 0) call post_data(CS%id_h_mask,ISS%hmask,CS%diag)
   if (CS%id_frazil > 0) call post_data(CS%id_frazil,ISS%frazil,CS%diag)
+  if (CS%id_smb_rate > 0) call post_data(CS%id_smb_rate, dh_adott*Itime_step, CS%diag)
+  if (CS%id_bmb_rate > 0) call post_data(CS%id_bmb_rate, dh_bdott*Itime_step, CS%diag)
   if (CS%active_shelf_dynamics) &
       call process_and_post_scalar_data(CS, vaf0, vaf0_A, vaf0_G, Itime_step, dh_adott, dh_bdott)
   call disable_averaging(CS%diag)
@@ -2380,7 +2382,12 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
     CS%id_h_mask = register_diag_field('ice_shelf_model', 'h_mask', CS%diag%axesT1, CS%Time, &
        'ice shelf thickness mask', 'none', conversion=1.0)
   endif
-
+  CS%id_smb_rate = register_diag_field('ice_shelf_model', 'smb_rate', CS%diag%axesT1, CS%Time, &
+     'Surface mass balance rate calculated as change in ice-sheet thickness ' //&
+     'due to surface accum+melt', 'm yr-1', conversion=US%Z_to_m*US%s_to_T*(86400.0*365.0))
+  CS%id_bmb_rate = register_diag_field('ice_shelf_model', 'bmb_rate', CS%diag%axesT1, CS%Time, &
+     'Basal mass balance rate calculated as change in ice-sheet thickness ' //&
+     'due to surface accum+melt', 'm yr-1', conversion=US%Z_to_m*US%s_to_T*(86400.0*365.0))
   CS%id_shelf_sfc_mass_flux = register_diag_field('ice_shelf_model', 'sfc_mass_flux', CS%diag%axesT1, CS%Time, &
      'ice shelf surface mass flux deposition from atmosphere', &
      'kg m-2 s-1', conversion=US%RZ_T_to_kg_m2s)
@@ -2544,7 +2551,8 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
         CS%id_Ant_adott>0 .or. CS%id_Ant_g_adott>0 .or. CS%id_Ant_f_adott>0 .or. &
         CS%id_Ant_adot >0 .or. CS%id_Ant_g_adot >0 .or. CS%id_Ant_f_adot >0 .or. &
         CS%id_Gr_adott>0  .or. CS%id_Gr_g_adott>0  .or. CS%id_Gr_f_adott>0  .or. &
-        CS%id_Gr_adot >0  .or. CS%id_Gr_g_adot >0  .or. CS%id_Gr_f_adot >0) then
+        CS%id_Gr_adot >0  .or. CS%id_Gr_g_adot >0  .or. CS%id_Gr_f_adot >0  .or. &
+        CS%id_smb_rate>0) then
       CS%smb_diag=.true.
     else
       CS%smb_diag=.false.
@@ -2555,7 +2563,8 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
         CS%id_Ant_bdott>0 .or. CS%id_Ant_bdott_melt>0 .or. CS%id_Ant_bdott_accum>0 .or. &
         CS%id_Ant_bdot >0 .or. CS%id_Ant_bdot_melt >0 .or. CS%id_Ant_bdot_accum >0 .or. &
         CS%id_Gr_bdott>0  .or. CS%id_Gr_bdott_melt>0  .or. CS%id_Gr_bdott_accum>0  .or. &
-        CS%id_Gr_bdot >0  .or. CS%id_Gr_bdot_melt >0  .or. CS%id_Gr_bdot_accum >0) then
+        CS%id_Gr_bdot >0  .or. CS%id_Gr_bdot_melt >0  .or. CS%id_Gr_bdot_accum >0 .or. &
+        CS%id_bmb_rate>0) then
       CS%bmb_diag=.true.
     else
       CS%bmb_diag=.false.
@@ -3085,6 +3094,9 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
   if (CS%id_h_shelf > 0)      call post_data(CS%id_h_shelf      ,ISS%h_shelf     ,CS%diag)
   if (CS%id_dhdt_shelf > 0)   call post_data(CS%id_dhdt_shelf   ,ISS%dhdt_shelf  ,CS%diag)
   if (CS%id_h_mask > 0)       call post_data(CS%id_h_mask       ,ISS%hmask       ,CS%diag)
+  if (CS%id_smb_rate > 0)     call post_data(CS%id_smb_rate     ,dh_adott_sum*Ifull_time_step    ,CS%diag)
+  if (CS%id_bmb_rate > 0)     call post_data(CS%id_bmb_rate     ,dh_bdott_sum*Ifull_time_step    ,CS%diag)
+  if (CS%id_shelf_sfc_mass_flux > 0) call post_data(CS%id_shelf_sfc_mass_flux, fluxes_in%shelf_sfc_mass_flux, CS%diag)
   call process_and_post_scalar_data(CS, vaf0, vaf0_A, vaf0_G, Ifull_time_step, dh_adott_sum, dh_bdott_sum)
   call disable_averaging(CS%diag)
 
