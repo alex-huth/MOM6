@@ -2013,14 +2013,16 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
        'just-grounded side (traction reduced) and positive on the just-floating side (traction added, '//&
        'centered mode only), mapping where and how much the near-GL Weertman smoothing reweights traction.', &
        'none')
-    CS%id_f_ground_cell = register_diag_field('ice_shelf_model','f_ground_cell',CS%diag%axesT1, Time, &
-       'analytic grounded ice fraction at cell centers from the quadrant grounding-line '//&
-       'parameterization (Leguy et al. 2021); nonzero only when GL_QUADRANT_FRICTION or '//&
-       'GL_QUADRANT_TAUD is set', 'none')
-    CS%id_f_ground_node = register_diag_field('ice_shelf_model','f_ground_node',CS%diag%axesB1, Time, &
-       'analytic grounded ice fraction at B-grid nodes from the quadrant grounding-line '//&
-       'parameterization (Leguy et al. 2021); multiplies basal friction under '//&
-       'GL_QUADRANT_FRICTION', 'none')
+    if (CS%gl_quad_friction .or. CS%gl_quad_taud) then
+      CS%id_f_ground_cell = register_diag_field('ice_shelf_model','f_ground_cell',CS%diag%axesT1, Time, &
+        'analytic grounded ice fraction at cell centers from the quadrant grounding-line '//&
+        'parameterization (Leguy et al. 2021); nonzero only when GL_QUADRANT_FRICTION or '//&
+        'GL_QUADRANT_TAUD is set', 'none')
+      CS%id_f_ground_node = register_diag_field('ice_shelf_model','f_ground_node',CS%diag%axesB1, Time, &
+        'analytic grounded ice fraction at B-grid nodes from the quadrant grounding-line '//&
+        'parameterization (Leguy et al. 2021); multiplies basal friction under '//&
+        'GL_QUADRANT_FRICTION', 'none')
+    endif
     CS%id_col_thick = register_diag_field('ice_shelf_model','col_thick',CS%diag%axesT1, Time, &
        'ocean column thickness passed to ice model', 'm', conversion=US%Z_to_m)
     CS%id_visc_shelf = register_diag_field('ice_shelf_model','ice_visc',CS%diag%axesT1, Time, &
