@@ -273,6 +273,11 @@ type, public :: ice_shelf_dyn_CS ; private
                                !! quadrant areas with f_ground_node, so the two grids carry mutually
                                !! consistent grounded areas). Used to blend the surface for the FV
                                !! driving stress when GL_QUADRANT_TAUD is set [nondim].
+  real, pointer, dimension(:,:) :: H_node => NULL() !< The ice shelf thickness at B-grid corners,
+                               !! set by interpolate_H_to_B in update_grounded_geometry and used by
+                               !! the sub-element basal friction in the velocity solve.  It is only
+                               !! nonzero with GROUNDING_LINE_INTERPOLATE and without DG thickness,
+                               !! which are the cases that read it [Z ~> m].
   ! float_cond used to be a persistent CS field; it is now derived inline at use sites
   ! from CS%ground_frac (a GL cell is "0 < ground_frac < 1" under GL_regularize=True).
   real, pointer, dimension(:,:) :: basal_tr_dfrac => NULL() !< Diagnostic basal-traction smoothing anomaly:
@@ -304,6 +309,9 @@ type, public :: ice_shelf_dyn_CS ; private
                     ! this time interval, and solving for the equilibrated flow will begin to lose
                     ! meaning if it is done too frequently.
   real :: elapsed_velocity_time  !< The elapsed time since the ice velocities were last updated [T ~> s].
+  logical :: grounded_geom_current = .false. !< If true, the grounded geometry fields set by
+                               !! update_grounded_geometry have already been refreshed for the current
+                               !! ice thickness, so the velocity solve does not have to repeat the work.
 
   real :: g_Earth      !< The gravitational acceleration [L2 Z-1 T-2 ~> m s-2].
   real :: density_ice  !< A typical density of ice [R ~> kg m-3].
@@ -1029,6 +1037,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%ground_frac(isd:ied,jsd:jed), source=0.0)
     allocate(CS%f_ground_node(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%f_ground_cell(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%H_node(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%H_corner(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%fls_corner(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%corner_valid(IsdB:IedB,JsdB:JedB), source=.false.)
@@ -2422,12 +2431,19 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
                                               !! trigger an update.
   integer :: iters
   logical :: update_ice_vel, coupled_GL
+  logical :: refresh_gfrac ! If true, refresh the grounded geometry after the advection, rather
+                           ! than leaving it to the next velocity solve.
 
   update_ice_vel = .false.
   if (present(must_update_vel)) update_ice_vel = must_update_vel
 
   coupled_GL = .false.
   if (present(ocean_mass) .and. present(coupled_grounding)) coupled_GL = coupled_grounding
+
+  ! The prescribed basal melt reads the grounded fraction, so it has to follow the ice thickness
+  ! on every advective sub-step, not only on the sub-steps that solve for the velocities.  This
+  ! is only ever true for the ice-only driver; ICE_ONLY_BASAL_MELT is not permitted otherwise.
+  refresh_gfrac = (CS%ice_only_basal_melt .and. CS%advect_shelf) .and. (.not. coupled_GL)
 !
   if (CS%advect_shelf) then
     call ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
@@ -2441,9 +2457,16 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
 
   if (coupled_GL) then
     call update_OD_ffrac(CS, G, US, ocean_mass, update_ice_vel)
-  elseif (update_ice_vel) then
+  elseif (update_ice_vel .or. refresh_gfrac) then
     call update_OD_ffrac_uncoupled(CS, G, ISS%h_shelf(:,:))
     CS%GL_couple=.false.
+  endif
+
+  ! ice_shelf_solve_outer would otherwise do this itself, but the ice thickness does not change
+  ! between here and there, so it is only ever done once per call.
+  if (refresh_gfrac) then
+    call update_grounded_geometry(CS, ISS, G)
+    CS%grounded_geom_current = .true.
   endif
 
   if (update_ice_vel) then
@@ -3400,6 +3423,62 @@ subroutine ice_shelf_advect(CS, ISS, G, time_step, Time, calve_ice_shelf_bergs)
 
 end subroutine ice_shelf_advect
 
+!> Refresh every grounded/floating geometry field that is a function of the current ice thickness:
+!! CS%H_node, the flotation gate and corner flotation fields, CS%ground_frac (along with
+!! CS%basal_gate, CS%basal_tr_dfrac and CS%xi_basal), and the analytic quadrant grounded fractions
+!! CS%f_ground_cell and CS%f_ground_node.  These are read by the driving stress and the basal
+!! friction in the velocity solve, and by the prescribed basal melt parameterization.
+subroutine update_grounded_geometry(CS, ISS, G)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
+  type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe
+                                               !! the ice-shelf state
+  type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
+
+  real :: rhoi_rhow ! The density of ice divided by a typical water density [nondim]
+  integer :: i, j
+
+  rhoi_rhow = CS%density_ice / CS%density_ocean_avg
+
+  ! need to make these conditional on GL interpolation
+  CS%H_node(:,:) = 0.0
+  !CS%ground_frac(:,:) = 0.0
+
+  if (.not. CS%GL_couple) then
+    do j=G%jsc,G%jec ; do i=G%isc,G%iec
+      if (rhoi_rhow * max(ISS%h_shelf(i,j),CS%min_h_shelf) - CS%bed_elev(i,j) > 0) then
+        CS%ground_frac(i,j) = 1.0
+        CS%OD_av(i,j) =0.0
+      endif
+    enddo ; enddo
+  endif
+
+  ! Set CS%ground_frac in GL-regularize cells to the fraction of sub-grid integration
+  ! points that are grounded (case 2: GL_regularize=True). Other cases leave ground_frac
+  ! at the binary or running-mean value already set upstream. H_node is needed by the
+  ! non-DG branch of compute_ground_frac and by CG_action_subgrid_basal in the velocity solve.
+  ! Computed before the driving-stress call so that the DG nsub switch and the non-DG
+  ! Neumann test see the freshly-computed fractional ground_frac in the current outer
+  ! iteration rather than lagged by one.
+  if (CS%GL_regularize .and. .not. CS%use_DG_thickness) then
+    call interpolate_H_to_B(G, ISS%h_shelf, ISS%hmask, CS%H_node, CS%min_h_shelf)
+  endif
+  ! Refresh the continuous flotation-gate field before any grounded/floating
+  ! decisions are made for this outer solve (h is frozen for its duration).
+  if (CS%use_DG_thickness .and. CS%dg_gl_gate_continuous) call compute_h_flot(CS, ISS, G)
+  ! Corner thickness and flotation deficit for the FV sub-element paths. Built before
+  ! compute_ground_frac so the grounded fraction is measured on the same flotation field the
+  ! friction and driving stress integrate over.
+  if (CS%fv_subgrid_gl_friction .or. CS%fv_subgrid_gl_taud) &
+    call build_corner_flotation_fields(CS, ISS, G)
+  call compute_ground_frac(CS, ISS, G, CS%H_node)
+
+  ! Analytic quadrant grounding-line fractions for friction and/or the driving-stress surface
+  ! blend (Leguy et al. 2021). Uses cell-mean h_shelf/bed_elev, so it is independent of the
+  ! thickness-advection scheme.
+  if (CS%gl_quad_friction .or. CS%gl_quad_taud) call compute_gl_quadrant_fractions(CS, ISS, G)
+
+end subroutine update_grounded_geometry
+
 !>This subroutine computes u- and v-velocities of the ice shelf iterating on non-linear ice viscosity
 !subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, iters, time)
 subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, iters, Time)
@@ -3426,7 +3505,6 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   real, dimension(SZDIB_(G),SZDJB_(G)) :: u_pre_newton, v_pre_newton ! Velocities saved at the
                                               ! Picard-to-Newton switch, restored if Newton
                                               ! diverges [L T-1 ~> m s-1]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: H_node ! Ice shelf thickness at corners [Z ~> m].
   real, dimension(SZDIB_(G),SZDJB_(G)) :: Normvec  ! Velocities used for convergence [L2 T-2 ~> m2 s-2]
   logical :: converged ! Indicates nonlinear convergence
   logical :: calc_Au_for_convergence ! Used for convergence criteria than need a CG_action
@@ -3482,46 +3560,14 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   taudx(:,:) = 0.0 ; taudy(:,:) = 0.0
   Au(:,:) = 0.0 ; Av(:,:) = 0.0
 
-  ! need to make these conditional on GL interpolation
-  H_node(:,:) = 0.0
-  !CS%ground_frac(:,:) = 0.0
-
-  if (.not. CS%GL_couple) then
-    do j=G%jsc,G%jec ; do i=G%isc,G%iec
-      if (rhoi_rhow * max(ISS%h_shelf(i,j),CS%min_h_shelf) - CS%bed_elev(i,j) > 0) then
-        CS%ground_frac(i,j) = 1.0
-        CS%OD_av(i,j) =0.0
-      endif
-    enddo ; enddo
-  endif
-
   ! Warning: This turns off Picard entirely and may not converge.
   if (CS%newton_after_tolerance<=0.0) CS%doing_newton=.true.
 
-  ! Set CS%ground_frac in GL-regularize cells to the fraction of sub-grid integration
-  ! points that are grounded (case 2: GL_regularize=True). Other cases leave ground_frac
-  ! at the binary or running-mean value already set upstream. H_node is needed by the
-  ! non-DG branch of compute_ground_frac and by CG_action_subgrid_basal further down.
-  ! Computed before the driving-stress call so that the DG nsub switch and the non-DG
-  ! Neumann test see the freshly-computed fractional ground_frac in the current outer
-  ! iteration rather than lagged by one.
-  if (CS%GL_regularize .and. .not. CS%use_DG_thickness) then
-    call interpolate_H_to_B(G, ISS%h_shelf, ISS%hmask, H_node, CS%min_h_shelf)
-  endif
-  ! Refresh the continuous flotation-gate field before any grounded/floating
-  ! decisions are made for this outer solve (h is frozen for its duration).
-  if (CS%use_DG_thickness .and. CS%dg_gl_gate_continuous) call compute_h_flot(CS, ISS, G)
-  ! Corner thickness and flotation deficit for the FV sub-element paths. Built before
-  ! compute_ground_frac so the grounded fraction is measured on the same flotation field the
-  ! friction and driving stress integrate over.
-  if (CS%fv_subgrid_gl_friction .or. CS%fv_subgrid_gl_taud) &
-    call build_corner_flotation_fields(CS, ISS, G)
-  call compute_ground_frac(CS, ISS, G, H_node)
-
-  ! Analytic quadrant grounding-line fractions for friction and/or the driving-stress surface
-  ! blend (Leguy et al. 2021). Uses cell-mean h_shelf/bed_elev, so it is independent of the
-  ! thickness-advection scheme.
-  if (CS%gl_quad_friction .or. CS%gl_quad_taud) call compute_gl_quadrant_fractions(CS, ISS, G)
+  ! Refresh the grounded geometry that the driving stress and basal friction integrate over.
+  ! h_shelf has not changed since update_ice_shelf did this, in the cases where it does, so
+  ! the work is not repeated here.
+  if (.not. CS%grounded_geom_current) call update_grounded_geometry(CS, ISS, G)
+  CS%grounded_geom_current = .false.
 
   ! Calculate RHS. With GL_QUADRANT_TAUD, use the FV (non-DG) driving stress even under DG
   ! thickness advection, so the cell-mean quadrant surface blend (gl_surface_blend) takes effect.
@@ -3553,7 +3599,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   ! Calculate err_init, the denominator for some convergence criteria
   if (CS%nonlin_solve_err_mode == 1 .or. CS%nonlin_solve_err_mode == 4) then
     Au(:,:) = 0.0 ; Av(:,:) = 0.0
-    call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, H_node, &
+    call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, CS%H_node, &
       CS%ice_visc, CS%bed_elev, u_shlf, v_shlf, &
       G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow, use_newton_in=.false., &
       h_shelf=ISS%h_shelf)
@@ -3634,7 +3680,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     if (iter > 50) exit
 
     ! The linear solve
-    call ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H_node, &
+    call ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, CS%H_node, &
                                ISS%hmask, conv_flag, iters, time, CS%Phi, CS%Phisub)
 
     if (CS%debug) then
@@ -3661,7 +3707,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     if (calc_Au_for_convergence) then
       Au(:,:) = 0 ; Av(:,:) = 0
       call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, &
-        H_node, CS%ice_visc, CS%bed_elev, u_shlf, v_shlf, &
+        CS%H_node, CS%ice_visc, CS%bed_elev, u_shlf, v_shlf, &
         G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow, use_newton_in=.false., &
         h_shelf=ISS%h_shelf)
 
@@ -3824,7 +3870,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
           if (.not. calc_Au_for_convergence) then
             Au(:,:) = 0 ; Av(:,:) = 0
             call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, &
-              H_node, CS%ice_visc, CS%bed_elev, u_shlf, v_shlf, &
+              CS%H_node, CS%ice_visc, CS%bed_elev, u_shlf, v_shlf, &
               G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow, use_newton_in=.false., &
               h_shelf=ISS%h_shelf)
           endif
@@ -10372,6 +10418,7 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%fB_node)) deallocate(CS%fB_node)
   if (associated(CS%area_node)) deallocate(CS%area_node)
   deallocate(CS%OD_rt, CS%OD_av)
+  if (associated(CS%H_node)) deallocate(CS%H_node)
   deallocate(CS%t_bdry_val, CS%bed_elev, CS%bed_node)
   if (associated(CS%h_nodal)) deallocate(CS%h_nodal)
   if (associated(CS%h_flot)) deallocate(CS%h_flot)
