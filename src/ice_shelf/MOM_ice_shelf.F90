@@ -3074,20 +3074,24 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
       call MOM_mesg("solo_step_ice_shelf: "//mesg, 5)
     endif
 
-    if (CS%smb_diag) dh_adott(is:ie,js:je) = ISS%h_shelf(is:ie,js:je)
-    call change_thickness_using_precip(CS, ISS, G, US, fluxes_in, time_step, Time)
-    if (CS%smb_diag) dh_adott_sum(is:ie,js:je) = dh_adott_sum(is:ie,js:je) + &
-                                             (ISS%h_shelf(is:ie,js:je) - dh_adott(is:ie,js:je))
-
     ! Prescribed basal melt. calc_prescribed_basal_melt only fills ISS%water_flux (and is a
     ! no-op unless ICE_ONLY_BASAL_MELT is set); change_thickness_using_melt then applies it
     ! exactly as it does for ocean-supplied melt in a coupled run, so the melt-away handling,
     ! the mass_hole accounting and the DG source accumulation are shared between the two paths.
+    ! The melt is applied before the surface mass balance, as it is in a coupled run, so that
+    ! calc_prescribed_basal_melt reads the ice thickness that the grounded fractions it also
+    ! reads were computed from.  Were the precipitation applied first, the melt rate would be
+    ! set from the updated thickness but scaled by a grounded fraction that predates it.
     if (CS%bmb_diag) dh_bdott(is:ie,js:je) = ISS%h_shelf(is:ie,js:je)
     call calc_prescribed_basal_melt(CS%dCS, ISS, G, US)
     call change_thickness_using_melt(CS, ISS, G, US, time_step, fluxes_in)
     if (CS%bmb_diag) dh_bdott_sum(is:ie,js:je) = dh_bdott_sum(is:ie,js:je) + &
                                              (ISS%h_shelf(is:ie,js:je) - dh_bdott(is:ie,js:je))
+
+    if (CS%smb_diag) dh_adott(is:ie,js:je) = ISS%h_shelf(is:ie,js:je)
+    call change_thickness_using_precip(CS, ISS, G, US, fluxes_in, time_step, Time)
+    if (CS%smb_diag) dh_adott_sum(is:ie,js:je) = dh_adott_sum(is:ie,js:je) + &
+                                             (ISS%h_shelf(is:ie,js:je) - dh_adott(is:ie,js:je))
 
     remaining_time = remaining_time - time_step
 
