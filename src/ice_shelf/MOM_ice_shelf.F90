@@ -26,7 +26,7 @@ use MOM_IS_diag_mediator, only : MOM_IS_diag_mediator_close_registration
 use MOM_domains, only : MOM_domains_init, pass_var, pass_vector, clone_MOM_domain, MOM_domain_type
 use MOM_domains, only : TO_ALL, CGRID_NE, BGRID_NE, CORNER
 use MOM_dyn_horgrid, only : dyn_horgrid_type, create_dyn_horgrid, destroy_dyn_horgrid
-use MOM_error_handler, only : MOM_error, MOM_mesg, FATAL, WARNING, is_root_pe
+use MOM_error_handler, only : MOM_error, MOM_mesg, FATAL, WARNING, is_root_pe, MOM_verbose_enough
 use MOM_error_handler, only : callTree_showQuery
 use MOM_error_handler, only : callTree_enter, callTree_leave, callTree_waypoint
 use MOM_file_parser, only : read_param, get_param, log_param, log_version, param_file_type
@@ -2981,12 +2981,15 @@ subroutine ice_shelf_end(CS)
 end subroutine ice_shelf_end
 
 !> This routine is for stepping a stand-alone ice shelf model without an ocean.
-subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in, fluxes_in)
+subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in, adv_time_step_in, &
+                               fluxes_in)
   type(ice_shelf_CS), pointer    :: CS      !< A pointer to the ice shelf control structure
   type(time_type), intent(in)    :: time_interval !< The time interval for this update [s].
   integer,         intent(inout) :: nsteps  !< The running number of ice shelf steps.
   type(time_type), intent(inout) :: Time    !< The current model time
   real,  optional, intent(in)    :: min_time_step_in !< The minimum permitted time step [T ~> s].
+  real,  optional, intent(in)    :: adv_time_step_in !< The maximum thickness advection time step,
+                                            !! which may be shorter than time_interval [T ~> s].
   type(forcing),      optional, target, intent(inout) :: fluxes_in !< A structure containing pointers to any
                                                          !!  possible thermodynamic or mass-flux forcing fields.
   type(ocean_grid_type), pointer :: G => NULL()  ! A pointer to the ocean's grid structure
@@ -2999,10 +3002,12 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
   real :: full_time_step    ! The external time step (sum of internal time steps) during this call [T ~> s]
   real :: Ifull_time_step   ! The inverse of the external time step [T-1 ~> s-1]
   real :: min_time_step     ! The minimal required timestep that would indicate a fatal problem [T ~> s]
+  real :: adv_time_step     ! The maximum thickness advection time step [T ~> s]
+  real :: dt_CFL            ! The largest stable time step for the current ice velocities [T ~> s]
   character(len=240) :: mesg
   logical :: update_ice_vel ! If true, it is time to update the ice shelf velocities.
-  logical :: coupled_GL     ! If true the grounding line position is determined based on
-                            ! coupled ice-ocean dynamics.
+  logical :: vel_updated    ! If true, the ice shelf velocities were updated in this sub-step.
+  logical :: substepping    ! If true, the thickness advection sub-cycles within this call.
   integer :: is, ie, js, je, i, j
   real :: vaf0, vaf0_A, vaf0_G !The previous volumes above floatation
                                !for all ice sheets, Antarctica only, or Greenland only [Z L2 ~> m3]
@@ -3027,6 +3032,16 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
     min_time_step = 1000.0*US%s_to_T ! At 1 km resolution this would imply ice is moving at ~1 meter per second
   endif
 
+  ! The thickness advection sub-cycles within this call, but the ice velocities are only solved
+  ! for once per ICE_VELOCITY_TIMESTEP, on the last sub-step, unless the CFL limit intervenes.
+  adv_time_step = full_time_step
+  if (present(adv_time_step_in)) adv_time_step = min(adv_time_step_in, full_time_step)
+  substepping = (adv_time_step < full_time_step)
+
+  ! The CFL limit only changes when the ice velocities do.  The velocities were updated at the
+  ! end of the previous call, so it is evaluated here and again after each subsequent update.
+  dt_CFL = ice_time_step_CFL(CS%dCS, ISS, G)
+
   write (mesg,*) "TIME in ice shelf call, yrs: ", time_to_real(Time)/(365. * 86400.)
   call MOM_mesg("solo_step_ice_shelf: "//mesg, 5)
 
@@ -3045,13 +3060,17 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
   do while (remaining_time > 0.0)
     nsteps = nsteps+1
 
-    ! If time_interval is not too long, this is unnecessary.
-    time_step = min(ice_time_step_CFL(CS%dCS, ISS, G), remaining_time)
+    ! Sub-step on ICE_ADVECTION_TIMESTEP, or on the CFL limit if that is more restrictive.  If
+    ! neither is shorter than the remaining time, this loop only takes a single pass.
+    time_step = min(min(dt_CFL, adv_time_step), remaining_time)
 
-    write (mesg,*) "Ice model timestep = ", US%T_to_s*time_step, " seconds"
-    if ((time_step < min_time_step) .and. (time_step < remaining_time))  then
+    ! Only a CFL limit that has collapsed below min_time_step indicates a problem; a
+    ! deliberately short ICE_ADVECTION_TIMESTEP does not.
+    if ((dt_CFL < min_time_step) .and. (time_step < remaining_time))  then
+      write (mesg,*) "Ice model timestep = ", US%T_to_s*time_step, " seconds"
       call MOM_error(FATAL, "MOM_ice_shelf:solo_step_ice_shelf: abnormally small timestep "//mesg)
-    else
+    elseif (MOM_verbose_enough(5)) then
+      write (mesg,*) "Ice model timestep = ", US%T_to_s*time_step, " seconds"
       call MOM_mesg("solo_step_ice_shelf: "//mesg, 5)
     endif
 
@@ -3072,13 +3091,22 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
 
     remaining_time = remaining_time - time_step
 
-    ! If the last mini-timestep is a day or less, we cannot expect velocities to change by much.
-    ! Do not update the velocities if the last step is very short.
-    update_ice_vel = ((time_step > min_time_step) .or. (remaining_time > 0.0))
-    coupled_GL = .false.
+    ! Update the ice velocities whenever the CFL limit, rather than ICE_ADVECTION_TIMESTEP, set
+    ! the length of this sub-step, and on the last sub-step of the velocity time step.  Without
+    ! advective sub-cycling, if the last mini-timestep is a day or less, we cannot expect
+    ! velocities to change by much, so they are not updated if the last step is very short.
+    if (remaining_time > 0.0) then
+      update_ice_vel = (dt_CFL <= adv_time_step)
+    else
+      update_ice_vel = (substepping .or. (time_step > min_time_step))
+    endif
 
     call update_ice_shelf(CS%dCS, ISS, G, US, time_step, Time, CS%calve_ice_shelf_bergs, &
-                          must_update_vel=update_ice_vel)
+                          must_update_vel=update_ice_vel, vel_updated=vel_updated)
+
+    ! Refresh the CFL limit for the remaining sub-steps.  On the last sub-step this would be
+    ! discarded, as the next call re-evaluates it from these same velocities.
+    if (vel_updated .and. (remaining_time > 0.0)) dt_CFL = ice_time_step_CFL(CS%dCS, ISS, G)
 
   enddo
 

@@ -2400,7 +2400,7 @@ end function ice_time_step_CFL
 !> This subroutine updates the ice shelf velocities, mass, stresses and properties due to the
 !! ice shelf dynamics.
 subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_bergs, &
-                            ocean_mass, coupled_grounding, must_update_vel)
+                            ocean_mass, coupled_grounding, must_update_vel, vel_updated)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
   type(ice_shelf_state),  intent(inout) :: ISS !< A structure with elements that describe
                                               !! the ice-shelf state
@@ -2416,6 +2416,10 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
   logical,      optional, intent(in)    :: coupled_grounding !< If true, the grounding line is
                                               !! determined by coupled ice-ocean dynamics
   logical,      optional, intent(in)    :: must_update_vel !< Always update the ice velocities if true.
+  logical,      optional, intent(out)   :: vel_updated !< True if the ice velocities were updated
+                                              !! during this call.  This can not be anticipated by
+                                              !! the caller, as the elapsed velocity time can also
+                                              !! trigger an update.
   integer :: iters
   logical :: update_ice_vel, coupled_GL
 
@@ -2446,6 +2450,8 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
     call ice_shelf_solve_outer(CS, ISS, G, US, CS%u_shelf, CS%v_shelf,CS%taudx_shelf,CS%taudy_shelf, iters, Time)
     CS%elapsed_velocity_time = 0.0
   endif
+
+  if (present(vel_updated)) vel_updated = update_ice_vel
 
 ! call ice_shelf_temp(CS, ISS, G, US, time_step, ISS%water_flux, Time)
 

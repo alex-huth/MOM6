@@ -110,6 +110,9 @@ program Shelf_main
                                   ! if Time_step_shelf is not an exact
                                   ! representation of time_step.
   real :: time_step               ! The time step [T ~> s]
+  real :: adv_time_step           ! The thickness advection time step [T ~> s]
+  real :: min_time_step           ! The smallest permitted CFL-limited time step [T ~> s]
+  logical :: moving_shelf_front   ! If true, the ice shelf front is advanced (and calved).
 
   ! A pointer to a structure containing metrics and related information.
   type(ocean_grid_type), pointer :: ocn_grid => NULL()
@@ -245,6 +248,31 @@ program Shelf_main
                  "The time step for changing forcing, coupling with other "//&
                  "components, or potentially writing certain diagnostics.", &
                  units="s", scale=US%s_to_T, fail_if_missing=.true.)
+  call get_param(param_file, mod_name, "ICE_ADVECTION_TIMESTEP", adv_time_step, &
+                 "The time step on which the ice thickness is advected.  The ice velocities "//&
+                 "are updated every ICE_VELOCITY_TIMESTEP, while the thickness advection "//&
+                 "sub-cycles at this interval, or more often if the CFL limit requires it.  "//&
+                 "This is analogous to advecting the ice on DT_THERM in a coupled run.", &
+                 units="s", default=US%T_to_s*time_step, scale=US%s_to_T)
+  call get_param(param_file, mod_name, "ICE_MIN_TIMESTEP", min_time_step, &
+                 "The smallest CFL-limited time step that will be taken before the run is "//&
+                 "halted with a fatal error.", &
+                 units="s", default=1000.0, scale=US%s_to_T)
+
+  if (adv_time_step <= 0.0) call MOM_error(FATAL, &
+      "Shelf_driver: ICE_ADVECTION_TIMESTEP must be positive.")
+  if (adv_time_step > time_step) call MOM_error(FATAL, &
+      "Shelf_driver: ICE_ADVECTION_TIMESTEP can not exceed ICE_VELOCITY_TIMESTEP.")
+
+  ! A cell that the advancing front fills has active velocity nodes, but no velocity has been
+  ! solved at them until the next ice velocity update, so with advective sub-cycling it would
+  ! be advected with a stale velocity field.
+  call get_param(param_file, mod_name, "SHELF_MOVING_FRONT", moving_shelf_front, &
+                 default=.false., do_not_log=.true.)
+  if (moving_shelf_front .and. (adv_time_step < time_step)) call MOM_error(FATAL, &
+      "Shelf_driver: ICE_ADVECTION_TIMESTEP can not differ from ICE_VELOCITY_TIMESTEP when "//&
+      "SHELF_MOVING_FRONT is true, because the ice velocities are not solved at the nodes of "//&
+      "a cell in the time step when the advancing front fills it.")
 
   if (sum(date) >= 0) then
     ! In this case, the segment starts at a time fixed by ocean_solo.res
@@ -405,7 +433,9 @@ program Shelf_main
 
     ! This call steps the model over a time time_step.
     Time1 = Master_Time ; Time = Master_Time
-    call solo_step_ice_shelf(ice_shelf_CSp, Time_step_shelf, ns_ice, Time, fluxes_in=fluxes)
+    call solo_step_ice_shelf(ice_shelf_CSp, Time_step_shelf, ns_ice, Time, &
+                             min_time_step_in=min_time_step, adv_time_step_in=adv_time_step, &
+                             fluxes_in=fluxes)
 
 !   Time = Time + Time_step_shelf
 !   This is here to enable fractional-second time steps.
