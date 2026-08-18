@@ -569,8 +569,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! tilt mode [T ~> s].
   real :: dg_tilt_damp_r_hi       !< Normalized tilt-Laplacian excess at which the tilt
                                   !! damping reaches full strength [nondim].
-  real :: dg_tilt_damp_bed_fac    !< Multiple of the bed tilt-Laplacian treated as
-                                  !! legitimate, bed-forced structure [nondim].
+  logical :: dg_tilt_damp_dt_warned = .false. !< True once the short-DG1_TILT_DAMP_TAU
+                                  !! warning has been issued, so it is not repeated.
   real :: dg_art_visc_c_max       !< Peak dimensionless coefficient on the DG(1) artificial-
                                   !! viscosity face flux at fully-shocky faces [nondim].
                                   !! Face coefficient ramps from 0 (smooth) to c_max (shocky)
@@ -13205,8 +13205,6 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
   type(unit_scale_type),   intent(in)    :: US
 
   character(len=16) :: src_scheme_str ! DG(1) basal source cross-cell operator name
-  real :: tilt_tau_dflt ! Default delivered relaxation time for the tilt-damping term,
-                        ! taken from the artificial viscosity's own delivered time [T ~> s]
 
   call get_param(param_file, mdl, "DG1_NODAL_POSITIVITY", CS%nodal_positivity, &
                  "If true, apply the Liu-style positivity-preserving limiter to the "//&
@@ -13391,53 +13389,54 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  default=.false., do_not_log=(.not.CS%use_DG_thickness))
   if (.not.CS%use_DG_thickness) CS%dg_tilt_damp = .false.
 
-  ! Delivered relaxation time. The default is the artificial viscosity's own
-  ! delivered time TAU_FLOOR/(8*C_MAX), because both follow from the same lag
-  ! criterion: the slope must track its target to within the stated tolerance,
-  ! and that clock is the strain rate in either case. Deriving it rather than
-  ! exposing a second number also removes the trap that this parameter is the
-  ! analogue of TAU_NOM and not of TAU, which differ by 8*C_MAX.
-  tilt_tau_dflt = -1.0
-  if ((CS%dg_art_visc_tau_floor > 0.0) .and. (CS%dg_art_visc_c_max > 0.0)) &
-    tilt_tau_dflt = CS%dg_art_visc_tau_floor / (8.0*CS%dg_art_visc_c_max)
-
+  ! Delivered relaxation time. Deliberately independent of the artificial
+  ! viscosity. TAU_FLOOR is the AV's floor for STAGNANT ice, where the advective
+  ! clock 8*c_max*u_eff/dx has vanished; this mode has no such clock at all
+  ! (across a stream u_n = v ~ 0, so the intrinsic slope relaxation 6|u_n|/dx is
+  ! absent rather than slow), so there is nothing for it to match. Slaving them
+  ! also gave TAU_FLOOR two unrelated jobs: retuning the AV silently retuned
+  ! this term by the same factor.
+  !
+  ! The term removes a quantity whose correct value is zero, so its rate is not
+  ! set by any physical parameter -- it need only be fast against the run and
+  ! slow against the numerics. One year clears both by about four orders in a
+  ! typical spin-up. It is a fixed time rather than a multiple of dt on purpose:
+  ! a dt-proportional relaxation would do different physics at each dt and
+  ! destroy dt-convergence testing. The dt safety check is a warning instead,
+  ! issued once from the advection routine where the true step is known.
   call get_param(param_file, mdl, "DG1_TILT_DAMP_TAU", CS%dg_tilt_damp_tau, &
-                 "Delivered relaxation time for the grid-scale in-cell tilt mode. The "//&
-                 "default is the artificial viscosity's own delivered time, "//&
-                 "DG1_ART_VISC_TAU_FLOOR/(8*DG1_ART_VISC_C_MAX), since both follow from "//&
-                 "the same lag criterion. Note this is the analogue of that TAU_NOM and "//&
-                 "not of TAU itself, which is larger by 8*C_MAX. The explicit step caps "//&
-                 "the delivered rate at 0.5/dt, so requesting a value below the time step "//&
-                 "yields dt rather than what was asked for.", &
-                 units="s", default=US%T_to_s*tilt_tau_dflt, scale=US%s_to_T, &
+                 "Delivered e-folding time of the fully-gated grid-scale in-cell tilt "//&
+                 "mode. Independent of the artificial viscosity: that term's TAU_FLOOR "//&
+                 "is its stagnant-ice floor on an advective clock, and this mode has no "//&
+                 "advective clock at all. Since the term removes a quantity whose correct "//&
+                 "value is zero, the rate only has to be fast against the run and slow "//&
+                 "against the numerics, and results should be insensitive across a wide "//&
+                 "window -- verify that rather than tuning it. Below roughly 50 time "//&
+                 "steps the elliptic velocity solve, which has no lag, rings against the "//&
+                 "relaxation; the explicit step also caps the delivered rate at 0.5/dt, "//&
+                 "so a value below the time step silently yields dt.", &
+                 units="s", default=3.1536e7, scale=US%s_to_T, &
                  do_not_log=(.not.CS%dg_tilt_damp))
   if (CS%dg_tilt_damp .and. (CS%dg_tilt_damp_tau <= 0.0)) call MOM_error(FATAL, &
-    "DG1_TILT_DAMP is true but DG1_TILT_DAMP_TAU could not be defaulted from the "//&
-    "artificial viscosity (DG1_ART_VISC_TAU_FLOOR and DG1_ART_VISC_C_MAX must both "//&
-    "be positive). Set DG1_TILT_DAMP_TAU explicitly.")
+    "DG1_TILT_DAMP_TAU must be positive.")
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_R_HI", CS%dg_tilt_damp_r_hi, &
                  "Normalized tilt-Laplacian excess at which DG1_TILT_DAMP_TAU is "//&
-                 "delivered in full. The gate variable is (|A| - BED_FAC*|A_bed|)/h, "//&
+                 "delivered in full. The gate variable is "//&
+                 "(ds/dh)*(|A| - max(|A_bed|,|A_ref|))/h, "//&
                  "where A = t_j - (t_j-1 + t_j+1)/2 is the discrete Laplacian of the "//&
-                 "per-cell tilt. It is O(dx^3) on a smooth solution, so a fixed threshold "//&
-                 "means the same thing at every resolution, as for DG1_ART_VISC_R_HI. "//&
-                 "Note it is NOT the same scale as that parameter: A is a tilt, not a "//&
-                 "jump, and typical values are two orders larger.", &
+                 "per-cell tilt, A_bed is the same operator on the bed (zero on a "//&
+                 "floating cell, which owes the bed no structure), A_ref is that same "//&
+                 "operator on the tilt implied by the neighbouring cell means (real "//&
+                 "structure the conservative data already justify, such as a shear "//&
+                 "margin), and ds/dh is 1 on "//&
+                 "grounded ice and 1 - rho_i/rho_w on floating ice, so a shelf zigzag is "//&
+                 "gated by the surface gradient it actually produces. A is O(dx^3) on a "//&
+                 "smooth solution, so a fixed threshold means the same thing at every "//&
+                 "resolution, as for DG1_ART_VISC_R_HI. Note it is NOT the same scale as "//&
+                 "that parameter: A is a tilt, not a jump, and typical values are two "//&
+                 "orders larger.", &
                  units="nondim", default=0.02, &
-                 do_not_log=(.not.CS%dg_tilt_damp))
-
-  call get_param(param_file, mdl, "DG1_TILT_DAMP_BED_FAC", CS%dg_tilt_damp_bed_fac, &
-                 "Multiple of the bed tilt-Laplacian treated as legitimate structure and "//&
-                 "exempted from tilt damping. Where the bed has grid-scale structure the "//&
-                 "ice must take up rho_w/rho_i times as much thickness structure to track "//&
-                 "it, so that much grid-scale tilt is physical and damping it would smear "//&
-                 "the bed feature further. Only the one-sided excess above this floor is "//&
-                 "damped. The default is rho_w/rho_i; 0 disables the exemption and damps "//&
-                 "all grid-scale tilt, which over a rough bed is not what you want. "//&
-                 "Requires a nodal bed (USE_NODAL_BED_FILE); without one the exemption is "//&
-                 "silently inactive.", &
-                 units="nondim", default=CS%density_ocean_avg / CS%density_ice, &
                  do_not_log=(.not.CS%dg_tilt_damp))
 
   call get_param(param_file, mdl, "DG1_ART_VISC_C_MIN", CS%dg_art_visc_c_min, &
@@ -15620,12 +15619,44 @@ end subroutine DG1_nodal_spatial_operator
 !! mode the artificial viscosity already handles, so the two do not overlap --
 !! is maximal at theta = pi, and is O(dx^3) on a smooth solution.
 !!
-!! Not all grid-scale tilt is spurious.  Where the bed has structure at the
-!! grid scale the ice must take up rho_w/rho_i times as much thickness
-!! structure to track it, so the bed's own tilt Laplacian A_bed sets a floor of
-!! legitimate content.  Only the one-sided excess |A| - BED_FAC*|A_bed| is
-!! damped; cells whose tilt is already below what the bed forces are left
-!! alone.
+!! Not all grid-scale tilt is spurious, and the test is what the momentum
+!! balance sees: the surface, not the thickness.  On grounded ice s = h - bed,
+!! so a flat surface requires A_h = A_bed exactly -- the floor is the bed's own
+!! tilt Laplacian with a coefficient of one, not a fitted multiple of it.  A
+!! floating cell owes the bed nothing (s = (1 - rho_i/rho_w) h), so its floor is
+!! zero.  The test stays one-sided: only ice carrying MORE structure than the
+!! bed explains is damped.  That matters where a sub-grid bed feature leaves the
+!! ice carrying LESS structure than it should (a sidewall narrower than a cell),
+!! since there |A_h - A_bed| is large but damping would drive A_h further from
+!! A_bed and make the surface structure grow.
+!!
+!! The harm is then weighted into surface terms by ds/dh, which is 1 on grounded
+!! ice and 1 - rho_i/rho_w on floating ice: the same thickness zigzag on a shelf
+!! produces about a ninth of the spurious surface gradient, so it is gated about
+!! a ninth as readily.
+!!
+!! The bed is not the only legitimate source of grid-scale tilt: a shear margin
+!! carries a real one that no bed explains.  So the floor also includes what the
+!! neighbouring cell MEANS already justify.  The means are the trusted data --
+!! they are what the flux divergence updates conservatively, and unlike the
+!! tilts they carry no jump-invisible mode, since a mean checkerboard does
+!! produce face jumps.  Their implied tilt is the central difference
+!!   t_ref_j = (hbar_j+1 - hbar_j-1)/2,
+!! and A_ref is the same Laplacian applied to it.  On a smooth solution both A
+!! and A_ref are -h'''dx^3/2 to leading order, so the difference vanishes to
+!! higher order than either -- the smooth-solution residual cancels instead of
+!! merely being thresholded.  On the alternating mode the means stay smooth
+!! while the tilts do not, so the difference survives.
+!!
+!! The two floors are combined with max() rather than added: over a rough bed
+!! the means already show the bed's own structure, so summing them would
+!! double-count and under-damp.
+!!
+!! Cells where the flotation contour passes through the element are exempt
+!! entirely.  There the in-cell tilt IS the sub-cell grounding-line position,
+!! and no indicator built on a third difference can separate that from the
+!! spurious mode: a grounding line is a genuine slope break in whichever field
+!! is gated on.
 !!
 !! The correction is applied as equal and opposite rates on the two nodes that
 !! define the tilt, so the cell mean is unchanged to machine precision: this
@@ -15642,14 +15673,28 @@ subroutine dg_nodal_tilt_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real, dimension(SZDI_(G),SZDJ_(G)) :: t_eta  ! Per-cell eta-tilt of thickness [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: b_xi   ! Per-cell xi-tilt of the bed [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: b_eta  ! Per-cell eta-tilt of the bed [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: hbar_c ! Cell-mean thickness [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: tref_xi  ! Mean-supported xi-tilt,
+                   ! the central difference of the neighbouring means [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: tref_eta ! As tref_xi but in eta [Z ~> m]
   real :: A_h      ! Tilt Laplacian of the thickness [Z ~> m]
-  real :: A_bed    ! Tilt Laplacian of the bed [Z ~> m]
-  real :: excess   ! One-sided excess over the bed-forced floor [Z ~> m]
+  real :: A_bed    ! Tilt Laplacian of the bed, zero on a floating cell [Z ~> m]
+  real :: A_ref    ! Tilt Laplacian of the mean-supported tilt [Z ~> m]
+  real :: floor_A  ! Larger of the bed- and mean-supported floors [Z ~> m]
+  real :: excess   ! One-sided excess over that floor [Z ~> m]
   real :: href     ! Cell-mean thickness used to normalize the gate [Z ~> m]
+  real :: dsdh     ! d(surface)/d(thickness) for this cell: 1 grounded,
+                   ! 1 - rho_i/rho_w floating [nondim]
   real :: gam      ! Gate fraction, 0 to 1 [nondim]
   real :: kap      ! Delivered rate for this cell and direction [T-1 ~> s-1]
   real :: rate_cap ! Largest rate the explicit step may carry [T-1 ~> s-1]
-  logical :: use_bed
+  real :: rhoi_rhow ! Ice/ocean density ratio for the flotation test [nondim]
+  real :: one_m_r  ! 1 - rho_i/rho_w, the floating-ice ds/dh [nondim]
+  logical :: g11, g21, g12, g22 ! Per-corner grounded flags, (rho_i/rho_w)*h > bed
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: gl_cell !< True where the cell's four
+                   !! corners disagree on the flotation branch
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: gnd_cell !< Grounded branch of a cell
+                   !! whose corners agree; meaningless where gl_cell is true
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed
 
   T_node(:,:,:,:) = 0.0
@@ -15657,63 +15702,114 @@ subroutine dg_nodal_tilt_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
-  use_bed = associated(CS%bed_node) .and. (CS%dg_tilt_damp_bed_fac > 0.0)
+  ! Reach is two cells: A_ref at i reads tref at i-1:i+1, and tref at i-1 reads
+  ! the cell mean at i-2.  With a halo of one those edge values are the
+  ! zero-initialized array bounds, which would be read as real data.
+  if ((G%isc - G%isd < 2) .or. (G%jsc - G%jsd < 2)) call MOM_error(FATAL, &
+    "dg_nodal_tilt_damp_rate: DG1_TILT_DAMP needs a halo of at least 2 cells; "//&
+    "increase NIHALO/NJHALO.")
+
+  if (.not.associated(CS%bed_node)) call MOM_error(FATAL, &
+    "dg_nodal_tilt_damp_rate: DG1_TILT_DAMP requires a nodal bed (CS%bed_node), "//&
+    "which sets both the flotation branch and the bed-supported tilt floor.")
+  rhoi_rhow = CS%density_ice / CS%density_ocean_avg
+  one_m_r = 1.0 - rhoi_rhow
 
   ! Hold the delivered rate to half the SSP-RK2 single-cell budget so this term
   ! cannot on its own drive the step past the stable range; the remainder is
   ! left to advection and the artificial viscosity.
   rate_cap = 0.5 / max(dt, tiny(dt))
 
-  ! Tilts on the full halo: the Laplacian below reaches one cell either way.
+  ! Cell means on the full halo: the mean-supported tilt below reads one cell
+  ! either way, and its own Laplacian reads one further.
+  hbar_c(:,:) = 0.0
+  do j = jsd, jed ; do i = isd, ied
+    hbar_c(i,j) = 0.25*((h_nodal_in(i,j,1,1) + h_nodal_in(i,j,2,2)) + &
+                        (h_nodal_in(i,j,2,1) + h_nodal_in(i,j,1,2)))
+  enddo ; enddo
+
+  ! Tilts and the flotation branch: the Laplacians below reach one cell either
+  ! way, so everything here is needed on isc-1:iec+1 / jsc-1:jec+1.
   t_xi(:,:) = 0.0 ; t_eta(:,:) = 0.0
   b_xi(:,:) = 0.0 ; b_eta(:,:) = 0.0
-  do j = jsd, jed ; do i = isd, ied
+  tref_xi(:,:) = 0.0 ; tref_eta(:,:) = 0.0
+  gl_cell(:,:) = .false. ; gnd_cell(:,:) = .false.
+  do j = jsd+1, jed-1 ; do i = isd+1, ied-1
+    tref_xi(i,j)  = 0.5*(hbar_c(i+1,j) - hbar_c(i-1,j))
+    tref_eta(i,j) = 0.5*(hbar_c(i,j+1) - hbar_c(i,j-1))
     t_xi(i,j)  = 0.5*((h_nodal_in(i,j,2,1) - h_nodal_in(i,j,1,1)) + &
                       (h_nodal_in(i,j,2,2) - h_nodal_in(i,j,1,2)))
     t_eta(i,j) = 0.5*((h_nodal_in(i,j,1,2) - h_nodal_in(i,j,1,1)) + &
                       (h_nodal_in(i,j,2,2) - h_nodal_in(i,j,2,1)))
+    b_xi(i,j)  = 0.5*((CS%bed_node(I,J-1) - CS%bed_node(I-1,J-1)) + &
+                      (CS%bed_node(I,J)   - CS%bed_node(I-1,J)))
+    b_eta(i,j) = 0.5*((CS%bed_node(I-1,J) - CS%bed_node(I-1,J-1)) + &
+                      (CS%bed_node(I,J)   - CS%bed_node(I,J-1)))
+
+    ! Flotation branch per corner, the same test as fls_corners elsewhere in
+    ! this module: grounded where (rho_i/rho_w)*h exceeds the bed depth.
+    g11 = ((rhoi_rhow*h_nodal_in(i,j,1,1)) - CS%bed_node(I-1,J-1)) > 0.0
+    g21 = ((rhoi_rhow*h_nodal_in(i,j,2,1)) - CS%bed_node(I,J-1))   > 0.0
+    g12 = ((rhoi_rhow*h_nodal_in(i,j,1,2)) - CS%bed_node(I-1,J))   > 0.0
+    g22 = ((rhoi_rhow*h_nodal_in(i,j,2,2)) - CS%bed_node(I,J))     > 0.0
+    gl_cell(i,j) = .not.((((g11 .eqv. g21) .and. (g11 .eqv. g12)) .and. &
+                          (g11 .eqv. g22)))
+    gnd_cell(i,j) = g11
   enddo ; enddo
-  if (use_bed) then
-    do j = jsd+1, jed ; do i = isd+1, ied
-      b_xi(i,j)  = 0.5*((CS%bed_node(I,J-1) - CS%bed_node(I-1,J-1)) + &
-                        (CS%bed_node(I,J)   - CS%bed_node(I-1,J)))
-      b_eta(i,j) = 0.5*((CS%bed_node(I-1,J) - CS%bed_node(I-1,J-1)) + &
-                        (CS%bed_node(I,J)   - CS%bed_node(I,J-1)))
-    enddo ; enddo
-  endif
 
   do j = jsc, jec ; do i = isc, iec
     if (hmask(i,j) /= 1.0) cycle
-    href = 0.25*((h_nodal_in(i,j,1,1) + h_nodal_in(i,j,2,2)) + &
-                 (h_nodal_in(i,j,2,1) + h_nodal_in(i,j,1,2)))
+    href = hbar_c(i,j)
     if (href <= 0.0) cycle
 
     ! --- xi direction ---
-    A_h = t_xi(i,j) - 0.5*(t_xi(i-1,j) + t_xi(i+1,j))
-    A_bed = 0.0
-    if (use_bed) A_bed = b_xi(i,j) - 0.5*(b_xi(i-1,j) + b_xi(i+1,j))
-    excess = abs(A_h) - CS%dg_tilt_damp_bed_fac*abs(A_bed)
-    if (excess > 0.0) then
-      gam = min(1.0, excess / (CS%dg_tilt_damp_r_hi * href))
-      kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
-      T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_h
-      T_node(i,j,1,2) = T_node(i,j,1,2) + 0.5*kap*A_h
-      T_node(i,j,2,1) = T_node(i,j,2,1) - 0.5*kap*A_h
-      T_node(i,j,2,2) = T_node(i,j,2,2) - 0.5*kap*A_h
+    ! The detector spans i-1:i+1, so a cell one away from the grounding line
+    ! still reads the break through its stencil; exempt the whole stencil.
+    if (.not.(gl_cell(i-1,j) .or. gl_cell(i,j) .or. gl_cell(i+1,j))) then
+      A_h = t_xi(i,j) - 0.5*(t_xi(i-1,j) + t_xi(i+1,j))
+      ! A flat surface on grounded ice needs A_h = A_bed exactly; a floating
+      ! cell owes the bed nothing.  One-sided, so ice carrying LESS structure
+      ! than the bed forces is left alone rather than driven further from it.
+      A_bed = 0.0 ; dsdh = one_m_r
+      if (gnd_cell(i,j)) then
+        A_bed = b_xi(i,j) - 0.5*(b_xi(i-1,j) + b_xi(i+1,j))
+        dsdh = 1.0
+      endif
+      ! Structure the neighbouring cell means already justify -- a shear margin
+      ! carries real grid-scale tilt that no bed explains.  max(), not a sum:
+      ! over a rough bed the means already contain the bed's own structure.
+      A_ref = tref_xi(i,j) - 0.5*(tref_xi(i-1,j) + tref_xi(i+1,j))
+      floor_A = max(abs(A_bed), abs(A_ref))
+      excess = abs(A_h) - floor_A
+      if (excess > 0.0) then
+        gam = min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href))
+        kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
+        T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_h
+        T_node(i,j,1,2) = T_node(i,j,1,2) + 0.5*kap*A_h
+        T_node(i,j,2,1) = T_node(i,j,2,1) - 0.5*kap*A_h
+        T_node(i,j,2,2) = T_node(i,j,2,2) - 0.5*kap*A_h
+      endif
     endif
 
     ! --- eta direction ---
-    A_h = t_eta(i,j) - 0.5*(t_eta(i,j-1) + t_eta(i,j+1))
-    A_bed = 0.0
-    if (use_bed) A_bed = b_eta(i,j) - 0.5*(b_eta(i,j-1) + b_eta(i,j+1))
-    excess = abs(A_h) - CS%dg_tilt_damp_bed_fac*abs(A_bed)
-    if (excess > 0.0) then
-      gam = min(1.0, excess / (CS%dg_tilt_damp_r_hi * href))
-      kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
-      T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_h
-      T_node(i,j,2,1) = T_node(i,j,2,1) + 0.5*kap*A_h
-      T_node(i,j,1,2) = T_node(i,j,1,2) - 0.5*kap*A_h
-      T_node(i,j,2,2) = T_node(i,j,2,2) - 0.5*kap*A_h
+    if (.not.(gl_cell(i,j-1) .or. gl_cell(i,j) .or. gl_cell(i,j+1))) then
+      A_h = t_eta(i,j) - 0.5*(t_eta(i,j-1) + t_eta(i,j+1))
+      A_bed = 0.0 ; dsdh = one_m_r
+      if (gnd_cell(i,j)) then
+        A_bed = b_eta(i,j) - 0.5*(b_eta(i,j-1) + b_eta(i,j+1))
+        dsdh = 1.0
+      endif
+      A_ref = tref_eta(i,j) - 0.5*(tref_eta(i,j-1) + tref_eta(i,j+1))
+      floor_A = max(abs(A_bed), abs(A_ref))
+      excess = abs(A_h) - floor_A
+      if (excess > 0.0) then
+        gam = min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href))
+        kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
+        T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_h
+        T_node(i,j,2,1) = T_node(i,j,2,1) + 0.5*kap*A_h
+        T_node(i,j,1,2) = T_node(i,j,1,2) - 0.5*kap*A_h
+        T_node(i,j,2,2) = T_node(i,j,2,2) - 0.5*kap*A_h
+      endif
     endif
   enddo ; enddo
 
@@ -15741,6 +15837,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
                                                    ! the cell mean is untouched and no mass
                                                    ! moves between cells.
   real, dimension(2,2) :: dh
+  character(len=200) :: mesg  ! The text of a MOM warning
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed, a, b
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
@@ -15772,6 +15869,21 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   if (CS%dg_hierarchical_lim) call nodal_surface_slope_limit(CS, G, ISS)
   call pass_corner_field(CS%h_nodal, G)
   call DG1_nodal_spatial_operator(CS, G, hmask, CS%h_nodal, rhs, uh_ice, vh_ice, time_step)
+  ! The relaxation sits inside a feedback loop closed by an elliptic velocity
+  ! solve, which has no lag, so a time constant of a few steps rings rather than
+  ! simply converging faster. Warn once; this is not a stability bound (the
+  ! 0.5/dt rate cap covers that) but the practical floor.
+  if (CS%dg_tilt_damp .and. .not.CS%dg_tilt_damp_dt_warned) then
+    if (CS%dg_tilt_damp_tau < 50.0*time_step) then
+      write(mesg,'("DG1_TILT_DAMP_TAU is only ",F7.1," advection time steps. Below "//&
+                 "~50 the elliptic velocity solve, which has no lag, rings against the "//&
+                 "relaxation; expect a fluctuating steady state.")') &
+        CS%dg_tilt_damp_tau/time_step
+      call MOM_error(WARNING, trim(mesg))
+    endif
+    CS%dg_tilt_damp_dt_warned = .true.
+  endif
+
   call dg_nodal_tilt_damp_rate(CS, G, hmask, CS%h_nodal, time_step, T_node)
   do j = jsc, jec ; do i = isc, iec
     if (hmask(i,j) /= 1.0) cycle
