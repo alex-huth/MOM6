@@ -15686,10 +15686,13 @@ end subroutine DG1_nodal_spatial_operator
 !! nodal thickness is zero.  A zero there is not "no structure" but a fictitious
 !! cliff, and it corrupts the detector and both floors at once; an ice-free cell
 !! also reads as fully floating, so it neither raises gl_cell nor keeps its bed
-!! floor.  A cell is therefore damped only when the whole 5x5 block around it is
-!! ice-covered -- five cells being the reach of the mean-supported reference,
-!! which reads cell means two cells away.  Under-damping at an ice edge is the
-!! safe direction; over-damping there drives nodes onto the positivity floor.
+!! floor.  Each direction is therefore gated on ITS OWN stencil, not on a block:
+!! the xi detector never leaves row j, so it asks only for ice on (i-2:i+2, j),
+!! the reach of the mean-supported reference.  A block test would switch off
+!! xi damping in the outer rows of a domain, which in a problem uniform in y
+!! manufactures exactly the grid-scale y structure this term exists to remove.
+!! Under-damping at an ice edge is the safe direction; over-damping there drives
+!! nodes onto the positivity floor.
 !!
 !! Cells the flotation contour passes through are exempt, together with the
 !! three-cell stencil of the detector.  There the in-cell tilt IS the sub-cell
@@ -15838,12 +15841,6 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     href = hbar_c(i,j)
     if (href <= 0.0) cycle
 
-    ! Everything the detector reads is meaningless over ice-free ground, where
-    ! the nodal thickness is zero and the stencil sees a cliff that is not
-    ! there.  The mean-supported reference reaches two cells, so require the
-    ! whole 5x5 block.
-    if (.not. all(ice_ok(i-2:i+2, j-2:j+2))) cycle
-
     ! Normalize the gate by the MEAN cell thickness over the detector's stencil,
     ! not by the local value.  The spurious driving stress the mode produces is
     ! rho*g*h*(mu*E/dx), which scales WITH thickness, so the local value makes
@@ -15866,7 +15863,9 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     ! --- xi direction ---
     ! The detector spans i-1:i+1, so a cell one away from the grounding line
     ! still reads the break through its stencil; exempt the whole stencil.
-    if (CS%dg_tilt_damp .and. &
+    ! The ice test is the xi stencil alone: nothing in this direction leaves
+    ! row j, so a neighbouring ROW being ice-free is no reason to stop.
+    if (CS%dg_tilt_damp .and. all(ice_ok(i-2:i+2, j)) .and. &
         .not.(gl_cell(i-1,j) .or. gl_cell(i,j) .or. gl_cell(i+1,j))) then
       A_h = t_xi(i,j) - 0.5*(t_xi(i-1,j) + t_xi(i+1,j))
       ! One-sided, so ice carrying LESS structure than the bed forces is left
@@ -15889,7 +15888,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     endif
 
     ! --- eta direction ---
-    if (CS%dg_tilt_damp .and. &
+    if (CS%dg_tilt_damp .and. all(ice_ok(i, j-2:j+2)) .and. &
         .not.(gl_cell(i,j-1) .or. gl_cell(i,j) .or. gl_cell(i,j+1))) then
       A_h = t_eta(i,j) - 0.5*(t_eta(i,j-1) + t_eta(i,j+1))
       A_bed = f_gnd(i,j)*(b_eta(i,j) - 0.5*(b_eta(i,j-1) + b_eta(i,j+1)))
@@ -15908,6 +15907,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
 
     ! --- xy-twist ---
     if (CS%dg_twist_damp .and. &
+        (all(ice_ok(i-2:i+2, j-1:j+1)) .and. all(ice_ok(i-1:i+1, j-2:j+2))) .and. &
         .not.(gl_cell(i,j) .or. (gl_cell(i-1,j) .or. gl_cell(i+1,j)) .or. &
                                 (gl_cell(i,j-1) .or. gl_cell(i,j+1)))) then
       href_w = (hbar_c(i,j) + ((hbar_c(i-1,j) + hbar_c(i+1,j)) + &
