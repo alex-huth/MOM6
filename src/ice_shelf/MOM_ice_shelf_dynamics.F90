@@ -15682,6 +15682,15 @@ end subroutine DG1_nodal_spatial_operator
 !! uniform twist, and the sign pattern +,-,-,+ which is orthogonal to the cell
 !! mean and to both tilts.
 !!
+!! Every field the detector reads is undefined over ice-free ground, where the
+!! nodal thickness is zero.  A zero there is not "no structure" but a fictitious
+!! cliff, and it corrupts the detector and both floors at once; an ice-free cell
+!! also reads as fully floating, so it neither raises gl_cell nor keeps its bed
+!! floor.  A cell is therefore damped only when the whole 5x5 block around it is
+!! ice-covered -- five cells being the reach of the mean-supported reference,
+!! which reads cell means two cells away.  Under-damping at an ice edge is the
+!! safe direction; over-damping there drives nodes onto the positivity floor.
+!!
 !! Cells the flotation contour passes through are exempt, together with the
 !! three-cell stencil of the detector.  There the in-cell tilt IS the sub-cell
 !! grounding-line position -- it is what makes h - h_flot change sign inside the
@@ -15715,6 +15724,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real, dimension(SZDI_(G),SZDJ_(G)) :: b_xi   ! Per-cell xi-tilt of the bed [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: b_eta  ! Per-cell eta-tilt of the bed [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: hbar_c ! Cell-mean thickness [Z ~> m]
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: ice_ok !< True on a fully ice-covered cell
   real, dimension(SZDI_(G),SZDJ_(G)) :: tref_xi  ! Mean-supported xi-tilt,
                    ! the central difference of the neighbouring means [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: tref_eta ! As tref_xi but in eta [Z ~> m]
@@ -15774,10 +15784,11 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
 
   ! Cell means on the full halo: the mean-supported tilt below reads one cell
   ! either way, and its own Laplacian reads one further.
-  hbar_c(:,:) = 0.0
+  hbar_c(:,:) = 0.0 ; ice_ok(:,:) = .false.
   do j = jsd, jed ; do i = isd, ied
     hbar_c(i,j) = 0.25*((h_nodal_in(i,j,1,1) + h_nodal_in(i,j,2,2)) + &
                         (h_nodal_in(i,j,2,1) + h_nodal_in(i,j,1,2)))
+    ice_ok(i,j) = (hmask(i,j) == 1.0)
   enddo ; enddo
 
   ! Tilts and the flotation branch: the Laplacians below reach one cell either
@@ -15827,16 +15838,25 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     href = hbar_c(i,j)
     if (href <= 0.0) cycle
 
-    ! Normalize the gate by the largest cell mean the detector reaches, not by
-    ! the local one.  The spurious driving stress the mode produces is
-    ! rho*g*h*(mu*E/dx), which scales WITH thickness, so dividing by the local
-    ! mean makes the term most eager on the thinnest ice, where the harm is
-    ! least: on a continental bed the gate saturates in 20% of the thinnest
-    ! decile against 8% elsewhere.  Taking the stencil maximum removes the worst
-    ! case -- a thin cell beside thick ice -- with no new parameter, and leaves
-    ! uniform ice untouched since there the three means are equal.
-    href_xi  = max(href, max(hbar_c(i-1,j), hbar_c(i+1,j)))
-    href_eta = max(href, max(hbar_c(i,j-1), hbar_c(i,j+1)))
+    ! Everything the detector reads is meaningless over ice-free ground, where
+    ! the nodal thickness is zero and the stencil sees a cliff that is not
+    ! there.  The mean-supported reference reaches two cells, so require the
+    ! whole 5x5 block.
+    if (.not. all(ice_ok(i-2:i+2, j-2:j+2))) cycle
+
+    ! Normalize the gate by the MEAN cell thickness over the detector's stencil,
+    ! not by the local value.  The spurious driving stress the mode produces is
+    ! rho*g*h*(mu*E/dx), which scales WITH thickness, so the local value makes
+    ! the term most eager on the thinnest ice, where the harm is least: on a
+    ! continental bed the gate saturates in 20% of the thinnest decile against
+    ! 8% elsewhere.  The stencil mean is exactly the local value wherever
+    ! thickness varies linearly, so it changes nothing in the interior, and
+    ! rises only where a cell sits in a dip relative to its neighbours -- which
+    ! is the case it is meant to catch.  The stencil MAXIMUM was tried first and
+    ! is too blunt: it rises wherever thickness varies at all, weakening the
+    ! term across the whole domain rather than at margins.
+    href_xi  = ((hbar_c(i-1,j) + hbar_c(i,j)) + hbar_c(i+1,j)) / 3.0
+    href_eta = ((hbar_c(i,j-1) + hbar_c(i,j)) + hbar_c(i,j+1)) / 3.0
 
     ! ds/dh and the share of the bed floor the cell is owed, both interpolated
     ! by the grounded fraction: a flat surface on grounded ice needs
@@ -15890,8 +15910,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     if (CS%dg_twist_damp .and. &
         .not.(gl_cell(i,j) .or. (gl_cell(i-1,j) .or. gl_cell(i+1,j)) .or. &
                                 (gl_cell(i,j-1) .or. gl_cell(i,j+1)))) then
-      href_w = max(max(href, max(hbar_c(i-1,j), hbar_c(i+1,j))), &
-                        max(hbar_c(i,j-1), hbar_c(i,j+1)))
+      href_w = (hbar_c(i,j) + ((hbar_c(i-1,j) + hbar_c(i+1,j)) + &
+                               (hbar_c(i,j-1) + hbar_c(i,j+1)))) / 5.0
       ! Response 1 - (cos(theta_x) + cos(theta_y))/2: zero on a uniform twist,
       ! 2 on the checkerboard that no face jump can see.
       A_w = w_c(i,j) - 0.25*((w_c(i-1,j) + w_c(i+1,j)) + (w_c(i,j-1) + w_c(i,j+1)))
