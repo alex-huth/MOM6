@@ -1310,6 +1310,21 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     if (CS%gl_quad_taud .and. CS%FV_GL_one_sided) call MOM_error(FATAL, &
                  "GL_QUADRANT_TAUD and FV_GL_ONE_SIDED_TAUD both regularize the grounding-line "//&
                  "driving stress and cannot be used together.")
+    call get_param(param_file, mdl, "USE_DG_THICKNESS", CS%use_DG_thickness, &
+                 "If true, use a DG(1) polynomial representation for ice thickness "//&
+                 "with unsplit RK2 advection and sub-element Gauss quadrature for "//&
+                 "driving stress. Requires h_x and h_y slope moments.", &
+                 default=.false.)
+    call get_param(param_file, mdl, "USE_NODAL_BED_FILE", CS%use_nodal_bed_file, &
+                 "If true, read bed elevation directly at B-grid nodes from "//&
+                 "NODAL_BED_FILE into CS%bed_node and derive the cell-centered "//&
+                 "CS%bed_elev by bilinear averaging of the four surrounding "//&
+                 "nodes. Skips reconstruct_bed_to_nodes and skips the "//&
+                 "BED_TOPO_FILE read in initialize_ice_flow_from_file. "//&
+                 "Requires USE_DG_THICKNESS=True.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
+    if (CS%use_nodal_bed_file .and. .not. CS%use_DG_thickness) &
+      call MOM_error(FATAL, "MOM_ice_shelf_dynamics: USE_NODAL_BED_FILE=True requires USE_DG_THICKNESS=True")
 
     ! Prescribed basal melt for the ice-only driver. In a coupled run the melt rate comes from
     ! the ocean through shelf_calc_flux and these are ignored.
@@ -1685,21 +1700,6 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     call get_param(param_file, mdl, "ADVECT_SHELF", CS%advect_shelf, &
                  "If true, advect ice shelf and evolve thickness", &
                  default=.true.)
-    call get_param(param_file, mdl, "USE_DG_THICKNESS", CS%use_DG_thickness, &
-                 "If true, use a DG(1) polynomial representation for ice thickness "//&
-                 "with unsplit RK2 advection and sub-element Gauss quadrature for "//&
-                 "driving stress. Requires h_x and h_y slope moments.", &
-                 default=.false.)
-    call get_param(param_file, mdl, "USE_NODAL_BED_FILE", CS%use_nodal_bed_file, &
-                 "If true, read bed elevation directly at B-grid nodes from "//&
-                 "NODAL_BED_FILE into CS%bed_node and derive the cell-centered "//&
-                 "CS%bed_elev by bilinear averaging of the four surrounding "//&
-                 "nodes. Skips reconstruct_bed_to_nodes and skips the "//&
-                 "BED_TOPO_FILE read in initialize_ice_flow_from_file. "//&
-                 "Requires USE_DG_THICKNESS=True.", &
-                 default=.false., do_not_log=.not.CS%use_DG_thickness)
-    if (CS%use_nodal_bed_file .and. .not. CS%use_DG_thickness) &
-      call MOM_error(FATAL, "MOM_ice_shelf_dynamics: USE_NODAL_BED_FILE=True requires USE_DG_THICKNESS=True")
     call read_nodal_limiter_params(param_file, mdl, CS, US)
     call get_param(param_file, mdl, "REENTRANT_X", CS%reentrant_x, &
                  " If true, the domain is zonally reentrant.", &

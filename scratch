@@ -1,0 +1,46 @@
+Looking at this for the 5 km test case. Here are some cells (y spanning node 0 (S boundary) through 4, cell 0 though 3) at one x across the margins.
+
+
+Cell values (S to N):
+cell | ground_frac
+------------------
+0    | 1
+1    | 1
+2    | 0.5
+3    | 0
+
+
+Nodal values (S to N):
+node | nu_v    | excess_v | allow_v
+-----------------------------------
+0    | 0       | 0        | 0
+1    | 0       | 0        | 30.8
+2    | 0.0007  | 0.24     | 48.3
+3    | 0       | 0        | 72.15
+4    | 0.0006  | 0.74     | 3.66
+
+excess_frac and allow look nonzero where art visc fires. Allow is also nonzero for wide swaths both upstream and downstream of the margins, where art visc does not fire. Excess frac is also nonzero upsrream and downstream as well; mostly upstream 1 cell away from y computational boundary and a few cells along the centerline nearly everywhere (upstream and downstream).
+
+Art visc does seem to affect GL location, with no visc for 5 km putting the centerline grounding line at 343 km and w/ art visc at 450 (450 is the target). It has little impact however on the 2 km run (always at 450) and 10 km run (always at ~490)
+
+
+
+Correct file: at i 97
+
+Cell values (S to N):
+cell | ground_frac
+------------------
+0    | 1
+1    | 1
+2    | 0.55
+3    | 0
+
+
+Nodal values (S to N):
+node | nu_v    | excess_v | allow_v
+-----------------------------------
+0    | 0       | 0        | 0
+1    | 0       | 0        | 29.63
+2    | 0.0004  | 0.19     | 53.02
+3    | 0       | 0        | 100.98
+4    | 0.0005  | 0.76     | 2.97
