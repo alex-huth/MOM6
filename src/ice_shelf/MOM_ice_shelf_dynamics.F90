@@ -15617,6 +15617,53 @@ end subroutine DG1_nodal_spatial_operator
 
 !> Advect h_nodal one time step with SSP-RK2 + Barth-Jespersen + Liu positivity.
 !! Operates directly on CS%h_nodal (mutates the authoritative nodal storage).
+!> Biased second difference along one axis: centred (b=1), forward (b=2) or
+!! backward (b=3).  All three read 2*f(0) on the alternating mode and zero on a
+!! uniform field, so the delivered relaxation time does not depend on which is
+!! used.
+pure function dg_d2_biased(f, b) result(A)
+  real, dimension(-3:3), intent(in) :: f !< Samples along the axis [Z ~> m]
+  integer,               intent(in) :: b !< 1 centred, 2 forward, 3 backward
+  real :: A                              !< Second difference [Z ~> m]
+  select case (b)
+    case (1) ; A = f(0) - 0.5*(f(-1) + f(1))
+    case (2) ; A = 0.5*(f(0) - 2.0*f(1) + f(2))
+    case default ; A = 0.5*(f(0) - 2.0*f(-1) + f(-2))
+  end select
+end function dg_d2_biased
+
+!> Biased first difference of the cell means in eta, at x offset p and y offset q.
+pure function dg_d1_eta(hw, p, q, by) result(g)
+  real, dimension(-3:3,-3:3), intent(in) :: hw !< Cell means on the gather [Z ~> m]
+  integer, intent(in) :: p  !< Offset along xi
+  integer, intent(in) :: q  !< Offset along eta
+  integer, intent(in) :: by !< Bias along eta
+  real :: g                 !< First difference [Z ~> m]
+  select case (by)
+    case (1) ; g = 0.5*(hw(p,q+1) - hw(p,q-1))
+    case (2) ; g = hw(p,q+1) - hw(p,q)
+    case default ; g = hw(p,q) - hw(p,q-1)
+  end select
+end function dg_d1_eta
+
+!> Mean-supported twist at offset (p,q): the cross difference of the cell means,
+!! each first difference taking the bias of its own axis.  This is the twist the
+!! conservative data already justify, and subtracting it is what cancels the
+!! smooth-solution residual, exactly as A_ref does for the tilt.
+pure function dg_wref_at(hw, p, q, bx, by) result(wr)
+  real, dimension(-3:3,-3:3), intent(in) :: hw !< Cell means on the gather [Z ~> m]
+  integer, intent(in) :: p  !< Offset along xi
+  integer, intent(in) :: q  !< Offset along eta
+  integer, intent(in) :: bx !< Bias along xi
+  integer, intent(in) :: by !< Bias along eta
+  real :: wr                !< Mean-supported twist [Z ~> m]
+  select case (bx)
+    case (1) ; wr = 0.5*(dg_d1_eta(hw,p+1,q,by) - dg_d1_eta(hw,p-1,q,by))
+    case (2) ; wr = dg_d1_eta(hw,p+1,q,by) - dg_d1_eta(hw,p,q,by)
+    case default ; wr = dg_d1_eta(hw,p,q,by) - dg_d1_eta(hw,p-1,q,by)
+  end select
+end function dg_wref_at
+
 !> One-dimensional tilt detector, biased away from unavailable cells.
 !!
 !! The detector is a second difference of the per-cell tilt, and a second
@@ -15786,8 +15833,6 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   logical, dimension(SZDI_(G),SZDJ_(G)) :: ice_ok !< True on a fully ice-covered cell
   real, dimension(SZDI_(G),SZDJ_(G)) :: w_c    ! Per-cell xy-twist of thickness [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: b_w    ! Per-cell xy-twist of the bed [Z ~> m]
-  real, dimension(SZDI_(G),SZDJ_(G)) :: wref   ! Mean-supported twist, the cross
-                   ! central difference of the neighbouring cell means [Z ~> m]
   real :: A_h      ! Tilt Laplacian of the thickness [Z ~> m]
   real :: A_bed    ! Tilt Laplacian of the bed, zero on a floating cell [Z ~> m]
   real :: A_ref    ! Tilt Laplacian of the mean-supported tilt [Z ~> m]
@@ -15799,7 +15844,19 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real, dimension(-3:3) :: tv, bv, hv ! Stencil gathers of tilt, bed tilt and mean
   logical, dimension(-3:3) :: okv     ! Stencil gather of usability
   logical :: det_ok ! True if the detector found an admissible stencil
-  integer :: k, kk  ! Stencil offset, and the clamped array index
+  integer :: k, kk, kj, jj ! Stencil offsets, and the clamped array indices
+  ! Twist gathers, over the 7x7 block the biased cross difference can reach.
+  real, dimension(-3:3,-3:3) :: ww, bw, hw ! Twist, bed twist, cell mean
+  logical, dimension(-3:3,-3:3) :: okw     ! Usability
+  real, dimension(-3:3) :: wrx, wry ! Mean-supported twist along each axis [Z ~> m]
+  integer :: bx, by, m              ! Bias along xi, along eta, and the trial index
+  logical :: tw_ok                  ! True once an admissible bias pair is found
+  ! Offsets a bias reaches: S for the second difference, F for the first.
+  integer, dimension(3), parameter :: Slo = (/ -2, 0, -3 /), Shi = (/ 2, 3, 0 /)
+  integer, dimension(3), parameter :: Flo = (/ -1, 0, -1 /), Fhi = (/  1, 1, 0 /)
+  ! Trial order: centred in both axes first, then centred in one, then neither.
+  integer, dimension(9), parameter :: bx_try = (/ 1,1,1, 2,3, 2,2,3,3 /)
+  integer, dimension(9), parameter :: by_try = (/ 1,2,3, 1,1, 2,3,2,3 /)
   real :: floor_A  ! Larger of the bed- and mean-supported floors [Z ~> m]
   real :: excess   ! One-sided excess over that floor [Z ~> m]
   real :: href     ! Cell-mean thickness used to normalize the gate [Z ~> m]
@@ -15854,7 +15911,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   ! way, so everything here is needed on isc-1:iec+1 / jsc-1:jec+1.
   t_xi(:,:) = 0.0 ; t_eta(:,:) = 0.0
   b_xi(:,:) = 0.0 ; b_eta(:,:) = 0.0
-  w_c(:,:) = 0.0 ; b_w(:,:) = 0.0 ; wref(:,:) = 0.0
+  w_c(:,:) = 0.0 ; b_w(:,:) = 0.0
   f_gnd(:,:) = 0.0 ; gl_cell(:,:) = .false.
   do j = jsd+1, jed-1 ; do i = isd+1, ied-1
     if (CS%dg_twist_damp) then
@@ -15862,10 +15919,6 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
                  (h_nodal_in(i,j,2,1) - h_nodal_in(i,j,1,1))
       b_w(i,j) = (CS%bed_node(I,J) - CS%bed_node(I-1,J)) - &
                  (CS%bed_node(I,J-1) - CS%bed_node(I-1,J-1))
-      ! Twist the neighbouring cell means already justify: the cross central
-      ! difference, the mean-level analogue of the in-cell xy mode.
-      wref(i,j) = 0.25*((hbar_c(i+1,j+1) - hbar_c(i-1,j+1)) - &
-                        (hbar_c(i+1,j-1) - hbar_c(i-1,j-1)))
     endif
     t_xi(i,j)  = 0.5*((h_nodal_in(i,j,2,1) - h_nodal_in(i,j,1,1)) + &
                       (h_nodal_in(i,j,2,2) - h_nodal_in(i,j,1,2)))
@@ -15965,18 +16018,45 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
 
     ! --- xy-twist ---
     if (CS%dg_twist_damp .and. &
-        (all(ice_ok(i-2:i+2, j-1:j+1)) .and. all(ice_ok(i-1:i+1, j-2:j+2))) .and. &
         .not.(gl_cell(i,j) .or. (gl_cell(i-1,j) .or. gl_cell(i+1,j)) .or. &
                                 (gl_cell(i,j-1) .or. gl_cell(i,j+1)))) then
-      href_w = (hbar_c(i,j) + ((hbar_c(i-1,j) + hbar_c(i+1,j)) + &
-                               (hbar_c(i,j-1) + hbar_c(i,j+1)))) / 5.0
-      ! Response 1 - (cos(theta_x) + cos(theta_y))/2: zero on a uniform twist,
-      ! 2 on the checkerboard that no face jump can see.
-      A_w = w_c(i,j) - 0.25*((w_c(i-1,j) + w_c(i+1,j)) + (w_c(i,j-1) + w_c(i,j+1)))
-      A_w_bed = f_gnd(i,j) * &
-                (b_w(i,j) - 0.25*((b_w(i-1,j) + b_w(i+1,j)) + (b_w(i,j-1) + b_w(i,j+1))))
-      A_w_ref = wref(i,j) - 0.25*((wref(i-1,j) + wref(i+1,j)) + (wref(i,j-1) + wref(i,j+1)))
-      excess = abs(A_w) - max(abs(A_w_bed), abs(A_w_ref))
+      do kj = -3, 3 ; do k = -3, 3
+        kk = min(max(i+k, isd), ied) ; jj = min(max(j+kj, jsd), jed)
+        okw(k,kj) = ice_ok(kk,jj) .and. ((i+k >= isd) .and. (i+k <= ied)) &
+                                  .and. ((j+kj >= jsd) .and. (j+kj <= jed))
+        ww(k,kj) = w_c(kk,jj) ; bw(k,kj) = b_w(kk,jj) ; hw(k,kj) = hbar_c(kk,jj)
+      enddo ; enddo
+
+      ! The 2D detector separates, A_w = (A_xi(w) + A_eta(w))/2, so each axis
+      ! takes its own bias; only the mean-supported reference is genuinely
+      ! two-dimensional, and it is a product of two first differences which
+      ! bias the same way.  Take the first admissible pair in preference order.
+      tw_ok = .false.
+      do m = 1, 9
+        bx = bx_try(m) ; by = by_try(m)
+        if (all(okw(Slo(bx):Shi(bx), Flo(by):Fhi(by))) .and. &
+            all(okw(Flo(bx):Fhi(bx), Slo(by):Shi(by)))) then
+          tw_ok = .true. ; exit
+        endif
+      enddo
+
+      excess = -1.0
+      if (tw_ok) then
+        wrx(:) = 0.0 ; wry(:) = 0.0
+        do k = -2, 2
+          wrx(k) = dg_wref_at(hw, k, 0, bx, by)
+          wry(k) = dg_wref_at(hw, 0, k, bx, by)
+        enddo
+        ! Response 1 - (cos(theta_x) + cos(theta_y))/2: zero on a uniform twist,
+        ! 2 on the checkerboard that no face jump can see.
+        A_w     = 0.5*(dg_d2_biased(ww(:,0), bx) + dg_d2_biased(ww(0,:), by))
+        A_w_bed = f_gnd(i,j) * &
+                  0.5*(dg_d2_biased(bw(:,0), bx) + dg_d2_biased(bw(0,:), by))
+        A_w_ref = 0.5*(dg_d2_biased(wrx, bx) + dg_d2_biased(wry, by))
+        href_w  = (hw(0,0) + ((hw(Flo(bx),0) + hw(Fhi(bx),0)) + &
+                              (hw(0,Flo(by)) + hw(0,Fhi(by))))) / 5.0
+        excess = abs(A_w) - max(abs(A_w_bed), abs(A_w_ref))
+      endif
       if (excess > 0.0) then
         gam = min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_w))
         kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
