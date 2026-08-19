@@ -15617,6 +15617,62 @@ end subroutine DG1_nodal_spatial_operator
 
 !> Advect h_nodal one time step with SSP-RK2 + Barth-Jespersen + Liu positivity.
 !! Operates directly on CS%h_nodal (mutates the authoritative nodal storage).
+!> One-dimensional tilt detector, biased away from unavailable cells.
+!!
+!! The detector is a second difference of the per-cell tilt, and a second
+!! difference need not be centred.  Where a centred stencil would reach outside
+!! the ice or outside the domain, a forward- or backward-biased one is used
+!! instead, so a cell next to a boundary is still evaluated rather than skipped.
+!! Skipping it is not neutral: it treats neighbouring cells differently for a
+!! reason unrelated to the solution, which is itself a source of the grid-scale
+!! structure this term exists to remove.  At 10 km in a channel eight cells
+!! wide, skipping two cells at each wall would silence half the domain in the
+!! very direction the mode occupies.
+!!
+!! Both biased forms read 2*t on the alternating mode, exactly as the centred
+!! form does, so the delivered relaxation time is unchanged.  The same operator
+!! is applied to the tilt, to the bed and to the mean-supported reference, which
+!! is what preserves the cancellation between A and A_ref on a smooth solution:
+!! that follows from A(t) ~ A(t_ref) for any consistent second difference, not
+!! from the centred form in particular.
+pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, A, A_bed, A_ref, href, valid)
+  real,    dimension(-3:3), intent(in)  :: tv !< Per-cell tilt along the stencil [Z ~> m]
+  real,    dimension(-3:3), intent(in)  :: bv !< Per-cell bed tilt along the stencil [Z ~> m]
+  real,    dimension(-3:3), intent(in)  :: hv !< Per-cell mean thickness along the stencil [Z ~> m]
+  logical, dimension(-3:3), intent(in)  :: ok !< True where the cell is usable
+  real,    intent(out) :: A     !< Tilt-Laplacian detector [Z ~> m]
+  real,    intent(out) :: A_bed !< The same operator on the bed [Z ~> m]
+  real,    intent(out) :: A_ref !< The same operator on the mean-supported tilt [Z ~> m]
+  real,    intent(out) :: href  !< Mean thickness over the stencil used [Z ~> m]
+  logical, intent(out) :: valid !< False if no admissible stencil exists
+
+  real :: rm, r0, rp  ! Mean-supported tilt at the three stencil cells [Z ~> m]
+
+  A = 0.0 ; A_bed = 0.0 ; A_ref = 0.0 ; href = 0.0 ; valid = .true.
+
+  if (all(ok(-2:2))) then                       ! centred
+    A     = tv(0) - 0.5*(tv(-1) + tv(1))
+    A_bed = bv(0) - 0.5*(bv(-1) + bv(1))
+    rm = 0.5*(hv(0) - hv(-2)) ; r0 = 0.5*(hv(1) - hv(-1)) ; rp = 0.5*(hv(2) - hv(0))
+    A_ref = r0 - 0.5*(rm + rp)
+    href  = ((hv(-1) + hv(0)) + hv(1)) / 3.0
+  elseif (all(ok(0:3))) then                    ! forward
+    A     = 0.5*(tv(0) - 2.0*tv(1) + tv(2))
+    A_bed = 0.5*(bv(0) - 2.0*bv(1) + bv(2))
+    r0 = hv(1) - hv(0) ; rm = hv(2) - hv(1) ; rp = hv(3) - hv(2)
+    A_ref = 0.5*(r0 - 2.0*rm + rp)
+    href  = ((hv(0) + hv(1)) + hv(2)) / 3.0
+  elseif (all(ok(-3:0))) then                   ! backward
+    A     = 0.5*(tv(0) - 2.0*tv(-1) + tv(-2))
+    A_bed = 0.5*(bv(0) - 2.0*bv(-1) + bv(-2))
+    r0 = hv(0) - hv(-1) ; rm = hv(-1) - hv(-2) ; rp = hv(-2) - hv(-3)
+    A_ref = 0.5*(r0 - 2.0*rm + rp)
+    href  = ((hv(0) + hv(-1)) + hv(-2)) / 3.0
+  else
+    valid = .false.
+  endif
+end subroutine dg_tilt_detector_1d
+
 !> Damp the grid-scale component of the in-cell tilt and twist degrees of freedom.
 !!
 !! Every dissipative mechanism in this scheme -- the upwind flux and the
@@ -15728,9 +15784,6 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real, dimension(SZDI_(G),SZDJ_(G)) :: b_eta  ! Per-cell eta-tilt of the bed [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: hbar_c ! Cell-mean thickness [Z ~> m]
   logical, dimension(SZDI_(G),SZDJ_(G)) :: ice_ok !< True on a fully ice-covered cell
-  real, dimension(SZDI_(G),SZDJ_(G)) :: tref_xi  ! Mean-supported xi-tilt,
-                   ! the central difference of the neighbouring means [Z ~> m]
-  real, dimension(SZDI_(G),SZDJ_(G)) :: tref_eta ! As tref_xi but in eta [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: w_c    ! Per-cell xy-twist of thickness [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: b_w    ! Per-cell xy-twist of the bed [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: wref   ! Mean-supported twist, the cross
@@ -15741,9 +15794,12 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real :: A_w      ! 4-neighbour Laplacian of the twist [Z ~> m]
   real :: A_w_bed  ! As A_w for the bed [Z ~> m]
   real :: A_w_ref  ! As A_w for the mean-supported twist [Z ~> m]
-  real :: href_xi  ! Gate-normalizing thickness for the xi stencil [Z ~> m]
-  real :: href_eta ! Gate-normalizing thickness for the eta stencil [Z ~> m]
+  real :: href_d   ! Gate-normalizing thickness for the direction in hand [Z ~> m]
   real :: href_w   ! Gate-normalizing thickness for the twist stencil [Z ~> m]
+  real, dimension(-3:3) :: tv, bv, hv ! Stencil gathers of tilt, bed tilt and mean
+  logical, dimension(-3:3) :: okv     ! Stencil gather of usability
+  logical :: det_ok ! True if the detector found an admissible stencil
+  integer :: k, kk  ! Stencil offset, and the clamped array index
   real :: floor_A  ! Larger of the bed- and mean-supported floors [Z ~> m]
   real :: excess   ! One-sided excess over that floor [Z ~> m]
   real :: href     ! Cell-mean thickness used to normalize the gate [Z ~> m]
@@ -15798,12 +15854,9 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   ! way, so everything here is needed on isc-1:iec+1 / jsc-1:jec+1.
   t_xi(:,:) = 0.0 ; t_eta(:,:) = 0.0
   b_xi(:,:) = 0.0 ; b_eta(:,:) = 0.0
-  tref_xi(:,:) = 0.0 ; tref_eta(:,:) = 0.0
   w_c(:,:) = 0.0 ; b_w(:,:) = 0.0 ; wref(:,:) = 0.0
   f_gnd(:,:) = 0.0 ; gl_cell(:,:) = .false.
   do j = jsd+1, jed-1 ; do i = isd+1, ied-1
-    tref_xi(i,j)  = 0.5*(hbar_c(i+1,j) - hbar_c(i-1,j))
-    tref_eta(i,j) = 0.5*(hbar_c(i,j+1) - hbar_c(i,j-1))
     if (CS%dg_twist_damp) then
       w_c(i,j) = (h_nodal_in(i,j,2,2) - h_nodal_in(i,j,1,2)) - &
                  (h_nodal_in(i,j,2,1) - h_nodal_in(i,j,1,1))
@@ -15841,8 +15894,9 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     href = hbar_c(i,j)
     if (href <= 0.0) cycle
 
-    ! Normalize the gate by the MEAN cell thickness over the detector's stencil,
-    ! not by the local value.  The spurious driving stress the mode produces is
+    ! The gate is normalized by the MEAN cell thickness over whichever stencil
+    ! the detector ended up using, returned by dg_tilt_detector_1d, rather than
+    ! by the local value.  The spurious driving stress the mode produces is
     ! rho*g*h*(mu*E/dx), which scales WITH thickness, so the local value makes
     ! the term most eager on the thinnest ice, where the harm is least: on a
     ! continental bed the gate saturates in 20% of the thinnest decile against
@@ -15852,8 +15906,6 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     ! is the case it is meant to catch.  The stencil MAXIMUM was tried first and
     ! is too blunt: it rises wherever thickness varies at all, weakening the
     ! term across the whole domain rather than at margins.
-    href_xi  = ((hbar_c(i-1,j) + hbar_c(i,j)) + hbar_c(i+1,j)) / 3.0
-    href_eta = ((hbar_c(i,j-1) + hbar_c(i,j)) + hbar_c(i,j+1)) / 3.0
 
     ! ds/dh and the share of the bed floor the cell is owed, both interpolated
     ! by the grounded fraction: a flat surface on grounded ice needs
@@ -15861,24 +15913,26 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     dsdh = one_m_r + f_gnd(i,j)*(1.0 - one_m_r)
 
     ! --- xi direction ---
-    ! The detector spans i-1:i+1, so a cell one away from the grounding line
-    ! still reads the break through its stencil; exempt the whole stencil.
-    ! The ice test is the xi stencil alone: nothing in this direction leaves
-    ! row j, so a neighbouring ROW being ice-free is no reason to stop.
-    if (CS%dg_tilt_damp .and. all(ice_ok(i-2:i+2, j)) .and. &
+    ! The detector spans one cell either way, so a cell adjacent to the
+    ! grounding line still reads the break through its stencil; exempt the whole
+    ! stencil.  Nothing in this direction leaves row j, so a neighbouring ROW
+    ! being ice-free is no reason to stop.
+    if (CS%dg_tilt_damp .and. &
         .not.(gl_cell(i-1,j) .or. gl_cell(i,j) .or. gl_cell(i+1,j))) then
-      A_h = t_xi(i,j) - 0.5*(t_xi(i-1,j) + t_xi(i+1,j))
+      do k = -3, 3
+        kk = min(max(i+k, isd), ied)
+        okv(k) = ice_ok(kk,j) .and. (i+k >= isd) .and. (i+k <= ied)
+        tv(k) = t_xi(kk,j) ; bv(k) = b_xi(kk,j) ; hv(k) = hbar_c(kk,j)
+      enddo
+      call dg_tilt_detector_1d(tv, bv, hv, okv, A_h, A_bed, A_ref, href_d, det_ok)
       ! One-sided, so ice carrying LESS structure than the bed forces is left
-      ! alone rather than driven further from it.
-      A_bed = f_gnd(i,j)*(b_xi(i,j) - 0.5*(b_xi(i-1,j) + b_xi(i+1,j)))
-      ! Structure the neighbouring cell means already justify -- a shear margin
-      ! carries real grid-scale tilt that no bed explains.  max(), not a sum:
-      ! over a rough bed the means already contain the bed's own structure.
-      A_ref = tref_xi(i,j) - 0.5*(tref_xi(i-1,j) + tref_xi(i+1,j))
+      ! alone rather than driven further from it.  max(), not a sum: over a
+      ! rough bed the means already contain the bed's own structure.
+      A_bed = f_gnd(i,j)*A_bed
       floor_A = max(abs(A_bed), abs(A_ref))
       excess = abs(A_h) - floor_A
-      if (excess > 0.0) then
-        gam = min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_xi))
+      if (det_ok .and. (excess > 0.0)) then
+        gam = min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
         kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
         T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_h
         T_node(i,j,1,2) = T_node(i,j,1,2) + 0.5*kap*A_h
@@ -15888,15 +15942,19 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     endif
 
     ! --- eta direction ---
-    if (CS%dg_tilt_damp .and. all(ice_ok(i, j-2:j+2)) .and. &
+    if (CS%dg_tilt_damp .and. &
         .not.(gl_cell(i,j-1) .or. gl_cell(i,j) .or. gl_cell(i,j+1))) then
-      A_h = t_eta(i,j) - 0.5*(t_eta(i,j-1) + t_eta(i,j+1))
-      A_bed = f_gnd(i,j)*(b_eta(i,j) - 0.5*(b_eta(i,j-1) + b_eta(i,j+1)))
-      A_ref = tref_eta(i,j) - 0.5*(tref_eta(i,j-1) + tref_eta(i,j+1))
+      do k = -3, 3
+        kk = min(max(j+k, jsd), jed)
+        okv(k) = ice_ok(i,kk) .and. (j+k >= jsd) .and. (j+k <= jed)
+        tv(k) = t_eta(i,kk) ; bv(k) = b_eta(i,kk) ; hv(k) = hbar_c(i,kk)
+      enddo
+      call dg_tilt_detector_1d(tv, bv, hv, okv, A_h, A_bed, A_ref, href_d, det_ok)
+      A_bed = f_gnd(i,j)*A_bed
       floor_A = max(abs(A_bed), abs(A_ref))
       excess = abs(A_h) - floor_A
-      if (excess > 0.0) then
-        gam = min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_eta))
+      if (det_ok .and. (excess > 0.0)) then
+        gam = min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
         kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
         T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_h
         T_node(i,j,2,1) = T_node(i,j,2,1) + 0.5*kap*A_h
