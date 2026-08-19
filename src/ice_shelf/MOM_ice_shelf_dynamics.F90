@@ -15652,18 +15652,22 @@ end subroutine DG1_nodal_spatial_operator
 !! the means already show the bed's own structure, so summing them would
 !! double-count and under-damp.
 !!
-!! Cells the flotation contour passes through are NOT special-cased.  The
-!! mean-supported floor already removes the grounding line on its own -- the
-!! surface kinks there but the thickness does not, and A_ref is built from
-!! thickness means -- which drops the gate at a grounding line to a few percent,
-!! indistinguishable from ordinary grounded ice.  An explicit exemption was
-!! tried and removed: it is a hard switch, so it introduces exactly the kind of
-!! regime boundary that makes an answer depend on which side of a threshold a
-!! cell lands, and at a thin partly-grounded margin it handed the tilt to the
-!! positivity limiter, which rescales every deviation mode at once with no gate,
-!! no floor and no weighting.  Such a cell is instead described by the fraction
-!! of its corners that are grounded, which sets both ds/dh and the share of the
-!! bed floor it is owed.
+!! Cells the flotation contour passes through are exempt, together with the
+!! three-cell stencil of the detector.  There the in-cell tilt IS the sub-cell
+!! grounding-line position -- it is what makes h - h_flot change sign inside the
+!! element rather than the whole cell switching regime -- and no indicator built
+!! on a third difference can separate that from the spurious mode, a grounding
+!! line being a genuine slope break in whichever field is gated on.  Removing
+!! the exemption was tried and reverted: it returned the grounding-line
+!! oscillation at tau = 1 yr, and it introduced a ~20 m zigzag immediately
+!! upstream of the grounding line that had not been there, the term creating
+!! grid-scale structure rather than removing it because the gate strength itself
+!! steps from cell to cell across the transition.
+!!
+!! Cells are nonetheless described by the fraction of their corners that are
+!! grounded rather than by any single corner's branch, which is arbitrary for a
+!! mixed cell and depends on grid orientation.  That fraction sets both ds/dh
+!! and the share of the bed floor a cell is owed, and is exact at zero and one.
 !!
 !! The correction is applied as equal and opposite rates on the two nodes that
 !! define the tilt, so the cell mean is unchanged to machine precision: this
@@ -15701,6 +15705,8 @@ subroutine dg_nodal_tilt_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real, dimension(SZDI_(G),SZDJ_(G)) :: f_gnd !< Grounded fraction of a cell's
                    !! corners. Orientation-invariant, and exact at 0 and 1, so a
                    !! cell away from the grounding line is unaffected.
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: gl_cell !< True where the flotation
+                   !! contour crosses the cell, i.e. 0 < f_gnd < 1
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed
 
   T_node(:,:,:,:) = 0.0
@@ -15739,7 +15745,7 @@ subroutine dg_nodal_tilt_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   t_xi(:,:) = 0.0 ; t_eta(:,:) = 0.0
   b_xi(:,:) = 0.0 ; b_eta(:,:) = 0.0
   tref_xi(:,:) = 0.0 ; tref_eta(:,:) = 0.0
-  f_gnd(:,:) = 0.0
+  f_gnd(:,:) = 0.0 ; gl_cell(:,:) = .false.
   do j = jsd+1, jed-1 ; do i = isd+1, ied-1
     tref_xi(i,j)  = 0.5*(hbar_c(i+1,j) - hbar_c(i-1,j))
     tref_eta(i,j) = 0.5*(hbar_c(i,j+1) - hbar_c(i,j-1))
@@ -15762,6 +15768,7 @@ subroutine dg_nodal_tilt_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     if (((rhoi_rhow*h_nodal_in(i,j,1,2)) - CS%bed_node(I-1,J))   > 0.0) ngnd = ngnd + 1
     if (((rhoi_rhow*h_nodal_in(i,j,2,2)) - CS%bed_node(I,J))     > 0.0) ngnd = ngnd + 1
     f_gnd(i,j) = 0.25*real(ngnd)
+    gl_cell(i,j) = (ngnd > 0) .and. (ngnd < 4)
   enddo ; enddo
 
   do j = jsc, jec ; do i = isc, iec
@@ -15775,38 +15782,45 @@ subroutine dg_nodal_tilt_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     dsdh = one_m_r + f_gnd(i,j)*(1.0 - one_m_r)
 
     ! --- xi direction ---
-    A_h = t_xi(i,j) - 0.5*(t_xi(i-1,j) + t_xi(i+1,j))
-    ! One-sided, so ice carrying LESS structure than the bed forces is left
-    ! alone rather than driven further from it.
-    A_bed = f_gnd(i,j)*(b_xi(i,j) - 0.5*(b_xi(i-1,j) + b_xi(i+1,j)))
-    ! Structure the neighbouring cell means already justify -- a shear margin
-    ! carries real grid-scale tilt that no bed explains.  max(), not a sum:
-    ! over a rough bed the means already contain the bed's own structure.
-    A_ref = tref_xi(i,j) - 0.5*(tref_xi(i-1,j) + tref_xi(i+1,j))
-    floor_A = max(abs(A_bed), abs(A_ref))
-    excess = abs(A_h) - floor_A
-    if (excess > 0.0) then
-      gam = min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href))
-      kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
-      T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_h
-      T_node(i,j,1,2) = T_node(i,j,1,2) + 0.5*kap*A_h
-      T_node(i,j,2,1) = T_node(i,j,2,1) - 0.5*kap*A_h
-      T_node(i,j,2,2) = T_node(i,j,2,2) - 0.5*kap*A_h
+    ! The detector spans i-1:i+1, so a cell one away from the grounding line
+    ! still reads the break through its stencil; exempt the whole stencil.
+    if (.not.(gl_cell(i-1,j) .or. gl_cell(i,j) .or. gl_cell(i+1,j))) then
+      A_h = t_xi(i,j) - 0.5*(t_xi(i-1,j) + t_xi(i+1,j))
+      ! One-sided, so ice carrying LESS structure than the bed forces is left
+      ! alone rather than driven further from it.
+      A_bed = f_gnd(i,j)*(b_xi(i,j) - 0.5*(b_xi(i-1,j) + b_xi(i+1,j)))
+      ! Structure the neighbouring cell means already justify -- a shear margin
+      ! carries real grid-scale tilt that no bed explains.  max(), not a sum:
+      ! over a rough bed the means already contain the bed's own structure.
+      A_ref = tref_xi(i,j) - 0.5*(tref_xi(i-1,j) + tref_xi(i+1,j))
+      floor_A = max(abs(A_bed), abs(A_ref))
+      excess = abs(A_h) - floor_A
+      if (excess > 0.0) then
+        gam = min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href))
+        kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
+        T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_h
+        T_node(i,j,1,2) = T_node(i,j,1,2) + 0.5*kap*A_h
+        T_node(i,j,2,1) = T_node(i,j,2,1) - 0.5*kap*A_h
+        T_node(i,j,2,2) = T_node(i,j,2,2) - 0.5*kap*A_h
+      endif
+
     endif
 
     ! --- eta direction ---
-    A_h = t_eta(i,j) - 0.5*(t_eta(i,j-1) + t_eta(i,j+1))
-    A_bed = f_gnd(i,j)*(b_eta(i,j) - 0.5*(b_eta(i,j-1) + b_eta(i,j+1)))
-    A_ref = tref_eta(i,j) - 0.5*(tref_eta(i,j-1) + tref_eta(i,j+1))
-    floor_A = max(abs(A_bed), abs(A_ref))
-    excess = abs(A_h) - floor_A
-    if (excess > 0.0) then
-      gam = min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href))
-      kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
-      T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_h
-      T_node(i,j,2,1) = T_node(i,j,2,1) + 0.5*kap*A_h
-      T_node(i,j,1,2) = T_node(i,j,1,2) - 0.5*kap*A_h
-      T_node(i,j,2,2) = T_node(i,j,2,2) - 0.5*kap*A_h
+    if (.not.(gl_cell(i,j-1) .or. gl_cell(i,j) .or. gl_cell(i,j+1))) then
+      A_h = t_eta(i,j) - 0.5*(t_eta(i,j-1) + t_eta(i,j+1))
+      A_bed = f_gnd(i,j)*(b_eta(i,j) - 0.5*(b_eta(i,j-1) + b_eta(i,j+1)))
+      A_ref = tref_eta(i,j) - 0.5*(tref_eta(i,j-1) + tref_eta(i,j+1))
+      floor_A = max(abs(A_bed), abs(A_ref))
+      excess = abs(A_h) - floor_A
+      if (excess > 0.0) then
+        gam = min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href))
+        kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
+        T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_h
+        T_node(i,j,2,1) = T_node(i,j,2,1) + 0.5*kap*A_h
+        T_node(i,j,1,2) = T_node(i,j,1,2) - 0.5*kap*A_h
+        T_node(i,j,2,2) = T_node(i,j,2,2) - 0.5*kap*A_h
+      endif
     endif
   enddo ; enddo
 
