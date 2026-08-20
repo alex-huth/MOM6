@@ -571,6 +571,9 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! damping reaches full strength [nondim].
   logical :: dg_twist_damp        !< If true, damp the grid-scale component of the DG(1)
                                   !! in-cell xy-twist degree of freedom.
+  logical :: dg_damp_excess_only  !< If true, the mode damper removes only the part of its
+                                  !! detector that no reference explains, rather than the
+                                  !! whole detector once a threshold is crossed.
   integer :: dg_damp_gl_reach     !< How far the grounding-line protection in the mode
                                   !! damper extends: 0 the bisected cell alone, 1 the cells
                                   !! whose tilt enters the detector, 2 the full reach of the
@@ -13413,6 +13416,21 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  default=.false., do_not_log=(.not.CS%use_DG_thickness))
   if (.not.CS%use_DG_thickness) CS%dg_twist_damp = .false.
 
+  call get_param(param_file, mdl, "DG1_TILT_DAMP_EXCESS_ONLY", CS%dg_damp_excess_only, &
+                 "If true, the mode damper removes only the part of its detector that no "//&
+                 "reference accounts for, instead of removing the whole detector once the "//&
+                 "unexplained part crosses a threshold. The two agree exactly on the mode "//&
+                 "the term exists to remove, because a tilt reconstructed from cell means "//&
+                 "is identically zero on an alternating tilt AND on an alternating mean, "//&
+                 "so the reference vanishes there and the whole detector IS unexplained. "//&
+                 "They differ wherever the true solution has structure the means already "//&
+                 "show: at a grounding line in MISMIP3d the detector reads 48 m against a "//&
+                 "reference of 34 m, and the old form then damps all 48. Note this does "//&
+                 "NOT relax the tilt onto the reference: the operator is a second "//&
+                 "difference, so any disagreement that varies linearly from cell to cell "//&
+                 "is left alone and only CURVATURE in the disagreement is removed.", &
+                 default=.false., do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
+
   call get_param(param_file, mdl, "DG1_TILT_DAMP_GL_REACH", CS%dg_damp_gl_reach, &
                  "How far the mode damper's grounding-line protection extends from the "//&
                  "cell the flotation contour crosses. 0 protects that cell alone, 1 the "//&
@@ -15767,6 +15785,41 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, A, A_bed, A_ref, href, valid
   endif
 end subroutine dg_tilt_detector_1d
 
+!> The part of a detector reading that no reference accounts for.
+!!
+!! Both references are the SAME operator applied to a different field -- the
+!! tilt the neighbouring cell means already justify, and the tilt the bed
+!! forces -- so A, A_ref and A_bed are directly comparable and their difference
+!! is meaningful.  The reading is shrunk toward the interval those references
+!! span, widened to include zero:
+!!
+!!   - inside the interval, some reference explains the reading and nothing is
+!!     removed;
+!!   - outside it, only the signed distance to the nearest end is removed, so
+!!     the term never damps A past what a reference supports and never past
+!!     zero.  The result always has the sign of A, so the correction always
+!!     reduces |A| and cannot overshoot.
+!!
+!! Zero is in the interval so that a reference of the opposite sign cannot
+!! license MORE damping than A itself, and so that a floating cell -- whose bed
+!! reference is scaled to zero by the grounded fraction -- keeps a valid
+!! interval rather than an empty one.
+!!
+!! On the mode the term exists to remove this changes nothing at all: a tilt
+!! reconstructed from cell means is identically zero on an alternating tilt,
+!! and also on an alternating MEAN, since hbar(k+1) - hbar(k-1) vanishes there.
+!! A smooth bed likewise gives A_bed = 0.  The interval collapses to {0} and
+!! the whole reading is returned, so the delivered relaxation time is untouched.
+pure function dg_unexplained(A, r1, r2) result(Ad)
+  real, intent(in) :: A   !< The detector reading [Z ~> m]
+  real, intent(in) :: r1  !< The same operator on the mean-supported tilt [Z ~> m]
+  real, intent(in) :: r2  !< The same operator on the bed-forced tilt [Z ~> m]
+  real :: Ad              !< The part of A no reference accounts for [Z ~> m]
+  real :: lo, hi          ! Ends of the interval the references span [Z ~> m]
+  lo = min(min(r1, r2), 0.0) ; hi = max(max(r1, r2), 0.0)
+  Ad = A - min(max(A, lo), hi)
+end function dg_unexplained
+
 !> Grounding-line protection weight over the reach a chosen stencil covers.
 !!
 !! The bisected cell is not the only cell whose floor a grounding line breaks.
@@ -15937,6 +15990,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   logical :: det_ok ! True if the detector found an admissible stencil
   integer :: dmode  ! Stencil the detector chose: 1 centred, 2 forward, 3 backward
   real :: gwt       ! Grounding-line weight over the reach of that stencil [nondim]
+  real :: A_dmp     ! The part of the detector the correction actually removes [Z ~> m]
   integer :: k, kk, kj, jj ! Stencil offsets, and the clamped array indices
   ! Twist gathers, over the 7x7 block the biased cross difference can reach.
   real, dimension(-4:4,-4:4) :: ww, bw, hw ! Twist, bed twist, cell mean
@@ -16075,15 +16129,21 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       ! alone rather than driven further from it.  max(), not a sum: over a
       ! rough bed the means already contain the bed's own structure.
       A_bed = f_gnd(i,j)*A_bed
-      floor_A = max(abs(A_bed), abs(A_ref))
-      excess = abs(A_h) - floor_A
+      if (CS%dg_damp_excess_only) then
+        A_dmp = dg_unexplained(A_h, A_ref, A_bed)
+        excess = abs(A_dmp)
+      else
+        floor_A = max(abs(A_bed), abs(A_ref))
+        excess = abs(A_h) - floor_A
+        A_dmp = A_h
+      endif
       if (det_ok .and. (excess > 0.0)) then
         gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
         kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
-        T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_h
-        T_node(i,j,1,2) = T_node(i,j,1,2) + 0.5*kap*A_h
-        T_node(i,j,2,1) = T_node(i,j,2,1) - 0.5*kap*A_h
-        T_node(i,j,2,2) = T_node(i,j,2,2) - 0.5*kap*A_h
+        T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_dmp
+        T_node(i,j,1,2) = T_node(i,j,1,2) + 0.5*kap*A_dmp
+        T_node(i,j,2,1) = T_node(i,j,2,1) - 0.5*kap*A_dmp
+        T_node(i,j,2,2) = T_node(i,j,2,2) - 0.5*kap*A_dmp
       endif
     endif
 
@@ -16098,15 +16158,21 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       call dg_tilt_detector_1d(tv, bv, hv, okv, A_h, A_bed, A_ref, href_d, det_ok, dmode)
       gwt = dg_gl_reach_wt(gv, max(dmode,1), CS%dg_damp_gl_reach)
       A_bed = f_gnd(i,j)*A_bed
-      floor_A = max(abs(A_bed), abs(A_ref))
-      excess = abs(A_h) - floor_A
+      if (CS%dg_damp_excess_only) then
+        A_dmp = dg_unexplained(A_h, A_ref, A_bed)
+        excess = abs(A_dmp)
+      else
+        floor_A = max(abs(A_bed), abs(A_ref))
+        excess = abs(A_h) - floor_A
+        A_dmp = A_h
+      endif
       if (det_ok .and. (excess > 0.0)) then
         gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
         kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
-        T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_h
-        T_node(i,j,2,1) = T_node(i,j,2,1) + 0.5*kap*A_h
-        T_node(i,j,1,2) = T_node(i,j,1,2) - 0.5*kap*A_h
-        T_node(i,j,2,2) = T_node(i,j,2,2) - 0.5*kap*A_h
+        T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_dmp
+        T_node(i,j,2,1) = T_node(i,j,2,1) + 0.5*kap*A_dmp
+        T_node(i,j,1,2) = T_node(i,j,1,2) - 0.5*kap*A_dmp
+        T_node(i,j,2,2) = T_node(i,j,2,2) - 0.5*kap*A_dmp
       endif
     endif
 
@@ -16149,7 +16215,13 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         A_w_ref = 0.5*(dg_d2_biased(wrx, bx) + dg_d2_biased(wry, by))
         href_w  = (hw(0,0) + ((hw(Elo(bx),0) + hw(Ehi(bx),0)) + &
                               (hw(0,Elo(by)) + hw(0,Ehi(by))))) / 5.0
-        excess = abs(A_w) - max(abs(A_w_bed), abs(A_w_ref))
+        if (CS%dg_damp_excess_only) then
+          A_dmp = dg_unexplained(A_w, A_w_ref, A_w_bed)
+          excess = abs(A_dmp)
+        else
+          excess = abs(A_w) - max(abs(A_w_bed), abs(A_w_ref))
+          A_dmp = A_w
+        endif
       endif
       if (excess > 0.0) then
         ! The twist's second difference separates by axis, so the protection
@@ -16158,12 +16230,12 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
                   dg_gl_reach_wt(gwy, by, CS%dg_damp_gl_reach))
         gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_w))
         kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
-        ! +,-,-,+ : changes w by 4*(-0.25*kap*A_w) = -kap*A_w, and is exactly
+        ! +,-,-,+ : changes w by 4*(-0.25*kap*A_dmp) = -kap*A_dmp, and is exactly
         ! orthogonal to the cell mean and to both tilts.
-        T_node(i,j,1,1) = T_node(i,j,1,1) - 0.25*kap*A_w
-        T_node(i,j,2,2) = T_node(i,j,2,2) - 0.25*kap*A_w
-        T_node(i,j,2,1) = T_node(i,j,2,1) + 0.25*kap*A_w
-        T_node(i,j,1,2) = T_node(i,j,1,2) + 0.25*kap*A_w
+        T_node(i,j,1,1) = T_node(i,j,1,1) - 0.25*kap*A_dmp
+        T_node(i,j,2,2) = T_node(i,j,2,2) - 0.25*kap*A_dmp
+        T_node(i,j,2,1) = T_node(i,j,2,1) + 0.25*kap*A_dmp
+        T_node(i,j,1,2) = T_node(i,j,1,2) + 0.25*kap*A_dmp
       endif
     endif
   enddo ; enddo
