@@ -13390,6 +13390,10 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "tilt so it moves no mass.", &
                  default=.false., do_not_log=(.not.CS%use_DG_thickness))
   if (.not.CS%use_DG_thickness) CS%dg_tilt_damp = .false.
+  if (CS%use_DG_thickness .and. .not.CS%GL_regularize) call MOM_error(FATAL, &
+    "USE_DG_THICKNESS requires GROUNDING_LINE_INTERPOLATE=True: the sub-element "//&
+    "grounded fraction CS%ground_frac is what makes the grounding line sub-grid, "//&
+    "and the mode damping grades itself on it.")
 
   call get_param(param_file, mdl, "DG1_TWIST_DAMP", CS%dg_twist_damp, &
                  "If true, also damp the grid-scale component of the DG(1) in-cell "//&
@@ -15682,20 +15686,22 @@ end function dg_wref_at
 !! is what preserves the cancellation between A and A_ref on a smooth solution:
 !! that follows from A(t) ~ A(t_ref) for any consistent second difference, not
 !! from the centred form in particular.
-pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, A, A_bed, A_ref, href, valid)
+pure subroutine dg_tilt_detector_1d(tv, bv, hv, wv, ok, A, A_bed, A_ref, href, wmin, valid)
   real,    dimension(-3:3), intent(in)  :: tv !< Per-cell tilt along the stencil [Z ~> m]
   real,    dimension(-3:3), intent(in)  :: bv !< Per-cell bed tilt along the stencil [Z ~> m]
   real,    dimension(-3:3), intent(in)  :: hv !< Per-cell mean thickness along the stencil [Z ~> m]
+  real,    dimension(-3:3), intent(in)  :: wv !< Per-cell grounding-line weight [nondim]
   logical, dimension(-3:3), intent(in)  :: ok !< True where the cell is usable
   real,    intent(out) :: A     !< Tilt-Laplacian detector [Z ~> m]
   real,    intent(out) :: A_bed !< The same operator on the bed [Z ~> m]
   real,    intent(out) :: A_ref !< The same operator on the mean-supported tilt [Z ~> m]
   real,    intent(out) :: href  !< Mean thickness over the stencil used [Z ~> m]
+  real,    intent(out) :: wmin  !< Smallest grounding-line weight the stencil read [nondim]
   logical, intent(out) :: valid !< False if no admissible stencil exists
 
   real :: rm, r0, rp  ! Mean-supported tilt at the three stencil cells [Z ~> m]
 
-  A = 0.0 ; A_bed = 0.0 ; A_ref = 0.0 ; href = 0.0 ; valid = .true.
+  A = 0.0 ; A_bed = 0.0 ; A_ref = 0.0 ; href = 0.0 ; wmin = 0.0 ; valid = .true.
 
   if (all(ok(-2:2))) then                       ! centred
     A     = tv(0) - 0.5*(tv(-1) + tv(1))
@@ -15703,18 +15709,21 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, A, A_bed, A_ref, href, valid
     rm = 0.5*(hv(0) - hv(-2)) ; r0 = 0.5*(hv(1) - hv(-1)) ; rp = 0.5*(hv(2) - hv(0))
     A_ref = r0 - 0.5*(rm + rp)
     href  = ((hv(-1) + hv(0)) + hv(1)) / 3.0
+    wmin  = min(min(wv(-1), wv(0)), wv(1))
   elseif (all(ok(0:3))) then                    ! forward
     A     = 0.5*(tv(0) - 2.0*tv(1) + tv(2))
     A_bed = 0.5*(bv(0) - 2.0*bv(1) + bv(2))
     r0 = hv(1) - hv(0) ; rm = hv(2) - hv(1) ; rp = hv(3) - hv(2)
     A_ref = 0.5*(r0 - 2.0*rm + rp)
     href  = ((hv(0) + hv(1)) + hv(2)) / 3.0
+    wmin  = min(min(wv(0), wv(1)), wv(2))
   elseif (all(ok(-3:0))) then                   ! backward
     A     = 0.5*(tv(0) - 2.0*tv(-1) + tv(-2))
     A_bed = 0.5*(bv(0) - 2.0*bv(-1) + bv(-2))
     r0 = hv(0) - hv(-1) ; rm = hv(-1) - hv(-2) ; rp = hv(-2) - hv(-3)
     A_ref = 0.5*(r0 - 2.0*rm + rp)
     href  = ((hv(0) + hv(-1)) + hv(-2)) / 3.0
+    wmin  = min(min(wv(0), wv(-1)), wv(-2))
   else
     valid = .false.
   endif
@@ -15788,8 +15797,8 @@ end subroutine dg_tilt_detector_1d
 !! Every field the detector reads is undefined over ice-free ground, where the
 !! nodal thickness is zero.  A zero there is not "no structure" but a fictitious
 !! cliff, and it corrupts the detector and both floors at once; an ice-free cell
-!! also reads as fully floating, so it neither raises gl_cell nor keeps its bed
-!! floor.  Each direction is therefore gated on ITS OWN stencil, not on a block:
+!! also reads as fully floating, so it neither carries grounding-line protection
+!! nor keeps its bed floor.  Each direction is therefore gated on ITS OWN stencil, not on a block:
 !! the xi detector never leaves row j, so it asks only for ice on (i-2:i+2, j),
 !! the reach of the mean-supported reference.  A block test would switch off
 !! xi damping in the outer rows of a domain, which in a problem uniform in y
@@ -15797,22 +15806,28 @@ end subroutine dg_tilt_detector_1d
 !! Under-damping at an ice edge is the safe direction; over-damping there drives
 !! nodes onto the positivity floor.
 !!
-!! Cells the flotation contour passes through are exempt, together with the
-!! three-cell stencil of the detector.  There the in-cell tilt IS the sub-cell
+!! Where the flotation contour crosses a cell the in-cell tilt IS the sub-cell
 !! grounding-line position -- it is what makes h - h_flot change sign inside the
 !! element rather than the whole cell switching regime -- and no indicator built
 !! on a third difference can separate that from the spurious mode, a grounding
-!! line being a genuine slope break in whichever field is gated on.  Removing
-!! the exemption was tried and reverted: it returned the grounding-line
-!! oscillation at tau = 1 yr, and it introduced a ~20 m zigzag immediately
-!! upstream of the grounding line that had not been there, the term creating
-!! grid-scale structure rather than removing it because the gate strength itself
-!! steps from cell to cell across the transition.
+!! line being a genuine slope break in whichever field is gated on.  At fixed
+!! cell mean the tilt and the position of the crossing are in one-to-one
+!! correspondence, so in one dimension no scheme can damp such a cell without
+!! moving its grounding line.
 !!
-!! Cells are nonetheless described by the fraction of their corners that are
-!! grounded rather than by any single corner's branch, which is arbitrary for a
-!! mixed cell and depends on grid orientation.  That fraction sets both ds/dh
-!! and the share of the bed floor a cell is owed, and is exact at zero and one.
+!! That argument has force in proportion to how much of the cell straddles, so
+!! the protection is graded rather than binary.  With f the sub-element grounded
+!! fraction CS%ground_frac -- measured on the DG nodal state by the SEP2/SEP3
+!! partition, not reconstructed here -- the rate carries the factor |2f - 1|,
+!! minimised over the cells the detector actually read.  It is one where a cell
+!! is wholly grounded or wholly afloat, zero where the contour crosses the
+!! middle, and intermediate where it clips a corner.  A binary exemption was
+!! tried first and is wrong twice over: it silences a whole ice stream that
+!! grounds and ungrounds inside a valley a few cells across, and its edge is a
+!! step in treatment between neighbouring cells, which is itself a source of the
+!! grid-scale structure this term exists to remove.
+!!
+!! The same f sets ds/dh and the share of the bed floor a cell is owed.
 !!
 !! The correction is applied as equal and opposite rates on the two nodes that
 !! define the tilt, so the cell mean is unchanged to machine precision: this
@@ -15841,12 +15856,13 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real :: A_w_ref  ! As A_w for the mean-supported twist [Z ~> m]
   real :: href_d   ! Gate-normalizing thickness for the direction in hand [Z ~> m]
   real :: href_w   ! Gate-normalizing thickness for the twist stencil [Z ~> m]
-  real, dimension(-3:3) :: tv, bv, hv ! Stencil gathers of tilt, bed tilt and mean
+  real, dimension(-3:3) :: tv, bv, hv, wv ! Stencil gathers of tilt, bed tilt, mean, weight
+  real :: wmin ! Smallest grading weight the chosen stencil read [nondim]
   logical, dimension(-3:3) :: okv     ! Stencil gather of usability
   logical :: det_ok ! True if the detector found an admissible stencil
   integer :: k, kk, kj, jj ! Stencil offsets, and the clamped array indices
   ! Twist gathers, over the 7x7 block the biased cross difference can reach.
-  real, dimension(-3:3,-3:3) :: ww, bw, hw ! Twist, bed twist, cell mean
+  real, dimension(-3:3,-3:3) :: ww, bw, hw, gw ! Twist, bed twist, cell mean, weight
   logical, dimension(-3:3,-3:3) :: okw     ! Usability
   real, dimension(-3:3) :: wrx, wry ! Mean-supported twist along each axis [Z ~> m]
   integer :: bx, by, m              ! Bias along xi, along eta, and the trial index
@@ -15867,12 +15883,10 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real :: rate_cap ! Largest rate the explicit step may carry [T-1 ~> s-1]
   real :: rhoi_rhow ! Ice/ocean density ratio for the flotation test [nondim]
   real :: one_m_r  ! 1 - rho_i/rho_w, the floating-ice ds/dh [nondim]
-  integer :: ngnd  ! Number of grounded corners of a cell, 0 to 4
-  real, dimension(SZDI_(G),SZDJ_(G)) :: f_gnd !< Grounded fraction of a cell's
-                   !! corners. Orientation-invariant, and exact at 0 and 1, so a
-                   !! cell away from the grounding line is unaffected.
-  logical, dimension(SZDI_(G),SZDJ_(G)) :: gl_cell !< True where the flotation
-                   !! contour crosses the cell, i.e. 0 < f_gnd < 1
+  real, dimension(SZDI_(G),SZDJ_(G)) :: f_gnd !< Sub-element grounded fraction,
+                   !! taken from CS%ground_frac rather than reconstructed here
+  real, dimension(SZDI_(G),SZDJ_(G)) :: gl_wt !< Grading weight |2f-1|: one away
+                   !! from the grounding line, zero where the contour bisects
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed
 
   T_node(:,:,:,:) = 0.0
@@ -15912,7 +15926,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   t_xi(:,:) = 0.0 ; t_eta(:,:) = 0.0
   b_xi(:,:) = 0.0 ; b_eta(:,:) = 0.0
   w_c(:,:) = 0.0 ; b_w(:,:) = 0.0
-  f_gnd(:,:) = 0.0 ; gl_cell(:,:) = .false.
+  f_gnd(:,:) = 0.0 ; gl_wt(:,:) = 0.0
   do j = jsd+1, jed-1 ; do i = isd+1, ied-1
     if (CS%dg_twist_damp) then
       w_c(i,j) = (h_nodal_in(i,j,2,2) - h_nodal_in(i,j,1,2)) - &
@@ -15929,17 +15943,12 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     b_eta(i,j) = 0.5*((CS%bed_node(I-1,J) - CS%bed_node(I-1,J-1)) + &
                       (CS%bed_node(I,J)   - CS%bed_node(I,J-1)))
 
-    ! Flotation branch per corner, the same test as fls_corners elsewhere in
-    ! this module: grounded where (rho_i/rho_w)*h exceeds the bed depth. The
-    ! count, not any one corner, so the result does not depend on which corner
-    ! is asked and a cell the contour crosses gets an intermediate value.
-    ngnd = 0
-    if (((rhoi_rhow*h_nodal_in(i,j,1,1)) - CS%bed_node(I-1,J-1)) > 0.0) ngnd = ngnd + 1
-    if (((rhoi_rhow*h_nodal_in(i,j,2,1)) - CS%bed_node(I,J-1))   > 0.0) ngnd = ngnd + 1
-    if (((rhoi_rhow*h_nodal_in(i,j,1,2)) - CS%bed_node(I-1,J))   > 0.0) ngnd = ngnd + 1
-    if (((rhoi_rhow*h_nodal_in(i,j,2,2)) - CS%bed_node(I,J))     > 0.0) ngnd = ngnd + 1
-    f_gnd(i,j) = 0.25*real(ngnd)
-    gl_cell(i,j) = (ngnd > 0) .and. (ngnd < 4)
+    ! The sub-element grounded fraction, measured on this same nodal state by
+    ! the SEP2/SEP3 partition in compute_ground_frac.  Not reconstructed here:
+    ! any second opinion would disagree with the friction and the driving stress
+    ! about where the grounding line is.
+    f_gnd(i,j) = min(max(CS%ground_frac(i,j), 0.0), 1.0)
+    gl_wt(i,j) = abs(2.0*f_gnd(i,j) - 1.0)
   enddo ; enddo
 
   do j = jsc, jec ; do i = isc, iec
@@ -15970,14 +15979,14 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     ! grounding line still reads the break through its stencil; exempt the whole
     ! stencil.  Nothing in this direction leaves row j, so a neighbouring ROW
     ! being ice-free is no reason to stop.
-    if (CS%dg_tilt_damp .and. &
-        .not.(gl_cell(i-1,j) .or. gl_cell(i,j) .or. gl_cell(i+1,j))) then
+    if (CS%dg_tilt_damp) then
       do k = -3, 3
         kk = min(max(i+k, isd), ied)
         okv(k) = ice_ok(kk,j) .and. (i+k >= isd) .and. (i+k <= ied)
         tv(k) = t_xi(kk,j) ; bv(k) = b_xi(kk,j) ; hv(k) = hbar_c(kk,j)
+        wv(k) = gl_wt(kk,j)
       enddo
-      call dg_tilt_detector_1d(tv, bv, hv, okv, A_h, A_bed, A_ref, href_d, det_ok)
+      call dg_tilt_detector_1d(tv, bv, hv, wv, okv, A_h, A_bed, A_ref, href_d, wmin, det_ok)
       ! One-sided, so ice carrying LESS structure than the bed forces is left
       ! alone rather than driven further from it.  max(), not a sum: over a
       ! rough bed the means already contain the bed's own structure.
@@ -15985,7 +15994,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       floor_A = max(abs(A_bed), abs(A_ref))
       excess = abs(A_h) - floor_A
       if (det_ok .and. (excess > 0.0)) then
-        gam = min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
+        gam = wmin * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
         kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
         T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_h
         T_node(i,j,1,2) = T_node(i,j,1,2) + 0.5*kap*A_h
@@ -15995,19 +16004,19 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     endif
 
     ! --- eta direction ---
-    if (CS%dg_tilt_damp .and. &
-        .not.(gl_cell(i,j-1) .or. gl_cell(i,j) .or. gl_cell(i,j+1))) then
+    if (CS%dg_tilt_damp) then
       do k = -3, 3
         kk = min(max(j+k, jsd), jed)
         okv(k) = ice_ok(i,kk) .and. (j+k >= jsd) .and. (j+k <= jed)
         tv(k) = t_eta(i,kk) ; bv(k) = b_eta(i,kk) ; hv(k) = hbar_c(i,kk)
+        wv(k) = gl_wt(i,kk)
       enddo
-      call dg_tilt_detector_1d(tv, bv, hv, okv, A_h, A_bed, A_ref, href_d, det_ok)
+      call dg_tilt_detector_1d(tv, bv, hv, wv, okv, A_h, A_bed, A_ref, href_d, wmin, det_ok)
       A_bed = f_gnd(i,j)*A_bed
       floor_A = max(abs(A_bed), abs(A_ref))
       excess = abs(A_h) - floor_A
       if (det_ok .and. (excess > 0.0)) then
-        gam = min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
+        gam = wmin * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
         kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
         T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_h
         T_node(i,j,2,1) = T_node(i,j,2,1) + 0.5*kap*A_h
@@ -16017,14 +16026,13 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     endif
 
     ! --- xy-twist ---
-    if (CS%dg_twist_damp .and. &
-        .not.(gl_cell(i,j) .or. (gl_cell(i-1,j) .or. gl_cell(i+1,j)) .or. &
-                                (gl_cell(i,j-1) .or. gl_cell(i,j+1)))) then
+    if (CS%dg_twist_damp) then
       do kj = -3, 3 ; do k = -3, 3
         kk = min(max(i+k, isd), ied) ; jj = min(max(j+kj, jsd), jed)
         okw(k,kj) = ice_ok(kk,jj) .and. ((i+k >= isd) .and. (i+k <= ied)) &
                                   .and. ((j+kj >= jsd) .and. (j+kj <= jed))
         ww(k,kj) = w_c(kk,jj) ; bw(k,kj) = b_w(kk,jj) ; hw(k,kj) = hbar_c(kk,jj)
+        gw(k,kj) = gl_wt(kk,jj)
       enddo ; enddo
 
       ! The 2D detector separates, A_w = (A_xi(w) + A_eta(w))/2, so each axis
@@ -16055,10 +16063,13 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         A_w_ref = 0.5*(dg_d2_biased(wrx, bx) + dg_d2_biased(wry, by))
         href_w  = (hw(0,0) + ((hw(Flo(bx),0) + hw(Fhi(bx),0)) + &
                               (hw(0,Flo(by)) + hw(0,Fhi(by))))) / 5.0
+        ! Graded grounding-line protection over exactly the cells read.
+        wmin = min(minval(gw(Slo(bx):Shi(bx), Flo(by):Fhi(by))), &
+                   minval(gw(Flo(bx):Fhi(bx), Slo(by):Shi(by))))
         excess = abs(A_w) - max(abs(A_w_bed), abs(A_w_ref))
       endif
       if (excess > 0.0) then
-        gam = min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_w))
+        gam = wmin * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_w))
         kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
         ! +,-,-,+ : changes w by 4*(-0.25*kap*A_w) = -kap*A_w, and is exactly
         ! orthogonal to the cell mean and to both tilts.
