@@ -585,6 +585,10 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! transport already delivers, so it acts only where the
                                   !! flow is too slow to remove the mode unaided.
   real :: dg_damp_advective_c     !< Coefficient on c*|u_n|/dx in that subtraction [nondim].
+  real :: dg_damp_u_cut           !< Sweep speed the mode damper brings the grid-scale mode up
+                                  !! to, replacing DG1_TILT_DAMP_TAU with a per-cell,
+                                  !! per-direction relaxation time dx/(2*c*u_cut) when
+                                  !! positive [L T-1 ~> m s-1].
   logical :: dg_damp_excess_only  !< If true, the mode damper removes only the part of its
                                   !! detector that no reference explains, rather than the
                                   !! whole detector once a threshold is crossed.
@@ -13501,6 +13505,24 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  units="nondim", default=0.5, &
                  do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
+  call get_param(param_file, mdl, "DG1_TILT_DAMP_U_CUT", CS%dg_damp_u_cut, &
+                 "If positive, set the mode damper's relaxation time per cell and per "//&
+                 "direction as dx/(2*c*U_CUT) instead of taking it from DG1_TILT_DAMP_TAU, "//&
+                 "which is then ignored. The rate becomes "//&
+                 "kappa = (c/dx)*max(0, gate*U_CUT - |u_n|), a speed DEFICIT divided by the "//&
+                 "cell size, so U_CUT is simply the sweep speed the term brings the "//&
+                 "grid-scale mode up to: where the ice already moves that fast the term "//&
+                 "adds nothing. A time cannot be grid-invariant and a speed can. Both the "//&
+                 "rate the transport supplies, |u_n|/dx, and the harm the mode does, a "//&
+                 "spurious surface slope of order mu*t/dx, scale as 1/dx, so holding U_CUT "//&
+                 "fixed is the resolution-consistent choice while a fixed TAU is too long "//&
+                 "by exactly the refinement factor. It also resolves per direction, which "//&
+                 "matters on any grid whose cells are not square: the xi mode is swept out "//&
+                 "over dx and the eta mode over dy, and on a continental grid those "//&
+                 "differ. The twist, alternating along both axes, uses sqrt(dx*dy).", &
+                 units="m s-1", default=0.0, scale=US%m_s_to_L_T, &
+                 do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
+
   call get_param(param_file, mdl, "DG1_TILT_DAMP_EXCESS_ONLY", CS%dg_damp_excess_only, &
                  "If true, the mode damper removes only the part of its detector that no "//&
                  "reference accounts for, instead of removing the whole detector once the "//&
@@ -16097,6 +16119,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real :: A_dmp     ! The part of the detector the correction actually removes [Z ~> m]
   real :: knat_xi, knat_eta ! Removal rate the transport already delivers on each axis [T-1 ~> s-1]
   real :: kwant     ! Rate the gate asks for, before the transport's share [T-1 ~> s-1]
+  real :: itau_xi, itau_eta, itau_w ! 1/(2*tau) per direction, from DG1_TILT_DAMP_U_CUT
+                    !! when that is set and from DG1_TILT_DAMP_TAU when it is not [T-1 ~> s-1]
   real :: d_l2      ! Sum of squares of the per-mode corrections, for the activity
                     !! diagnostic [Z2 T-2 ~> m2 s-2]
   real :: d_gate    ! Largest gate opened in this cell, over the three modes [nondim]
@@ -16231,6 +16255,20 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     ! from the four B-grid corners, so it carries no staggering of its own; per
     ! axis, because the xi mode is swept out by u and the eta mode by v, and
     ! across a confined stream only the second of those vanishes.
+    ! 1/(2*tau) per direction.  With U_CUT set, tau = dx/(2*c*U_CUT) in each
+    ! direction separately, so the wanted rate is c*U_CUT/dx: a speed divided by
+    ! the cell size in the direction the mode alternates along.  The twist
+    ! alternates along both, so it takes the cell's geometric mean size.
+    if (CS%dg_damp_u_cut > 0.0) then
+      itau_xi  = CS%dg_damp_advective_c * CS%dg_damp_u_cut * G%IdxT(i,j)
+      itau_eta = CS%dg_damp_advective_c * CS%dg_damp_u_cut * G%IdyT(i,j)
+      itau_w   = CS%dg_damp_advective_c * CS%dg_damp_u_cut * &
+                 sqrt(G%IdxT(i,j) * G%IdyT(i,j))
+    else
+      itau_xi  = 0.5 / CS%dg_tilt_damp_tau
+      itau_eta = itau_xi ; itau_w = itau_xi
+    endif
+
     knat_xi = 0.0 ; knat_eta = 0.0
     if (CS%dg_damp_advective) then
       knat_xi = CS%dg_damp_advective_c * G%IdxT(i,j) * 0.25 * &
@@ -16269,7 +16307,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       endif
       if (det_ok .and. (excess > 0.0)) then
         gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
-        kwant = gam / (2.0*CS%dg_tilt_damp_tau)
+        kwant = gam * itau_xi
         kap = min(max(kwant - knat_xi, 0.0), rate_cap)
         T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_dmp
         T_node(i,j,1,2) = T_node(i,j,1,2) + 0.5*kap*A_dmp
@@ -16304,7 +16342,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       endif
       if (det_ok .and. (excess > 0.0)) then
         gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
-        kwant = gam / (2.0*CS%dg_tilt_damp_tau)
+        kwant = gam * itau_eta
         kap = min(max(kwant - knat_eta, 0.0), rate_cap)
         T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_dmp
         T_node(i,j,2,1) = T_node(i,j,2,1) + 0.5*kap*A_dmp
@@ -16374,7 +16412,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         ! The checkerboard twist alternates along BOTH axes, so it survives as
         ! long as either sweep is slow: credit the transport with the smaller of
         ! the two rates, not their sum.
-        kwant = gam / (2.0*CS%dg_tilt_damp_tau)
+        kwant = gam * itau_w
         kap = min(max(kwant - min(knat_xi, knat_eta), 0.0), rate_cap)
         ! +,-,-,+ : changes w by 4*(-0.25*kap*A_dmp) = -kap*A_dmp, and is exactly
         ! orthogonal to the cell mean and to both tilts.
@@ -16421,6 +16459,8 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
                                                    ! the cell mean is untouched and no mass
                                                    ! moves between cells.
   real, dimension(2,2) :: dh
+  real :: tau_chk ! Shortest relaxation time the mode damper will deliver anywhere in the
+                  ! computational domain, for the time-step warning [T ~> s]
   character(len=200) :: mesg  ! The text of a MOM warning
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed, a, b
 
@@ -16458,11 +16498,22 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   ! simply converging faster. Warn once; this is not a stability bound (the
   ! 0.5/dt rate cap covers that) but the practical floor.
   if ((CS%dg_tilt_damp .or. CS%dg_twist_damp) .and. .not.CS%dg_tilt_damp_dt_warned) then
-    if (CS%dg_tilt_damp_tau < 50.0*time_step) then
-      write(mesg,'("DG1_TILT_DAMP_TAU is only ",F7.1," advection time steps. Below "//&
-                 "~50 the elliptic velocity solve, which has no lag, rings against the "//&
-                 "relaxation; expect a fluctuating steady state.")') &
-        CS%dg_tilt_damp_tau/time_step
+    ! With U_CUT set the relaxation time varies by cell and by direction, so the
+    ! binding one is the smallest: tau = dx/(2*c*U_CUT), minimised over the
+    ! shortest cell dimension in the computational domain.
+    tau_chk = CS%dg_tilt_damp_tau
+    if (CS%dg_damp_u_cut > 0.0) then
+      tau_chk = huge(1.0)
+      do j = jsc, jec ; do i = isc, iec
+        tau_chk = min(tau_chk, 0.5 / max(CS%dg_damp_advective_c * CS%dg_damp_u_cut * &
+                                         max(G%IdxT(i,j), G%IdyT(i,j)), tiny(1.0)))
+      enddo ; enddo
+    endif
+    if (tau_chk < 50.0*time_step) then
+      write(mesg,'("The mode damper''s relaxation time is only ",F7.1," advection time "//&
+                 "steps at its shortest. Below ~50 the elliptic velocity solve, which has "//&
+                 "no lag, rings against the relaxation; expect a fluctuating steady state.")') &
+        tau_chk/time_step
       call MOM_error(WARNING, trim(mesg))
     endif
     CS%dg_tilt_damp_dt_warned = .true.
