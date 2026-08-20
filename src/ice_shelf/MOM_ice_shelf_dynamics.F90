@@ -16509,11 +16509,21 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
                                          max(G%IdxT(i,j), G%IdyT(i,j)), tiny(1.0)))
       enddo ; enddo
     endif
-    if (tau_chk < 50.0*time_step) then
-      write(mesg,'("The mode damper''s relaxation time is only ",F7.1," advection time "//&
-                 "steps at its shortest. Below ~50 the elliptic velocity solve, which has "//&
-                 "no lag, rings against the relaxation; expect a fluctuating steady state.")') &
-        tau_chk/time_step
+    ! One collective, once per run, so that a PE holding the smallest cell is not
+    ! the only one that knows.  Every PE reaches this: the flag below is set
+    ! unconditionally and the enclosing test is on parameters, so there is no
+    ! path where some ranks enter the reduction and others do not.
+    call min_across_PEs(tau_chk)
+    ! Root only.  Warning from every rank at once is what overwhelms the error
+    ! handler on a large decomposition, and the message is identical on all of
+    ! them now that the minimum is global.
+    if ((tau_chk < 50.0*time_step) .and. is_root_pe()) then
+      write(mesg,'("The mode damper''s shortest relaxation time anywhere is ",ES10.3, &
+                 &" s, only ",F8.1," advection steps. Below ~50 the elliptic velocity "//&
+                 "solve, which has no lag, rings against the relaxation; expect a "//&
+                 "fluctuating steady state. Note the binding lag is actually "//&
+                 "ICE_VELOCITY_TIMESTEP, which is the longer of the two.")') &
+        tau_chk, tau_chk/time_step
       call MOM_error(WARNING, trim(mesg))
     endif
     CS%dg_tilt_damp_dt_warned = .true.
