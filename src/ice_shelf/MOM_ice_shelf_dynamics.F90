@@ -571,6 +571,10 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! damping reaches full strength [nondim].
   logical :: dg_twist_damp        !< If true, damp the grid-scale component of the DG(1)
                                   !! in-cell xy-twist degree of freedom.
+  integer :: dg_damp_gl_reach     !< How far the grounding-line protection in the mode
+                                  !! damper extends: 0 the bisected cell alone, 1 the cells
+                                  !! whose tilt enters the detector, 2 the full reach of the
+                                  !! mean-supported reference.
   logical :: dg_damp_biased_stencil !< If true, the mode damper falls back to a one-sided
                                   !! second difference where a centred stencil would leave
                                   !! the ice or the domain; if false it skips the cell in
@@ -13413,6 +13417,23 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  default=.false., do_not_log=(.not.CS%use_DG_thickness))
   if (.not.CS%use_DG_thickness) CS%dg_twist_damp = .false.
 
+  call get_param(param_file, mdl, "DG1_TILT_DAMP_GL_REACH", CS%dg_damp_gl_reach, &
+                 "How far the mode damper's grounding-line protection extends from the "//&
+                 "cell the flotation contour crosses. 0 protects that cell alone, 1 the "//&
+                 "cells whose tilt enters the detector, 2 the full reach of the "//&
+                 "mean-supported reference; the reach follows whichever stencil bias the "//&
+                 "detector selected. The bisected cell is not the only one a grounding "//&
+                 "line disqualifies: the reference is built from cell means, which cannot "//&
+                 "represent a slope break, so |A| exceeds the floor over the whole "//&
+                 "neighbourhood of the grounding line and not just at its own cell. In "//&
+                 "MISMIP3d Stnd at 10 km, which is uniform in y and forces no "//&
+                 "jump-invisible mode at all, reach 0 leaves the four cells around the "//&
+                 "grounding line carrying essentially all of the term's work and moves "//&
+                 "the steady grounding line 30 km seaward of the undamped run.", &
+                 default=1, do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
+  if ((CS%dg_damp_gl_reach < 0) .or. (CS%dg_damp_gl_reach > 2)) call MOM_error(FATAL, &
+    "DG1_TILT_DAMP_GL_REACH must be 0, 1 or 2.")
+
   call get_param(param_file, mdl, "DG1_TILT_DAMP_BIASED_STENCIL", CS%dg_damp_biased_stencil, &
                  "If true, where a centred second difference would reach outside the ice "//&
                  "or outside the domain the mode damper uses a forward or backward one "//&
@@ -15720,7 +15741,7 @@ end function dg_wref_at
 !! from O(dx^5) to O(dx^3.8) against a detector that is O(dx^3) -- and the leak
 !! is signed, so it damps a smooth solution steadily for as long as the model
 !! runs.  That is a fifth cell's worth of stencil, hence the +-4 gather.
-pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, allow_bias, A, A_bed, A_ref, href, valid)
+pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, allow_bias, A, A_bed, A_ref, href, valid, mode)
   real,    dimension(-4:4), intent(in)  :: tv !< Per-cell tilt along the stencil [Z ~> m]
   real,    dimension(-4:4), intent(in)  :: bv !< Per-cell bed tilt along the stencil [Z ~> m]
   real,    dimension(-4:4), intent(in)  :: hv !< Per-cell mean thickness along the stencil [Z ~> m]
@@ -15731,10 +15752,11 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, allow_bias, A, A_bed, A_ref,
   real,    intent(out) :: A_ref !< The same operator on the mean-supported tilt [Z ~> m]
   real,    intent(out) :: href  !< Mean thickness over the stencil used [Z ~> m]
   logical, intent(out) :: valid !< False if no admissible stencil exists
+  integer, intent(out) :: mode  !< Stencil chosen: 1 centred, 2 forward, 3 backward, 0 none
 
   real :: rm, r0, rp  ! Mean-supported tilt at the three stencil cells [Z ~> m]
 
-  A = 0.0 ; A_bed = 0.0 ; A_ref = 0.0 ; href = 0.0 ; valid = .true.
+  A = 0.0 ; A_bed = 0.0 ; A_ref = 0.0 ; href = 0.0 ; valid = .true. ; mode = 1
 
   if (all(ok(-2:2))) then                       ! centred
     A     = tv(0) - 0.5*(tv(-1) + tv(1))
@@ -15749,7 +15771,7 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, allow_bias, A, A_bed, A_ref,
     rm = 0.5*(-3.0*hv(1) + 4.0*hv(2) - hv(3))
     rp = 0.5*(-3.0*hv(2) + 4.0*hv(3) - hv(4))
     A_ref = 0.5*(r0 - 2.0*rm + rp)
-    href  = ((hv(0) + hv(1)) + hv(2)) / 3.0
+    href  = ((hv(0) + hv(1)) + hv(2)) / 3.0 ; mode = 2
   elseif (allow_bias .and. all(ok(-4:0))) then  ! backward
     A     = 0.5*(tv(0) - 2.0*tv(-1) + tv(-2))
     A_bed = 0.5*(bv(0) - 2.0*bv(-1) + bv(-2))
@@ -15757,11 +15779,46 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, allow_bias, A, A_bed, A_ref,
     rm = 0.5*( 3.0*hv(-1) - 4.0*hv(-2) + hv(-3))
     rp = 0.5*( 3.0*hv(-2) - 4.0*hv(-3) + hv(-4))
     A_ref = 0.5*(r0 - 2.0*rm + rp)
-    href  = ((hv(0) + hv(-1)) + hv(-2)) / 3.0
+    href  = ((hv(0) + hv(-1)) + hv(-2)) / 3.0 ; mode = 3
   else
-    valid = .false.
+    valid = .false. ; mode = 0
   endif
 end subroutine dg_tilt_detector_1d
+
+!> Grounding-line protection weight over the reach a chosen stencil covers.
+!!
+!! The bisected cell is not the only cell whose floor a grounding line breaks.
+!! A_ref is built from CELL MEANS, and a slope break is precisely what a
+!! mean-supported reconstruction cannot represent: the means smooth the kink,
+!! the tilts resolve it, and |A| - |A_ref| is left large and systematically
+!! POSITIVE over the whole neighbourhood of the break rather than at the one
+!! cell the contour passes through.  Measured in MISMIP3d Stnd at 10 km, the
+!! four cells around the grounding line carry essentially all of the term's
+!! work, at |A| near 48 m against a floor of 34 m and gates from 0.16 to 0.71,
+!! while the biased-stencil cells carry 0.0% and the domain-mean gate is 0.02.
+!! Protecting only the bisected cell therefore leaves the term acting at close
+!! to full strength on the sub-grid grounding line itself.
+!!
+!! The reach is not a tunable band but the reach of an operator.  Level 1 is
+!! the cells whose TILT enters A, level 2 those whose MEAN enters A_ref, both
+!! following whichever bias the detector selected; level 0 is the cell alone.
+pure function dg_gl_reach_wt(gw, mode, reach) result(wt)
+  real, dimension(-4:4), intent(in) :: gw !< Per-cell protection weight on the gather [nondim]
+  integer, intent(in) :: mode  !< Stencil chosen: 1 centred, 2 forward, 3 backward
+  integer, intent(in) :: reach !< 0 the cell alone, 1 the reach of A, 2 the reach of A_ref
+  real :: wt                   !< Weight to apply to the rate [nondim]
+  ! Offsets each operator reads, by stencil: A is a second difference and
+  ! A_ref its own second difference of a first difference, two cells wider.
+  integer, dimension(3), parameter :: Alo = (/ -1, 0, -2 /), Ahi = (/ 1, 2, 0 /)
+  integer, dimension(3), parameter :: Rlo = (/ -2, 0, -4 /), Rhi = (/ 2, 4, 0 /)
+  if (reach <= 0) then
+    wt = gw(0)
+  elseif (reach == 1) then
+    wt = minval(gw(Alo(mode):Ahi(mode)))
+  else
+    wt = minval(gw(Rlo(mode):Rhi(mode)))
+  endif
+end function dg_gl_reach_wt
 
 !> Damp the grid-scale component of the in-cell tilt and twist degrees of freedom.
 !!
@@ -15893,11 +15950,15 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real :: href_d   ! Gate-normalizing thickness for the direction in hand [Z ~> m]
   real :: href_w   ! Gate-normalizing thickness for the twist stencil [Z ~> m]
   real, dimension(-4:4) :: tv, bv, hv ! Stencil gathers of tilt, bed tilt and mean
+  real, dimension(-4:4) :: gv         ! Stencil gather of the grounding-line weight [nondim]
   logical, dimension(-4:4) :: okv     ! Stencil gather of usability
   logical :: det_ok ! True if the detector found an admissible stencil
+  integer :: dmode  ! Stencil the detector chose: 1 centred, 2 forward, 3 backward
+  real :: gwt       ! Grounding-line weight over the reach of that stencil [nondim]
   integer :: k, kk, kj, jj ! Stencil offsets, and the clamped array indices
   ! Twist gathers, over the 7x7 block the biased cross difference can reach.
   real, dimension(-4:4,-4:4) :: ww, bw, hw ! Twist, bed twist, cell mean
+  real, dimension(-4:4) :: gwx, gwy        ! Grounding-line weight along each axis [nondim]
   logical, dimension(-4:4,-4:4) :: okw     ! Usability
   real, dimension(-4:4) :: wrx, wry ! Mean-supported twist along each axis [Z ~> m]
   integer :: bx, by, m              ! Bias along xi, along eta, and the trial index
@@ -16016,17 +16077,19 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
 
     ! --- xi direction ---
     ! Nothing in this direction leaves row j, so a neighbouring ROW being
-    ! ice-free is no reason to stop.  The grounding-line grading is taken as the
-    ! minimum over the cells the chosen stencil actually read, so it follows the
-    ! bias automatically.
+    ! ice-free is no reason to stop.  The grounding-line protection is taken as
+    ! the minimum over the reach DG1_TILT_DAMP_GL_REACH asks for, evaluated on
+    ! the stencil the detector actually chose, so it follows the bias.
     if (CS%dg_tilt_damp) then
       do k = -4, 4
         kk = min(max(i+k, isd), ied)
         okv(k) = ice_ok(kk,j) .and. (i+k >= isd) .and. (i+k <= ied)
         tv(k) = t_xi(kk,j) ; bv(k) = b_xi(kk,j) ; hv(k) = hbar_c(kk,j)
+        gv(k) = gl_wt(kk,j)
       enddo
       call dg_tilt_detector_1d(tv, bv, hv, okv, CS%dg_damp_biased_stencil, &
-                               A_h, A_bed, A_ref, href_d, det_ok)
+                               A_h, A_bed, A_ref, href_d, det_ok, dmode)
+      gwt = dg_gl_reach_wt(gv, max(dmode,1), CS%dg_damp_gl_reach)
       ! One-sided, so ice carrying LESS structure than the bed forces is left
       ! alone rather than driven further from it.  max(), not a sum: over a
       ! rough bed the means already contain the bed's own structure.
@@ -16034,7 +16097,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       floor_A = max(abs(A_bed), abs(A_ref))
       excess = abs(A_h) - floor_A
       if (det_ok .and. (excess > 0.0)) then
-        gam = gl_wt(i,j) * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
+        gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
         kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
         T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_h
         T_node(i,j,1,2) = T_node(i,j,1,2) + 0.5*kap*A_h
@@ -16049,14 +16112,16 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         kk = min(max(j+k, jsd), jed)
         okv(k) = ice_ok(i,kk) .and. (j+k >= jsd) .and. (j+k <= jed)
         tv(k) = t_eta(i,kk) ; bv(k) = b_eta(i,kk) ; hv(k) = hbar_c(i,kk)
+        gv(k) = gl_wt(i,kk)
       enddo
       call dg_tilt_detector_1d(tv, bv, hv, okv, CS%dg_damp_biased_stencil, &
-                               A_h, A_bed, A_ref, href_d, det_ok)
+                               A_h, A_bed, A_ref, href_d, det_ok, dmode)
+      gwt = dg_gl_reach_wt(gv, max(dmode,1), CS%dg_damp_gl_reach)
       A_bed = f_gnd(i,j)*A_bed
       floor_A = max(abs(A_bed), abs(A_ref))
       excess = abs(A_h) - floor_A
       if (det_ok .and. (excess > 0.0)) then
-        gam = gl_wt(i,j) * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
+        gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
         kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
         T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_h
         T_node(i,j,2,1) = T_node(i,j,2,1) + 0.5*kap*A_h
@@ -16072,6 +16137,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         okw(k,kj) = ice_ok(kk,jj) .and. ((i+k >= isd) .and. (i+k <= ied)) &
                                   .and. ((j+kj >= jsd) .and. (j+kj <= jed))
         ww(k,kj) = w_c(kk,jj) ; bw(k,kj) = b_w(kk,jj) ; hw(k,kj) = hbar_c(kk,jj)
+        if (kj == 0) gwx(k) = gl_wt(kk,jj)
+        if (k == 0) gwy(kj) = gl_wt(kk,jj)
       enddo ; enddo
 
       ! The 2D detector separates, A_w = (A_xi(w) + A_eta(w))/2, so each axis
@@ -16105,7 +16172,11 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         excess = abs(A_w) - max(abs(A_w_bed), abs(A_w_ref))
       endif
       if (excess > 0.0) then
-        gam = gl_wt(i,j) * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_w))
+        ! The twist's second difference separates by axis, so the protection
+        ! does too: each axis contributes the minimum over its own bias's reach.
+        gwt = min(dg_gl_reach_wt(gwx, bx, CS%dg_damp_gl_reach), &
+                  dg_gl_reach_wt(gwy, by, CS%dg_damp_gl_reach))
+        gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_w))
         kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
         ! +,-,-,+ : changes w by 4*(-0.25*kap*A_w) = -kap*A_w, and is exactly
         ! orthogonal to the cell mean and to both tilts.
