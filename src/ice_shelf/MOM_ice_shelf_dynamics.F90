@@ -15626,7 +15626,7 @@ end subroutine DG1_nodal_spatial_operator
 !! uniform field, so the delivered relaxation time does not depend on which is
 !! used.
 pure function dg_d2_biased(f, b) result(A)
-  real, dimension(-3:3), intent(in) :: f !< Samples along the axis [Z ~> m]
+  real, dimension(-4:4), intent(in) :: f !< Samples along the axis [Z ~> m]
   integer,               intent(in) :: b !< 1 centred, 2 forward, 3 backward
   real :: A                              !< Second difference [Z ~> m]
   select case (b)
@@ -15638,15 +15638,18 @@ end function dg_d2_biased
 
 !> Biased first difference of the cell means in eta, at x offset p and y offset q.
 pure function dg_d1_eta(hw, p, q, by) result(g)
-  real, dimension(-3:3,-3:3), intent(in) :: hw !< Cell means on the gather [Z ~> m]
+  real, dimension(-4:4,-4:4), intent(in) :: hw !< Cell means on the gather [Z ~> m]
   integer, intent(in) :: p  !< Offset along xi
   integer, intent(in) :: q  !< Offset along eta
   integer, intent(in) :: by !< Bias along eta
   real :: g                 !< First difference [Z ~> m]
+  ! Second-order and centred on the cell in every case: a first-order one-sided
+  ! difference would estimate the tilt half a cell away, and the reference has
+  ! to sit where the detector does or the cancellation degrades.
   select case (by)
     case (1) ; g = 0.5*(hw(p,q+1) - hw(p,q-1))
-    case (2) ; g = hw(p,q+1) - hw(p,q)
-    case default ; g = hw(p,q) - hw(p,q-1)
+    case (2) ; g = 0.5*(-3.0*hw(p,q) + 4.0*hw(p,q+1) - hw(p,q+2))
+    case default ; g = 0.5*( 3.0*hw(p,q) - 4.0*hw(p,q-1) + hw(p,q-2))
   end select
 end function dg_d1_eta
 
@@ -15655,7 +15658,7 @@ end function dg_d1_eta
 !! conservative data already justify, and subtracting it is what cancels the
 !! smooth-solution residual, exactly as A_ref does for the tilt.
 pure function dg_wref_at(hw, p, q, bx, by) result(wr)
-  real, dimension(-3:3,-3:3), intent(in) :: hw !< Cell means on the gather [Z ~> m]
+  real, dimension(-4:4,-4:4), intent(in) :: hw !< Cell means on the gather [Z ~> m]
   integer, intent(in) :: p  !< Offset along xi
   integer, intent(in) :: q  !< Offset along eta
   integer, intent(in) :: bx !< Bias along xi
@@ -15663,8 +15666,10 @@ pure function dg_wref_at(hw, p, q, bx, by) result(wr)
   real :: wr                !< Mean-supported twist [Z ~> m]
   select case (bx)
     case (1) ; wr = 0.5*(dg_d1_eta(hw,p+1,q,by) - dg_d1_eta(hw,p-1,q,by))
-    case (2) ; wr = dg_d1_eta(hw,p+1,q,by) - dg_d1_eta(hw,p,q,by)
-    case default ; wr = dg_d1_eta(hw,p,q,by) - dg_d1_eta(hw,p-1,q,by)
+    case (2) ; wr = 0.5*(-3.0*dg_d1_eta(hw,p,q,by) + 4.0*dg_d1_eta(hw,p+1,q,by) &
+                         - dg_d1_eta(hw,p+2,q,by))
+    case default ; wr = 0.5*( 3.0*dg_d1_eta(hw,p,q,by) - 4.0*dg_d1_eta(hw,p-1,q,by) &
+                             + dg_d1_eta(hw,p-2,q,by))
   end select
 end function dg_wref_at
 
@@ -15686,11 +15691,22 @@ end function dg_wref_at
 !! is what preserves the cancellation between A and A_ref on a smooth solution:
 !! that follows from A(t) ~ A(t_ref) for any consistent second difference, not
 !! from the centred form in particular.
+!!
+!! The reference must be SECOND-order and evaluated at the cell centre, and the
+!! SAME form at every offset of the stencil.  A first-order one-sided difference
+!! hbar(k+1) - hbar(k) estimates the tilt half a cell away, and mixing a
+!! one-sided value at the edge offset with centred values elsewhere makes the
+!! reference non-smooth in k, which its own second difference then picks up.
+!! Either mistake leaves a leak that no longer vanishes relative to the detector
+!! under refinement -- measured convergence of the smooth-solution excess falls
+!! from O(dx^5) to O(dx^3.8) against a detector that is O(dx^3) -- and the leak
+!! is signed, so it damps a smooth solution steadily for as long as the model
+!! runs.  That is a fifth cell's worth of stencil, hence the +-4 gather.
 pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, A, A_bed, A_ref, href, valid)
-  real,    dimension(-3:3), intent(in)  :: tv !< Per-cell tilt along the stencil [Z ~> m]
-  real,    dimension(-3:3), intent(in)  :: bv !< Per-cell bed tilt along the stencil [Z ~> m]
-  real,    dimension(-3:3), intent(in)  :: hv !< Per-cell mean thickness along the stencil [Z ~> m]
-  logical, dimension(-3:3), intent(in)  :: ok !< True where the cell is usable
+  real,    dimension(-4:4), intent(in)  :: tv !< Per-cell tilt along the stencil [Z ~> m]
+  real,    dimension(-4:4), intent(in)  :: bv !< Per-cell bed tilt along the stencil [Z ~> m]
+  real,    dimension(-4:4), intent(in)  :: hv !< Per-cell mean thickness along the stencil [Z ~> m]
+  logical, dimension(-4:4), intent(in)  :: ok !< True where the cell is usable
   real,    intent(out) :: A     !< Tilt-Laplacian detector [Z ~> m]
   real,    intent(out) :: A_bed !< The same operator on the bed [Z ~> m]
   real,    intent(out) :: A_ref !< The same operator on the mean-supported tilt [Z ~> m]
@@ -15707,16 +15723,20 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, A, A_bed, A_ref, href, valid
     rm = 0.5*(hv(0) - hv(-2)) ; r0 = 0.5*(hv(1) - hv(-1)) ; rp = 0.5*(hv(2) - hv(0))
     A_ref = r0 - 0.5*(rm + rp)
     href  = ((hv(-1) + hv(0)) + hv(1)) / 3.0
-  elseif (all(ok(0:3))) then                    ! forward
+  elseif (all(ok(0:4))) then                    ! forward
     A     = 0.5*(tv(0) - 2.0*tv(1) + tv(2))
     A_bed = 0.5*(bv(0) - 2.0*bv(1) + bv(2))
-    r0 = hv(1) - hv(0) ; rm = hv(2) - hv(1) ; rp = hv(3) - hv(2)
+    r0 = 0.5*(-3.0*hv(0) + 4.0*hv(1) - hv(2))
+    rm = 0.5*(-3.0*hv(1) + 4.0*hv(2) - hv(3))
+    rp = 0.5*(-3.0*hv(2) + 4.0*hv(3) - hv(4))
     A_ref = 0.5*(r0 - 2.0*rm + rp)
     href  = ((hv(0) + hv(1)) + hv(2)) / 3.0
-  elseif (all(ok(-3:0))) then                   ! backward
+  elseif (all(ok(-4:0))) then                   ! backward
     A     = 0.5*(tv(0) - 2.0*tv(-1) + tv(-2))
     A_bed = 0.5*(bv(0) - 2.0*bv(-1) + bv(-2))
-    r0 = hv(0) - hv(-1) ; rm = hv(-1) - hv(-2) ; rp = hv(-2) - hv(-3)
+    r0 = 0.5*( 3.0*hv(0) - 4.0*hv(-1) + hv(-2))
+    rm = 0.5*( 3.0*hv(-1) - 4.0*hv(-2) + hv(-3))
+    rp = 0.5*( 3.0*hv(-2) - 4.0*hv(-3) + hv(-4))
     A_ref = 0.5*(r0 - 2.0*rm + rp)
     href  = ((hv(0) + hv(-1)) + hv(-2)) / 3.0
   else
@@ -15853,19 +15873,19 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real :: A_w_ref  ! As A_w for the mean-supported twist [Z ~> m]
   real :: href_d   ! Gate-normalizing thickness for the direction in hand [Z ~> m]
   real :: href_w   ! Gate-normalizing thickness for the twist stencil [Z ~> m]
-  real, dimension(-3:3) :: tv, bv, hv ! Stencil gathers of tilt, bed tilt and mean
-  logical, dimension(-3:3) :: okv     ! Stencil gather of usability
+  real, dimension(-4:4) :: tv, bv, hv ! Stencil gathers of tilt, bed tilt and mean
+  logical, dimension(-4:4) :: okv     ! Stencil gather of usability
   logical :: det_ok ! True if the detector found an admissible stencil
   integer :: k, kk, kj, jj ! Stencil offsets, and the clamped array indices
   ! Twist gathers, over the 7x7 block the biased cross difference can reach.
-  real, dimension(-3:3,-3:3) :: ww, bw, hw ! Twist, bed twist, cell mean
-  logical, dimension(-3:3,-3:3) :: okw     ! Usability
-  real, dimension(-3:3) :: wrx, wry ! Mean-supported twist along each axis [Z ~> m]
+  real, dimension(-4:4,-4:4) :: ww, bw, hw ! Twist, bed twist, cell mean
+  logical, dimension(-4:4,-4:4) :: okw     ! Usability
+  real, dimension(-4:4) :: wrx, wry ! Mean-supported twist along each axis [Z ~> m]
   integer :: bx, by, m              ! Bias along xi, along eta, and the trial index
   logical :: tw_ok                  ! True once an admissible bias pair is found
   ! Offsets a bias reaches: S for the second difference, F for the first.
-  integer, dimension(3), parameter :: Slo = (/ -2, 0, -3 /), Shi = (/ 2, 3, 0 /)
-  integer, dimension(3), parameter :: Flo = (/ -1, 0, -1 /), Fhi = (/  1, 1, 0 /)
+  integer, dimension(3), parameter :: Slo = (/ -2, 0, -4 /), Shi = (/ 2, 4, 0 /)
+  integer, dimension(3), parameter :: Flo = (/ -1, 0, -2 /), Fhi = (/  1, 2, 0 /)
   ! The two NON-centre cells the second difference uses, for the stencil mean.
   integer, dimension(3), parameter :: Elo = (/ -1, 1, -1 /), Ehi = (/  1, 2, -2 /)
   ! Trial order: centred in both axes first, then centred in one, then neither.
@@ -15981,7 +16001,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     ! minimum over the cells the chosen stencil actually read, so it follows the
     ! bias automatically.
     if (CS%dg_tilt_damp) then
-      do k = -3, 3
+      do k = -4, 4
         kk = min(max(i+k, isd), ied)
         okv(k) = ice_ok(kk,j) .and. (i+k >= isd) .and. (i+k <= ied)
         tv(k) = t_xi(kk,j) ; bv(k) = b_xi(kk,j) ; hv(k) = hbar_c(kk,j)
@@ -16005,7 +16025,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
 
     ! --- eta direction ---
     if (CS%dg_tilt_damp) then
-      do k = -3, 3
+      do k = -4, 4
         kk = min(max(j+k, jsd), jed)
         okv(k) = ice_ok(i,kk) .and. (j+k >= jsd) .and. (j+k <= jed)
         tv(k) = t_eta(i,kk) ; bv(k) = b_eta(i,kk) ; hv(k) = hbar_c(i,kk)
@@ -16026,7 +16046,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
 
     ! --- xy-twist ---
     if (CS%dg_twist_damp) then
-      do kj = -3, 3 ; do k = -3, 3
+      do kj = -4, 4 ; do k = -4, 4
         kk = min(max(i+k, isd), ied) ; jj = min(max(j+kj, jsd), jed)
         okw(k,kj) = ice_ok(kk,jj) .and. ((i+k >= isd) .and. (i+k <= ied)) &
                                   .and. ((j+kj >= jsd) .and. (j+kj <= jed))
