@@ -576,9 +576,11 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! the cell of the correction it applies [Z T-1 ~> m s-1].
   real, pointer, dimension(:,:) :: dg_damp_gate => NULL() !< Largest gate fraction the mode
                                   !! damper opened in a cell, over its three modes [nondim].
-  real, pointer, dimension(:,:) :: dg_damp_held => NULL() !< Fraction of the rate the gate asked
-                                  !! for that was withheld because the transport already
-                                  !! delivers it; zero unless DG1_TILT_DAMP_ADVECTIVE [nondim].
+  real, pointer, dimension(:,:) :: dg_damp_want => NULL() !< Rate the mode damper's gate asked
+                                  !! for, summed over its three modes, before the transport's
+                                  !! share is credited [T-1 ~> s-1].
+  real, pointer, dimension(:,:) :: dg_damp_got => NULL() !< Rate the mode damper actually
+                                  !! delivered, summed over its three modes [T-1 ~> s-1].
   logical :: dg_damp_advective    !< If true, the mode damper subtracts the removal rate the
                                   !! transport already delivers, so it acts only where the
                                   !! flow is too slow to remove the mode unaided.
@@ -818,7 +820,8 @@ type, public :: ice_shelf_dyn_CS ; private
   !>@{ Diagnostic handles
   integer :: id_u_shelf = -1, id_v_shelf = -1, id_shelf_speed, id_t_shelf = -1, &
              id_taudx_shelf = -1, id_taudy_shelf = -1, id_taud_shelf = -1, id_bed_elev = -1, &
-             id_dg_damp_tend = -1, id_dg_damp_gate = -1, id_dg_damp_held = -1, &
+             id_dg_damp_tend = -1, id_dg_damp_gate = -1, &
+             id_dg_damp_want = -1, id_dg_damp_got = -1, &
              id_ground_frac = -1, id_basal_tr_dfrac = -1, id_col_thick = -1, id_OD_av = -1, &
              id_f_ground_cell = -1, id_f_ground_node = -1, &
              id_u_mask = -1, id_v_mask = -1, id_ufb_mask =-1, id_vfb_mask = -1, id_t_mask = -1, &
@@ -1071,7 +1074,8 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     ! diagnostics are registered against those flags later, once they are known.
     allocate(CS%dg_damp_tend(isd:ied,jsd:jed), source=0.0)
     allocate(CS%dg_damp_gate(isd:ied,jsd:jed), source=0.0)
-    allocate(CS%dg_damp_held(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_damp_want(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_damp_got(isd:ied,jsd:jed), source=0.0)
     allocate(CS%f_ground_node(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%f_ground_cell(isd:ied,jsd:jed), source=0.0)
     allocate(CS%H_node(IsdB:IedB,JsdB:JedB), source=0.0)
@@ -2058,10 +2062,17 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          CS%diag%axesT1, Time, 'largest gate fraction the DG(1) mode damper opened in a '//&
          'cell over its three modes; 0 shut, 1 saturated. Says WHERE the term wants to act, '//&
          'as against dg_mode_damp_tend which says how much it actually does', 'none')
-      CS%id_dg_damp_held = register_diag_field('ice_shelf_model','dg_mode_damp_held', &
-         CS%diag%axesT1, Time, 'fraction of the rate the gate asked for that was withheld '//&
-         'because the transport already delivers it, under DG1_TILT_DAMP_ADVECTIVE; 0 the '//&
-         'term supplies everything, 1 the flow is fast enough that it supplies nothing', 'none')
+      CS%id_dg_damp_want = register_diag_field('ice_shelf_model','dg_mode_damp_rate_want', &
+         CS%diag%axesT1, Time, 'rate the DG(1) mode damper''s gate asked for, summed over its '//&
+         'three modes, before the transport''s share is credited. Zero exactly where the gate '//&
+         'is shut', 's-1', conversion=US%s_to_T)
+      CS%id_dg_damp_got = register_diag_field('ice_shelf_model','dg_mode_damp_rate_got', &
+         CS%diag%axesT1, Time, 'rate the DG(1) mode damper actually delivered, summed over its '//&
+         'three modes. Its ratio to dg_mode_damp_rate_want is the share the term supplied and '//&
+         'the complement is what DG1_TILT_DAMP_ADVECTIVE credited to the flow; posting the two '//&
+         'rates rather than the ratio is what makes that share correct under time averaging, '//&
+         'since a ratio averaged over steps when the gate was shut is pulled toward zero by '//&
+         'them', 's-1', conversion=US%s_to_T)
     endif
 
     CS%id_ground_frac = register_diag_field('ice_shelf_model','ice_ground_frac',CS%diag%axesT1, Time, &
@@ -2715,7 +2726,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
     endif
     if (CS%id_dg_damp_tend > 0) call post_data(CS%id_dg_damp_tend, CS%dg_damp_tend, CS%diag)
     if (CS%id_dg_damp_gate > 0) call post_data(CS%id_dg_damp_gate, CS%dg_damp_gate, CS%diag)
-    if (CS%id_dg_damp_held > 0) call post_data(CS%id_dg_damp_held, CS%dg_damp_held, CS%diag)
+    if (CS%id_dg_damp_want > 0) call post_data(CS%id_dg_damp_want, CS%dg_damp_want, CS%diag)
+    if (CS%id_dg_damp_got > 0) call post_data(CS%id_dg_damp_got, CS%dg_damp_got, CS%diag)
     if (CS%id_ground_frac > 0) call post_data(CS%id_ground_frac, CS%ground_frac, CS%diag)
     if (CS%id_f_ground_cell > 0) call post_data(CS%id_f_ground_cell, CS%f_ground_cell, CS%diag)
     if (CS%id_f_ground_node > 0) call post_data(CS%id_f_ground_node, CS%f_ground_node, CS%diag)
@@ -10510,7 +10522,8 @@ subroutine ice_shelf_dyn_end(CS)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
   if (associated(CS%dg_damp_tend)) deallocate(CS%dg_damp_tend)
   if (associated(CS%dg_damp_gate)) deallocate(CS%dg_damp_gate)
-  if (associated(CS%dg_damp_held)) deallocate(CS%dg_damp_held)
+  if (associated(CS%dg_damp_want)) deallocate(CS%dg_damp_want)
+  if (associated(CS%dg_damp_got)) deallocate(CS%dg_damp_got)
   if (associated(CS%basal_gate)) deallocate(CS%basal_gate)
   if (associated(CS%basal_tr_dfrac)) deallocate(CS%basal_tr_dfrac)
   if (associated(CS%Jac)) deallocate(CS%Jac)
@@ -16121,9 +16134,11 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed
 
   T_node(:,:,:,:) = 0.0
-  diag_on = (CS%id_dg_damp_tend > 0) .or. (CS%id_dg_damp_gate > 0) .or. (CS%id_dg_damp_held > 0)
+  diag_on = (CS%id_dg_damp_tend > 0) .or. (CS%id_dg_damp_gate > 0) .or. &
+            (CS%id_dg_damp_want > 0) .or. (CS%id_dg_damp_got > 0)
   if (diag_on) then
-    CS%dg_damp_tend(:,:) = 0.0 ; CS%dg_damp_gate(:,:) = 0.0 ; CS%dg_damp_held(:,:) = 0.0
+    CS%dg_damp_tend(:,:) = 0.0 ; CS%dg_damp_gate(:,:) = 0.0
+    CS%dg_damp_want(:,:) = 0.0 ; CS%dg_damp_got(:,:) = 0.0
   endif
   if (.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)) return
 
@@ -16378,7 +16393,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     if (diag_on) then
       CS%dg_damp_tend(i,j) = sqrt(d_l2)
       CS%dg_damp_gate(i,j) = d_gate
-      if (d_want > 0.0) CS%dg_damp_held(i,j) = max(0.0, 1.0 - d_got/d_want)
+      CS%dg_damp_want(i,j) = d_want ; CS%dg_damp_got(i,j) = d_got
     endif
   enddo ; enddo
 
