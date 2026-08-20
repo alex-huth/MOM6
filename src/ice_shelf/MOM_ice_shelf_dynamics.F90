@@ -13443,7 +13443,18 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "MISMIP3d Stnd at 10 km, which is uniform in y and forces no "//&
                  "jump-invisible mode at all, reach 0 leaves the four cells around the "//&
                  "grounding line carrying essentially all of the term's work and moves "//&
-                 "the steady grounding line 30 km seaward of the undamped run.", &
+                 "the steady grounding line 30 km seaward of the undamped run; reach 1 "//&
+                 "cuts that work sevenfold and reach 2 by a factor of 500. Reach 0 also "//&
+                 "asks a question one cell cannot answer robustly. It can only test "//&
+                 "whether the grounded fraction is fractional, and that fraction is "//&
+                 "counted at sub-quadrature points which sit INSIDE the sub-cells, so a "//&
+                 "flotation contour lying within about a tenth of a cell of a face flips "//&
+                 "no sub-point and the fraction steps cleanly from one to zero with "//&
+                 "nothing bisected anywhere. The protection then vanishes for as long as "//&
+                 "the grounding line rests there, which at a steady state is the whole "//&
+                 "run. Reach 1 and 2 instead ask whether the window spans both grounded "//&
+                 "and floating content, which is the same question asked of data that "//&
+                 "can answer it.", &
                  default=1, do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
   if ((CS%dg_damp_gl_reach < 0) .or. (CS%dg_damp_gl_reach > 2)) call MOM_error(FATAL, &
     "DG1_TILT_DAMP_GL_REACH must be 0, 1 or 2.")
@@ -15837,22 +15848,30 @@ end function dg_unexplained
 !! The reach is not a tunable band but the reach of an operator.  Level 1 is
 !! the cells whose TILT enters A, level 2 those whose MEAN enters A_ref, both
 !! following whichever bias the detector selected; level 0 is the cell alone.
-pure function dg_gl_reach_wt(gw, mode, reach) result(wt)
-  real, dimension(-4:4), intent(in) :: gw !< Per-cell protection weight on the gather [nondim]
+pure function dg_gl_reach_wt(fv, mode, reach) result(wt)
+  real, dimension(-4:4), intent(in) :: fv !< Grounded fraction on the gather [nondim]
   integer, intent(in) :: mode  !< Stencil chosen: 1 centred, 2 forward, 3 backward
   integer, intent(in) :: reach !< 0 the cell alone, 1 the reach of A, 2 the reach of A_ref
   real :: wt                   !< Weight to apply to the rate [nondim]
   ! Offsets each operator reads, by stencil: A is a second difference and
   ! A_ref its own second difference of a first difference, two cells wider.
+  ! Every cell in either window is ice-covered by construction, since that is
+  ! what the detector's admissibility test guarantees before a bias is chosen.
   integer, dimension(3), parameter :: Alo = (/ -1, 0, -2 /), Ahi = (/ 1, 2, 0 /)
   integer, dimension(3), parameter :: Rlo = (/ -2, 0, -4 /), Rhi = (/ 2, 4, 0 /)
+  integer :: lo, hi
   if (reach <= 0) then
-    wt = gw(0)
+    ! The cell alone, which can only ask whether the fraction is fractional.
+    wt = merge(0.0, 1.0, (fv(0) > 0.0) .and. (fv(0) < 1.0))
+    return
   elseif (reach == 1) then
-    wt = minval(gw(Alo(mode):Ahi(mode)))
+    lo = Alo(mode) ; hi = Ahi(mode)
   else
-    wt = minval(gw(Rlo(mode):Rhi(mode)))
+    lo = Rlo(mode) ; hi = Rhi(mode)
   endif
+  ! A window that contains both grounded and floating content has a grounding
+  ! line in it, whether or not any single cell reports a fractional value.
+  wt = merge(0.0, 1.0, (minval(fv(lo:hi)) < 1.0) .and. (maxval(fv(lo:hi)) > 0.0))
 end function dg_gl_reach_wt
 
 !> Damp the grid-scale component of the in-cell tilt and twist degrees of freedom.
@@ -15985,7 +16004,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real :: href_d   ! Gate-normalizing thickness for the direction in hand [Z ~> m]
   real :: href_w   ! Gate-normalizing thickness for the twist stencil [Z ~> m]
   real, dimension(-4:4) :: tv, bv, hv ! Stencil gathers of tilt, bed tilt and mean
-  real, dimension(-4:4) :: gv         ! Stencil gather of the grounding-line weight [nondim]
+  real, dimension(-4:4) :: gv         ! Stencil gather of the grounded fraction [nondim]
   logical, dimension(-4:4) :: okv     ! Stencil gather of usability
   logical :: det_ok ! True if the detector found an admissible stencil
   integer :: dmode  ! Stencil the detector chose: 1 centred, 2 forward, 3 backward
@@ -15994,7 +16013,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   integer :: k, kk, kj, jj ! Stencil offsets, and the clamped array indices
   ! Twist gathers, over the 7x7 block the biased cross difference can reach.
   real, dimension(-4:4,-4:4) :: ww, bw, hw ! Twist, bed twist, cell mean
-  real, dimension(-4:4) :: gwx, gwy        ! Grounding-line weight along each axis [nondim]
+  real, dimension(-4:4) :: gwx, gwy        ! Grounded fraction along each axis [nondim]
   logical, dimension(-4:4,-4:4) :: okw     ! Usability
   real, dimension(-4:4) :: wrx, wry ! Mean-supported twist along each axis [Z ~> m]
   integer :: bx, by, m              ! Bias along xi, along eta, and the trial index
@@ -16019,8 +16038,6 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real :: one_m_r  ! 1 - rho_i/rho_w, the floating-ice ds/dh [nondim]
   real, dimension(SZDI_(G),SZDJ_(G)) :: f_gnd !< Sub-element grounded fraction,
                    !! taken from CS%ground_frac rather than reconstructed here
-  real, dimension(SZDI_(G),SZDJ_(G)) :: gl_wt !< Zero where the flotation
-                   !! contour crosses the cell, one elsewhere
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed
 
   T_node(:,:,:,:) = 0.0
@@ -16053,7 +16070,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   ! tilts are restricted below, because they index bed_node one further out.
   hbar_c(:,:) = 0.0 ; ice_ok(:,:) = .false.
   t_xi(:,:) = 0.0 ; t_eta(:,:) = 0.0 ; w_c(:,:) = 0.0
-  f_gnd(:,:) = 0.0 ; gl_wt(:,:) = 0.0
+  f_gnd(:,:) = 0.0
   do j = jsd, jed ; do i = isd, ied
     hbar_c(i,j) = 0.25*((h_nodal_in(i,j,1,1) + h_nodal_in(i,j,2,2)) + &
                         (h_nodal_in(i,j,2,1) + h_nodal_in(i,j,1,2)))
@@ -16070,7 +16087,6 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     ! any second opinion would disagree with the friction and the driving stress
     ! about where the grounding line is.
     f_gnd(i,j) = min(max(CS%ground_frac(i,j), 0.0), 1.0)
-    gl_wt(i,j) = merge(0.0, 1.0, (f_gnd(i,j) > 0.0) .and. (f_gnd(i,j) < 1.0))
   enddo ; enddo
 
   ! Bed tilts index bed_node one cell beyond the host cell, so they stop one
@@ -16121,7 +16137,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         kk = min(max(i+k, isd), ied)
         okv(k) = ice_ok(kk,j) .and. (i+k >= isd) .and. (i+k <= ied)
         tv(k) = t_xi(kk,j) ; bv(k) = b_xi(kk,j) ; hv(k) = hbar_c(kk,j)
-        gv(k) = gl_wt(kk,j)
+        gv(k) = f_gnd(kk,j)
       enddo
       call dg_tilt_detector_1d(tv, bv, hv, okv, A_h, A_bed, A_ref, href_d, det_ok, dmode)
       gwt = dg_gl_reach_wt(gv, max(dmode,1), CS%dg_damp_gl_reach)
@@ -16153,7 +16169,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         kk = min(max(j+k, jsd), jed)
         okv(k) = ice_ok(i,kk) .and. (j+k >= jsd) .and. (j+k <= jed)
         tv(k) = t_eta(i,kk) ; bv(k) = b_eta(i,kk) ; hv(k) = hbar_c(i,kk)
-        gv(k) = gl_wt(i,kk)
+        gv(k) = f_gnd(i,kk)
       enddo
       call dg_tilt_detector_1d(tv, bv, hv, okv, A_h, A_bed, A_ref, href_d, det_ok, dmode)
       gwt = dg_gl_reach_wt(gv, max(dmode,1), CS%dg_damp_gl_reach)
@@ -16183,8 +16199,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         okw(k,kj) = ice_ok(kk,jj) .and. ((i+k >= isd) .and. (i+k <= ied)) &
                                   .and. ((j+kj >= jsd) .and. (j+kj <= jed))
         ww(k,kj) = w_c(kk,jj) ; bw(k,kj) = b_w(kk,jj) ; hw(k,kj) = hbar_c(kk,jj)
-        if (kj == 0) gwx(k) = gl_wt(kk,jj)
-        if (k == 0) gwy(kj) = gl_wt(kk,jj)
+        if (kj == 0) gwx(k) = f_gnd(kk,jj)
+        if (k == 0) gwy(kj) = f_gnd(kk,jj)
       enddo ; enddo
 
       ! The 2D detector separates, A_w = (A_xi(w) + A_eta(w))/2, so each axis
