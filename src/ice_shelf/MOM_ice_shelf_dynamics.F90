@@ -16493,10 +16493,32 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   if (CS%dg_hierarchical_lim) call nodal_surface_slope_limit(CS, G, ISS)
   call pass_corner_field(CS%h_nodal, G)
   call DG1_nodal_spatial_operator(CS, G, hmask, CS%h_nodal, rhs, uh_ice, vh_ice, time_step)
-  ! The relaxation sits inside a feedback loop closed by an elliptic velocity
-  ! solve, which has no lag, so a time constant of a few steps rings rather than
-  ! simply converging faster. Warn once; this is not a stability bound (the
-  ! 0.5/dt rate cap covers that) but the practical floor.
+  ! Two independent floors on the delivered relaxation time, warned once each.
+  ! Neither is a stability bound: the 0.5/dt rate cap covers stability outright.
+  !
+  ! (a) The cap itself. Once tau falls below the advection step the cap binds and
+  !     the DELIVERED relaxation time is the advection step, not the tau that was
+  !     asked for. Lowering tau further then changes nothing, so a tau ladder goes
+  !     flat for a reason that has nothing to do with the solution. Sharp, and
+  !     with no free constant in it.
+  !
+  ! (b) Ringing against the velocity solve. The damper acts continuously while the
+  !     velocity, and so the transport's feedback on the tilt, is frozen for one
+  !     ICE_VELOCITY_TIMESTEP. Linearising that as
+  !     dt/ds = -t/tau + lam*t(s-T) and putting z = i*w in its characteristic
+  !     equation gives w = sqrt(lam^2 - 1/tau^2) and w*T = 2*pi - arccos(1/(lam*tau)),
+  !     from which two things follow. Oscillation requires lam > 1/tau: a damper
+  !     faster than the feedback cannot ring, and the frozen interval on its own is
+  !     a pure decay. Once that is met the critical lag is a FEW tau, not tens --
+  !     3.0 tau at lam*tau = 2, 1.3 at 4, 0.6 at 8. The gain lam is the
+  !     tilt -> surface -> velocity -> flux-divergence loop and is configuration
+  !     dependent, so the margin below is empirical; a factor of ten covers gains
+  !     up to about 8/tau.
+  !
+  ! The velocity step is the right clock for (b), not the advection step. Testing
+  ! against the advection step, as this did, is permissive by exactly the ratio of
+  ! the two, which is why the old threshold had to be set at 50 advection steps to
+  ! catch anything at all.
   if ((CS%dg_tilt_damp .or. CS%dg_twist_damp) .and. .not.CS%dg_tilt_damp_dt_warned) then
     ! With U_CUT set the relaxation time varies by cell and by direction, so the
     ! binding one is the smallest: tau = dx/(2*c*U_CUT), minimised over the
@@ -16514,17 +16536,28 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
     ! unconditionally and the enclosing test is on parameters, so there is no
     ! path where some ranks enter the reduction and others do not.
     call min_across_PEs(tau_chk)
-    ! Root only.  Warning from every rank at once is what overwhelms the error
+    ! Root only.  A warning from every rank at once is what overwhelms the error
     ! handler on a large decomposition, and the message is identical on all of
     ! them now that the minimum is global.
-    if ((tau_chk < 50.0*time_step) .and. is_root_pe()) then
-      write(mesg,'("The mode damper''s shortest relaxation time anywhere is ",ES10.3, &
-                 &" s, only ",F8.1," advection steps. Below ~50 the elliptic velocity "//&
-                 "solve, which has no lag, rings against the relaxation; expect a "//&
-                 "fluctuating steady state. Note the binding lag is actually "//&
-                 "ICE_VELOCITY_TIMESTEP, which is the longer of the two.")') &
-        tau_chk, tau_chk/time_step
-      call MOM_error(WARNING, trim(mesg))
+    if (is_root_pe()) then
+      if (tau_chk < time_step) then
+        write(mesg,'("The mode damper''s shortest relaxation time anywhere, ",ES10.3, &
+                   &" s, is below the advection step of ",ES10.3," s. The 0.5/dt rate "//&
+                   "cap therefore binds and the DELIVERED relaxation time is the "//&
+                   "advection step, not the one requested. Lowering it further will "//&
+                   "change nothing.")') tau_chk, time_step
+        call MOM_error(WARNING, trim(mesg))
+      endif
+      if (tau_chk < 10.0*CS%velocity_update_time_step) then
+        write(mesg,'("The mode damper''s shortest relaxation time anywhere, ",ES10.3, &
+                   &" s, is only ",F7.2," ICE_VELOCITY_TIMESTEPs. The velocity is frozen "//&
+                   "between updates while the damper keeps acting, and that lag rings "//&
+                   "once the relaxation is within a few times it; expect a fluctuating "//&
+                   "steady state. Lengthen the relaxation or shorten "//&
+                   "ICE_VELOCITY_TIMESTEP -- these are different fixes.")') &
+          tau_chk, tau_chk/CS%velocity_update_time_step
+        call MOM_error(WARNING, trim(mesg))
+      endif
     endif
     CS%dg_tilt_damp_dt_warned = .true.
   endif
