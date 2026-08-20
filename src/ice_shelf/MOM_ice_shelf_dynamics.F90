@@ -571,6 +571,14 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! damping reaches full strength [nondim].
   logical :: dg_twist_damp        !< If true, damp the grid-scale component of the DG(1)
                                   !! in-cell xy-twist degree of freedom.
+  real, pointer, dimension(:,:) :: dg_damp_tend => NULL() !< Rate at which the mode damper is
+                                  !! removing in-cell thickness structure, as the L2 norm over
+                                  !! the cell of the correction it applies [Z T-1 ~> m s-1].
+  real, pointer, dimension(:,:) :: dg_damp_gate => NULL() !< Largest gate fraction the mode
+                                  !! damper opened in a cell, over its three modes [nondim].
+  real, pointer, dimension(:,:) :: dg_damp_held => NULL() !< Fraction of the rate the gate asked
+                                  !! for that was withheld because the transport already
+                                  !! delivers it; zero unless DG1_TILT_DAMP_ADVECTIVE [nondim].
   logical :: dg_damp_advective    !< If true, the mode damper subtracts the removal rate the
                                   !! transport already delivers, so it acts only where the
                                   !! flow is too slow to remove the mode unaided.
@@ -810,6 +818,7 @@ type, public :: ice_shelf_dyn_CS ; private
   !>@{ Diagnostic handles
   integer :: id_u_shelf = -1, id_v_shelf = -1, id_shelf_speed, id_t_shelf = -1, &
              id_taudx_shelf = -1, id_taudy_shelf = -1, id_taud_shelf = -1, id_bed_elev = -1, &
+             id_dg_damp_tend = -1, id_dg_damp_gate = -1, id_dg_damp_held = -1, &
              id_ground_frac = -1, id_basal_tr_dfrac = -1, id_col_thick = -1, id_OD_av = -1, &
              id_f_ground_cell = -1, id_f_ground_node = -1, &
              id_u_mask = -1, id_v_mask = -1, id_ufb_mask =-1, id_vfb_mask = -1, id_t_mask = -1, &
@@ -1057,6 +1066,12 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%area_node(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%OD_av(isd:ied,jsd:jed), source=0.0)
     allocate(CS%ground_frac(isd:ied,jsd:jed), source=0.0)
+    ! Unconditionally: this runs before read_nodal_limiter_params, so the
+    ! damper's own flags are not set yet and cannot be tested here.  The
+    ! diagnostics are registered against those flags later, once they are known.
+    allocate(CS%dg_damp_tend(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_damp_gate(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_damp_held(isd:ied,jsd:jed), source=0.0)
     allocate(CS%f_ground_node(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%f_ground_cell(isd:ied,jsd:jed), source=0.0)
     allocate(CS%H_node(IsdB:IedB,JsdB:JedB), source=0.0)
@@ -2033,6 +2048,22 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
        'mask for u-nodes', 'none')
     CS%id_v_mask = register_diag_field('ice_shelf_model','v_mask',CS%diag%axesB1, Time, &
        'mask for v-nodes', 'none')
+    if ((CS%dg_tilt_damp .or. CS%dg_twist_damp) .and. associated(CS%dg_damp_tend)) then
+      CS%id_dg_damp_tend = register_diag_field('ice_shelf_model','dg_mode_damp_tend', &
+         CS%diag%axesT1, Time, 'rate at which the DG(1) mode damper is removing in-cell '//&
+         'thickness structure, as the L2 norm over the cell of the correction it applies; '//&
+         'zero wherever the term is inactive, and directly comparable with a melt rate', &
+         'm s-1', conversion=US%Z_to_m*US%s_to_T)
+      CS%id_dg_damp_gate = register_diag_field('ice_shelf_model','dg_mode_damp_gate', &
+         CS%diag%axesT1, Time, 'largest gate fraction the DG(1) mode damper opened in a '//&
+         'cell over its three modes; 0 shut, 1 saturated. Says WHERE the term wants to act, '//&
+         'as against dg_mode_damp_tend which says how much it actually does', 'none')
+      CS%id_dg_damp_held = register_diag_field('ice_shelf_model','dg_mode_damp_held', &
+         CS%diag%axesT1, Time, 'fraction of the rate the gate asked for that was withheld '//&
+         'because the transport already delivers it, under DG1_TILT_DAMP_ADVECTIVE; 0 the '//&
+         'term supplies everything, 1 the flow is fast enough that it supplies nothing', 'none')
+    endif
+
     CS%id_ground_frac = register_diag_field('ice_shelf_model','ice_ground_frac',CS%diag%axesT1, Time, &
        'fraction of cell that is grounded; under GL_regularize this is the fraction of '//&
        'sub-cell quadrature points whose draft sits below the bed', 'none')
@@ -2682,6 +2713,9 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       enddo ; enddo
       call post_data(CS%id_surf_slope_mag_shelf, surf_slope, CS%diag)
     endif
+    if (CS%id_dg_damp_tend > 0) call post_data(CS%id_dg_damp_tend, CS%dg_damp_tend, CS%diag)
+    if (CS%id_dg_damp_gate > 0) call post_data(CS%id_dg_damp_gate, CS%dg_damp_gate, CS%diag)
+    if (CS%id_dg_damp_held > 0) call post_data(CS%id_dg_damp_held, CS%dg_damp_held, CS%diag)
     if (CS%id_ground_frac > 0) call post_data(CS%id_ground_frac, CS%ground_frac, CS%diag)
     if (CS%id_f_ground_cell > 0) call post_data(CS%id_f_ground_cell, CS%f_ground_cell, CS%diag)
     if (CS%id_f_ground_node > 0) call post_data(CS%id_f_ground_node, CS%f_ground_node, CS%diag)
@@ -10474,6 +10508,9 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_lim_phi))        deallocate(CS%dg_lim_phi)
   if (associated(CS%dg_lim_pk_factor))  deallocate(CS%dg_lim_pk_factor)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
+  if (associated(CS%dg_damp_tend)) deallocate(CS%dg_damp_tend)
+  if (associated(CS%dg_damp_gate)) deallocate(CS%dg_damp_gate)
+  if (associated(CS%dg_damp_held)) deallocate(CS%dg_damp_held)
   if (associated(CS%basal_gate)) deallocate(CS%basal_gate)
   if (associated(CS%basal_tr_dfrac)) deallocate(CS%basal_tr_dfrac)
   if (associated(CS%Jac)) deallocate(CS%Jac)
@@ -16047,6 +16084,12 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real :: A_dmp     ! The part of the detector the correction actually removes [Z ~> m]
   real :: knat_xi, knat_eta ! Removal rate the transport already delivers on each axis [T-1 ~> s-1]
   real :: kwant     ! Rate the gate asks for, before the transport's share [T-1 ~> s-1]
+  real :: d_l2      ! Sum of squares of the per-mode corrections, for the activity
+                    !! diagnostic [Z2 T-2 ~> m2 s-2]
+  real :: d_gate    ! Largest gate opened in this cell, over the three modes [nondim]
+  real :: d_want, d_got ! Rates summed over the modes, before and after the transport's
+                    !! share, for the withheld-fraction diagnostic [T-1 ~> s-1]
+  logical :: diag_on ! True if any of the three activity diagnostics is registered
   integer :: k, kk, kj, jj ! Stencil offsets, and the clamped array indices
   ! Twist gathers, over the 7x7 block the biased cross difference can reach.
   real, dimension(-4:4,-4:4) :: ww, bw, hw ! Twist, bed twist, cell mean
@@ -16078,6 +16121,10 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed
 
   T_node(:,:,:,:) = 0.0
+  diag_on = (CS%id_dg_damp_tend > 0) .or. (CS%id_dg_damp_gate > 0) .or. (CS%id_dg_damp_held > 0)
+  if (diag_on) then
+    CS%dg_damp_tend(:,:) = 0.0 ; CS%dg_damp_gate(:,:) = 0.0 ; CS%dg_damp_held(:,:) = 0.0
+  endif
   if (.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)) return
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
@@ -16145,6 +16192,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     if (hmask(i,j) /= 1.0) cycle
     href = hbar_c(i,j)
     if (href <= 0.0) cycle
+    d_l2 = 0.0 ; d_gate = 0.0 ; d_want = 0.0 ; d_got = 0.0
 
     ! The gate is normalized by the MEAN cell thickness over whichever stencil
     ! the detector ended up using, returned by dg_tilt_detector_1d, rather than
@@ -16212,6 +16260,11 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         T_node(i,j,1,2) = T_node(i,j,1,2) + 0.5*kap*A_dmp
         T_node(i,j,2,1) = T_node(i,j,2,1) - 0.5*kap*A_dmp
         T_node(i,j,2,2) = T_node(i,j,2,2) - 0.5*kap*A_dmp
+        if (diag_on) then
+          d_l2 = d_l2 + ((kap*A_dmp)**2) / 12.0
+          d_gate = max(d_gate, gam) ; d_want = d_want + kwant
+          d_got = d_got + kap
+        endif
       endif
     endif
 
@@ -16242,6 +16295,11 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         T_node(i,j,2,1) = T_node(i,j,2,1) + 0.5*kap*A_dmp
         T_node(i,j,1,2) = T_node(i,j,1,2) - 0.5*kap*A_dmp
         T_node(i,j,2,2) = T_node(i,j,2,2) - 0.5*kap*A_dmp
+        if (diag_on) then
+          d_l2 = d_l2 + ((kap*A_dmp)**2) / 12.0
+          d_gate = max(d_gate, gam) ; d_want = d_want + kwant
+          d_got = d_got + kap
+        endif
       endif
     endif
 
@@ -16309,7 +16367,18 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         T_node(i,j,2,2) = T_node(i,j,2,2) - 0.25*kap*A_dmp
         T_node(i,j,2,1) = T_node(i,j,2,1) + 0.25*kap*A_dmp
         T_node(i,j,1,2) = T_node(i,j,1,2) + 0.25*kap*A_dmp
+        if (diag_on) then
+          d_l2 = d_l2 + ((kap*A_dmp)**2) / 144.0
+          d_gate = max(d_gate, gam) ; d_want = d_want + kwant
+          d_got = d_got + kap
+        endif
       endif
+    endif
+
+    if (diag_on) then
+      CS%dg_damp_tend(i,j) = sqrt(d_l2)
+      CS%dg_damp_gate(i,j) = d_gate
+      if (d_want > 0.0) CS%dg_damp_held(i,j) = max(0.0, 1.0 - d_got/d_want)
     endif
   enddo ; enddo
 
