@@ -15696,7 +15696,9 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, wv, ok, A, A_bed, A_ref, href, w
   real,    intent(out) :: A_bed !< The same operator on the bed [Z ~> m]
   real,    intent(out) :: A_ref !< The same operator on the mean-supported tilt [Z ~> m]
   real,    intent(out) :: href  !< Mean thickness over the stencil used [Z ~> m]
-  real,    intent(out) :: wmin  !< Smallest grounding-line weight the stencil read [nondim]
+  real,    intent(out) :: wmin  !< Smallest grounding-line weight over the FULL
+                                !! reach of the chosen stencil, the reference
+                                !! included [nondim]
   logical, intent(out) :: valid !< False if no admissible stencil exists
 
   real :: rm, r0, rp  ! Mean-supported tilt at the three stencil cells [Z ~> m]
@@ -15709,21 +15711,21 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, wv, ok, A, A_bed, A_ref, href, w
     rm = 0.5*(hv(0) - hv(-2)) ; r0 = 0.5*(hv(1) - hv(-1)) ; rp = 0.5*(hv(2) - hv(0))
     A_ref = r0 - 0.5*(rm + rp)
     href  = ((hv(-1) + hv(0)) + hv(1)) / 3.0
-    wmin  = min(min(wv(-1), wv(0)), wv(1))
+    wmin  = minval(wv(-2:2))
   elseif (all(ok(0:3))) then                    ! forward
     A     = 0.5*(tv(0) - 2.0*tv(1) + tv(2))
     A_bed = 0.5*(bv(0) - 2.0*bv(1) + bv(2))
     r0 = hv(1) - hv(0) ; rm = hv(2) - hv(1) ; rp = hv(3) - hv(2)
     A_ref = 0.5*(r0 - 2.0*rm + rp)
     href  = ((hv(0) + hv(1)) + hv(2)) / 3.0
-    wmin  = min(min(wv(0), wv(1)), wv(2))
+    wmin  = minval(wv(0:3))
   elseif (all(ok(-3:0))) then                   ! backward
     A     = 0.5*(tv(0) - 2.0*tv(-1) + tv(-2))
     A_bed = 0.5*(bv(0) - 2.0*bv(-1) + bv(-2))
     r0 = hv(0) - hv(-1) ; rm = hv(-1) - hv(-2) ; rp = hv(-2) - hv(-3)
     A_ref = 0.5*(r0 - 2.0*rm + rp)
     href  = ((hv(0) + hv(-1)) + hv(-2)) / 3.0
-    wmin  = min(min(wv(0), wv(-1)), wv(-2))
+    wmin  = minval(wv(-3:0))
   else
     valid = .false.
   endif
@@ -15870,6 +15872,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   ! Offsets a bias reaches: S for the second difference, F for the first.
   integer, dimension(3), parameter :: Slo = (/ -2, 0, -3 /), Shi = (/ 2, 3, 0 /)
   integer, dimension(3), parameter :: Flo = (/ -1, 0, -1 /), Fhi = (/  1, 1, 0 /)
+  ! The two NON-centre cells the second difference uses, for the stencil mean.
+  integer, dimension(3), parameter :: Elo = (/ -1, 1, -1 /), Ehi = (/  1, 2, -2 /)
   ! Trial order: centred in both axes first, then centred in one, then neither.
   integer, dimension(9), parameter :: bx_try = (/ 1,1,1, 2,3, 2,2,3,3 /)
   integer, dimension(9), parameter :: by_try = (/ 1,2,3, 1,1, 2,3,2,3 /)
@@ -15914,41 +15918,44 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
 
   ! Cell means on the full halo: the mean-supported tilt below reads one cell
   ! either way, and its own Laplacian reads one further.
+  ! Everything that needs only cell-local data is built on the FULL halo, so
+  ! that a stencil reaching the outermost ring reads real values.  Only the bed
+  ! tilts are restricted below, because they index bed_node one further out.
   hbar_c(:,:) = 0.0 ; ice_ok(:,:) = .false.
+  t_xi(:,:) = 0.0 ; t_eta(:,:) = 0.0 ; w_c(:,:) = 0.0
+  f_gnd(:,:) = 0.0 ; gl_wt(:,:) = 0.0
   do j = jsd, jed ; do i = isd, ied
     hbar_c(i,j) = 0.25*((h_nodal_in(i,j,1,1) + h_nodal_in(i,j,2,2)) + &
                         (h_nodal_in(i,j,2,1) + h_nodal_in(i,j,1,2)))
     ice_ok(i,j) = (hmask(i,j) == 1.0)
-  enddo ; enddo
-
-  ! Tilts and the flotation branch: the Laplacians below reach one cell either
-  ! way, so everything here is needed on isc-1:iec+1 / jsc-1:jec+1.
-  t_xi(:,:) = 0.0 ; t_eta(:,:) = 0.0
-  b_xi(:,:) = 0.0 ; b_eta(:,:) = 0.0
-  w_c(:,:) = 0.0 ; b_w(:,:) = 0.0
-  f_gnd(:,:) = 0.0 ; gl_wt(:,:) = 0.0
-  do j = jsd+1, jed-1 ; do i = isd+1, ied-1
-    if (CS%dg_twist_damp) then
-      w_c(i,j) = (h_nodal_in(i,j,2,2) - h_nodal_in(i,j,1,2)) - &
-                 (h_nodal_in(i,j,2,1) - h_nodal_in(i,j,1,1))
-      b_w(i,j) = (CS%bed_node(I,J) - CS%bed_node(I-1,J)) - &
-                 (CS%bed_node(I,J-1) - CS%bed_node(I-1,J-1))
-    endif
     t_xi(i,j)  = 0.5*((h_nodal_in(i,j,2,1) - h_nodal_in(i,j,1,1)) + &
                       (h_nodal_in(i,j,2,2) - h_nodal_in(i,j,1,2)))
     t_eta(i,j) = 0.5*((h_nodal_in(i,j,1,2) - h_nodal_in(i,j,1,1)) + &
                       (h_nodal_in(i,j,2,2) - h_nodal_in(i,j,2,1)))
-    b_xi(i,j)  = 0.5*((CS%bed_node(I,J-1) - CS%bed_node(I-1,J-1)) + &
-                      (CS%bed_node(I,J)   - CS%bed_node(I-1,J)))
-    b_eta(i,j) = 0.5*((CS%bed_node(I-1,J) - CS%bed_node(I-1,J-1)) + &
-                      (CS%bed_node(I,J)   - CS%bed_node(I,J-1)))
-
+    if (CS%dg_twist_damp) &
+      w_c(i,j) = (h_nodal_in(i,j,2,2) - h_nodal_in(i,j,1,2)) - &
+                 (h_nodal_in(i,j,2,1) - h_nodal_in(i,j,1,1))
     ! The sub-element grounded fraction, measured on this same nodal state by
     ! the SEP2/SEP3 partition in compute_ground_frac.  Not reconstructed here:
     ! any second opinion would disagree with the friction and the driving stress
     ! about where the grounding line is.
     f_gnd(i,j) = min(max(CS%ground_frac(i,j), 0.0), 1.0)
     gl_wt(i,j) = abs(2.0*f_gnd(i,j) - 1.0)
+  enddo ; enddo
+
+  ! Bed tilts index bed_node one cell beyond the host cell, so they stop one
+  ! ring short of the halo edge.  The outermost ring is never read by a selected
+  ! stencil: the biased branches that would reach it are exactly the ones the
+  ! range test rejects there.
+  b_xi(:,:) = 0.0 ; b_eta(:,:) = 0.0 ; b_w(:,:) = 0.0
+  do j = jsd+1, jed-1 ; do i = isd+1, ied-1
+    b_xi(i,j)  = 0.5*((CS%bed_node(I,J-1) - CS%bed_node(I-1,J-1)) + &
+                      (CS%bed_node(I,J)   - CS%bed_node(I-1,J)))
+    b_eta(i,j) = 0.5*((CS%bed_node(I-1,J) - CS%bed_node(I-1,J-1)) + &
+                      (CS%bed_node(I,J)   - CS%bed_node(I,J-1)))
+    if (CS%dg_twist_damp) &
+      b_w(i,j) = (CS%bed_node(I,J) - CS%bed_node(I-1,J)) - &
+                 (CS%bed_node(I,J-1) - CS%bed_node(I-1,J-1))
   enddo ; enddo
 
   do j = jsc, jec ; do i = isc, iec
@@ -15975,10 +15982,10 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     dsdh = one_m_r + f_gnd(i,j)*(1.0 - one_m_r)
 
     ! --- xi direction ---
-    ! The detector spans one cell either way, so a cell adjacent to the
-    ! grounding line still reads the break through its stencil; exempt the whole
-    ! stencil.  Nothing in this direction leaves row j, so a neighbouring ROW
-    ! being ice-free is no reason to stop.
+    ! Nothing in this direction leaves row j, so a neighbouring ROW being
+    ! ice-free is no reason to stop.  The grounding-line grading is taken as the
+    ! minimum over the cells the chosen stencil actually read, so it follows the
+    ! bias automatically.
     if (CS%dg_tilt_damp) then
       do k = -3, 3
         kk = min(max(i+k, isd), ied)
@@ -16061,8 +16068,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         A_w_bed = f_gnd(i,j) * &
                   0.5*(dg_d2_biased(bw(:,0), bx) + dg_d2_biased(bw(0,:), by))
         A_w_ref = 0.5*(dg_d2_biased(wrx, bx) + dg_d2_biased(wry, by))
-        href_w  = (hw(0,0) + ((hw(Flo(bx),0) + hw(Fhi(bx),0)) + &
-                              (hw(0,Flo(by)) + hw(0,Fhi(by))))) / 5.0
+        href_w  = (hw(0,0) + ((hw(Elo(bx),0) + hw(Ehi(bx),0)) + &
+                              (hw(0,Elo(by)) + hw(0,Ehi(by))))) / 5.0
         ! Graded grounding-line protection over exactly the cells read.
         wmin = min(minval(gw(Slo(bx):Shi(bx), Flo(by):Fhi(by))), &
                    minval(gw(Flo(bx):Fhi(bx), Slo(by):Shi(by))))
