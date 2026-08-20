@@ -571,6 +571,10 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! damping reaches full strength [nondim].
   logical :: dg_twist_damp        !< If true, damp the grid-scale component of the DG(1)
                                   !! in-cell xy-twist degree of freedom.
+  logical :: dg_damp_advective    !< If true, the mode damper subtracts the removal rate the
+                                  !! transport already delivers, so it acts only where the
+                                  !! flow is too slow to remove the mode unaided.
+  real :: dg_damp_advective_c     !< Coefficient on c*|u_n|/dx in that subtraction [nondim].
   logical :: dg_damp_excess_only  !< If true, the mode damper removes only the part of its
                                   !! detector that no reference explains, rather than the
                                   !! whole detector once a threshold is crossed.
@@ -13416,6 +13420,37 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  default=.false., do_not_log=(.not.CS%use_DG_thickness))
   if (.not.CS%use_DG_thickness) CS%dg_twist_damp = .false.
 
+  call get_param(param_file, mdl, "DG1_TILT_DAMP_ADVECTIVE", CS%dg_damp_advective, &
+                 "If true, the mode damper supplies only the DEFICIT between the rate it "//&
+                 "wants and the rate the transport already delivers, so it switches itself "//&
+                 "off wherever the flow is fast enough to remove the mode unaided. The "//&
+                 "premise that this mode is invisible to every dissipative mechanism is "//&
+                 "true of the face JUMP and false of the OPERATOR: an alternating tilt is "//&
+                 "not an eigenvector, it couples immediately into the cell mean, whose own "//&
+                 "jump at that wavenumber is maximal. Taking the eigenvalues of DG(1) "//&
+                 "upwind advection, the damping rate RISES monotonically with wavenumber "//&
+                 "and reaches its maximum of |u_n|/dx at exactly the grid scale, where the "//&
+                 "tilt's weight in the jump is zero -- the grid-scale tilt is the "//&
+                 "best-damped mode in pure transport, not an undamped one. What is true is "//&
+                 "narrower: that rate is proportional to |u_n|, so it vanishes across a "//&
+                 "confined stream or on stagnant ice, which is a LOCAL gap and not a "//&
+                 "global one. The subtraction is per direction, since the xi damper's "//&
+                 "clock is |u| and the eta damper's is |v|, and across a stream only the "//&
+                 "second one vanishes.", &
+                 default=.false., do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
+
+  call get_param(param_file, mdl, "DG1_TILT_DAMP_ADVECTIVE_C", CS%dg_damp_advective_c, &
+                 "Coefficient on the transport's own removal rate c*|u_n|/dx that "//&
+                 "DG1_TILT_DAMP_ADVECTIVE subtracts. The eigenvalue analysis gives exactly "//&
+                 "1 at the grid scale, but the rate degrades away from it -- 0.67 at "//&
+                 "0.9*pi and 0.33 at 0.75*pi -- and the analysis is one-dimensional, "//&
+                 "constant-coefficient and pure advection, whereas the scheme adds "//&
+                 "SSP-RK2, the artificial viscosity and sources. Below 1 is the "//&
+                 "conservative side: it credits the transport with less than it delivers "//&
+                 "and leaves the term doing more.", &
+                 units="nondim", default=0.5, &
+                 do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
+
   call get_param(param_file, mdl, "DG1_TILT_DAMP_EXCESS_ONLY", CS%dg_damp_excess_only, &
                  "If true, the mode damper removes only the part of its detector that no "//&
                  "reference accounts for, instead of removing the whole detector once the "//&
@@ -16010,6 +16045,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   integer :: dmode  ! Stencil the detector chose: 1 centred, 2 forward, 3 backward
   real :: gwt       ! Grounding-line weight over the reach of that stencil [nondim]
   real :: A_dmp     ! The part of the detector the correction actually removes [Z ~> m]
+  real :: knat_xi, knat_eta ! Removal rate the transport already delivers on each axis [T-1 ~> s-1]
+  real :: kwant     ! Rate the gate asks for, before the transport's share [T-1 ~> s-1]
   integer :: k, kk, kj, jj ! Stencil offsets, and the clamped array indices
   ! Twist gathers, over the 7x7 block the biased cross difference can reach.
   real, dimension(-4:4,-4:4) :: ww, bw, hw ! Twist, bed twist, cell mean
@@ -16127,6 +16164,20 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     ! A_h = A_bed exactly, while a floating cell owes the bed nothing.
     dsdh = one_m_r + f_gnd(i,j)*(1.0 - one_m_r)
 
+    ! The rate the transport itself delivers on each axis.  Cell-centred speed
+    ! from the four B-grid corners, so it carries no staggering of its own; per
+    ! axis, because the xi mode is swept out by u and the eta mode by v, and
+    ! across a confined stream only the second of those vanishes.
+    knat_xi = 0.0 ; knat_eta = 0.0
+    if (CS%dg_damp_advective) then
+      knat_xi = CS%dg_damp_advective_c * G%IdxT(i,j) * 0.25 * &
+                ((abs(CS%u_shelf(I-1,J-1)) + abs(CS%u_shelf(I,J))) + &
+                 (abs(CS%u_shelf(I,J-1))   + abs(CS%u_shelf(I-1,J))))
+      knat_eta = CS%dg_damp_advective_c * G%IdyT(i,j) * 0.25 * &
+                ((abs(CS%v_shelf(I-1,J-1)) + abs(CS%v_shelf(I,J))) + &
+                 (abs(CS%v_shelf(I,J-1))   + abs(CS%v_shelf(I-1,J))))
+    endif
+
     ! --- xi direction ---
     ! Nothing in this direction leaves row j, so a neighbouring ROW being
     ! ice-free is no reason to stop.  The grounding-line protection is taken as
@@ -16155,7 +16206,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       endif
       if (det_ok .and. (excess > 0.0)) then
         gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
-        kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
+        kwant = gam / (2.0*CS%dg_tilt_damp_tau)
+        kap = min(max(kwant - knat_xi, 0.0), rate_cap)
         T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_dmp
         T_node(i,j,1,2) = T_node(i,j,1,2) + 0.5*kap*A_dmp
         T_node(i,j,2,1) = T_node(i,j,2,1) - 0.5*kap*A_dmp
@@ -16184,7 +16236,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       endif
       if (det_ok .and. (excess > 0.0)) then
         gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
-        kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
+        kwant = gam / (2.0*CS%dg_tilt_damp_tau)
+        kap = min(max(kwant - knat_eta, 0.0), rate_cap)
         T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_dmp
         T_node(i,j,2,1) = T_node(i,j,2,1) + 0.5*kap*A_dmp
         T_node(i,j,1,2) = T_node(i,j,1,2) - 0.5*kap*A_dmp
@@ -16245,7 +16298,11 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         gwt = min(dg_gl_reach_wt(gwx, bx, CS%dg_damp_gl_reach), &
                   dg_gl_reach_wt(gwy, by, CS%dg_damp_gl_reach))
         gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_w))
-        kap = min(gam / (2.0*CS%dg_tilt_damp_tau), rate_cap)
+        ! The checkerboard twist alternates along BOTH axes, so it survives as
+        ! long as either sweep is slow: credit the transport with the smaller of
+        ! the two rates, not their sum.
+        kwant = gam / (2.0*CS%dg_tilt_damp_tau)
+        kap = min(max(kwant - min(knat_xi, knat_eta), 0.0), rate_cap)
         ! +,-,-,+ : changes w by 4*(-0.25*kap*A_dmp) = -kap*A_dmp, and is exactly
         ! orthogonal to the cell mean and to both tilts.
         T_node(i,j,1,1) = T_node(i,j,1,1) - 0.25*kap*A_dmp
