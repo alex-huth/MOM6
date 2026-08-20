@@ -575,10 +575,6 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! damper extends: 0 the bisected cell alone, 1 the cells
                                   !! whose tilt enters the detector, 2 the full reach of the
                                   !! mean-supported reference.
-  logical :: dg_damp_biased_stencil !< If true, the mode damper falls back to a one-sided
-                                  !! second difference where a centred stencil would leave
-                                  !! the ice or the domain; if false it skips the cell in
-                                  !! that direction, as the term originally did.
   logical :: dg_tilt_damp_dt_warned = .false. !< True once the short-DG1_TILT_DAMP_TAU
                                   !! warning has been issued, so it is not repeated.
   real :: dg_art_visc_c_max       !< Peak dimensionless coefficient on the DG(1) artificial-
@@ -13434,19 +13430,6 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
   if ((CS%dg_damp_gl_reach < 0) .or. (CS%dg_damp_gl_reach > 2)) call MOM_error(FATAL, &
     "DG1_TILT_DAMP_GL_REACH must be 0, 1 or 2.")
 
-  call get_param(param_file, mdl, "DG1_TILT_DAMP_BIASED_STENCIL", CS%dg_damp_biased_stencil, &
-                 "If true, where a centred second difference would reach outside the ice "//&
-                 "or outside the domain the mode damper uses a forward or backward one "//&
-                 "instead, so that a cell at a divide or an ice edge is damped on the "//&
-                 "same terms as an interior cell. If false the cell is skipped in that "//&
-                 "direction, which is what the term did originally. Skipping is not "//&
-                 "neutral -- it treats neighbouring cells differently for a reason "//&
-                 "unrelated to the solution, and in a channel eight cells wide it "//&
-                 "silences half the domain -- but it is the only change in this term "//&
-                 "that turns damping ON where it had been off, so it is the switch to "//&
-                 "try first if a run moves after the term was believed settled.", &
-                 default=.true., &
-                 do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
   ! Delivered relaxation time. Deliberately independent of the artificial
   ! viscosity. TAU_FLOOR is the AV's floor for STAGNANT ice, where the advective
@@ -15741,12 +15724,11 @@ end function dg_wref_at
 !! from O(dx^5) to O(dx^3.8) against a detector that is O(dx^3) -- and the leak
 !! is signed, so it damps a smooth solution steadily for as long as the model
 !! runs.  That is a fifth cell's worth of stencil, hence the +-4 gather.
-pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, allow_bias, A, A_bed, A_ref, href, valid, mode)
+pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, A, A_bed, A_ref, href, valid, mode)
   real,    dimension(-4:4), intent(in)  :: tv !< Per-cell tilt along the stencil [Z ~> m]
   real,    dimension(-4:4), intent(in)  :: bv !< Per-cell bed tilt along the stencil [Z ~> m]
   real,    dimension(-4:4), intent(in)  :: hv !< Per-cell mean thickness along the stencil [Z ~> m]
   logical, dimension(-4:4), intent(in)  :: ok !< True where the cell is usable
-  logical, intent(in) :: allow_bias !< If false, only a centred stencil is admissible
   real,    intent(out) :: A     !< Tilt-Laplacian detector [Z ~> m]
   real,    intent(out) :: A_bed !< The same operator on the bed [Z ~> m]
   real,    intent(out) :: A_ref !< The same operator on the mean-supported tilt [Z ~> m]
@@ -15764,7 +15746,7 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, allow_bias, A, A_bed, A_ref,
     rm = 0.5*(hv(0) - hv(-2)) ; r0 = 0.5*(hv(1) - hv(-1)) ; rp = 0.5*(hv(2) - hv(0))
     A_ref = r0 - 0.5*(rm + rp)
     href  = ((hv(-1) + hv(0)) + hv(1)) / 3.0
-  elseif (allow_bias .and. all(ok(0:4))) then   ! forward
+  elseif (all(ok(0:4))) then                    ! forward
     A     = 0.5*(tv(0) - 2.0*tv(1) + tv(2))
     A_bed = 0.5*(bv(0) - 2.0*bv(1) + bv(2))
     r0 = 0.5*(-3.0*hv(0) + 4.0*hv(1) - hv(2))
@@ -15772,7 +15754,7 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, allow_bias, A, A_bed, A_ref,
     rp = 0.5*(-3.0*hv(2) + 4.0*hv(3) - hv(4))
     A_ref = 0.5*(r0 - 2.0*rm + rp)
     href  = ((hv(0) + hv(1)) + hv(2)) / 3.0 ; mode = 2
-  elseif (allow_bias .and. all(ok(-4:0))) then  ! backward
+  elseif (all(ok(-4:0))) then                   ! backward
     A     = 0.5*(tv(0) - 2.0*tv(-1) + tv(-2))
     A_bed = 0.5*(bv(0) - 2.0*bv(-1) + bv(-2))
     r0 = 0.5*( 3.0*hv(0) - 4.0*hv(-1) + hv(-2))
@@ -16087,8 +16069,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         tv(k) = t_xi(kk,j) ; bv(k) = b_xi(kk,j) ; hv(k) = hbar_c(kk,j)
         gv(k) = gl_wt(kk,j)
       enddo
-      call dg_tilt_detector_1d(tv, bv, hv, okv, CS%dg_damp_biased_stencil, &
-                               A_h, A_bed, A_ref, href_d, det_ok, dmode)
+      call dg_tilt_detector_1d(tv, bv, hv, okv, A_h, A_bed, A_ref, href_d, det_ok, dmode)
       gwt = dg_gl_reach_wt(gv, max(dmode,1), CS%dg_damp_gl_reach)
       ! One-sided, so ice carrying LESS structure than the bed forces is left
       ! alone rather than driven further from it.  max(), not a sum: over a
@@ -16114,8 +16095,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         tv(k) = t_eta(i,kk) ; bv(k) = b_eta(i,kk) ; hv(k) = hbar_c(i,kk)
         gv(k) = gl_wt(i,kk)
       enddo
-      call dg_tilt_detector_1d(tv, bv, hv, okv, CS%dg_damp_biased_stencil, &
-                               A_h, A_bed, A_ref, href_d, det_ok, dmode)
+      call dg_tilt_detector_1d(tv, bv, hv, okv, A_h, A_bed, A_ref, href_d, det_ok, dmode)
       gwt = dg_gl_reach_wt(gv, max(dmode,1), CS%dg_damp_gl_reach)
       A_bed = f_gnd(i,j)*A_bed
       floor_A = max(abs(A_bed), abs(A_ref))
@@ -16146,7 +16126,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       ! two-dimensional, and it is a product of two first differences which
       ! bias the same way.  Take the first admissible pair in preference order.
       tw_ok = .false.
-      do m = 1, merge(9, 1, CS%dg_damp_biased_stencil)
+      do m = 1, 9
         bx = bx_try(m) ; by = by_try(m)
         if (all(okw(Slo(bx):Shi(bx), Flo(by):Fhi(by))) .and. &
             all(okw(Flo(bx):Fhi(bx), Slo(by):Shi(by)))) then
