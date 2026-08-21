@@ -15916,7 +15916,7 @@ end function dg_wref_at
 !! is signed, so it damps a smooth solution steadily for as long as the model
 !! runs.  That is a fifth cell's worth of stencil, hence the +-4 gather.
 pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, A, A_bed, A_ref, href, &
-                                    valid, mode, kink_ok)
+                                    valid, mode, kink_c)
   real,    dimension(-4:4), intent(in)  :: tv !< Per-cell tilt along the stencil [Z ~> m]
   real,    dimension(-4:4), intent(in)  :: bv !< Per-cell bed tilt along the stencil [Z ~> m]
   real,    dimension(-4:4), intent(in)  :: hv !< Per-cell mean thickness along the stencil [Z ~> m]
@@ -15929,12 +15929,15 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, A, A_bed, A_ref, h
   real,    intent(out) :: href  !< Mean thickness over the stencil used [Z ~> m]
   logical, intent(out) :: valid !< False if no admissible stencil exists
   integer, intent(out) :: mode  !< Stencil chosen: 1 centred, 2 forward, 3 backward, 0 none
-  logical, intent(out) :: kink_ok !< True if the reference carries the break, so the caller
-                                  !! need not fall back to the grounding-line exemption
+  real,    intent(out) :: kink_c  !< How far the reference carries the break, 0 to 1: the
+                                  !! caller interpolates the grounding-line exemption on it
+                                  !! rather than switching, so that a cell does not jump
+                                  !! between damped and exempt as the geometry shifts
 
   real :: rm, r0, rp  ! Mean-supported tilt at the three stencil cells [Z ~> m]
   real :: s_g, s_f    ! Branch slopes across a flotation transition [Z ~> m]
   real :: sigma       ! How much of a transition the reference's window spans [nondim]
+  real :: cf          ! Confidence in the branch slopes that were found [nondim]
   integer :: km, k0, kp ! Offsets of the three cells whose tilt the reference supplies
   integer :: rlo, rhi   ! Offsets of the cell MEANS the reference reads, which reach two
                         ! further than the tilts it supplies and are what the span must
@@ -15943,7 +15946,7 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, A, A_bed, A_ref, h
   logical :: kv       ! True if the branch slopes could be built
 
   A = 0.0 ; A_bed = 0.0 ; A_ref = 0.0 ; href = 0.0 ; valid = .true. ; mode = 1
-  kink_ok = .false.
+  kink_c = 0.0
 
   if (all(ok(-2:2))) then                       ! centred
     A     = tv(0) - 0.5*(tv(-1) + tv(1))
@@ -15977,12 +15980,13 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, A, A_bed, A_ref, h
   ! spans, so sigma = 0 in a smooth region returns the centred form bit for bit
   ! and nothing outside a grounding line changes.
   if (kink) then
-    call dg_kink_branches(hv, fv, ok, rlo, rhi, s_g, s_f, sigma, kv)
+    call dg_kink_branches(hv, fv, ok, rlo, rhi, s_g, s_f, sigma, cf, kv)
     if (kv) then
+      sigma = sigma * cf
       rm = (1.0-sigma)*rm + sigma*(fv(km)*s_g + (1.0-fv(km))*s_f)
       r0 = (1.0-sigma)*r0 + sigma*(fv(k0)*s_g + (1.0-fv(k0))*s_f)
       rp = (1.0-sigma)*rp + sigma*(fv(kp)*s_g + (1.0-fv(kp))*s_f)
-      kink_ok = .true.
+      kink_c = cf
     endif
   endif
 
@@ -16016,7 +16020,7 @@ end subroutine dg_tilt_detector_1d
 !! than two and there is nothing to build from: the caller falls back to the
 !! grounding-line exemption, on the much smaller set of cells where that is now
 !! the only option.
-pure subroutine dg_kink_branches(hv, fv, ok, lo, hi, s_g, s_f, sigma, valid)
+pure subroutine dg_kink_branches(hv, fv, ok, lo, hi, s_g, s_f, sigma, conf, valid)
   real,    dimension(-4:4), intent(in)  :: hv !< Cell means on the gather [Z ~> m]
   real,    dimension(-4:4), intent(in)  :: fv !< Grounded fraction on the gather [nondim]
   logical, dimension(-4:4), intent(in)  :: ok !< True where the cell is usable
@@ -16030,6 +16034,7 @@ pure subroutine dg_kink_branches(hv, fv, ok, lo, hi, s_g, s_f, sigma, valid)
   real,    intent(out) :: s_g   !< Rise per cell on the grounded branch [Z ~> m]
   real,    intent(out) :: s_f   !< Rise per cell on the floating branch [Z ~> m]
   real,    intent(out) :: sigma !< Span max(f) - min(f) over the window [nondim]
+  real,    intent(out) :: conf  !< How far the branch slopes are to be trusted, 0 to 1 [nondim]
   logical, intent(out) :: valid !< False if either branch has fewer than two cells
   real, parameter :: eps = 1.0e-9 ! Wholly grounded or afloat is exact, every
                         ! sub-point of the partition falling the same way, so this
@@ -16037,7 +16042,7 @@ pure subroutine dg_kink_branches(hv, fv, ok, lo, hi, s_g, s_f, sigma, valid)
   integer :: k, ng, nf, ge, fs, slo, shi
   logical :: gnd_low    ! True when the grounded end of the window is the low one
 
-  s_g = 0.0 ; s_f = 0.0 ; sigma = 0.0 ; valid = .false.
+  s_g = 0.0 ; s_f = 0.0 ; sigma = 0.0 ; conf = 0.0 ; valid = .false.
   sigma = maxval(fv(lo:hi)) - minval(fv(lo:hi))
   if (.not.all(ok(lo:hi))) return
 
@@ -16058,6 +16063,15 @@ pure subroutine dg_kink_branches(hv, fv, ok, lo, hi, s_g, s_f, sigma, valid)
     ge = shi - ng + 1 ; fs = slo + nf - 1
   endif
   if ((ng < 2) .or. (nf < 2)) return
+  ! How far to trust what was found.  Three cells give a centred difference,
+  ! which is exactly zero on an alternating mean and so cannot import that mode
+  ! into the reference; two give a one-sided difference, which can, and was
+  ! measured 30% wrong with an alternating mean present.  The weaker branch sets
+  ! the confidence, and it is interpolated rather than switched so that a cell
+  ! does not flip between damped and exempt as a valley's clean-cell count
+  ! changes under a migrating grounding line.
+  conf = 1.0
+  if (min(ng, nf) < 3) conf = 0.7
 
   ! Nearest the transition in both cases, and in the +index sense in both, so the
   ! slopes are directly comparable with the tilts whatever way round the
@@ -16475,7 +16489,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real, dimension(-4:4) :: gv         ! Stencil gather of the grounded fraction [nondim]
   logical, dimension(-4:4) :: okv     ! Stencil gather of usability
   logical :: det_ok ! True if the detector found an admissible stencil
-  logical :: kink_ok ! True if the reference carried the flotation break itself
+  real :: kink_c ! How far the reference carried the flotation break itself [nondim]
   integer :: dmode  ! Stencil the detector chose: 1 centred, 2 forward, 3 backward
   real :: gwt       ! Grounding-line weight over the reach of that stencil [nondim]
   real :: A_dmp     ! The part of the detector the correction actually removes [Z ~> m]
@@ -16658,16 +16672,13 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         gv(k) = f_gnd(kk,j)
       enddo
       call dg_tilt_detector_1d(tv, bv, hv, okv, gv, CS%dg_damp_kink_ref, &
-                               A_h, A_bed, A_ref, href_d, det_ok, dmode, kink_ok)
+                               A_h, A_bed, A_ref, href_d, det_ok, dmode, kink_c)
       ! The exemption is a workaround for a reference that cannot represent the
       ! break.  Where the reference now represents it, there is nothing to work
       ! around, and the cell is damped like any other -- which is the point, those
       ! being the thin, heavily buttressing cells along a channel's walls.
-      if (kink_ok) then
-        gwt = 1.0
-      else
-        gwt = dg_gl_reach_wt(gv, max(dmode,1), CS%dg_damp_gl_reach)
-      endif
+      gwt = kink_c + (1.0 - kink_c) * &
+            dg_gl_reach_wt(gv, max(dmode,1), CS%dg_damp_gl_reach)
       ! One-sided, so ice carrying LESS structure than the bed forces is left
       ! alone rather than driven further from it.  max(), not a sum: over a
       ! rough bed the means already contain the bed's own structure.
@@ -16705,16 +16716,13 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         gv(k) = f_gnd(i,kk)
       enddo
       call dg_tilt_detector_1d(tv, bv, hv, okv, gv, CS%dg_damp_kink_ref, &
-                               A_h, A_bed, A_ref, href_d, det_ok, dmode, kink_ok)
+                               A_h, A_bed, A_ref, href_d, det_ok, dmode, kink_c)
       ! The exemption is a workaround for a reference that cannot represent the
       ! break.  Where the reference now represents it, there is nothing to work
       ! around, and the cell is damped like any other -- which is the point, those
       ! being the thin, heavily buttressing cells along a channel's walls.
-      if (kink_ok) then
-        gwt = 1.0
-      else
-        gwt = dg_gl_reach_wt(gv, max(dmode,1), CS%dg_damp_gl_reach)
-      endif
+      gwt = kink_c + (1.0 - kink_c) * &
+            dg_gl_reach_wt(gv, max(dmode,1), CS%dg_damp_gl_reach)
       A_bed = f_gnd(i,j)*A_bed
       if (CS%dg_damp_excess_only) then
         A_dmp = dg_unexplained(A_h, A_ref, A_bed)
