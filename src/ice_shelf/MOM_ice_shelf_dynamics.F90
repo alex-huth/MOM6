@@ -589,6 +589,10 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! to, replacing DG1_TILT_DAMP_TAU with a per-cell,
                                   !! per-direction relaxation time dx/(2*c*u_cut) when
                                   !! positive [L T-1 ~> m s-1].
+  real :: dg_damp_kink_tol        !< Grounded-fraction misfit at which confidence in the
+                                  !! single-line reconstruction of the flotation break falls
+                                  !! to zero, so the reference reverts to the mean-supported
+                                  !! one [nondim].
   logical :: dg_damp_kink_ref     !< If true, the mode damper's reference is told where the
                                   !! flotation contour is and reconstructs the slope break
                                   !! across it, instead of the cell being exempted.
@@ -13568,6 +13572,25 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "far smaller set of cells.", &
                  default=.false., do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
+  call get_param(param_file, mdl, "DG1_TILT_DAMP_KINK_TOL", CS%dg_damp_kink_tol, &
+                 "Grounded-fraction misfit at which the twist's single-line reconstruction "//&
+                 "of the flotation break stops being trusted. The reconstruction fits ONE "//&
+                 "straight break across the neighbourhood, which a curving or disconnected "//&
+                 "grounding line is not, so having placed the line it predicts every "//&
+                 "straddling cell's grounded fraction and compares with what the partition "//&
+                 "reported; confidence ramps linearly from one at no misfit to zero at this "//&
+                 "value, and at zero the reference is exactly the mean-supported one that "//&
+                 "was there before. The check is not a formality: against a grounding line "//&
+                 "curving with a radius of four to eight cells the single-line reference is "//&
+                 "WORSE than the one it replaces, by more than the amplitude of the mode it "//&
+                 "is meant to isolate, while the mean-supported reference's error is roughly "//&
+                 "constant because it assumes no geometry to be wrong about. In that test "//&
+                 "the misfit was at most 0.16 wherever the kink model won and at least 0.23 "//&
+                 "wherever it lost, hence the default; the evidence is one sweep of radii, "//&
+                 "so it is exposed rather than hard-coded.", &
+                 units="nondim", default=0.2, &
+                 do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
+
   call get_param(param_file, mdl, "DG1_TILT_DAMP_GL_REACH", CS%dg_damp_gl_reach, &
                  "How far the mode damper's grounding-line protection extends from the "//&
                  "cell the flotation contour crosses. 0 protects that cell alone, 1 the "//&
@@ -16125,7 +16148,8 @@ end function dg_shift_to_frac
 !! and the driving stress about where the grounding line is.  One line is placed
 !! for the whole neighbourhood rather than one per cell, a grounding line being
 !! one curve and not a set of independent segments.
-pure subroutine dg_kink_plane_2d(hw, fw, okw, lo, hi, dqx, dqy, dq0, sigma, valid)
+pure subroutine dg_kink_plane_2d(hw, fw, okw, lo, hi, tol, dqx, dqy, dq0, sigma, &
+                                 conf, valid)
   real,    dimension(-4:4,-4:4), intent(in) :: hw  !< Cell means on the gather [Z ~> m]
   real,    dimension(-4:4,-4:4), intent(in) :: fw  !< Grounded fraction [nondim]
   logical, dimension(-4:4,-4:4), intent(in) :: okw !< True where the cell is usable
@@ -16134,13 +16158,15 @@ pure subroutine dg_kink_plane_2d(hw, fw, okw, lo, hi, dqx, dqy, dq0, sigma, vali
   real,    intent(out) :: dqy    !< d(D)/dy, one cell [Z ~> m]
   real,    intent(out) :: dq0    !< Constant, so that D = dq0 + dqx*x + dqy*y [Z ~> m]
   real,    intent(out) :: sigma  !< Span of the grounded fraction over the window [nondim]
+  real,    intent(in)  :: tol    !< Misfit at which confidence in the fit reaches zero [nondim]
+  real,    intent(out) :: conf   !< How far the single-line fit is to be trusted, 0 to 1 [nondim]
   logical, intent(out) :: valid  !< False if either branch or the anchor is missing
   real, parameter :: eps = 1.0e-9
-  real :: gx(2), gy(2), sx, sy, best, dr(4)
+  real :: gx(2), gy(2), sx, sy, best, dr(4), mis, amax
   integer :: p, q, b, nx(2), ny(2), pa, qa
   logical :: ing, inf, m1, m2
 
-  dqx = 0.0 ; dqy = 0.0 ; dq0 = 0.0 ; valid = .false.
+  dqx = 0.0 ; dqy = 0.0 ; dq0 = 0.0 ; conf = 0.0 ; valid = .false.
   sigma = maxval(fw(lo:hi,lo:hi)) - minval(fw(lo:hi,lo:hi))
 
   ! Branch gradients, averaged over every adjacent pair lying wholly on the side
@@ -16188,7 +16214,33 @@ pure subroutine dg_kink_plane_2d(hw, fw, okw, lo, hi, dqx, dqy, dq0, sigma, vali
   dr(3) = dqx*real(pa)       + dqy*real(qa+1)
   dr(4) = dqx*real(pa+1)     + dqy*real(qa+1)
   dq0 = dg_shift_to_frac(dr, fw(pa,qa))
-  valid = .true.
+
+  ! Does one line actually describe this neighbourhood?  Having placed it,
+  ! predict every straddling cell's grounded fraction from it and compare with
+  ! what the partition reported.  A single line that fits reproduces them all.
+  !
+  ! This is not a formality.  Against a grounding line curving with a radius of
+  ! four to eight cells the single-line reference is WORSE than the
+  ! mean-supported one it replaces -- errors above the amplitude of the mode it
+  ! is meant to isolate, where the old reference's error is roughly constant
+  ! because it makes no geometric assumption to be wrong about.  The misfit
+  ! separated the two outcomes cleanly in that test, at most 0.16 wherever the
+  ! kink model won and at least 0.23 wherever it lost, so confidence is ramped
+  ! down over it rather than switched, and at zero confidence the reference is
+  ! exactly the one that was there before.
+  amax = 0.0
+  do q = lo, hi ; do p = lo, hi
+    if (.not.okw(p,q)) cycle
+    if ((fw(p,q) <= eps) .or. (fw(p,q) >= 1.0-eps)) cycle
+    dr(1) = dq0 + dqx*real(p)   + dqy*real(q)
+    dr(2) = dq0 + dqx*real(p+1) + dqy*real(q)
+    dr(3) = dq0 + dqx*real(p)   + dqy*real(q+1)
+    dr(4) = dq0 + dqx*real(p+1) + dqy*real(q+1)
+    mis = abs(dg_lin_area(dr) - fw(p,q))
+    amax = max(amax, mis)
+  enddo ; enddo
+  conf = max(0.0, 1.0 - amax / max(tol, tiny(1.0)))
+  valid = (conf > 0.0)
 end subroutine dg_kink_plane_2d
 
 !> The twist of the clipped linear kink over cell (p,q).
@@ -16424,7 +16476,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real :: A_dmp     ! The part of the detector the correction actually removes [Z ~> m]
   real :: kqx, kqy, kq0 ! The flotation break near the cell as one linear function [Z ~> m]
   real :: ksig      ! Span of the grounded fraction over the twist's window [nondim]
-  logical :: kw_ok  ! True if that break could be reconstructed
+  real :: kconf     ! How far a single-line fit describes this neighbourhood [nondim]
+  logical :: kw_ok  ! True if that break could be reconstructed at all
   real :: knat_xi, knat_eta ! Removal rate the transport already delivers on each axis [T-1 ~> s-1]
   real :: kwant     ! Rate the gate asks for, before the transport's share [T-1 ~> s-1]
   real :: itau_xi, itau_eta, itau_w ! 1/(2*tau) per direction, from DG1_TILT_DAMP_U_CUT
@@ -16713,9 +16766,11 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         ! the reference toward the twist it implies by how much of a transition
         ! the window spans.  A span of zero returns the mean-supported form bit
         ! for bit, so nothing away from a grounding line moves.
-        kw_ok = .false. ; ksig = 0.0
+        kw_ok = .false. ; ksig = 0.0 ; kconf = 0.0
         if (CS%dg_damp_kink_ref) &
-          call dg_kink_plane_2d(hw, fw, okw, -2, 2, kqx, kqy, kq0, ksig, kw_ok)
+          call dg_kink_plane_2d(hw, fw, okw, -2, 2, CS%dg_damp_kink_tol, &
+                                kqx, kqy, kq0, ksig, kconf, kw_ok)
+        ksig = ksig * kconf
         wrx(:) = 0.0 ; wry(:) = 0.0
         do k = -2, 2
           wrx(k) = dg_wref_at(hw, k, 0, bx, by)
