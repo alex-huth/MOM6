@@ -16240,7 +16240,10 @@ pure subroutine dg_kink_plane_2d(hw, fw, okw, lo, hi, tol, dqx, dqy, dq0, sigma,
     amax = max(amax, mis)
   enddo ; enddo
   conf = max(0.0, 1.0 - amax / max(tol, tiny(1.0)))
-  valid = (conf > 0.0)
+  ! Valid means the branches were found, not that the fit is any good: a fit
+  ! that is credible but poor must still hand back a confidence for the caller
+  ! to interpolate on, rather than being reported as absent.
+  valid = .true.
 end subroutine dg_kink_plane_2d
 
 !> The twist of the clipped linear kink over cell (p,q).
@@ -16799,14 +16802,17 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       if (excess > 0.0) then
         ! The twist's second difference separates by axis, so the protection
         ! does too: each axis contributes the minimum over its own bias's reach.
-        ! As for the tilt: where the reference carries the break there is nothing
-        ! for the exemption to work around, and the cell damps like any other.
-        if (kw_ok) then
-          gwt = 1.0
-        else
-          gwt = min(dg_gl_reach_wt(gwx, bx, CS%dg_damp_gl_reach), &
-                    dg_gl_reach_wt(gwy, by, CS%dg_damp_gl_reach))
-        endif
+        ! Where the reference carries the break there is nothing for the
+        ! exemption to work around and the cell damps like any other; where it
+        ! does not, the exemption is all there is.  Interpolated by confidence,
+        ! not switched on it: a hard test at confidence zero would hand a cell
+        ! FULL damping the moment the fit became marginally credible, while the
+        ! blend had already reverted the reference to the uncorrected one --
+        ! full strength against the worst floor, which is the combination this
+        ! whole exercise exists to avoid.
+        gwt = kconf + (1.0 - kconf) * &
+              min(dg_gl_reach_wt(gwx, bx, CS%dg_damp_gl_reach), &
+                  dg_gl_reach_wt(gwy, by, CS%dg_damp_gl_reach))
         gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_w))
         ! The checkerboard twist alternates along BOTH axes, so it survives as
         ! long as either sweep is slow: credit the transport with the smaller of
