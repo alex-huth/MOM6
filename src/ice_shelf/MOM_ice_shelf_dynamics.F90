@@ -15911,6 +15911,10 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, A, A_bed, A_ref, h
   real :: s_g, s_f    ! Branch slopes across a flotation transition [Z ~> m]
   real :: sigma       ! How much of a transition the reference's window spans [nondim]
   integer :: km, k0, kp ! Offsets of the three cells whose tilt the reference supplies
+  integer :: rlo, rhi   ! Offsets of the cell MEANS the reference reads, which reach two
+                        ! further than the tilts it supplies and are what the span must
+                        ! cover: a cell whose reference reads a straddling neighbour is
+                        ! contaminated by it even though its own three offsets are not.
   logical :: kv       ! True if the branch slopes could be built
 
   A = 0.0 ; A_bed = 0.0 ; A_ref = 0.0 ; href = 0.0 ; valid = .true. ; mode = 1
@@ -15920,7 +15924,7 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, A, A_bed, A_ref, h
     A     = tv(0) - 0.5*(tv(-1) + tv(1))
     A_bed = bv(0) - 0.5*(bv(-1) + bv(1))
     rm = 0.5*(hv(0) - hv(-2)) ; r0 = 0.5*(hv(1) - hv(-1)) ; rp = 0.5*(hv(2) - hv(0))
-    km = -1 ; k0 = 0 ; kp = 1
+    km = -1 ; k0 = 0 ; kp = 1 ; rlo = -2 ; rhi = 2
     href  = ((hv(-1) + hv(0)) + hv(1)) / 3.0
   elseif (all(ok(0:4))) then                    ! forward
     A     = 0.5*(tv(0) - 2.0*tv(1) + tv(2))
@@ -15928,7 +15932,7 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, A, A_bed, A_ref, h
     r0 = 0.5*(-3.0*hv(0) + 4.0*hv(1) - hv(2))
     rm = 0.5*(-3.0*hv(1) + 4.0*hv(2) - hv(3))
     rp = 0.5*(-3.0*hv(2) + 4.0*hv(3) - hv(4))
-    km = 1 ; k0 = 0 ; kp = 2
+    km = 1 ; k0 = 0 ; kp = 2 ; rlo = 0 ; rhi = 4
     href  = ((hv(0) + hv(1)) + hv(2)) / 3.0 ; mode = 2
   elseif (all(ok(-4:0))) then                   ! backward
     A     = 0.5*(tv(0) - 2.0*tv(-1) + tv(-2))
@@ -15936,7 +15940,7 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, A, A_bed, A_ref, h
     r0 = 0.5*( 3.0*hv(0) - 4.0*hv(-1) + hv(-2))
     rm = 0.5*( 3.0*hv(-1) - 4.0*hv(-2) + hv(-3))
     rp = 0.5*( 3.0*hv(-2) - 4.0*hv(-3) + hv(-4))
-    km = -1 ; k0 = 0 ; kp = -2
+    km = -1 ; k0 = 0 ; kp = -2 ; rlo = -4 ; rhi = 0
     href  = ((hv(0) + hv(-1)) + hv(-2)) / 3.0 ; mode = 3
   else
     valid = .false. ; mode = 0
@@ -15948,8 +15952,7 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, A, A_bed, A_ref, h
   ! spans, so sigma = 0 in a smooth region returns the centred form bit for bit
   ! and nothing outside a grounding line changes.
   if (kink) then
-    call dg_kink_branches(hv, fv, ok, min(min(km,k0),kp), max(max(km,k0),kp), &
-                          s_g, s_f, sigma, kv)
+    call dg_kink_branches(hv, fv, ok, rlo, rhi, s_g, s_f, sigma, kv)
     if (kv) then
       rm = (1.0-sigma)*rm + sigma*(fv(km)*s_g + (1.0-fv(km))*s_f)
       r0 = (1.0-sigma)*r0 + sigma*(fv(k0)*s_g + (1.0-fv(k0))*s_f)
