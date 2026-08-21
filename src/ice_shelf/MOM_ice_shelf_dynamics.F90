@@ -13527,7 +13527,7 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "matters on any grid whose cells are not square: the xi mode is swept out "//&
                  "over dx and the eta mode over dy, and on a continental grid those "//&
                  "differ. The twist, alternating along both axes, uses sqrt(dx*dy).", &
-                 units="m s-1", default=3.170979E-05, scale=US%m_s_to_L_T, &
+                 units="m s-1", default=6.341958E-06, scale=US%m_s_to_L_T, &
                  do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_EXCESS_ONLY", CS%dg_damp_excess_only, &
