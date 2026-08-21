@@ -16047,6 +16047,166 @@ pure subroutine dg_kink_branches(hv, fv, ok, lo, hi, s_g, s_f, sigma, valid)
   valid = .true.
 end subroutine dg_kink_branches
 
+!> Area of the unit cell where a LINEAR function is positive, from its corners.
+!!
+!! Linear, so the bilinear interpolant of the corners is the function itself and
+!! the region is a polygon: clip the square against the zero contour and take the
+!! area.  Exact, and the count of vertices is at most five.
+pure function dg_lin_area(d) result(a)
+  real, dimension(4), intent(in) :: d !< Corner values, SW SE NW NE [Z ~> m]
+  real :: a                           !< Area fraction where the value is positive [nondim]
+  real, dimension(2,8) :: p   ! Clipped polygon vertices, cell coordinates [nondim]
+  real, dimension(2,4) :: v   ! The square, counter-clockwise [nondim]
+  real, dimension(4)   :: dv  ! The function at those vertices, in the same order [Z ~> m]
+  real :: t
+  integer :: k, kn, n
+  v(:,1) = (/ 0.0, 0.0 /) ; v(:,2) = (/ 1.0, 0.0 /)
+  v(:,3) = (/ 1.0, 1.0 /) ; v(:,4) = (/ 0.0, 1.0 /)
+  dv = (/ d(1), d(2), d(4), d(3) /)     ! SW SE NE NW, matching v
+  n = 0
+  do k = 1, 4
+    kn = 1 + mod(k, 4)
+    if (dv(k) > 0.0) then
+      n = n + 1 ; p(:,n) = v(:,k)
+    endif
+    if ((dv(k) > 0.0) .neqv. (dv(kn) > 0.0)) then
+      t = dv(k) / (dv(k) - dv(kn))
+      n = n + 1 ; p(:,n) = v(:,k) + t*(v(:,kn) - v(:,k))
+    endif
+  enddo
+  a = 0.0
+  do k = 1, n
+    kn = 1 + mod(k, n)
+    a = a + (p(1,k)*p(2,kn) - p(1,kn)*p(2,k))
+  enddo
+  a = min(max(0.5*abs(a), 0.0), 1.0)
+end function dg_lin_area
+
+!> Shift a linear function so the area where it is positive matches a target.
+!!
+!! Bisection rather than the closed form: the area is piecewise quadratic in the
+!! shift with breakpoints at the four corner values, so the closed form has cases
+!! and the iteration has none.  Fifty steps is deterministic and takes it to the
+!! last bit, and it runs only on cells a grounding line passes near.
+pure function dg_shift_to_frac(d, f) result(c)
+  real, dimension(4), intent(in) :: d !< Corner values before the shift [Z ~> m]
+  real, intent(in) :: f               !< Target positive-area fraction [nondim]
+  real :: c                           !< Constant to add to every corner [Z ~> m]
+  real :: lo, hi, mid
+  integer :: it
+  if (f <= 0.0) then ; c = -maxval(d) - 1.0 ; return ; endif
+  if (f >= 1.0) then ; c = -minval(d) + 1.0 ; return ; endif
+  lo = -maxval(d) ; hi = -minval(d)
+  do it = 1, 50
+    mid = 0.5*(lo + hi)
+    if (dg_lin_area(d + mid) < f) then ; lo = mid ; else ; hi = mid ; endif
+  enddo
+  c = 0.5*(lo + hi)
+end function dg_shift_to_frac
+
+!> The flotation break near a cell, as one clipped linear function.
+!!
+!! The twist needs more than the tilt did.  The tilt depends only on the grounded
+!! AREA fraction, so one number placed it; the twist depends on the ORIENTATION
+!! as well.  Continuity along a break forces the gradient jump to be normal to it,
+!! so a break aligned with x cannot change the x-slope and produces exactly zero
+!! twist, while a diagonal one produces the most -- at the same area fraction.
+!!
+!! Writing the kink as a single clipped linear function carries the orientation
+!! for free.  The field near the break is P_f + max(0, D) with D = P_g - P_f
+!! linear and vanishing on the break, so D's gradient IS the jump and its zero
+!! contour IS the grounding line.  Nothing needs integrating: a cell's tilt and
+!! twist follow from D at its four corners.  The 1D rule of dg_kink_branches is
+!! this one's shadow, so the two agree by construction.
+!!
+!! Only the GRADIENT of D has to be estimated, from cells lying wholly on each
+!! side; its constant comes from requiring the grounded area of one straddling
+!! cell to match ground_frac, which keeps the reference agreeing with the friction
+!! and the driving stress about where the grounding line is.  One line is placed
+!! for the whole neighbourhood rather than one per cell, a grounding line being
+!! one curve and not a set of independent segments.
+pure subroutine dg_kink_plane_2d(hw, fw, okw, lo, hi, dqx, dqy, dq0, sigma, valid)
+  real,    dimension(-4:4,-4:4), intent(in) :: hw  !< Cell means on the gather [Z ~> m]
+  real,    dimension(-4:4,-4:4), intent(in) :: fw  !< Grounded fraction [nondim]
+  logical, dimension(-4:4,-4:4), intent(in) :: okw !< True where the cell is usable
+  integer, intent(in)  :: lo, hi !< Offsets, both axes, over which the span is measured
+  real,    intent(out) :: dqx    !< d(D)/dx, one cell [Z ~> m]
+  real,    intent(out) :: dqy    !< d(D)/dy, one cell [Z ~> m]
+  real,    intent(out) :: dq0    !< Constant, so that D = dq0 + dqx*x + dqy*y [Z ~> m]
+  real,    intent(out) :: sigma  !< Span of the grounded fraction over the window [nondim]
+  logical, intent(out) :: valid  !< False if either branch or the anchor is missing
+  real, parameter :: eps = 1.0e-9
+  real :: gx(2), gy(2), sx, sy, best, dr(4)
+  integer :: p, q, b, nx(2), ny(2), pa, qa
+  logical :: ing, inf, m1, m2
+
+  dqx = 0.0 ; dqy = 0.0 ; dq0 = 0.0 ; valid = .false.
+  sigma = maxval(fw(lo:hi,lo:hi)) - minval(fw(lo:hi,lo:hi))
+
+  ! Branch gradients, averaged over every adjacent pair lying wholly on the side
+  ! in question.  Averaging over positions is what suppresses an alternating mean,
+  ! which a single difference would import into the reference.
+  gx = 0.0 ; gy = 0.0 ; nx = 0 ; ny = 0
+  do b = 1, 2
+    do q = -4, 4 ; do p = -4, 3
+      m1 = okw(p,q) .and. okw(p+1,q)
+      if (b == 1) then
+        m1 = m1 .and. (fw(p,q) >= 1.0-eps) .and. (fw(p+1,q) >= 1.0-eps)
+      else
+        m1 = m1 .and. (fw(p,q) <= eps) .and. (fw(p+1,q) <= eps)
+      endif
+      if (m1) then ; gx(b) = gx(b) + (hw(p+1,q) - hw(p,q)) ; nx(b) = nx(b) + 1 ; endif
+    enddo ; enddo
+    do q = -4, 3 ; do p = -4, 4
+      m2 = okw(p,q) .and. okw(p,q+1)
+      if (b == 1) then
+        m2 = m2 .and. (fw(p,q) >= 1.0-eps) .and. (fw(p,q+1) >= 1.0-eps)
+      else
+        m2 = m2 .and. (fw(p,q) <= eps) .and. (fw(p,q+1) <= eps)
+      endif
+      if (m2) then ; gy(b) = gy(b) + (hw(p,q+1) - hw(p,q)) ; ny(b) = ny(b) + 1 ; endif
+    enddo ; enddo
+  enddo
+  if (any(nx == 0) .or. any(ny == 0)) return
+  dqx = gx(1)/real(nx(1)) - gx(2)/real(nx(2))
+  dqy = gy(1)/real(ny(1)) - gy(2)/real(ny(2))
+  if ((abs(dqx) + abs(dqy)) <= 0.0) return
+
+  ! Anchor on the most straddled cell available: it is the best conditioned place
+  ! to fix the offset, and an unstraddled one carries no information about it.
+  best = -1.0 ; pa = 0 ; qa = 0
+  do q = lo, hi ; do p = lo, hi
+    if (.not.okw(p,q)) cycle
+    if (0.5 - abs(fw(p,q) - 0.5) > best) then
+      best = 0.5 - abs(fw(p,q) - 0.5) ; pa = p ; qa = q
+    endif
+  enddo ; enddo
+  if (best <= 0.0) return
+
+  dr(1) = dqx*real(pa)       + dqy*real(qa)
+  dr(2) = dqx*real(pa+1)     + dqy*real(qa)
+  dr(3) = dqx*real(pa)       + dqy*real(qa+1)
+  dr(4) = dqx*real(pa+1)     + dqy*real(qa+1)
+  dq0 = dg_shift_to_frac(dr, fw(pa,qa))
+  valid = .true.
+end subroutine dg_kink_plane_2d
+
+!> The twist of the clipped linear kink over cell (p,q).
+!!
+!! The smooth part of the field is a plane and contributes no twist at all, so the
+!! whole of it comes from the clipped part and follows from four corner values.
+pure function dg_kink_twist_at(dqx, dqy, dq0, p, q) result(w)
+  real,    intent(in) :: dqx, dqy, dq0 !< The linear function D [Z ~> m]
+  integer, intent(in) :: p, q          !< Cell offsets
+  real :: w                            !< Twist the kink implies [Z ~> m]
+  real :: m(4)
+  m(1) = max(0.0, dq0 + dqx*real(p)   + dqy*real(q))
+  m(2) = max(0.0, dq0 + dqx*real(p+1) + dqy*real(q))
+  m(3) = max(0.0, dq0 + dqx*real(p)   + dqy*real(q+1))
+  m(4) = max(0.0, dq0 + dqx*real(p+1) + dqy*real(q+1))
+  w = (m(4) - m(3)) - (m(2) - m(1))
+end function dg_kink_twist_at
+
 !> The part of a detector reading that no reference accounts for.
 !!
 !! Both references are the SAME operator applied to a different field -- the
@@ -16262,6 +16422,9 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   integer :: dmode  ! Stencil the detector chose: 1 centred, 2 forward, 3 backward
   real :: gwt       ! Grounding-line weight over the reach of that stencil [nondim]
   real :: A_dmp     ! The part of the detector the correction actually removes [Z ~> m]
+  real :: kqx, kqy, kq0 ! The flotation break near the cell as one linear function [Z ~> m]
+  real :: ksig      ! Span of the grounded fraction over the twist's window [nondim]
+  logical :: kw_ok  ! True if that break could be reconstructed
   real :: knat_xi, knat_eta ! Removal rate the transport already delivers on each axis [T-1 ~> s-1]
   real :: kwant     ! Rate the gate asks for, before the transport's share [T-1 ~> s-1]
   real :: itau_xi, itau_eta, itau_w ! 1/(2*tau) per direction, from DG1_TILT_DAMP_U_CUT
@@ -16274,7 +16437,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   logical :: diag_on ! True if any of the three activity diagnostics is registered
   integer :: k, kk, kj, jj ! Stencil offsets, and the clamped array indices
   ! Twist gathers, over the 7x7 block the biased cross difference can reach.
-  real, dimension(-4:4,-4:4) :: ww, bw, hw ! Twist, bed twist, cell mean
+  real, dimension(-4:4,-4:4) :: ww, bw, hw, fw ! Twist, bed twist, cell mean, grounded frac
   real, dimension(-4:4) :: gwx, gwy        ! Grounded fraction along each axis [nondim]
   logical, dimension(-4:4,-4:4) :: okw     ! Usability
   real, dimension(-4:4) :: wrx, wry ! Mean-supported twist along each axis [Z ~> m]
@@ -16526,6 +16689,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         okw(k,kj) = ice_ok(kk,jj) .and. ((i+k >= isd) .and. (i+k <= ied)) &
                                   .and. ((j+kj >= jsd) .and. (j+kj <= jed))
         ww(k,kj) = w_c(kk,jj) ; bw(k,kj) = b_w(kk,jj) ; hw(k,kj) = hbar_c(kk,jj)
+        fw(k,kj) = f_gnd(kk,jj)
         if (kj == 0) gwx(k) = f_gnd(kk,jj)
         if (k == 0) gwy(kj) = f_gnd(kk,jj)
       enddo ; enddo
@@ -16545,10 +16709,21 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
 
       excess = -1.0
       if (tw_ok) then
+        ! Place the flotation break once for the whole neighbourhood, and blend
+        ! the reference toward the twist it implies by how much of a transition
+        ! the window spans.  A span of zero returns the mean-supported form bit
+        ! for bit, so nothing away from a grounding line moves.
+        kw_ok = .false. ; ksig = 0.0
+        if (CS%dg_damp_kink_ref) &
+          call dg_kink_plane_2d(hw, fw, okw, -2, 2, kqx, kqy, kq0, ksig, kw_ok)
         wrx(:) = 0.0 ; wry(:) = 0.0
         do k = -2, 2
           wrx(k) = dg_wref_at(hw, k, 0, bx, by)
           wry(k) = dg_wref_at(hw, 0, k, bx, by)
+          if (kw_ok) then
+            wrx(k) = (1.0-ksig)*wrx(k) + ksig*dg_kink_twist_at(kqx, kqy, kq0, k, 0)
+            wry(k) = (1.0-ksig)*wry(k) + ksig*dg_kink_twist_at(kqx, kqy, kq0, 0, k)
+          endif
         enddo
         ! Response 1 - (cos(theta_x) + cos(theta_y))/2: zero on a uniform twist,
         ! 2 on the checkerboard that no face jump can see.
@@ -16569,8 +16744,14 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       if (excess > 0.0) then
         ! The twist's second difference separates by axis, so the protection
         ! does too: each axis contributes the minimum over its own bias's reach.
-        gwt = min(dg_gl_reach_wt(gwx, bx, CS%dg_damp_gl_reach), &
-                  dg_gl_reach_wt(gwy, by, CS%dg_damp_gl_reach))
+        ! As for the tilt: where the reference carries the break there is nothing
+        ! for the exemption to work around, and the cell damps like any other.
+        if (kw_ok) then
+          gwt = 1.0
+        else
+          gwt = min(dg_gl_reach_wt(gwx, bx, CS%dg_damp_gl_reach), &
+                    dg_gl_reach_wt(gwy, by, CS%dg_damp_gl_reach))
+        endif
         gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_w))
         ! The checkerboard twist alternates along BOTH axes, so it survives as
         ! long as either sweep is slow: credit the transport with the smaller of
