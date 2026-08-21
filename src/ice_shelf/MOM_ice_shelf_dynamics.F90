@@ -13460,7 +13460,7 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "on a uniform tilt so it does not overlap with the artificial viscosity, "//&
                  "and by a correction that is equal and opposite on the two nodes of each "//&
                  "tilt so it moves no mass.", &
-                 default=.false., do_not_log=(.not.CS%use_DG_thickness))
+                 default=.true., do_not_log=(.not.CS%use_DG_thickness))
   if (.not.CS%use_DG_thickness) CS%dg_tilt_damp = .false.
   if (CS%use_DG_thickness .and. .not.CS%GL_regularize) call MOM_error(FATAL, &
     "USE_DG_THICKNESS requires GROUNDING_LINE_INTERPOLATE=True: the sub-element "//&
@@ -13478,7 +13478,7 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "forces no twist at all and the median twist there is 1.4% of the tilt, "//&
                  "whereas a continental bed gives 35%. Uses DG1_TILT_DAMP_TAU and "//&
                  "DG1_TILT_DAMP_R_HI, the two modes being of comparable magnitude.", &
-                 default=.false., do_not_log=(.not.CS%use_DG_thickness))
+                 default=.true., do_not_log=(.not.CS%use_DG_thickness))
   if (.not.CS%use_DG_thickness) CS%dg_twist_damp = .false.
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_ADVECTIVE", CS%dg_damp_advective, &
@@ -13498,7 +13498,7 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "global one. The subtraction is per direction, since the xi damper's "//&
                  "clock is |u| and the eta damper's is |v|, and across a stream only the "//&
                  "second one vanishes.", &
-                 default=.false., do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
+                 default=.true., do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_ADVECTIVE_C", CS%dg_damp_advective_c, &
                  "Coefficient on the transport's own removal rate c*|u_n|/dx that "//&
@@ -13527,7 +13527,7 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "matters on any grid whose cells are not square: the xi mode is swept out "//&
                  "over dx and the eta mode over dy, and on a continental grid those "//&
                  "differ. The twist, alternating along both axes, uses sqrt(dx*dy).", &
-                 units="m s-1", default=0.0, scale=US%m_s_to_L_T, &
+                 units="m s-1", default=3.170979E-05, scale=US%m_s_to_L_T, &
                  do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_EXCESS_ONLY", CS%dg_damp_excess_only, &
@@ -13543,7 +13543,7 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "NOT relax the tilt onto the reference: the operator is a second "//&
                  "difference, so any disagreement that varies linearly from cell to cell "//&
                  "is left alone and only CURVATURE in the disagreement is removed.", &
-                 default=.false., do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
+                 default=.true., do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_KINK_REF", CS%dg_damp_kink_ref, &
                  "If true, the mode damper's mean-supported reference reconstructs the "//&
@@ -13570,7 +13570,7 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  "a valley a couple of cells across -- the cell falls back to "//&
                  "DG1_TILT_DAMP_GL_REACH, which is then doing the job it is good at on a "//&
                  "far smaller set of cells.", &
-                 default=.false., do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
+                 default=.true., do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_KINK_TOL", CS%dg_damp_kink_tol, &
                  "Grounded-fraction misfit at which the twist's single-line reconstruction "//&
@@ -13635,6 +13635,8 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
   ! a dt-proportional relaxation would do different physics at each dt and
   ! destroy dt-convergence testing. The dt safety check is a warning instead,
   ! issued once from the advection routine where the true step is known.
+  ! Superseded by DG1_TILT_DAMP_U_CUT, which now carries a non-zero default, and
+  ! read only when that is set to zero.  A time cannot be grid-invariant.
   call get_param(param_file, mdl, "DG1_TILT_DAMP_TAU", CS%dg_tilt_damp_tau, &
                  "Delivered e-folding time of the fully-gated grid-scale in-cell tilt "//&
                  "mode. Independent of the artificial viscosity: that term's TAU_FLOOR "//&
