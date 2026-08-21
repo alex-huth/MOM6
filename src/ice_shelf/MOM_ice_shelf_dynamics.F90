@@ -16461,7 +16461,16 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   real, dimension(2,2) :: dh
   real :: tau_chk ! Shortest relaxation time the mode damper will deliver anywhere in the
                   ! computational domain, for the time-step warning [T ~> s]
-  character(len=200) :: mesg  ! The text of a MOM warning
+  character(len=24) :: n1, n2 ! Formatted numbers for the warnings below.  Only the
+                  ! NUMBERS go through an internal write; the prose is concatenated
+                  ! afterwards.  Two hazards are avoided that way, both of which bit:
+                  ! an internal write that overruns its scalar buffer does not
+                  ! truncate but fails at run time with "too many records", the
+                  ! format having tried to start a second record where a scalar has
+                  ! only one; and the "//& idiom that MOM6 uses to continue a long
+                  ! message means something different inside a FORMAT literal, where
+                  ! it splices two quoted strings and leaves a stray quote in the
+                  ! format itself.
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed, a, b
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
@@ -16541,22 +16550,21 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
     ! them now that the minimum is global.
     if (is_root_pe()) then
       if (tau_chk < time_step) then
-        write(mesg,'("The mode damper''s shortest relaxation time anywhere, ",ES10.3, &
-                   &" s, is below the advection step of ",ES10.3," s. The 0.5/dt rate "//&
-                   "cap therefore binds and the DELIVERED relaxation time is the "//&
-                   "advection step, not the one requested. Lowering it further will "//&
-                   "change nothing.")') tau_chk, time_step
-        call MOM_error(WARNING, trim(mesg))
+        write(n1,'(ES10.3)') tau_chk ; write(n2,'(ES10.3)') time_step
+        call MOM_error(WARNING, "DG(1) mode damper: shortest relaxation time "//&
+             trim(adjustl(n1))//" s is below the advection step "//trim(adjustl(n2))//&
+             " s. The rate cap binds, so the delivered relaxation time IS the advection "//&
+             "step and not the one requested; lowering it further will change nothing.")
       endif
       if (tau_chk < 10.0*CS%velocity_update_time_step) then
-        write(mesg,'("The mode damper''s shortest relaxation time anywhere, ",ES10.3, &
-                   &" s, is only ",F7.2," ICE_VELOCITY_TIMESTEPs. The velocity is frozen "//&
-                   "between updates while the damper keeps acting, and that lag rings "//&
-                   "once the relaxation is within a few times it; expect a fluctuating "//&
-                   "steady state. Lengthen the relaxation or shorten "//&
-                   "ICE_VELOCITY_TIMESTEP -- these are different fixes.")') &
-          tau_chk, tau_chk/CS%velocity_update_time_step
-        call MOM_error(WARNING, trim(mesg))
+        write(n1,'(ES10.3)') tau_chk
+        write(n2,'(F8.2)') tau_chk / CS%velocity_update_time_step
+        call MOM_error(WARNING, "DG(1) mode damper: shortest relaxation time "//&
+             trim(adjustl(n1))//" s is only "//trim(adjustl(n2))//" ICE_VELOCITY_TIMESTEPs. "//&
+             "The velocity is frozen between updates while the damper keeps acting, and "//&
+             "that lag rings once the relaxation is within a few times it; expect a "//&
+             "fluctuating steady state. Lengthen the relaxation or shorten "//&
+             "ICE_VELOCITY_TIMESTEP -- these are different fixes.")
       endif
     endif
     CS%dg_tilt_damp_dt_warned = .true.
