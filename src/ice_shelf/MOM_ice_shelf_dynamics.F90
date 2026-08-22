@@ -593,6 +593,10 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! single-line reconstruction of the flotation break falls
                                   !! to zero, so the reference reverts to the mean-supported
                                   !! one [nondim].
+  real :: dg_damp_kink_fit_tol    !< Relative slope misfit at which confidence in the TILT's
+                                  !! two-branch reconstruction of the flotation break falls to
+                                  !! zero, the counterpart of dg_damp_kink_tol for the twist.
+                                  !! Non-positive skips the test [nondim].
   logical :: dg_damp_kink_ref     !< If true, the mode damper's reference is told where the
                                   !! flotation contour is and reconstructs the slope break
                                   !! across it, instead of the cell being exempted.
@@ -13591,6 +13595,33 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  units="nondim", default=0.2, &
                  do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
+  call get_param(param_file, mdl, "DG1_TILT_DAMP_KINK_FIT_TOL", CS%dg_damp_kink_fit_tol, &
+                 "Relative slope misfit at which the TILT's two-branch reconstruction of "//&
+                 "the flotation break stops being trusted, the counterpart of "//&
+                 "DG1_TILT_DAMP_KINK_TOL for the twist. Non-positive, the default, skips "//&
+                 "the test and leaves answers bitwise unchanged. Without it the tilt's "//&
+                 "confidence rests on a count of how many clean cells each branch had, "//&
+                 "which is a sufficiency test and not a fit test: a flotation transition "//&
+                 "that refinement has RESOLVED offers plenty of clean cells on both sides "//&
+                 "and is still the wrong shape for a single sharp break, so confidence "//&
+                 "grows exactly where the model becomes less appropriate. Measured on "//&
+                 "MISMIP+, below about 4 km the residual the reference leaves near the "//&
+                 "grounding line stops alternating and turns coherent -- the lag-1 "//&
+                 "correlation of the detector runs -0.61, -0.50, -0.40, -0.17, +0.13 from "//&
+                 "10 km to 2 km while away from the line it holds near -0.6 -- and the "//&
+                 "term spends most of its effort there for a 1.8% reduction in what it "//&
+                 "targets. With this set, the model predicts each cell's rise as "//&
+                 "f*s_g + (1-f)*s_f, compares the implied centre-to-centre differences "//&
+                 "with the cell means, and ramps confidence linearly from one at no "//&
+                 "misfit to zero at this fraction of the largest branch slope. Confidence "//&
+                 "can only FALL, and a falling confidence reverts the reference toward the "//&
+                 "mean-supported one AND closes the gate toward the grounding-line "//&
+                 "exemption together, so a misread cell is damped less rather than damped "//&
+                 "against a reference it should not trust. 0.2 matches the twist's "//&
+                 "default.", &
+                 units="nondim", default=-1.0, &
+                 do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
+
   call get_param(param_file, mdl, "DG1_TILT_DAMP_GL_REACH", CS%dg_damp_gl_reach, &
                  "How far the mode damper's grounding-line protection extends from the "//&
                  "cell the flotation contour crosses. 0 protects that cell alone, 1 the "//&
@@ -15915,7 +15946,7 @@ end function dg_wref_at
 !! from O(dx^5) to O(dx^3.8) against a detector that is O(dx^3) -- and the leak
 !! is signed, so it damps a smooth solution steadily for as long as the model
 !! runs.  That is a fifth cell's worth of stencil, hence the +-4 gather.
-pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, A, A_bed, A_ref, href, &
+pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, fit_tol, A, A_bed, A_ref, href, &
                                     valid, mode, kink_c)
   real,    dimension(-4:4), intent(in)  :: tv !< Per-cell tilt along the stencil [Z ~> m]
   real,    dimension(-4:4), intent(in)  :: bv !< Per-cell bed tilt along the stencil [Z ~> m]
@@ -15923,6 +15954,8 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, A, A_bed, A_ref, h
   logical, dimension(-4:4), intent(in)  :: ok !< True where the cell is usable
   real,    dimension(-4:4), intent(in)  :: fv !< Grounded fraction on the gather [nondim]
   logical, intent(in) :: kink !< If true, build the reference with the flotation break in it
+  real,    intent(in) :: fit_tol !< Relative slope misfit at which the two-branch model is
+                                !! disbelieved, or non-positive to skip the test [nondim]
   real,    intent(out) :: A     !< Tilt-Laplacian detector [Z ~> m]
   real,    intent(out) :: A_bed !< The same operator on the bed [Z ~> m]
   real,    intent(out) :: A_ref !< The same operator on the mean-supported tilt [Z ~> m]
@@ -15980,7 +16013,7 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, A, A_bed, A_ref, h
   ! spans, so sigma = 0 in a smooth region returns the centred form bit for bit
   ! and nothing outside a grounding line changes.
   if (kink) then
-    call dg_kink_branches(hv, fv, ok, rlo, rhi, s_g, s_f, sigma, cf, kv)
+    call dg_kink_branches(hv, fv, ok, rlo, rhi, fit_tol, s_g, s_f, sigma, cf, kv)
     if (kv) then
       sigma = sigma * cf
       rm = (1.0-sigma)*rm + sigma*(fv(km)*s_g + (1.0-fv(km))*s_f)
@@ -16020,12 +16053,15 @@ end subroutine dg_tilt_detector_1d
 !! than two and there is nothing to build from: the caller falls back to the
 !! grounding-line exemption, on the much smaller set of cells where that is now
 !! the only option.
-pure subroutine dg_kink_branches(hv, fv, ok, lo, hi, s_g, s_f, sigma, conf, valid)
+pure subroutine dg_kink_branches(hv, fv, ok, lo, hi, fit_tol, s_g, s_f, sigma, conf, valid)
   real,    dimension(-4:4), intent(in)  :: hv !< Cell means on the gather [Z ~> m]
   real,    dimension(-4:4), intent(in)  :: fv !< Grounded fraction on the gather [nondim]
   logical, dimension(-4:4), intent(in)  :: ok !< True where the cell is usable
   integer, intent(in)  :: lo    !< First offset the reference reads
   integer, intent(in)  :: hi    !< Last offset the reference reads
+  real,    intent(in)  :: fit_tol !< Relative slope misfit at which the two-branch model is
+                                !! disbelieved outright, or non-positive to skip the test
+                                !! and keep the count-only confidence [nondim]
                                 !! The span is measured over [lo,hi]; the branch slopes are
                                 !! sought over the whole usable gather, since cells wholly
                                 !! on one side generally lie OUTSIDE the three offsets the
@@ -16041,6 +16077,9 @@ pure subroutine dg_kink_branches(hv, fv, ok, lo, hi, s_g, s_f, sigma, conf, vali
                         ! guards against round-trip rounding and nothing else.
   integer :: k, ng, nf, ge, fs, slo, shi
   logical :: gnd_low    ! True when the grounded end of the window is the low one
+  real :: den           ! Largest slope in play, the scale a misfit is judged against [Z ~> m]
+  real :: amax          ! Worst centre-to-centre misfit of the two-branch model [Z ~> m]
+  real :: mk, mk1       ! Model rise across cells k and k+1 [Z ~> m]
 
   s_g = 0.0 ; s_f = 0.0 ; sigma = 0.0 ; conf = 0.0 ; valid = .false.
   sigma = maxval(fv(lo:hi)) - minval(fv(lo:hi))
@@ -16082,6 +16121,45 @@ pure subroutine dg_kink_branches(hv, fv, ok, lo, hi, s_g, s_f, sigma, conf, vali
   else
     if (ng >= 3) then ; s_g = 0.5*(hv(ge+2) - hv(ge)) ; else ; s_g = hv(ge+1) - hv(ge) ; endif
     if (nf >= 3) then ; s_f = 0.5*(hv(fs) - hv(fs-2)) ; else ; s_f = hv(fs) - hv(fs-1) ; endif
+  endif
+
+  ! Does the two-branch model actually DESCRIBE these cells?  The count above is
+  ! a sufficiency test -- were there enough clean cells to build a slope from --
+  ! and it says nothing about fit.  A flotation transition that refinement has
+  ! resolved offers plenty of clean cells on both sides and is still the wrong
+  ! shape for a single sharp break, so the count grows more confident exactly
+  ! where the model grows less appropriate.  Measured on MISMIP+: below about
+  ! 4 km the residual the reference leaves near the grounding line stops
+  ! alternating and turns coherent, the lag-1 correlation of the detector going
+  ! -0.61, -0.50, -0.40, -0.17, +0.13 from 10 km to 2 km, while away from the
+  ! line it stays near -0.6.  The term was spending most of its effort there for
+  ! a 1.8% reduction in the thing it was aimed at.
+  !
+  ! So check the model against the means.  Under it cell k rises by
+  ! f(k)*s_g + (1-f(k))*s_f, and a centre-to-centre difference spans half of each
+  ! of two cells.  Judge the misfit against the largest slope in play, a misfit
+  ! mattering only relative to the correction being made.  This mirrors the test
+  ! dg_kink_plane_2d already applies to the twist, which has had one from the
+  ! start; only the 1D branch was missing it.
+  !
+  ! min(), never max(): confidence can only FALL here.  That matters for more
+  ! than tidiness.  A falling confidence blends the reference back toward the
+  ! plain centred form AND closes the gate toward the grounding-line exemption,
+  ! together, so a cell whose geometry the model misreads ends up damped LESS
+  ! rather than damped against a reference it should not have trusted.  Less
+  ! damping at a grounding line is the configuration whose P75R reversibility was
+  ! established before the kink reference existed, so this cannot cost it.
+  if (fit_tol > 0.0) then
+    den = max(abs(s_g - s_f), max(abs(s_g), abs(s_f)))
+    if (den > 0.0) then
+      amax = 0.0
+      do k = lo, hi-1
+        mk  = fv(k)  *s_g + (1.0 - fv(k))  *s_f
+        mk1 = fv(k+1)*s_g + (1.0 - fv(k+1))*s_f
+        amax = max(amax, abs((hv(k+1) - hv(k)) - 0.5*(mk + mk1)))
+      enddo
+      conf = min(conf, max(0.0, 1.0 - (amax/den)/fit_tol))
+    endif
   endif
   valid = .true.
 end subroutine dg_kink_branches
@@ -16672,6 +16750,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         gv(k) = f_gnd(kk,j)
       enddo
       call dg_tilt_detector_1d(tv, bv, hv, okv, gv, CS%dg_damp_kink_ref, &
+                               CS%dg_damp_kink_fit_tol, &
                                A_h, A_bed, A_ref, href_d, det_ok, dmode, kink_c)
       ! The exemption is a workaround for a reference that cannot represent the
       ! break.  Where the reference now represents it, there is nothing to work
@@ -16716,6 +16795,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         gv(k) = f_gnd(i,kk)
       enddo
       call dg_tilt_detector_1d(tv, bv, hv, okv, gv, CS%dg_damp_kink_ref, &
+                               CS%dg_damp_kink_fit_tol, &
                                A_h, A_bed, A_ref, href_d, det_ok, dmode, kink_c)
       ! The exemption is a workaround for a reference that cannot represent the
       ! break.  Where the reference now represents it, there is nothing to work
