@@ -8065,6 +8065,11 @@ subroutine calc_shelf_basal_prefactors_node(CS, ISS, G, US)
   real :: asum_all       ! Sum of all four in-domain cell areas at the node [L2 ~> m2]
   real :: asum_ice       ! Sum of the ice-covered cell areas at the node [L2 ~> m2]
   real :: w              ! Area weight of one cell [L2 ~> m2]
+  real, dimension(4) :: aq ! Per-cell area weight at the node, by corner slot [L2 ~> m2]
+  real, dimension(4) :: cq ! Per-cell area-weighted C_basal_friction [R L Z T-2 (s m-1)^n L2]
+  real, dimension(4) :: iq ! Per-cell area weight where ice is present [L2 ~> m2]
+  real, dimension(4) :: nq ! Per-cell area-weighted effective pressure [R Z L T-2 L2]
+  integer :: kq            ! Corner slot index: 1=SW, 2=SE, 3=NW, 4=NE
   real :: Cw             ! Area-weighted sum of C_basal_friction over all four cells [R L Z T-2 (s m-1)^n L2]
   real :: Nw             ! Area-weighted sum of the cell effective pressures [R Z L T-2 L2]
   real :: hw             ! Area-weighted sum of ice thickness over ice cells [Z L2 ~> m3]
@@ -8085,7 +8090,9 @@ subroutine calc_shelf_basal_prefactors_node(CS, ISS, G, US)
   do J=G%jsd,G%jed-1 ; do I=G%isd,G%ied-1
     asum_all = 0.0 ; asum_ice = 0.0 ; Cw = 0.0 ; Nw = 0.0 ; hw = 0.0 ; bw = 0.0
     C_n = 0.0 ; N_n = 0.0
+    aq(:) = 0.0 ; cq(:) = 0.0 ; iq(:) = 0.0 ; nq(:) = 0.0
     do jj=0,1 ; jc = J+jj ; do ii=0,1 ; ic = I+ii
+      kq = 1 + ii + 2*jj   ! 1=SW, 2=SE, 3=NW, 4=NE
       ! Skip across-wall halo cells: beyond a non-reentrant wall C_basal_friction is not read from
       ! file and pass_var does not fill it, so it keeps the (large) allocate default and would poison
       ! the nodal C average at wall nodes, inflating the wall-node drag and breaking meridional
@@ -8100,9 +8107,9 @@ subroutine calc_shelf_basal_prefactors_node(CS, ISS, G, US)
       ice_here = (ISS%hmask(ic,jc) == 1 .or. ISS%hmask(ic,jc) == 3)
       ! C is a static bed property under floating and ice-free ice alike: average over all in-domain
       ! cells so the nodal C is fixed by geometry, not by where the ice front happens to be.
-      asum_all = asum_all + w
-      Cw = Cw + w*CS%C_basal_friction(ic,jc)
-      if (ice_here) asum_ice = asum_ice + w
+      aq(kq) = w
+      cq(kq) = w*CS%C_basal_friction(ic,jc)
+      if (ice_here) iq(kq) = w
       ! CISM order of operations (glissade_basal_traction, calc_effective_pressure): form N in the
       ! cell and cap it to [0, overburden] there, then stagger N itself to the node over ALL four
       ! in-domain cells. An ice-free cell has no overburden and so contributes N = 0, exactly as
@@ -8110,9 +8117,18 @@ subroutine calc_shelf_basal_prefactors_node(CS, ISS, G, US)
       ! makes the nodal N continuous as a cell gains or loses thin ice, and capping per cell stops a
       ! deeply floating neighbor from pulling the nodal average below zero without bound.
       if (ice_here) &
-        Nw = Nw + w*coulomb_effective_pressure(max(ISS%h_shelf(ic,jc), CS%min_h_shelf), &
+        nq(kq) = w*coulomb_effective_pressure(max(ISS%h_shelf(ic,jc), CS%min_h_shelf), &
                       CS%bed_elev(ic,jc), rho_oi_ratio, rho_ice_g_LtoZ, 0.0)
     enddo ; enddo
+    ! Reduce over the four cells by opposite pairs, SW+NE then SE+NW. A quarter turn
+    ! permutes the four cyclically, so this pairing is bit-for-bit rotation-invariant
+    ! while a running accumulation over the loop order is not. Only Nw actually varies
+    ! from cell to cell here under a uniform grid and a constant C, but all four are
+    ! grouped the same way so the routine stays invariant on a stretched grid too.
+    asum_all = (aq(1) + aq(4)) + (aq(2) + aq(3))
+    Cw       = (cq(1) + cq(4)) + (cq(2) + cq(3))
+    asum_ice = (iq(1) + iq(4)) + (iq(2) + iq(3))
+    Nw       = (nq(1) + nq(4)) + (nq(2) + nq(3))
     ! Nodal control volume for the local drag, as lumped corner areas (0.25*areaT per cell). With
     ! LOCAL_NODE_FULL_AREA this is the full dual-cell area of the in-domain cells, which is what CISM
     ! adds to the diagonal (dx*dy) at every active vertex; otherwise it is restricted to the
@@ -8755,29 +8771,34 @@ subroutine compute_gl_quadrant_fractions(CS, ISS, G)
     ! Quadrant 1: NE quarter of cell (i,j) (southwest of the node)
     fv(1) =        f_flot(i,j)
     fv(2) = 0.5 * (f_flot(i,j)   + f_flot(i+1,j))
-    fv(3) = 0.25*((f_flot(i,j)   + f_flot(i+1,j)) + (f_flot(i,j+1) + f_flot(i+1,j+1)))
+    fv(3) = 0.25*((f_flot(i,j) + f_flot(i+1,j+1)) + (f_flot(i+1,j) + f_flot(i,j+1)))
     fv(4) = 0.5 * (f_flot(i,j)   + f_flot(i,j+1))
     call gl_quadrant_grounded_frac(fv, fgq(1,i,j))
     ! Quadrant 2: NW quarter of cell (i+1,j) (southeast of the node)
     fv(1) = 0.5 * (f_flot(i+1,j) + f_flot(i,j))
     fv(2) =        f_flot(i+1,j)
     fv(3) = 0.5 * (f_flot(i+1,j) + f_flot(i+1,j+1))
-    fv(4) = 0.25*((f_flot(i,j)   + f_flot(i+1,j)) + (f_flot(i,j+1) + f_flot(i+1,j+1)))
+    fv(4) = 0.25*((f_flot(i,j) + f_flot(i+1,j+1)) + (f_flot(i+1,j) + f_flot(i,j+1)))
     call gl_quadrant_grounded_frac(fv, fgq(2,i,j))
     ! Quadrant 3: SW quarter of cell (i+1,j+1) (northeast of the node)
-    fv(1) = 0.25*((f_flot(i,j)   + f_flot(i+1,j)) + (f_flot(i,j+1) + f_flot(i+1,j+1)))
+    fv(1) = 0.25*((f_flot(i,j) + f_flot(i+1,j+1)) + (f_flot(i+1,j) + f_flot(i,j+1)))
     fv(2) = 0.5 * (f_flot(i+1,j+1) + f_flot(i+1,j))
     fv(3) =        f_flot(i+1,j+1)
     fv(4) = 0.5 * (f_flot(i+1,j+1) + f_flot(i,j+1))
     call gl_quadrant_grounded_frac(fv, fgq(3,i,j))
     ! Quadrant 4: SE quarter of cell (i,j+1) (northwest of the node)
     fv(1) = 0.5 * (f_flot(i,j+1) + f_flot(i,j))
-    fv(2) = 0.25*((f_flot(i,j)   + f_flot(i+1,j)) + (f_flot(i,j+1) + f_flot(i+1,j+1)))
+    fv(2) = 0.25*((f_flot(i,j) + f_flot(i+1,j+1)) + (f_flot(i+1,j) + f_flot(i,j+1)))
     fv(3) = 0.5 * (f_flot(i,j+1) + f_flot(i+1,j+1))
     fv(4) =        f_flot(i,j+1)
     call gl_quadrant_grounded_frac(fv, fgq(4,i,j))
 
-    CS%f_ground_node(i,j) = 0.25*((fgq(1,i,j) + fgq(2,i,j)) + (fgq(3,i,j) + fgq(4,i,j)))
+    ! Quadrants 1..4 run SW, SE, NE, NW around the node, so a quarter turn permutes them
+    ! cyclically. Pairing opposite quadrants makes the sum bit-for-bit rotation-invariant:
+    ! the shift maps the two partial sums onto each other, and their addition commutes.
+    ! Pairing adjacent quadrants would instead regroup the four addends and change the
+    ! rounding. Same convention as the SEP2 and DG reductions elsewhere in this module.
+    CS%f_ground_node(i,j) = 0.25*((fgq(1,i,j) + fgq(3,i,j)) + (fgq(2,i,j) + fgq(4,i,j)))
   enddo ; enddo
 
   ! Per-cell grounded fraction = mean of the four in-cell quadrants, taken from the node sums
@@ -8785,7 +8806,7 @@ subroutine compute_gl_quadrant_fractions(CS, ISS, G)
   ! collects quadrant 3 of node (i-1,j-1), quadrant 4 of node (i,j-1), quadrant 1 of node (i,j),
   ! and quadrant 2 of node (i-1,j).
   do j=jsd+1,jed-1 ; do i=isd+1,ied-1
-    CS%f_ground_cell(i,j) = 0.25*((fgq(3,i-1,j-1) + fgq(4,i,j-1)) + (fgq(1,i,j) + fgq(2,i-1,j)))
+    CS%f_ground_cell(i,j) = 0.25*((fgq(3,i-1,j-1) + fgq(1,i,j)) + (fgq(4,i,j-1) + fgq(2,i-1,j)))
     ! Each quadrant is the quarter of the cell adjacent to one corner, so the same four numbers
     ! that average to the cell grounded fraction are, individually, the nodal grounded fractions.
     ! The floating fraction is their complement. No extra integration is needed.
