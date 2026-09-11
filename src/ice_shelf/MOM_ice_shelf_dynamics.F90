@@ -10878,10 +10878,10 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
       d = (dyCu_W * x_marginal_1) + (dyCu_E * x_marginal_2)
       weight = 0.25 * subarea * (a * d)
 
-      dhdx_gp = ( ((-y_marginal_1) * h_nodal_cell(1,1) + ( y_marginal_2) * h_nodal_cell(2,2)) + &
-                  (( y_marginal_1) * h_nodal_cell(2,1) + (-y_marginal_2) * h_nodal_cell(1,2)) ) / a
-      dhdy_gp = ( ((-x_marginal_1) * h_nodal_cell(1,1) + ( x_marginal_2) * h_nodal_cell(2,2)) + &
-                  ((-x_marginal_2) * h_nodal_cell(2,1) + ( x_marginal_1) * h_nodal_cell(1,2)) ) / d
+      dhdx_gp = ( (((-y_marginal_1) * h_nodal_cell(1,1)) + (( y_marginal_2) * h_nodal_cell(2,2))) + &
+                  ((( y_marginal_1) * h_nodal_cell(2,1)) + ((-y_marginal_2) * h_nodal_cell(1,2))) ) / a
+      dhdy_gp = ( (((-x_marginal_1) * h_nodal_cell(1,1)) + (( x_marginal_2) * h_nodal_cell(2,2))) + &
+                  (((-x_marginal_2) * h_nodal_cell(2,1)) + (( x_marginal_1) * h_nodal_cell(1,2))) ) / d
 
       dbdx_ref = ((bed_corners(1,1) * (-y_marginal_1))  + &
                   (bed_corners(2,2) * ( y_marginal_2))) + &
