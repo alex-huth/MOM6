@@ -32,7 +32,6 @@ use MOM_checksums, only : hchksum, qchksum
 use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary_channel,initialize_ice_flow_from_file
 use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary_from_file,initialize_ice_C_basal_friction
 use MOM_ice_shelf_initialize, only : initialize_ice_AGlen, initialize_bed_node_from_file
-use MOM_ice_shelf_initialize, only : initialize_DG_thickness_from_node_file
 implicit none ; private
 
 #include <MOM_memory.h>
@@ -41,6 +40,7 @@ public register_ice_shelf_dyn_restarts, initialize_ice_shelf_dyn, update_ice_she
 public ice_time_step_CFL, ice_shelf_dyn_end, change_in_draft, write_ice_shelf_energy
 public shelf_advance_front, ice_shelf_min_thickness_calve, calve_to_mask, volume_above_floatation
 public reset_DG_to_cellmean_at_cell, reset_DG_to_cellmean_bulk, is_DG_thickness_active
+public DG_nodal_thickness_ptr
 public accumulate_DG_source_rate
 public calc_prescribed_basal_melt
 public masked_var_grounded
@@ -476,10 +476,14 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: moving_shelf_front  !< Specify whether to advance shelf front (and calve).
   logical :: use_DG_thickness     !< If true, use DG(1) representation for ice thickness with
                                   !! unsplit advection scheme and sub-element driving stress quadrature.
-  logical :: use_nodal_bed_file   !< If true, read bed elevation at B-grid nodes from NODAL_BED_FILE
-                                  !! into CS%bed_node and derive CS%bed_elev by bilinear averaging.
-                                  !! Skips reconstruct_bed_to_nodes and the BED_TOPO_FILE read in
-                                  !! initialize_ice_flow_from_file. Requires USE_DG_THICKNESS.
+  logical :: init_bed_nodal       !< If true, read bed elevation at B-grid nodes from BED_TOPO_FILE
+                                  !! into CS%bed_node and derive CS%bed_elev as the area-weighted
+                                  !! cell mean of their bilinear interpolant. Skips
+                                  !! reconstruct_bed_to_nodes and the cell-averaged BED_TOPO_FILE
+                                  !! read in initialize_ice_flow_from_file.
+  logical :: init_thickness_nodal !< If true, ICE_THICKNESS_VARNAME was read at B-grid nodes and
+                                  !! CS%h_nodal was filled during initialize_ice_thickness, so the
+                                  !! cell-mean seeding of h_nodal is skipped.
   logical :: dg_fv_advect         !< If true (with USE_DG_THICKNESS), transport ISS%h_shelf with
                                   !! the 2nd-order limited FV advection and slave CS%h_nodal flat
                                   !! to the cell means: the DG(0) hybrid. All non-advection DG
@@ -1224,7 +1228,6 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   logical :: valid_E, valid_W, valid_N, valid_S ! DG cold-start neighbour-mask checks
   real :: h_E, h_W, h_N, h_S ! Effective neighbour cell-mean thickness for DG cold-start [Z ~> m]
   logical :: slopes_from_file ! True if DG h_x, h_y were read from ICE_THICKNESS_FILE
-  logical :: node_ic_used     ! True if nodal h was read and used to set h_shelf, h_x, h_y
   character(len=200) :: IS_energyfile  ! The name of the energy file.
   character(len=32) :: filename_appendix = '' ! FMS appendix to filename for ensemble runs
   character(len=16) :: inner_solver_str ! The type of inner solver to use for the SSA
@@ -1362,16 +1365,16 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "with unsplit RK2 advection and sub-element Gauss quadrature for "//&
                  "driving stress. Requires h_x and h_y slope moments.", &
                  default=.false.)
-    call get_param(param_file, mdl, "USE_NODAL_BED_FILE", CS%use_nodal_bed_file, &
-                 "If true, read bed elevation directly at B-grid nodes from "//&
-                 "NODAL_BED_FILE into CS%bed_node and derive the cell-centered "//&
-                 "CS%bed_elev by bilinear averaging of the four surrounding "//&
-                 "nodes. Skips reconstruct_bed_to_nodes and skips the "//&
-                 "BED_TOPO_FILE read in initialize_ice_flow_from_file. "//&
-                 "Requires USE_DG_THICKNESS=True.", &
-                 default=.false., do_not_log=.not.CS%use_DG_thickness)
-    if (CS%use_nodal_bed_file .and. .not. CS%use_DG_thickness) &
-      call MOM_error(FATAL, "MOM_ice_shelf_dynamics: USE_NODAL_BED_FILE=True requires USE_DG_THICKNESS=True")
+    call get_param(param_file, mdl, "INIT_ICE_BED_NODAL", CS%init_bed_nodal, &
+                 "If true, read the bed elevation directly at B-grid nodes from "//&
+                 "BED_TOPO_VARNAME in BED_TOPO_FILE into CS%bed_node, and derive the "//&
+                 "cell-centered CS%bed_elev as the area-weighted cell mean of the "//&
+                 "bilinear interpolant of the four surrounding nodes, instead of reading "//&
+                 "a cell-averaged bed. The nodal bed is what USE_DG_THICKNESS needs; "//&
+                 "without DG it is discarded after initialization.", &
+                 default=.false.)
+    call get_param(param_file, mdl, "INIT_ICE_THICKNESS_NODAL", CS%init_thickness_nodal, &
+                 default=.false., do_not_log=.true.)
 
     ! Prescribed basal melt for the ice-only driver. In a coupled run the melt rate comes from
     ! the ocean through shelf_calc_flux and these are ignored.
@@ -1882,7 +1885,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     call pass_var(CS%h_bdry_val, G%domain, complete=.true.)
     call pass_var(CS%ice_visc, G%domain)
     if (CS%use_DG_thickness) then
-      if (CS%use_nodal_bed_file) then
+      if (CS%init_bed_nodal) then
         call initialize_bed_node_from_file(CS%bed_node, CS%bed_elev, G, US, param_file)
       else
         call reconstruct_bed_to_nodes(CS, G, ISS%hmask)
@@ -2000,10 +2003,10 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
 
       !initialize ice flow characteristic (velocities, bed elevation under the grounded part, etc) from file
       call initialize_ice_flow_from_file(CS%bed_elev,CS%u_shelf, CS%v_shelf, CS%ground_frac, &
-                  G, US, param_file, skip_bed=CS%use_nodal_bed_file)
+                  G, US, param_file, skip_bed=CS%init_bed_nodal)
       call pass_vector(CS%u_shelf, CS%v_shelf, G%domain, TO_ALL, BGRID_NE, complete=.true.)
       call pass_var(CS%ground_frac, G%domain, complete=.true.)
-      if (CS%use_nodal_bed_file) then
+      if (CS%init_bed_nodal) then
         ! Reads bed_node from file and derives bed_elev (both halo-updated inside).
         call initialize_bed_node_from_file(CS%bed_node, CS%bed_elev, G, US, param_file)
       else
@@ -2011,16 +2014,13 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         if (CS%use_DG_thickness) call reconstruct_bed_to_nodes(CS, G, ISS%hmask)
       endif
       if (CS%use_DG_thickness) then
-        ! Nodal DG(1) cold-start: try node-file IC, otherwise project cell means.
+        ! Nodal DG(1) cold-start. Under INIT_ICE_THICKNESS_NODAL, CS%h_nodal was already
+        ! filled from the corner field by initialize_ice_thickness; otherwise project the
+        ! cell means. The DG(0) hybrid always takes the flat cell-mean branch, since
+        ! corner values would introduce slopes it cannot carry.
         call pass_var(ISS%h_shelf, G%domain)
-        CS%h_nodal(:,:,:,:) = 0.0
-        node_ic_used = .false.
-        ! DG(0) hybrid: skip the node-file IC (it would introduce slopes); always
-        ! take the flat cell-mean branch below.
-        if (.not. CS%dg_fv_advect) &
-          call initialize_DG_thickness_from_node_file(ISS%h_shelf, CS%h_nodal, ISS%hmask, &
-                                                      node_ic_used, G, US, param_file)
-        if (.not. node_ic_used) then
+        if ((.not. CS%init_thickness_nodal) .or. CS%dg_fv_advect) then
+          CS%h_nodal(:,:,:,:) = 0.0
           call initialize_h_nodal_from_cellmean(ISS%h_shelf, CS%h_nodal, ISS%hmask, G)
         endif
         if (CS%nodal_positivity) call nodal_positivity_limit(CS, G, ISS)
@@ -2416,6 +2416,10 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   if (new_sim) then
     call update_OD_ffrac_uncoupled(CS, G, ISS%h_shelf(:,:))
   endif
+
+  ! Only the DG(1) paths read the nodal bed; without them it has served its purpose in
+  ! deriving CS%bed_elev. It is not a restart field, so it is rebuilt on every startup.
+  if ((.not. CS%use_DG_thickness) .and. associated(CS%bed_node)) deallocate(CS%bed_node)
 
 end subroutine initialize_ice_shelf_dyn
 
@@ -10502,7 +10506,8 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%area_node)) deallocate(CS%area_node)
   deallocate(CS%OD_rt, CS%OD_av)
   if (associated(CS%H_node)) deallocate(CS%H_node)
-  deallocate(CS%t_bdry_val, CS%bed_elev, CS%bed_node)
+  deallocate(CS%t_bdry_val, CS%bed_elev)
+  if (associated(CS%bed_node)) deallocate(CS%bed_node)
   if (associated(CS%h_nodal)) deallocate(CS%h_nodal)
   if (associated(CS%h_flot)) deallocate(CS%h_flot)
   if (associated(CS%Minv_xi)) deallocate(CS%Minv_xi)
@@ -12775,6 +12780,17 @@ function is_DG_thickness_active(CS) result(active)
   if (.not. associated(CS)) return
   active = CS%use_DG_thickness
 end function is_DG_thickness_active
+
+!> Return a pointer to the Q1 nodal thickness array, so that the thickness
+!! initialization in MOM_ice_shelf can fill it directly under
+!! INIT_ICE_THICKNESS_NODAL. Returns null if the CS is not associated.
+function DG_nodal_thickness_ptr(CS) result(h_nodal)
+  type(ice_shelf_dyn_CS),           pointer :: CS !< The ice shelf dynamics control structure
+  real, dimension(:,:,:,:),         pointer :: h_nodal !< Q1 nodal thickness [Z ~> m]
+  h_nodal => NULL()
+  if (.not. associated(CS)) return
+  h_nodal => CS%h_nodal
+end function DG_nodal_thickness_ptr
 
 !> Reset all 4 nodal corners of every cell to zero (typical use: pre-init
 !! cleanup before populating from a cell-mean field). No-op when DG(1)

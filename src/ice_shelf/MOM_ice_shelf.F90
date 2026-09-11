@@ -62,6 +62,7 @@ use MOM_ice_shelf_dynamics, only : register_ice_shelf_dyn_restarts, initialize_i
 use MOM_ice_shelf_dynamics, only : ice_shelf_min_thickness_calve, change_in_draft
 use MOM_ice_shelf_dynamics, only : ice_time_step_CFL, ice_shelf_dyn_end, IS_dynamics_post_data
 use MOM_ice_shelf_dynamics, only : volume_above_floatation, masked_var_grounded
+use MOM_ice_shelf_dynamics, only : DG_nodal_thickness_ptr
 use MOM_ice_shelf_initialize, only : initialize_ice_thickness
 !MJH use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary
 use MOM_ice_shelf_state, only : ice_shelf_state, ice_shelf_state_end, ice_shelf_state_init
@@ -1732,6 +1733,8 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
   real, allocatable, dimension(:,:) :: tmp2d ! Temporary array for ice shelf input data [L T-1 ~> m s-1]
   real, allocatable, dimension(:,:) :: maskT ! Temporary array for the tracer points masks [nondim]
 
+  real, dimension(:,:,:,:), pointer :: h_nodal_ptr => NULL() ! Q1 nodal thickness at the 4 cell
+                                             ! corners, filled under INIT_ICE_THICKNESS_NODAL [Z ~> m]
   type(surface), pointer :: sfc_state => NULL()
   type(vardesc) :: u_desc, v_desc
 
@@ -2258,9 +2261,13 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
   endif
 
   if (new_sim .and. (.not. (CS%override_shelf_movement .and. CS%mass_from_file))) then
-    ! This model is initialized internally or from a file.
+    ! This model is initialized internally or from a file. The nodal thickness array is
+    ! handed over so that INIT_ICE_THICKNESS_NODAL can fill it here, where the cell mean it
+    ! implies is still needed to set mass_shelf below. It is allocated by
+    ! register_ice_shelf_dyn_restarts, which has already run.
+    h_nodal_ptr => DG_nodal_thickness_ptr(CS%dCS)
     call initialize_ice_thickness(ISS%h_shelf, ISS%area_shelf_h, ISS%hmask, ISS%melt_mask, CS%Grid, CS%Grid_in, &
-                                  US, param_file, CS%rotate_index, CS%turns)
+                                  US, param_file, CS%rotate_index, CS%turns, h_nodal=h_nodal_ptr)
     ! next make sure mass is consistent with thickness
     do j=G%jsd,G%jed ; do i=G%isd,G%ied
       if ((ISS%hmask(i,j) == 1) .or. (ISS%hmask(i,j) == 2) .or. (ISS%hmask(i,j) == 3)) then

@@ -23,7 +23,6 @@ public initialize_ice_thickness
 public initialize_ice_shelf_boundary_channel
 public initialize_ice_flow_from_file
 public initialize_bed_node_from_file
-public initialize_DG_thickness_from_node_file
 public initialize_ice_shelf_boundary_from_file
 public initialize_ice_C_basal_friction
 public initialize_ice_AGlen
@@ -36,7 +35,8 @@ public initialize_ice_SMB
 contains
 
 !> Initialize ice shelf thickness
-subroutine initialize_ice_thickness(h_shelf, area_shelf_h, hmask, melt_mask, G, G_in, US, PF, rotate_index, turns)
+subroutine initialize_ice_thickness(h_shelf, area_shelf_h, hmask, melt_mask, G, G_in, US, PF, &
+                                    rotate_index, turns, h_nodal)
   type(ocean_grid_type), intent(in)    :: G    !< The ocean's grid structure
   type(ocean_grid_type), intent(in)    :: G_in    !< The ocean's unrotated grid structure
   real, dimension(SZDI_(G),SZDJ_(G)), &
@@ -52,10 +52,14 @@ subroutine initialize_ice_thickness(h_shelf, area_shelf_h, hmask, melt_mask, G, 
   type(param_file_type), intent(in)    :: PF !< A structure to parse for run-time parameters
   logical, intent(in), optional        :: rotate_index !< If true, this is a rotation test
   integer, intent(in), optional        :: turns !< Number of turns for rotation test
+  real, dimension(:,:,:,:), optional, pointer :: h_nodal !< Q1 nodal thickness at the 4 cell
+                                             !! corners, filled only when
+                                             !! INIT_ICE_THICKNESS_NODAL is true [Z ~> m].
 
   character(len=40)  :: mdl = "initialize_ice_thickness" ! This subroutine's name.
   character(len=200) :: config
   logical :: rotate = .false.
+  logical :: nodal_thickness ! If true, the thickness is read at B-grid corner nodes.
   real, allocatable, dimension(:,:) :: tmp1_2d ! Temporary array for storing ice shelf input data [Z~>m]
   real, allocatable, dimension(:,:) :: tmp2_2d ! Temporary array for storing ice shelf input data [L2~>m2]
   real, allocatable, dimension(:,:) :: tmp3_2d ! Temporary array for storing ice shelf input data [nondim]
@@ -69,13 +73,19 @@ subroutine initialize_ice_thickness(h_shelf, area_shelf_h, hmask, melt_mask, G, 
   if (PRESENT(rotate_index)) rotate=rotate_index
 
   if (rotate) then
+    ! The nodal thickness would need a corner-position rotate_array, which does not exist.
+    call get_param(PF, mdl, "INIT_ICE_THICKNESS_NODAL", nodal_thickness, &
+                   default=.false., do_not_log=.true.)
+    if (nodal_thickness) call MOM_error(FATAL, "initialize_ice_thickness: "//&
+                 "INIT_ICE_THICKNESS_NODAL is not supported in a rotation test.")
     allocate(tmp1_2d(G_in%isd:G_in%ied,G_in%jsd:G_in%jed), source=0.0)
     allocate(tmp2_2d(G_in%isd:G_in%ied,G_in%jsd:G_in%jed), source=0.0)
     allocate(tmp3_2d(G_in%isd:G_in%ied,G_in%jsd:G_in%jed), source=0.0)
     allocate(tmp4_2d(G_in%isd:G_in%ied,G_in%jsd:G_in%jed), source=1.0)
     select case ( trim(config) )
       case ("CHANNEL") ; call initialize_ice_thickness_channel (tmp1_2d, tmp2_2d, tmp3_2d, G_in, US, PF)
-      case ("FILE") ; call initialize_ice_thickness_from_file (tmp1_2d, tmp2_2d, tmp3_2d, tmp4_2d, G_in, US, PF)
+      case ("FILE") ; call initialize_ice_thickness_from_file (tmp1_2d, tmp2_2d, tmp3_2d, tmp4_2d, &
+                                                               G_in, US, PF)
       case ("USER") ; call USER_init_ice_thickness (tmp1_2d, tmp2_2d, tmp3_2d, G_in, US, PF)
       case default  ; call MOM_error(FATAL,"MOM_initialize: Unrecognized ice profile setup "//trim(config))
     end select
@@ -83,11 +93,12 @@ subroutine initialize_ice_thickness(h_shelf, area_shelf_h, hmask, melt_mask, G, 
     call rotate_array(tmp2_2d,turns, area_shelf_h)
     call rotate_array(tmp3_2d,turns, hmask)
     call rotate_array(tmp4_2d,turns, melt_mask)
-    deallocate(tmp1_2d,tmp2_2d,tmp3_2d)
+    deallocate(tmp1_2d,tmp2_2d,tmp3_2d,tmp4_2d)
   else
     select case ( trim(config) )
       case ("CHANNEL") ; call initialize_ice_thickness_channel (h_shelf, area_shelf_h, hmask, G, US, PF)
-      case ("FILE") ; call initialize_ice_thickness_from_file (h_shelf, area_shelf_h, hmask, melt_mask, G, US, PF)
+      case ("FILE") ; call initialize_ice_thickness_from_file (h_shelf, area_shelf_h, hmask, melt_mask, &
+                                                               G, US, PF, h_nodal)
       case ("USER") ; call USER_init_ice_thickness (h_shelf, area_shelf_h, hmask, G, US, PF)
       case default  ; call MOM_error(FATAL,"MOM_initialize: Unrecognized ice profile setup "//trim(config))
     end select
@@ -96,7 +107,7 @@ subroutine initialize_ice_thickness(h_shelf, area_shelf_h, hmask, melt_mask, G, 
 end subroutine initialize_ice_thickness
 
 !> Initialize ice shelf thickness from file
-subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, melt_mask, G, US, PF)
+subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, melt_mask, G, US, PF, h_nodal)
   type(ocean_grid_type), intent(in)    :: G    !< The ocean's grid structure
   real, dimension(SZDI_(G),SZDJ_(G)), &
                          intent(inout) :: h_shelf !< The ice shelf thickness [Z ~> m].
@@ -109,14 +120,19 @@ subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, melt
                          intent(inout) :: melt_mask !< A mask indicating where to allow ice-shelf melting [nondim]
   type(unit_scale_type), intent(in)    :: US !< A structure containing unit conversion factors
   type(param_file_type), intent(in)    :: PF !< A structure to parse for run-time parameters
+  real, dimension(:,:,:,:), optional, pointer :: h_nodal !< Q1 nodal thickness at the 4 cell
+                                             !! corners, filled only when
+                                             !! INIT_ICE_THICKNESS_NODAL is true [Z ~> m].
 
   !  This subroutine reads ice thickness and area from a file and puts it into
   !  h_shelf [Z ~> m] and area_shelf_h [L2 ~> m2] (and dimensionless) and updates hmask
   character(len=200) :: filename,thickness_file,inputdir ! Strings for file/path
   character(len=200) :: thickness_varname, area_varname, hmask_varname, melt_mask_varname  ! Variable name in file
   character(len=40)  :: mdl = "initialize_ice_thickness_from_file" ! This subroutine's name.
+  real, allocatable :: h_node(:,:) ! Nodal (B-grid corner) ice thickness [Z ~> m].
   integer :: i, j, isc, jsc, iec, jec
   logical :: hmask_set
+  logical :: nodal_thickness ! If true, read the thickness at B-grid corner nodes.
   real :: len_sidestress, udh
 
   call MOM_mesg("Initialize_ice_thickness_from_file: reading thickness")
@@ -133,8 +149,18 @@ subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, melt
   filename = trim(inputdir)//trim(thickness_file)
   call log_param(PF, mdl, "INPUTDIR/THICKNESS_FILE", filename)
   call get_param(PF, mdl, "ICE_THICKNESS_VARNAME", thickness_varname, &
-                 "The name of the thickness variable in ICE_THICKNESS_FILE.", &
+                 "The name of the thickness variable in ICE_THICKNESS_FILE. With "//&
+                 "INIT_ICE_THICKNESS_NODAL this names a B-grid corner field instead of "//&
+                 "a cell-averaged one.", &
                  default="h_shelf")
+  call get_param(PF, mdl, "INIT_ICE_THICKNESS_NODAL", nodal_thickness, &
+                 "If true, ICE_THICKNESS_VARNAME is read as a nodal (B-grid corner) "//&
+                 "field rather than a cell average, and the cell-averaged thickness is "//&
+                 "derived from it as the area-weighted mean of the bilinear interpolant "//&
+                 "of the four corners. The corner values are also the Q1 nodal thickness "//&
+                 "used by USE_DG_THICKNESS; without DG they are discarded after "//&
+                 "initialization. Requires the shelf mask to be present in the file.", &
+                 default=.false.)
   call get_param(PF, mdl, "ICE_AREA_VARNAME", area_varname, &
                  "The name of the area variable in ICE_THICKNESS_FILE.", &
                  default="area_shelf_h")
@@ -144,7 +170,8 @@ subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, melt
                  default="melt_mask")
   if (.not.file_exists(filename, G%Domain)) call MOM_error(FATAL, &
        " initialize_topography_from_file: Unable to open "//trim(filename))
-  call MOM_read_data(filename, trim(thickness_varname), h_shelf, G%Domain, scale=US%m_to_Z)
+  if (.not.nodal_thickness) &
+    call MOM_read_data(filename, trim(thickness_varname), h_shelf, G%Domain, scale=US%m_to_Z)
   call MOM_read_data(filename,trim(area_varname), area_shelf_h, G%Domain, scale=US%m_to_L**2)
   if (field_exists(filename, trim(hmask_varname), MOM_domain=G%Domain)) then
     call MOM_read_data(filename, trim(hmask_varname), hmask, G%Domain)
@@ -164,10 +191,47 @@ subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, melt
 
   if (.not.hmask_set) then
     ! Set hmask based on the values in h_shelf.
+    if (nodal_thickness) call MOM_error(FATAL, "initialize_ice_thickness_from_file: "//&
+              "INIT_ICE_THICKNESS_NODAL derives hmask from no cell-averaged thickness, so "//&
+              "it requires the variable "//trim(hmask_varname)//" in "//trim(filename)//".")
     do j=jsc,jec ; do i=isc,iec
       hmask(i,j) = 0.0
       if (h_shelf(i,j) > 0.0) hmask(i,j) = 1.0
     enddo ; enddo
+  endif
+
+  ! Read the nodal thickness and derive the cell mean from it. This happens after hmask is
+  ! known, because ice-free cells take no thickness from the nodal field, and before the
+  ! area/hmask loop below, which reads h_shelf through the side-stress taper.
+  if (nodal_thickness) then
+    if (.not. present(h_nodal)) call MOM_error(FATAL, "initialize_ice_thickness_from_file: "//&
+              "INIT_ICE_THICKNESS_NODAL needs the nodal thickness array, which only the "//&
+              "dynamic ice-shelf initialization path provides.")
+    if (.not. associated(h_nodal)) call MOM_error(FATAL, "initialize_ice_thickness_from_file: "//&
+              "INIT_ICE_THICKNESS_NODAL was requested before the nodal thickness was allocated.")
+    if (len_sidestress > 0.) call MOM_error(FATAL, "initialize_ice_thickness_from_file: "//&
+              "LEN_SIDE_STRESS tapers the cell-averaged thickness, which "//&
+              "INIT_ICE_THICKNESS_NODAL derives from the nodal field rather than reading, "//&
+              "leaving the taper and the nodal thickness inconsistent.")
+    allocate(h_node(G%IsdB:G%IedB, G%JsdB:G%JedB), source=0.0)
+    call MOM_read_data(filename, trim(thickness_varname), h_node, G%Domain, &
+                       position=CORNER, scale=US%m_to_Z)
+    call pass_var(h_node, G%domain, position=CORNER)
+
+    h_nodal(:,:,:,:) = 0.0
+    do j=jsc,jec ; do i=isc,iec
+      if (hmask(i,j)==0) then
+        h_shelf(i,j) = 0.0
+      else
+        h_nodal(i,j,1,1) = h_node(I-1, J-1)
+        h_nodal(i,j,2,1) = h_node(I,   J-1)
+        h_nodal(i,j,1,2) = h_node(I-1, J  )
+        h_nodal(i,j,2,2) = h_node(I,   J  )
+        h_shelf(i,j) = corner_cell_mean(G, i, j, h_nodal(i,j,1,1), h_nodal(i,j,2,1), &
+                                        h_nodal(i,j,1,2), h_nodal(i,j,2,2))
+      endif
+    enddo ; enddo
+    deallocate(h_node)
   endif
 
     do j=jsc,jec
@@ -489,10 +553,53 @@ subroutine initialize_ice_flow_from_file(bed_elev,u_shelf, v_shelf,float_cond,&
 
 end subroutine initialize_ice_flow_from_file
 
-!> Read node-based bed elevation from NODAL_BED_FILE into CS%bed_node, then
-!! derive the cell-centered CS%bed_elev by bilinear averaging the four
-!! surrounding nodes. Replaces the reconstruct_bed_to_nodes Jacobi inversion
-!! when an authoritative nodal bed product is available.
+!> Area-weighted cell mean of the bilinear interpolant of a field given at the
+!! four B-grid corners of cell (i,j), on the separable-Jacobian element
+!! a(eta)*d(xi). Uniform cells collapse to 0.25*sum(corners) bit-exactly.
+!!
+!! Pxm/Pxp and Pym/Pyp are the 1D half-cell integrals of d(xi) and a(eta)
+!! against the Q1 basis; expanded, Pxm = dyW/3 + dyE/6 and so on, which is the
+!! same quadrature as nodal_cell_mean/cell_mean_w in MOM_ice_shelf_dynamics.
+!! The two are written differently and are not bit-for-bit interchangeable.
+function corner_cell_mean(G, i, j, c11, c21, c12, c22) result(cmean)
+  type(ocean_grid_type), intent(in) :: G   !< The grid structure used by the ice shelf.
+  integer,               intent(in) :: i   !< The i-index of the cell.
+  integer,               intent(in) :: j   !< The j-index of the cell.
+  real,                  intent(in) :: c11 !< Corner value at (I-1,J-1) [Z ~> m].
+  real,                  intent(in) :: c21 !< Corner value at (I,J-1) [Z ~> m].
+  real,                  intent(in) :: c12 !< Corner value at (I-1,J) [Z ~> m].
+  real,                  intent(in) :: c22 !< Corner value at (I,J) [Z ~> m].
+  real :: cmean                            !< The area-weighted cell mean [Z ~> m].
+
+  real :: a0, a1, d0, d1     ! Per-cell metric scalars [L ~> m].
+  real :: Pxm, Pxp, Pym, Pyp ! 1D half-cell integrals of d(xi) and a(eta) [L ~> m].
+
+  if ((J-1 >= G%JsdB) .and. (j + G%jdg_offset > G%jsg)) then
+    a0 = 0.5*(G%dxCv(i,J-1) + G%dxCv(i,J))
+    a1 = G%dxCv(i,J) - G%dxCv(i,J-1)
+  else
+    a0 = G%dxCv(i,J) ; a1 = 0.0
+  endif
+  if ((I-1 >= G%IsdB) .and. (i + G%idg_offset > G%isg)) then
+    d0 = 0.5*(G%dyCu(I-1,j) + G%dyCu(I,j))
+    d1 = G%dyCu(I,j) - G%dyCu(I-1,j)
+  else
+    d0 = G%dyCu(I,j) ; d1 = 0.0
+  endif
+
+  Pxm = (0.5*d0) - (d1/12.0)
+  Pxp = (0.5*d0) + (d1/12.0)
+  Pym = (0.5*a0) - (a1/12.0)
+  Pyp = (0.5*a0) + (a1/12.0)
+  cmean = ( ((c11*(Pxm*Pym)) + (c22*(Pxp*Pyp))) + &
+            ((c21*(Pxp*Pym)) + (c12*(Pxm*Pyp))) ) / (a0*d0)
+
+end function corner_cell_mean
+
+!> Read node-based bed elevation from BED_TOPO_FILE into CS%bed_node, then
+!! derive the cell-centered CS%bed_elev as the area-weighted cell mean of the
+!! bilinear interpolant of the four surrounding nodes. Used when
+!! INIT_ICE_BED_NODAL is true.
 subroutine initialize_bed_node_from_file(bed_node, bed_elev, G, US, PF)
   type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
   real, dimension(SZDIB_(G),SZDJB_(G)), &
@@ -505,18 +612,17 @@ subroutine initialize_bed_node_from_file(bed_node, bed_elev, G, US, PF)
   character(len=200) :: filename, inputdir, nodal_bed_file
   character(len=200) :: bed_node_varname
   character(len=40)  :: mdl = "initialize_bed_node_from_file"
-  real :: a0, a1, d0, d1   ! Per-cell metric scalars [L ~> m].
-  real :: Pxm, Pxp, Pym, Pyp ! 1D half-cell integrals of d(xi) and a(eta) [L ~> m].
   integer :: i, j
 
   call get_param(PF, mdl, "INPUTDIR", inputdir, default=".", do_not_log=.true.)
   inputdir = slasher(inputdir)
   call get_param(PF, mdl, "BED_TOPO_FILE", nodal_bed_file, &
                  "The file from which the nodal (B-grid corner) bed elevation is read "//&
-                 "when USE_NODAL_BED_FILE=True.", &
+                 "when INIT_ICE_BED_NODAL=True.", &
                  default="ice_shelf_vel.nc")
   call get_param(PF, mdl, "BED_TOPO_VARNAME", bed_node_varname, &
-                 "The name of the nodal bed elevation variable in NODAL_BED_FILE.", &
+                 "The name of the nodal bed elevation variable in BED_TOPO_FILE "//&
+                 "when INIT_ICE_BED_NODAL=True.", &
                  default="depth_n")
 
   filename = trim(inputdir)//trim(nodal_bed_file)
@@ -531,122 +637,12 @@ subroutine initialize_bed_node_from_file(bed_node, bed_elev, G, US, PF)
   ! bilinear corner-node interpolant on the separable-Jacobian element.
   ! Uniform cells collapse to bed_elev = 0.25*sum(corners) bit-exactly.
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
-    if ((J-1 >= G%JsdB) .and. (j + G%jdg_offset > G%jsg)) then
-      a0 = 0.5*(G%dxCv(i,J-1) + G%dxCv(i,J))
-      a1 = G%dxCv(i,J) - G%dxCv(i,J-1)
-    else
-      a0 = G%dxCv(i,J) ; a1 = 0.0
-    endif
-    if ((I-1 >= G%IsdB) .and. (i + G%idg_offset > G%isg)) then
-      d0 = 0.5*(G%dyCu(I-1,j) + G%dyCu(I,j))
-      d1 = G%dyCu(I,j) - G%dyCu(I-1,j)
-    else
-      d0 = G%dyCu(I,j) ; d1 = 0.0
-    endif
-    ! Area-weighted cell mean of the bilinear corner-node interpolant on the
-    ! separable-Jacobian element. Pxm/Pxp/Pym/Pyp are 1D half-cell integrals
-    ! of d(xi) and a(eta). On uniform cells Pxm=Pxp=d0/2, Pym=Pyp=a0/2, so
-    ! bed_elev collapses to 0.25*sum(corners).
-    Pxm = (0.5*d0) - (d1/12.0)
-    Pxp = (0.5*d0) + (d1/12.0)
-    Pym = (0.5*a0) - (a1/12.0)
-    Pyp = (0.5*a0) + (a1/12.0)
-    bed_elev(i,j) = ( ((bed_node(I-1,J-1)*(Pxm*Pym)) + (bed_node(I,J)*(Pxp*Pyp))) + &
-                      ((bed_node(I,J-1)  *(Pxp*Pym)) + (bed_node(I-1,J)*(Pxm*Pyp))) ) / (a0*d0)
+    bed_elev(i,j) = corner_cell_mean(G, i, j, bed_node(I-1,J-1), bed_node(I,J-1), &
+                                     bed_node(I-1,J), bed_node(I,J))
   enddo ; enddo
   call pass_var(bed_elev, G%domain)
 
 end subroutine initialize_bed_node_from_file
-
-!> Optionally read nodal (B-grid corner) ice thickness from ICE_THICKNESS_FILE
-!! and use it to populate the nodal Q1 DG thickness h_nodal and the
-!! area-weighted cell mean h_shelf. Returns used=.true. when the nodal field
-!! is present and consumed; otherwise leaves h_shelf, h_nodal untouched so the
-!! caller can fall back to area-weighted seeding from neighbour cell means.
-!! The nodal file is consumed locally and not retained beyond initialization.
-subroutine initialize_DG_thickness_from_node_file(h_shelf, h_nodal, hmask, used, G, US, PF)
-  type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(inout) :: h_shelf !< Cell-mean ice thickness [Z ~> m].
-  real, dimension(SZDI_(G),SZDJ_(G),2,2), &
-                          intent(inout) :: h_nodal !< Q1 nodal thickness at 4 cell corners [Z ~> m].
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                         intent(in) :: hmask !< A mask indicating which tracer points are
-                                             !! partly or fully covered by an ice-shelf [nondim]
-  logical,                intent(out)   :: used !< True if the nodal IC was applied.
-  type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
-  type(param_file_type),  intent(in)    :: PF !< A structure to parse for run-time parameters
-
-  real, allocatable :: h_node(:,:) ! Nodal (corner) ice thickness [Z ~> m].
-  character(len=200) :: filename, inputdir, thickness_file
-  character(len=200) :: node_varname
-  character(len=40)  :: mdl = "initialize_DG_thickness_from_node_file"
-  real :: a0, a1, d0, d1   ! Per-cell metric scalars [L ~> m].
-  real :: Pxm, Pxp, Pym, Pyp ! 1D half-cell integrals of d(xi) and a(eta) [L ~> m].
-  integer :: i, j
-
-  used = .false.
-
-  call get_param(PF, mdl, "INPUTDIR", inputdir, default=".", do_not_log=.true.)
-  inputdir = slasher(inputdir)
-  call get_param(PF, mdl, "ICE_THICKNESS_FILE", thickness_file, &
-                 default="ice_shelf_h.nc", do_not_log=.true.)
-  call get_param(PF, mdl, "ICE_THICKNESS_NODE_VARNAME", node_varname, &
-                 "The name of the nodal (B-grid corner) ice thickness variable in "//&
-                 "ICE_THICKNESS_FILE. If present and USE_DG_THICKNESS=True, the field "//&
-                 "is read and used directly as the nodal Q1 DG thickness h_nodal; "//&
-                 "the cell mean h_shelf is set to the area-weighted mean of the four "//&
-                 "corners. The nodal file is not retained after initialization.", &
-                 default="h_shelf_node")
-
-  filename = trim(inputdir)//trim(thickness_file)
-  if (.not.file_exists(filename, G%Domain)) return
-  if (.not.field_exists(filename, trim(node_varname), MOM_domain=G%Domain)) return
-
-  allocate(h_node(G%IsdB:G%IedB, G%JsdB:G%JedB)) ; h_node(:,:) = 0.0
-  call MOM_read_data(filename, trim(node_varname), h_node, G%Domain, &
-                     position=CORNER, scale=US%m_to_Z)
-  call pass_var(h_node, G%domain, position=CORNER)
-
-  ! Assign nodal H directly to the 4 DG corners per cell, then take the
-  ! area-weighted cell mean of the bilinear-from-corners interpolant.
-  do j=G%jsc,G%jec ; do i=G%isc,G%iec
-    if (hmask(i,j)==0) then
-      h_shelf(i,j) = 0.0
-      h_nodal(i,j,:,:) = 0.0
-    else
-      h_nodal(i,j,1,1) = h_node(I-1, J-1)
-      h_nodal(i,j,2,1) = h_node(I,   J-1)
-      h_nodal(i,j,1,2) = h_node(I-1, J  )
-      h_nodal(i,j,2,2) = h_node(I,   J  )
-
-      if ((J-1 >= G%JsdB) .and. (j + G%jdg_offset > G%jsg)) then
-        a0 = 0.5*(G%dxCv(i,J-1) + G%dxCv(i,J))
-        a1 = G%dxCv(i,J) - G%dxCv(i,J-1)
-      else
-        a0 = G%dxCv(i,J) ; a1 = 0.0
-      endif
-      if ((I-1 >= G%IsdB) .and. (i + G%idg_offset > G%isg)) then
-        d0 = 0.5*(G%dyCu(I-1,j) + G%dyCu(I,j))
-        d1 = G%dyCu(I,j) - G%dyCu(I-1,j)
-      else
-        d0 = G%dyCu(I,j) ; d1 = 0.0
-      endif
-      ! Area-weighted cell mean of the bilinear-from-corners interpolant on a
-      ! separable-Jacobian element. Uniform cells collapse to 0.25*sum(corners).
-      Pxm = (0.5*d0) - (d1/12.0)
-      Pxp = (0.5*d0) + (d1/12.0)
-      Pym = (0.5*a0) - (a1/12.0)
-      Pyp = (0.5*a0) + (a1/12.0)
-      h_shelf(i,j) = ( ((h_nodal(i,j,1,1)*(Pxm*Pym)) + (h_nodal(i,j,2,2)*(Pxp*Pyp))) + &
-                       ((h_nodal(i,j,2,1)*(Pxp*Pym)) + (h_nodal(i,j,1,2)*(Pxm*Pyp))) ) / (a0*d0)
-    endif
-  enddo ; enddo
-
-  deallocate(h_node)
-  used = .true.
-
-end subroutine initialize_DG_thickness_from_node_file
 
 !> Initialize ice shelf b.c.s from file
 subroutine initialize_ice_shelf_boundary_from_file(u_face_mask_bdry, v_face_mask_bdry, &
