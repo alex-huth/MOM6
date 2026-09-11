@@ -78,11 +78,19 @@ integer, parameter :: CISM_INTEGRATE = 2 !< Quadrant grounded fraction with the 
 real, parameter :: SEP2_W23 = 2.0/3.0    !< Heavy vertex weight of the interior 3-pt triangle rule [nondim]
 real, parameter :: SEP2_W16 = 1.0/6.0    !< Light vertex weight of the interior 3-pt triangle rule [nondim]
 real, parameter :: SEP2_TRI3 = 0.25/3.0  !< Per-QP reference measure of a whole parent triangle [nondim]
-real, parameter, dimension(2) :: SEP2_GP = (/ 0.21132486540518712, 0.78867513459481288 /)
-                                         !< 2-pt Gauss abscissae on [0,1] [nondim]
-real, parameter, dimension(2) :: SEP2_GC = (/ 0.78867513459481288, 0.21132486540518712 /)
+real, parameter, dimension(2) :: SEP2_GP = (/ 0.5*(1.0 - sqrt(1.0/3.0)), &
+                                              0.5*(1.0 + sqrt(1.0/3.0)) /)
+                                         !< 2-pt Gauss abscissae on [0,1] [nondim].
+                                         !! Built from this expression rather than from decimal
+                                         !! literals because the pair must satisfy both
+                                         !! 1-GP(1) == GP(2) and 1-GP(2) == GP(1) to the last bit.
+                                         !! A quarter turn of the grid maps each abscissa to the
+                                         !! complement of the other, so a pair that is asymmetric
+                                         !! by one ulp makes every quadrature built on it
+                                         !! irreproducible under rotation.
+real, parameter, dimension(2) :: SEP2_GC = (/ SEP2_GP(2), SEP2_GP(1) /)
                                          !< Complementary Gauss factors (1-abscissa), stored as the
-                                         !! same literals swapped so reflection orbits are exact [nondim]
+                                         !! same values swapped so reflection orbits are exact [nondim]
 
 ! TVD slope limiters for thickness advection (ICE_SHELF_ADVECT_LIMITER)
 integer, parameter :: LIMITER_VANLEER = 0   !< Van Leer limiter (original scheme)
@@ -12305,13 +12313,16 @@ pure subroutine apply_nodal_DG_mass_inverse(Minv_xi_cell, Minv_eta_cell, rhs, ou
   real, dimension(2,2), intent(in)  :: rhs            !< Per-cell RHS at the 4 corners [Z L2 T-1]
   real, dimension(2,2), intent(out) :: out            !< M^-1 * rhs [Z T-1]
   integer :: a, b, ap, bp
-  real :: s
+  real, dimension(2,2) :: p   ! Per-source-corner products, reduced in diagonal pairs
+  ! The four source corners are held and then reduced as opposite pairs rather
+  ! than accumulated in ap,bp loop order. A quarter turn of the grid permutes the
+  ! corners cyclically, which would reorder a running sum; it maps each opposite
+  ! pair onto the other, which leaves this reduction unchanged.
   do b = 1, 2 ; do a = 1, 2
-    s = 0.0
     do bp = 1, 2 ; do ap = 1, 2
-      s = s + Minv_xi_cell(a,ap) * Minv_eta_cell(b,bp) * rhs(ap,bp)
+      p(ap,bp) = Minv_xi_cell(a,ap) * Minv_eta_cell(b,bp) * rhs(ap,bp)
     enddo ; enddo
-    out(a,b) = s
+    out(a,b) = (p(1,1) + p(2,2)) + (p(2,1) + p(1,2))
   enddo ; enddo
 end subroutine apply_nodal_DG_mass_inverse
 
@@ -12414,8 +12425,11 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
                                                               !! artificial-viscosity coef.
 
   ! 2-point Gauss-Legendre on [0,1]
-  real, parameter :: gp1 = 0.5 - 0.5/sqrt(3.0)
-  real, parameter :: gp2 = 0.5 + 0.5/sqrt(3.0)
+  ! Symmetric about the cell midpoint to the last bit: 1-gp1 == gp2 and 1-gp2 == gp1.
+  ! The obvious 0.5 -+ 0.5/sqrt(3) form satisfies only the first of those, and that
+  ! one-ulp asymmetry alone breaks rotational reproducibility of this operator.
+  real, parameter :: gp1 = 0.5 * (1.0 - sqrt(1.0/3.0))
+  real, parameter :: gp2 = 1.0 - gp1
   real, parameter :: gw  = 0.5
 
   integer :: i, j, isc, iec, jsc, jec, qx, qy, gp, a, b
@@ -12479,15 +12493,24 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   logical, dimension(SZDI_(G),SZDJB_(G)) :: active_N
   real, dimension(SZDI_(G),SZDJ_(G))    :: cell_scale
   real :: S_K                ! Per-cell sum of face rates for the CFL bound [T-1]
+  real, dimension(2,2,2,2) :: qv_vol ! Per-QP volume contribution to the 4 cell corners,
+                                     ! indexed (qx,qy,a,b) [Z L2 T-1 ~> m3 s-1]
   integer :: i_lo, i_hi, j_lo, j_hi  ! One-sided clipping bounds for boundary strain
-  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_vol, rhs_face
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_vol
+  ! Face contributions are held in four accumulators, one per direction and per
+  ! term, rather than summed into a single array in loop order. A quarter turn of
+  ! the grid exchanges the x and y families, so a single running sum would add the
+  ! same four numbers in a different order. The pairwise reduction at the end of
+  ! this routine is order-independent; a running sum is not.
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_advx, rhs_advy, rhs_viscx, rhs_viscy
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   rhoi_rhow_wb = CS%density_ice / CS%density_ocean_avg
 
   rhs(:,:,:,:) = 0.0
   rhs_vol(:,:,:,:) = 0.0
-  rhs_face(:,:,:,:) = 0.0
+  rhs_advx(:,:,:,:) = 0.0 ; rhs_advy(:,:,:,:) = 0.0
+  rhs_viscx(:,:,:,:) = 0.0 ; rhs_viscy(:,:,:,:) = 0.0
   if (associated(CS%dg_art_visc_coef_u)) CS%dg_art_visc_coef_u(:,:) = 0.0
   if (associated(CS%dg_art_visc_coef_v)) CS%dg_art_visc_coef_v(:,:) = 0.0
   if (associated(CS%dg_art_visc_nu_u)) CS%dg_art_visc_nu_u(:,:) = 0.0
@@ -12536,14 +12559,20 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
 
       ! Volume contribution at this QP for each test function N(a,b):
       ! + weight * h * ( u * dN/dxi * d + v * dN/deta * a )
-      rhs_vol(i,j,1,1) = rhs_vol(i,j,1,1) + &
-        gw*gw * h_qp * (u_qp * dN_dxi_11 * d_qp + v_qp * dN_deta_11 * a_qp)
-      rhs_vol(i,j,2,1) = rhs_vol(i,j,2,1) + &
-        gw*gw * h_qp * (u_qp * dN_dxi_21 * d_qp + v_qp * dN_deta_21 * a_qp)
-      rhs_vol(i,j,1,2) = rhs_vol(i,j,1,2) + &
-        gw*gw * h_qp * (u_qp * dN_dxi_12 * d_qp + v_qp * dN_deta_12 * a_qp)
-      rhs_vol(i,j,2,2) = rhs_vol(i,j,2,2) + &
-        gw*gw * h_qp * (u_qp * dN_dxi_22 * d_qp + v_qp * dN_deta_22 * a_qp)
+      ! Held per-QP rather than accumulated in place. A quarter turn of the grid
+      ! permutes the four quadrature points cyclically, so a running sum over
+      ! qx,qy is not reproducible under rotation. The diagonal-pair reduction
+      ! below is, because that permutation maps each opposite-corner pair of
+      ! quadrature points onto the other.
+      qv_vol(qx,qy,1,1) = gw*gw * h_qp * (u_qp * dN_dxi_11 * d_qp + v_qp * dN_deta_11 * a_qp)
+      qv_vol(qx,qy,2,1) = gw*gw * h_qp * (u_qp * dN_dxi_21 * d_qp + v_qp * dN_deta_21 * a_qp)
+      qv_vol(qx,qy,1,2) = gw*gw * h_qp * (u_qp * dN_dxi_12 * d_qp + v_qp * dN_deta_12 * a_qp)
+      qv_vol(qx,qy,2,2) = gw*gw * h_qp * (u_qp * dN_dxi_22 * d_qp + v_qp * dN_deta_22 * a_qp)
+    enddo ; enddo
+
+    do b = 1, 2 ; do a = 1, 2
+      rhs_vol(i,j,a,b) = (qv_vol(1,1,a,b) + qv_vol(2,2,a,b)) + &
+                         (qv_vol(1,2,a,b) + qv_vol(2,1,a,b))
     enddo ; enddo
   enddo ; enddo
 
@@ -12553,12 +12582,12 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       face_flux_total = G%dyCu(i,j) * CS%u_flux_bdry_val(i,j)
       uh_ice(i,j) = uh_ice(i,j) + face_flux_total
       if (i >= isc .and. hmask(i,j) == 1.0) then
-        rhs_face(i,j,2,1) = rhs_face(i,j,2,1) - 0.5*face_flux_total
-        rhs_face(i,j,2,2) = rhs_face(i,j,2,2) - 0.5*face_flux_total
+        rhs_advx(i,j,2,1) = rhs_advx(i,j,2,1) - 0.5*face_flux_total
+        rhs_advx(i,j,2,2) = rhs_advx(i,j,2,2) - 0.5*face_flux_total
       endif
       if (i+1 <= iec .and. hmask(i+1,j) == 1.0) then
-        rhs_face(i+1,j,1,1) = rhs_face(i+1,j,1,1) + 0.5*face_flux_total
-        rhs_face(i+1,j,1,2) = rhs_face(i+1,j,1,2) + 0.5*face_flux_total
+        rhs_advx(i+1,j,1,1) = rhs_advx(i+1,j,1,1) + 0.5*face_flux_total
+        rhs_advx(i+1,j,1,2) = rhs_advx(i+1,j,1,2) + 0.5*face_flux_total
       endif
     else if (((i >= isc .and. (hmask(i,j) == 1.0 .or. hmask(i,j) == 3.0))) .or. &
              ((i+1 <= iec .and. (hmask(i+1,j) == 1.0 .or. hmask(i+1,j) == 3.0)))) then
@@ -12587,12 +12616,12 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         flux_qp = gw * u_at_qp * h_upwind * G%dyCu(i,j)
         uh_ice(i,j) = uh_ice(i,j) + flux_qp
         if (i >= isc .and. hmask(i,j) == 1.0) then
-          rhs_face(i,j,2,1) = rhs_face(i,j,2,1) - flux_qp * t_co
-          rhs_face(i,j,2,2) = rhs_face(i,j,2,2) - flux_qp * t_face
+          rhs_advx(i,j,2,1) = rhs_advx(i,j,2,1) - flux_qp * t_co
+          rhs_advx(i,j,2,2) = rhs_advx(i,j,2,2) - flux_qp * t_face
         endif
         if (i+1 <= iec .and. hmask(i+1,j) == 1.0) then
-          rhs_face(i+1,j,1,1) = rhs_face(i+1,j,1,1) + flux_qp * t_co
-          rhs_face(i+1,j,1,2) = rhs_face(i+1,j,1,2) + flux_qp * t_face
+          rhs_advx(i+1,j,1,1) = rhs_advx(i+1,j,1,1) + flux_qp * t_co
+          rhs_advx(i+1,j,1,2) = rhs_advx(i+1,j,1,2) + flux_qp * t_face
         endif
       enddo
     endif
@@ -12619,7 +12648,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   ! to the cell-mean rate. The excess map is 1-Lipschitz in the face traces, so
   ! this rate remains a valid bound with DG1_ART_VISC_EXCESS_JUMP. Weak one-sided
   ! imposition at Dirichlet thickness BCs (hmask==3): the existing hmask==1 write
-  ! guards on rhs_face discard the BC-side update; the BC side uses h_bdry_val for
+  ! guards on rhs_advx discard the BC-side update; the BC side uses h_bdry_val for
   ! h and Hbar.
   active_E(:,:) = .false.
   cK_E(:,:)     = 0.0
@@ -12773,12 +12802,12 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       face_flux_total = G%dxCv(i,j) * CS%v_flux_bdry_val(i,j)
       vh_ice(i,j) = vh_ice(i,j) + face_flux_total
       if (j >= jsc .and. hmask(i,j) == 1.0) then
-        rhs_face(i,j,1,2) = rhs_face(i,j,1,2) - 0.5*face_flux_total
-        rhs_face(i,j,2,2) = rhs_face(i,j,2,2) - 0.5*face_flux_total
+        rhs_advy(i,j,1,2) = rhs_advy(i,j,1,2) - 0.5*face_flux_total
+        rhs_advy(i,j,2,2) = rhs_advy(i,j,2,2) - 0.5*face_flux_total
       endif
       if (j+1 <= jec .and. hmask(i,j+1) == 1.0) then
-        rhs_face(i,j+1,1,1) = rhs_face(i,j+1,1,1) + 0.5*face_flux_total
-        rhs_face(i,j+1,2,1) = rhs_face(i,j+1,2,1) + 0.5*face_flux_total
+        rhs_advy(i,j+1,1,1) = rhs_advy(i,j+1,1,1) + 0.5*face_flux_total
+        rhs_advy(i,j+1,2,1) = rhs_advy(i,j+1,2,1) + 0.5*face_flux_total
       endif
     else if (((j >= jsc .and. (hmask(i,j) == 1.0 .or. hmask(i,j) == 3.0))) .or. &
              ((j+1 <= jec .and. (hmask(i,j+1) == 1.0 .or. hmask(i,j+1) == 3.0)))) then
@@ -12807,12 +12836,12 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         flux_qp = gw * v_at_qp * h_upwind * G%dxCv(i,j)
         vh_ice(i,j) = vh_ice(i,j) + flux_qp
         if (j >= jsc .and. hmask(i,j) == 1.0) then
-          rhs_face(i,j,1,2) = rhs_face(i,j,1,2) - flux_qp * t_co
-          rhs_face(i,j,2,2) = rhs_face(i,j,2,2) - flux_qp * t_face
+          rhs_advy(i,j,1,2) = rhs_advy(i,j,1,2) - flux_qp * t_co
+          rhs_advy(i,j,2,2) = rhs_advy(i,j,2,2) - flux_qp * t_face
         endif
         if (j+1 <= jec .and. hmask(i,j+1) == 1.0) then
-          rhs_face(i,j+1,1,1) = rhs_face(i,j+1,1,1) + flux_qp * t_co
-          rhs_face(i,j+1,2,1) = rhs_face(i,j+1,2,1) + flux_qp * t_face
+          rhs_advy(i,j+1,1,1) = rhs_advy(i,j+1,1,1) + flux_qp * t_co
+          rhs_advy(i,j+1,2,1) = rhs_advy(i,j+1,2,1) + flux_qp * t_face
         endif
       enddo
     endif
@@ -12978,12 +13007,12 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       t_co = 1.0 - t_face
       visc_flux_qp = gw * coef_face * ueff_E(i,j,gp) * dheq_E(i,j,gp) * G%dyCu(i,j)
       if (i >= isc .and. hmask(i,j) == 1.0) then
-        rhs_face(i,j,2,1) = rhs_face(i,j,2,1) + visc_flux_qp * t_co
-        rhs_face(i,j,2,2) = rhs_face(i,j,2,2) + visc_flux_qp * t_face
+        rhs_viscx(i,j,2,1) = rhs_viscx(i,j,2,1) + visc_flux_qp * t_co
+        rhs_viscx(i,j,2,2) = rhs_viscx(i,j,2,2) + visc_flux_qp * t_face
       endif
       if (i+1 <= iec .and. hmask(i+1,j) == 1.0) then
-        rhs_face(i+1,j,1,1) = rhs_face(i+1,j,1,1) - visc_flux_qp * t_co
-        rhs_face(i+1,j,1,2) = rhs_face(i+1,j,1,2) - visc_flux_qp * t_face
+        rhs_viscx(i+1,j,1,1) = rhs_viscx(i+1,j,1,1) - visc_flux_qp * t_co
+        rhs_viscx(i+1,j,1,2) = rhs_viscx(i+1,j,1,2) - visc_flux_qp * t_face
       endif
     enddo
   enddo ; enddo
@@ -13001,12 +13030,12 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       t_co = 1.0 - t_face
       visc_flux_qp = gw * coef_face * ueff_N(i,j,gp) * dheq_N(i,j,gp) * G%dxCv(i,j)
       if (j >= jsc .and. hmask(i,j) == 1.0) then
-        rhs_face(i,j,1,2) = rhs_face(i,j,1,2) + visc_flux_qp * t_co
-        rhs_face(i,j,2,2) = rhs_face(i,j,2,2) + visc_flux_qp * t_face
+        rhs_viscy(i,j,1,2) = rhs_viscy(i,j,1,2) + visc_flux_qp * t_co
+        rhs_viscy(i,j,2,2) = rhs_viscy(i,j,2,2) + visc_flux_qp * t_face
       endif
       if (j+1 <= jec .and. hmask(i,j+1) == 1.0) then
-        rhs_face(i,j+1,1,1) = rhs_face(i,j+1,1,1) - visc_flux_qp * t_co
-        rhs_face(i,j+1,2,1) = rhs_face(i,j+1,2,1) - visc_flux_qp * t_face
+        rhs_viscy(i,j+1,1,1) = rhs_viscy(i,j+1,1,1) - visc_flux_qp * t_co
+        rhs_viscy(i,j+1,2,1) = rhs_viscy(i,j+1,2,1) - visc_flux_qp * t_face
       endif
     enddo
   enddo ; enddo
@@ -13015,7 +13044,9 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   do j = jsc, jec ; do i = isc, iec
     if (hmask(i,j) /= 1.0) cycle
     do b = 1, 2 ; do a = 1, 2
-      rhs(i,j,a,b) = rhs_vol(i,j,a,b) + rhs_face(i,j,a,b)
+      rhs(i,j,a,b) = rhs_vol(i,j,a,b) + &
+        ((rhs_advx(i,j,a,b) + rhs_advy(i,j,a,b)) + &
+         (rhs_viscx(i,j,a,b) + rhs_viscy(i,j,a,b)))
     enddo ; enddo
   enddo ; enddo
 end subroutine DG1_nodal_spatial_operator
@@ -13143,7 +13174,12 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, fit_tol, A, A_bed,
     A_bed = bv(0) - 0.5*(bv(-1) + bv(1))
     rm = 0.5*(hv(0) - hv(-2)) ; r0 = 0.5*(hv(1) - hv(-1)) ; rp = 0.5*(hv(2) - hv(0))
     km = -1 ; k0 = 0 ; kp = 1 ; rlo = -2 ; rhi = 2
-    href  = ((hv(-1) + hv(0)) + hv(1)) / 3.0
+    ! Grouped so the pair straddling the centre is summed first. A quarter turn
+    ! of the grid reverses this stencil, and ((hv(-1)+hv(0))+hv(1)) would then be
+    ! summed as ((hv(1)+hv(0))+hv(-1)), which is a different number. The biased
+    ! branches below need no such care: reflection maps one onto the other with
+    ! the operand order already matching.
+    href  = (hv(0) + (hv(-1) + hv(1))) / 3.0
   elseif (all(ok(0:4))) then                    ! forward
     A     = 0.5*(tv(0) - 2.0*tv(1) + tv(2))
     A_bed = 0.5*(bv(0) - 2.0*bv(1) + bv(2))
