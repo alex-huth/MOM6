@@ -596,8 +596,12 @@ pure real function nodal_cell_mean(h_cell, w_cell) result(Hbar)
 
   area = ((w_cell(1,1) + w_cell(2,2)) + (w_cell(1,2) + w_cell(2,1)))
   if (area > 0.0) then
-    Hbar = ( (w_cell(1,1)*h_cell(1,1) + w_cell(2,2)*h_cell(2,2)) + &
-             (w_cell(1,2)*h_cell(1,2) + w_cell(2,1)*h_cell(2,1)) ) / area
+    ! Each product is parenthesised, not just the pairs. Under a quarter turn of
+    ! the grid the two pairs exchange, and without the inner parentheses the
+    ! compiler may fuse one multiply into the add, making that product exact and
+    ! its partner rounded, which the exchange then does not preserve.
+    Hbar = ( ((w_cell(1,1)*h_cell(1,1)) + (w_cell(2,2)*h_cell(2,2))) + &
+             ((w_cell(1,2)*h_cell(1,2)) + (w_cell(2,1)*h_cell(2,1))) ) / area
   else
     Hbar = 0.0
   endif

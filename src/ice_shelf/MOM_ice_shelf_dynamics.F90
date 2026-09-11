@@ -10383,15 +10383,15 @@ subroutine add_Neumann_face_DG(face_length, face_sign, &
 
   do gp_face = 1, 2
     t_face = xquad(gp_face)
-    h_loc = (1.0 - t_face)*h_A + t_face*h_B
-    b_loc = (1.0 - t_face)*b_A + t_face*b_B
+    h_loc = ((1.0 - t_face)*h_A) + (t_face*h_B)
+    b_loc = ((1.0 - t_face)*b_A) + (t_face*b_B)
     P_ice = 0.5 * grav * rho * h_loc**2
     d_ocean = max(0.0, min(b_loc, rhoi_rhow * h_loc))
     P_ocean = 0.5 * grav * rhow * d_ocean**2
     P_face = P_ice - P_ocean
     phi_A = 1.0 - t_face ; phi_B = t_face
-    face_A = face_A + face_sign * 0.5 * face_length * phi_A * P_face
-    face_B = face_B + face_sign * 0.5 * face_length * phi_B * P_face
+    face_A = face_A + (face_sign * 0.5 * face_length * phi_A * P_face)
+    face_B = face_B + (face_sign * 0.5 * face_length * phi_B * P_face)
   enddo
 end subroutine add_Neumann_face_DG
 
@@ -10445,9 +10445,9 @@ subroutine add_taud_edge_correction_DG(face_length, face_sign, &
 
   do gp_face = 1, 2
     t_face = xquad(gp_face)
-    h_loc = (1.0 - t_face)*hL_A + t_face*hL_B
-    h_ngh = (1.0 - t_face)*hN_A + t_face*hN_B
-    b_loc = (1.0 - t_face)*b_A + t_face*b_B
+    h_loc = ((1.0 - t_face)*hL_A) + (t_face*hL_B)
+    h_ngh = ((1.0 - t_face)*hN_A) + (t_face*hN_B)
+    b_loc = ((1.0 - t_face)*b_A) + (t_face*b_B)
 
     ! Per-side surface elevation: each side takes its own flotation branch on its
     ! own h against the shared face bed.
@@ -10469,8 +10469,8 @@ subroutine add_taud_edge_correction_DG(face_length, face_sign, &
     jump_factor = rho * grav * h_avg * (s_loc - s_ngh)
 
     phi_A = 1.0 - t_face ; phi_B = t_face
-    face_A = face_A + face_sign * 0.25 * face_length * phi_A * jump_factor
-    face_B = face_B + face_sign * 0.25 * face_length * phi_B * jump_factor
+    face_A = face_A + (face_sign * 0.25 * face_length * phi_A * jump_factor)
+    face_B = face_B + (face_sign * 0.25 * face_length * phi_B * jump_factor)
   enddo
 end subroutine add_taud_edge_correction_DG
 
@@ -10631,10 +10631,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
                ((CS%h_nodal(i,j,2,1) * (xquad(iq)   * xquad(3-jq))) + &
                 (CS%h_nodal(i,j,1,2) * (xquad(3-iq) * xquad(jq))))
         h_gp = max(h_gp, CS%min_h_shelf)
-        dhdx_gp = ( ((-xquad(3-jq))*CS%h_nodal(i,j,1,1) + ( xquad(jq))   *CS%h_nodal(i,j,2,2)) + &
-                    (( xquad(3-jq))*CS%h_nodal(i,j,2,1) + (-xquad(jq))   *CS%h_nodal(i,j,1,2)) ) / a_qp
-        dhdy_gp = ( ((-xquad(3-iq))*CS%h_nodal(i,j,1,1) + ( xquad(iq))   *CS%h_nodal(i,j,2,2)) + &
-                    ((-xquad(iq))  *CS%h_nodal(i,j,2,1) + ( xquad(3-iq)) *CS%h_nodal(i,j,1,2)) ) / d_qp
+        dhdx_gp = ( (((-xquad(3-jq))*CS%h_nodal(i,j,1,1)) + (( xquad(jq))  *CS%h_nodal(i,j,2,2))) + &
+                    ((( xquad(3-jq))*CS%h_nodal(i,j,2,1)) + ((-xquad(jq))  *CS%h_nodal(i,j,1,2))) ) / a_qp
+        dhdy_gp = ( (((-xquad(3-iq))*CS%h_nodal(i,j,1,1)) + (( xquad(iq))  *CS%h_nodal(i,j,2,2))) + &
+                    (((-xquad(iq))  *CS%h_nodal(i,j,2,1)) + (( xquad(3-iq))*CS%h_nodal(i,j,1,2))) ) / d_qp
 
         bed_gp = ((bed_corners(1,1) * (xquad(3-iq) * xquad(3-jq))) + &
                   (bed_corners(2,2) * (xquad(iq)   * xquad(jq))))  + &
@@ -12060,8 +12060,8 @@ subroutine init_nodal_DG_metric(CS, G)
 
     ! M_xi: int_0^1 N_a*N_a'*d(xi) dxi where d(xi) = dyW*(1-xi) + dyE*xi.
     ! Closed-form: M11 = dyW/4 + dyE/12, M22 = dyW/12 + dyE/4, M12 = dyW/12 + dyE/12.
-    M11 = dyW/4.0 + dyE/12.0
-    M22 = dyW/12.0 + dyE/4.0
+    M11 = (dyW/4.0) + (dyE/12.0)
+    M22 = (dyW/12.0) + (dyE/4.0)
     M12 = (dyW + dyE)/12.0
     det = M11*M22 - M12*M12
     if (det > 0.0) then
@@ -12072,8 +12072,8 @@ subroutine init_nodal_DG_metric(CS, G)
     endif
 
     ! M_eta: int_0^1 N_b*N_b'*a(eta) deta where a(eta) = dxS*(1-eta) + dxN*eta.
-    M11 = dxS/4.0 + dxN/12.0
-    M22 = dxS/12.0 + dxN/4.0
+    M11 = (dxS/4.0) + (dxN/12.0)
+    M22 = (dxS/12.0) + (dxN/4.0)
     M12 = (dxS + dxN)/12.0
     det = M11*M22 - M12*M12
     if (det > 0.0) then
@@ -12319,7 +12319,7 @@ pure real function subgrid_cell_mean_s(Phisub, h_nodal_cell, bed_corners, &
     else
       s_gp = (1.0 - rhoi_rhow) * h_gp
     endif
-    accum = accum + (0.25 * subarea) * s_gp
+    accum = accum + ((0.25 * subarea) * s_gp)
   enddo ; enddo ; enddo ; enddo
   Sbar = accum
 end function subgrid_cell_mean_s
@@ -12358,10 +12358,15 @@ pure function dg1_wb_surface_jump(h_A, h_B, bed_qp, rhoi_rhow) result(ds)
   real :: s_A, s_B              ! Per-side surface elevation [Z ~> m]
   real :: one_m_r               ! 1 - rhoi_rhow [nondim]
   one_m_r = 1.0 - rhoi_rhow
-  if (rhoi_rhow*h_A - bed_qp > 0.0) then ; s_A = h_A - bed_qp
-  else ; s_A = one_m_r*h_A ; endif
-  if (rhoi_rhow*h_B - bed_qp > 0.0) then ; s_B = h_B - bed_qp
-  else ; s_B = one_m_r*h_B ; endif
+  ! The floating branch is parenthesised so that the product is rounded before the
+  ! subtraction below. At a mixed-flotation face ds is (h_B - bed) - one_m_r*h_A, and
+  ! a compiler that fuses the multiply into that subtract keeps one side exact and
+  ! rounds the other. Which side is which changes when a quarter turn of the grid
+  ! exchanges A and B, so ds would stop being exactly antisymmetric.
+  if (rhoi_rhow*h_A - bed_qp > 0.0) then ; s_A = (h_A - bed_qp)
+  else ; s_A = (one_m_r*h_A) ; endif
+  if (rhoi_rhow*h_B - bed_qp > 0.0) then ; s_B = (h_B - bed_qp)
+  else ; s_B = (one_m_r*h_B) ; endif
   ds = s_B - s_A
 end function dg1_wb_surface_jump
 
@@ -12421,7 +12426,12 @@ pure function dg1_face_eps_eff(dudx, dudy, dvdx, dvdy) result(eps_e)
   real :: eps_e                !< Effective strain rate [T-1]
   real :: eps_xy               ! Off-diagonal symmetric strain rate [T-1]
   eps_xy = 0.5*(dudy + dvdx)
-  eps_e = sqrt(max(0.0, dudx*dudx + dvdy*dvdy + dudx*dvdy + eps_xy*eps_xy))
+  ! Each product is parenthesised and the pair that a quarter turn exchanges
+  ! (dudx <-> dvdy) is grouped, so the sum is unchanged by the exchange. Without
+  ! the inner parentheses the compiler may fuse one multiply into the add, which
+  ! makes that product exact and its partner rounded and breaks the symmetry.
+  eps_e = sqrt(max(0.0, (((dudx*dudx) + (dvdy*dvdy)) + &
+                         ((dudx*dvdy) + (eps_xy*eps_xy)))))
 end function dg1_face_eps_eff
 
 !> Compute the nodal Q1 DG(1) spatial operator (RHS of the per-cell mass-matrix
@@ -12559,8 +12569,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     do qy = 1, 2 ; do qx = 1, 2
       if (qx == 1) then ; xi_q  = gp1 ; else ; xi_q  = gp2 ; endif
       if (qy == 1) then ; eta_q = gp1 ; else ; eta_q = gp2 ; endif
-      a_qp = dxCv_S*(1.0 - eta_q) + dxCv_N*eta_q
-      d_qp = dyCu_W*(1.0 - xi_q)  + dyCu_E*xi_q
+      a_qp = (dxCv_S*(1.0 - eta_q)) + (dxCv_N*eta_q)
+      d_qp = (dyCu_W*(1.0 - xi_q))  + (dyCu_E*xi_q)
 
       N11 = (1.0-xi_q)*(1.0-eta_q) ; N21 = xi_q*(1.0-eta_q)
       N12 = (1.0-xi_q)*eta_q       ; N22 = xi_q*eta_q
@@ -12569,12 +12579,12 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       dN_deta_11 = -(1.0 - xi_q)  ; dN_deta_21 = -xi_q
       dN_deta_12 =  (1.0 - xi_q)  ; dN_deta_22 =  xi_q
 
-      h_qp = ((N11*h_nodal_in(i,j,1,1) + N22*h_nodal_in(i,j,2,2)) + &
-              (N21*h_nodal_in(i,j,2,1) + N12*h_nodal_in(i,j,1,2)))
-      u_qp = ((N11*CS%u_shelf(i-1,j-1) + N22*CS%u_shelf(i,j)) + &
-              (N21*CS%u_shelf(i,j-1)   + N12*CS%u_shelf(i-1,j)))
-      v_qp = ((N11*CS%v_shelf(i-1,j-1) + N22*CS%v_shelf(i,j)) + &
-              (N21*CS%v_shelf(i,j-1)   + N12*CS%v_shelf(i-1,j)))
+      h_qp = (((N11*h_nodal_in(i,j,1,1)) + (N22*h_nodal_in(i,j,2,2))) + &
+              ((N21*h_nodal_in(i,j,2,1)) + (N12*h_nodal_in(i,j,1,2))))
+      u_qp = (((N11*CS%u_shelf(i-1,j-1)) + (N22*CS%u_shelf(i,j))) + &
+              ((N21*CS%u_shelf(i,j-1))   + (N12*CS%u_shelf(i-1,j))))
+      v_qp = (((N11*CS%v_shelf(i-1,j-1)) + (N22*CS%v_shelf(i,j))) + &
+              ((N21*CS%v_shelf(i,j-1))   + (N12*CS%v_shelf(i-1,j))))
 
       ! Volume contribution at this QP for each test function N(a,b):
       ! + weight * h * ( u * dN/dxi * d + v * dN/deta * a )
@@ -12583,10 +12593,10 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       ! qx,qy is not reproducible under rotation. The diagonal-pair reduction
       ! below is, because that permutation maps each opposite-corner pair of
       ! quadrature points onto the other.
-      qv_vol(qx,qy,1,1) = gw*gw * h_qp * (u_qp * dN_dxi_11 * d_qp + v_qp * dN_deta_11 * a_qp)
-      qv_vol(qx,qy,2,1) = gw*gw * h_qp * (u_qp * dN_dxi_21 * d_qp + v_qp * dN_deta_21 * a_qp)
-      qv_vol(qx,qy,1,2) = gw*gw * h_qp * (u_qp * dN_dxi_12 * d_qp + v_qp * dN_deta_12 * a_qp)
-      qv_vol(qx,qy,2,2) = gw*gw * h_qp * (u_qp * dN_dxi_22 * d_qp + v_qp * dN_deta_22 * a_qp)
+      qv_vol(qx,qy,1,1) = gw*gw * h_qp * (((u_qp * dN_dxi_11) * d_qp) + ((v_qp * dN_deta_11) * a_qp))
+      qv_vol(qx,qy,2,1) = gw*gw * h_qp * (((u_qp * dN_dxi_21) * d_qp) + ((v_qp * dN_deta_21) * a_qp))
+      qv_vol(qx,qy,1,2) = gw*gw * h_qp * (((u_qp * dN_dxi_12) * d_qp) + ((v_qp * dN_deta_12) * a_qp))
+      qv_vol(qx,qy,2,2) = gw*gw * h_qp * (((u_qp * dN_dxi_22) * d_qp) + ((v_qp * dN_deta_22) * a_qp))
     enddo ; enddo
 
     do b = 1, 2 ; do a = 1, 2
@@ -12601,24 +12611,24 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       face_flux_total = G%dyCu(i,j) * CS%u_flux_bdry_val(i,j)
       uh_ice(i,j) = uh_ice(i,j) + face_flux_total
       if (i >= isc .and. hmask(i,j) == 1.0) then
-        rhs_advx(i,j,2,1) = rhs_advx(i,j,2,1) - 0.5*face_flux_total
-        rhs_advx(i,j,2,2) = rhs_advx(i,j,2,2) - 0.5*face_flux_total
+        rhs_advx(i,j,2,1) = rhs_advx(i,j,2,1) - (0.5*face_flux_total)
+        rhs_advx(i,j,2,2) = rhs_advx(i,j,2,2) - (0.5*face_flux_total)
       endif
       if (i+1 <= iec .and. hmask(i+1,j) == 1.0) then
-        rhs_advx(i+1,j,1,1) = rhs_advx(i+1,j,1,1) + 0.5*face_flux_total
-        rhs_advx(i+1,j,1,2) = rhs_advx(i+1,j,1,2) + 0.5*face_flux_total
+        rhs_advx(i+1,j,1,1) = rhs_advx(i+1,j,1,1) + (0.5*face_flux_total)
+        rhs_advx(i+1,j,1,2) = rhs_advx(i+1,j,1,2) + (0.5*face_flux_total)
       endif
     else if (((i >= isc .and. (hmask(i,j) == 1.0 .or. hmask(i,j) == 3.0))) .or. &
              ((i+1 <= iec .and. (hmask(i+1,j) == 1.0 .or. hmask(i+1,j) == 3.0)))) then
       do gp = 1, 2
         if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
         t_co = 1.0 - t_face
-        u_at_qp = t_co*CS%u_shelf(i,j-1) + t_face*CS%u_shelf(i,j)
+        u_at_qp = (t_co*CS%u_shelf(i,j-1)) + (t_face*CS%u_shelf(i,j))
         if (u_at_qp >= 0.0) then
           if (hmask(i,j) == 3.0) then
             h_upwind = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
           elseif (hmask(i,j) == 1.0) then
-            h_upwind = t_co*h_nodal_in(i,j,2,1) + t_face*h_nodal_in(i,j,2,2)
+            h_upwind = (t_co*h_nodal_in(i,j,2,1)) + (t_face*h_nodal_in(i,j,2,2))
           else
             h_upwind = 0.0
           endif
@@ -12626,7 +12636,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
           if (hmask(i+1,j) == 3.0) then
             h_upwind = max(CS%h_bdry_val(i+1,j), CS%min_h_shelf)
           elseif (hmask(i+1,j) == 1.0) then
-            h_upwind = t_co*h_nodal_in(i+1,j,1,1) + t_face*h_nodal_in(i+1,j,1,2)
+            h_upwind = (t_co*h_nodal_in(i+1,j,1,1)) + (t_face*h_nodal_in(i+1,j,1,2))
           else
             h_upwind = 0.0
           endif
@@ -12635,12 +12645,12 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         flux_qp = gw * u_at_qp * h_upwind * G%dyCu(i,j)
         uh_ice(i,j) = uh_ice(i,j) + flux_qp
         if (i >= isc .and. hmask(i,j) == 1.0) then
-          rhs_advx(i,j,2,1) = rhs_advx(i,j,2,1) - flux_qp * t_co
-          rhs_advx(i,j,2,2) = rhs_advx(i,j,2,2) - flux_qp * t_face
+          rhs_advx(i,j,2,1) = rhs_advx(i,j,2,1) - (flux_qp * t_co)
+          rhs_advx(i,j,2,2) = rhs_advx(i,j,2,2) - (flux_qp * t_face)
         endif
         if (i+1 <= iec .and. hmask(i+1,j) == 1.0) then
-          rhs_advx(i+1,j,1,1) = rhs_advx(i+1,j,1,1) + flux_qp * t_co
-          rhs_advx(i+1,j,1,2) = rhs_advx(i+1,j,1,2) + flux_qp * t_face
+          rhs_advx(i+1,j,1,1) = rhs_advx(i+1,j,1,1) + (flux_qp * t_co)
+          rhs_advx(i+1,j,1,2) = rhs_advx(i+1,j,1,2) + (flux_qp * t_face)
         endif
       enddo
     endif
@@ -12744,20 +12754,20 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     do gp = 1, 2
       if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
       t_co = 1.0 - t_face
-      u_at_qp = t_co*CS%u_shelf(i,j-1) + t_face*CS%u_shelf(i,j)
-      v_at_qp = t_co*CS%v_shelf(i,j-1) + t_face*CS%v_shelf(i,j)
-      u_mag_qp = sqrt(u_at_qp*u_at_qp + v_at_qp*v_at_qp)
+      u_at_qp = (t_co*CS%u_shelf(i,j-1)) + (t_face*CS%u_shelf(i,j))
+      v_at_qp = (t_co*CS%v_shelf(i,j-1)) + (t_face*CS%v_shelf(i,j))
+      u_mag_qp = sqrt((u_at_qp*u_at_qp) + (v_at_qp*v_at_qp))
       if (hmask(i,j) == 3.0) then
         h_A_qp = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
       else
-        h_A_qp = t_co*h_nodal_in(i,  j,2,1) + t_face*h_nodal_in(i,  j,2,2)
+        h_A_qp = (t_co*h_nodal_in(i,  j,2,1)) + (t_face*h_nodal_in(i,  j,2,2))
       endif
       if (hmask(i+1,j) == 3.0) then
         h_B_qp = max(CS%h_bdry_val(i+1,j), CS%min_h_shelf)
       else
-        h_B_qp = t_co*h_nodal_in(i+1,j,1,1) + t_face*h_nodal_in(i+1,j,1,2)
+        h_B_qp = (t_co*h_nodal_in(i+1,j,1,1)) + (t_face*h_nodal_in(i+1,j,1,2))
       endif
-      bed_qp = t_co*CS%bed_node(i,j-1) + t_face*CS%bed_node(i,j)
+      bed_qp = (t_co*CS%bed_node(i,j-1)) + (t_face*CS%bed_node(i,j))
       ds_use = dg1_wb_surface_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
       dh_eq = dg1_wb_equiv_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
       amp_qp = DG1_WB_JUMP_RATE_AMP
@@ -12821,24 +12831,24 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       face_flux_total = G%dxCv(i,j) * CS%v_flux_bdry_val(i,j)
       vh_ice(i,j) = vh_ice(i,j) + face_flux_total
       if (j >= jsc .and. hmask(i,j) == 1.0) then
-        rhs_advy(i,j,1,2) = rhs_advy(i,j,1,2) - 0.5*face_flux_total
-        rhs_advy(i,j,2,2) = rhs_advy(i,j,2,2) - 0.5*face_flux_total
+        rhs_advy(i,j,1,2) = rhs_advy(i,j,1,2) - (0.5*face_flux_total)
+        rhs_advy(i,j,2,2) = rhs_advy(i,j,2,2) - (0.5*face_flux_total)
       endif
       if (j+1 <= jec .and. hmask(i,j+1) == 1.0) then
-        rhs_advy(i,j+1,1,1) = rhs_advy(i,j+1,1,1) + 0.5*face_flux_total
-        rhs_advy(i,j+1,2,1) = rhs_advy(i,j+1,2,1) + 0.5*face_flux_total
+        rhs_advy(i,j+1,1,1) = rhs_advy(i,j+1,1,1) + (0.5*face_flux_total)
+        rhs_advy(i,j+1,2,1) = rhs_advy(i,j+1,2,1) + (0.5*face_flux_total)
       endif
     else if (((j >= jsc .and. (hmask(i,j) == 1.0 .or. hmask(i,j) == 3.0))) .or. &
              ((j+1 <= jec .and. (hmask(i,j+1) == 1.0 .or. hmask(i,j+1) == 3.0)))) then
       do gp = 1, 2
         if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
         t_co = 1.0 - t_face
-        v_at_qp = t_co*CS%v_shelf(i-1,j) + t_face*CS%v_shelf(i,j)
+        v_at_qp = (t_co*CS%v_shelf(i-1,j)) + (t_face*CS%v_shelf(i,j))
         if (v_at_qp >= 0.0) then
           if (hmask(i,j) == 3.0) then
             h_upwind = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
           elseif (hmask(i,j) == 1.0) then
-            h_upwind = t_co*h_nodal_in(i,j,1,2) + t_face*h_nodal_in(i,j,2,2)
+            h_upwind = (t_co*h_nodal_in(i,j,1,2)) + (t_face*h_nodal_in(i,j,2,2))
           else
             h_upwind = 0.0
           endif
@@ -12846,7 +12856,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
           if (hmask(i,j+1) == 3.0) then
             h_upwind = max(CS%h_bdry_val(i,j+1), CS%min_h_shelf)
           elseif (hmask(i,j+1) == 1.0) then
-            h_upwind = t_co*h_nodal_in(i,j+1,1,1) + t_face*h_nodal_in(i,j+1,2,1)
+            h_upwind = (t_co*h_nodal_in(i,j+1,1,1)) + (t_face*h_nodal_in(i,j+1,2,1))
           else
             h_upwind = 0.0
           endif
@@ -12855,12 +12865,12 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         flux_qp = gw * v_at_qp * h_upwind * G%dxCv(i,j)
         vh_ice(i,j) = vh_ice(i,j) + flux_qp
         if (j >= jsc .and. hmask(i,j) == 1.0) then
-          rhs_advy(i,j,1,2) = rhs_advy(i,j,1,2) - flux_qp * t_co
-          rhs_advy(i,j,2,2) = rhs_advy(i,j,2,2) - flux_qp * t_face
+          rhs_advy(i,j,1,2) = rhs_advy(i,j,1,2) - (flux_qp * t_co)
+          rhs_advy(i,j,2,2) = rhs_advy(i,j,2,2) - (flux_qp * t_face)
         endif
         if (j+1 <= jec .and. hmask(i,j+1) == 1.0) then
-          rhs_advy(i,j+1,1,1) = rhs_advy(i,j+1,1,1) + flux_qp * t_co
-          rhs_advy(i,j+1,2,1) = rhs_advy(i,j+1,2,1) + flux_qp * t_face
+          rhs_advy(i,j+1,1,1) = rhs_advy(i,j+1,1,1) + (flux_qp * t_co)
+          rhs_advy(i,j+1,2,1) = rhs_advy(i,j+1,2,1) + (flux_qp * t_face)
         endif
       enddo
     endif
@@ -12925,20 +12935,20 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     do gp = 1, 2
       if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
       t_co = 1.0 - t_face
-      u_at_qp = t_co*CS%u_shelf(i-1,j) + t_face*CS%u_shelf(i,j)
-      v_at_qp = t_co*CS%v_shelf(i-1,j) + t_face*CS%v_shelf(i,j)
-      u_mag_qp = sqrt(u_at_qp*u_at_qp + v_at_qp*v_at_qp)
+      u_at_qp = (t_co*CS%u_shelf(i-1,j)) + (t_face*CS%u_shelf(i,j))
+      v_at_qp = (t_co*CS%v_shelf(i-1,j)) + (t_face*CS%v_shelf(i,j))
+      u_mag_qp = sqrt((u_at_qp*u_at_qp) + (v_at_qp*v_at_qp))
       if (hmask(i,j) == 3.0) then
         h_A_qp = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
       else
-        h_A_qp = t_co*h_nodal_in(i,j,  1,2) + t_face*h_nodal_in(i,j,  2,2)
+        h_A_qp = (t_co*h_nodal_in(i,j,  1,2)) + (t_face*h_nodal_in(i,j,  2,2))
       endif
       if (hmask(i,j+1) == 3.0) then
         h_B_qp = max(CS%h_bdry_val(i,j+1), CS%min_h_shelf)
       else
-        h_B_qp = t_co*h_nodal_in(i,j+1,1,1) + t_face*h_nodal_in(i,j+1,2,1)
+        h_B_qp = (t_co*h_nodal_in(i,j+1,1,1)) + (t_face*h_nodal_in(i,j+1,2,1))
       endif
-      bed_qp = t_co*CS%bed_node(i-1,j) + t_face*CS%bed_node(i,j)
+      bed_qp = (t_co*CS%bed_node(i-1,j)) + (t_face*CS%bed_node(i,j))
       ds_use = dg1_wb_surface_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
       dh_eq = dg1_wb_equiv_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
       amp_qp = DG1_WB_JUMP_RATE_AMP
@@ -13026,12 +13036,12 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       t_co = 1.0 - t_face
       visc_flux_qp = gw * coef_face * ueff_E(i,j,gp) * dheq_E(i,j,gp) * G%dyCu(i,j)
       if (i >= isc .and. hmask(i,j) == 1.0) then
-        rhs_viscx(i,j,2,1) = rhs_viscx(i,j,2,1) + visc_flux_qp * t_co
-        rhs_viscx(i,j,2,2) = rhs_viscx(i,j,2,2) + visc_flux_qp * t_face
+        rhs_viscx(i,j,2,1) = rhs_viscx(i,j,2,1) + (visc_flux_qp * t_co)
+        rhs_viscx(i,j,2,2) = rhs_viscx(i,j,2,2) + (visc_flux_qp * t_face)
       endif
       if (i+1 <= iec .and. hmask(i+1,j) == 1.0) then
-        rhs_viscx(i+1,j,1,1) = rhs_viscx(i+1,j,1,1) - visc_flux_qp * t_co
-        rhs_viscx(i+1,j,1,2) = rhs_viscx(i+1,j,1,2) - visc_flux_qp * t_face
+        rhs_viscx(i+1,j,1,1) = rhs_viscx(i+1,j,1,1) - (visc_flux_qp * t_co)
+        rhs_viscx(i+1,j,1,2) = rhs_viscx(i+1,j,1,2) - (visc_flux_qp * t_face)
       endif
     enddo
   enddo ; enddo
@@ -13049,12 +13059,12 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       t_co = 1.0 - t_face
       visc_flux_qp = gw * coef_face * ueff_N(i,j,gp) * dheq_N(i,j,gp) * G%dxCv(i,j)
       if (j >= jsc .and. hmask(i,j) == 1.0) then
-        rhs_viscy(i,j,1,2) = rhs_viscy(i,j,1,2) + visc_flux_qp * t_co
-        rhs_viscy(i,j,2,2) = rhs_viscy(i,j,2,2) + visc_flux_qp * t_face
+        rhs_viscy(i,j,1,2) = rhs_viscy(i,j,1,2) + (visc_flux_qp * t_co)
+        rhs_viscy(i,j,2,2) = rhs_viscy(i,j,2,2) + (visc_flux_qp * t_face)
       endif
       if (j+1 <= jec .and. hmask(i,j+1) == 1.0) then
-        rhs_viscy(i,j+1,1,1) = rhs_viscy(i,j+1,1,1) - visc_flux_qp * t_co
-        rhs_viscy(i,j+1,2,1) = rhs_viscy(i,j+1,2,1) - visc_flux_qp * t_face
+        rhs_viscy(i,j+1,1,1) = rhs_viscy(i,j+1,1,1) - (visc_flux_qp * t_co)
+        rhs_viscy(i,j+1,2,1) = rhs_viscy(i,j+1,2,1) - (visc_flux_qp * t_face)
       endif
     enddo
   enddo ; enddo
@@ -13081,7 +13091,7 @@ pure function dg_d2_biased(f, b) result(A)
   integer,               intent(in) :: b !< 1 centred, 2 forward, 3 backward
   real :: A                              !< Second difference [Z ~> m]
   select case (b)
-    case (1) ; A = f(0) - 0.5*(f(-1) + f(1))
+    case (1) ; A = f(0) - (0.5*(f(-1) + f(1)))
     case (2) ; A = 0.5*(f(0) - 2.0*f(1) + f(2))
     case default ; A = 0.5*(f(0) - 2.0*f(-1) + f(-2))
   end select
@@ -13189,8 +13199,8 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, fit_tol, A, A_bed,
   kink_c = 0.0
 
   if (all(ok(-2:2))) then                       ! centred
-    A     = tv(0) - 0.5*(tv(-1) + tv(1))
-    A_bed = bv(0) - 0.5*(bv(-1) + bv(1))
+    A     = tv(0) - (0.5*(tv(-1) + tv(1)))
+    A_bed = bv(0) - (0.5*(bv(-1) + bv(1)))
     rm = 0.5*(hv(0) - hv(-2)) ; r0 = 0.5*(hv(1) - hv(-1)) ; rp = 0.5*(hv(2) - hv(0))
     km = -1 ; k0 = 0 ; kp = 1 ; rlo = -2 ; rhi = 2
     ! Grouped so the pair straddling the centre is summed first. A quarter turn
@@ -13228,9 +13238,9 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, fit_tol, A, A_bed,
     call dg_kink_branches(hv, fv, ok, rlo, rhi, fit_tol, s_g, s_f, sigma, cf, kv)
     if (kv) then
       sigma = sigma * cf
-      rm = (1.0-sigma)*rm + sigma*(fv(km)*s_g + (1.0-fv(km))*s_f)
-      r0 = (1.0-sigma)*r0 + sigma*(fv(k0)*s_g + (1.0-fv(k0))*s_f)
-      rp = (1.0-sigma)*rp + sigma*(fv(kp)*s_g + (1.0-fv(kp))*s_f)
+      rm = ((1.0-sigma)*rm) + (sigma*(fv(km)*s_g + (1.0-fv(km))*s_f))
+      r0 = ((1.0-sigma)*r0) + (sigma*(fv(k0)*s_g + (1.0-fv(k0))*s_f))
+      rp = ((1.0-sigma)*rp) + (sigma*(fv(kp)*s_g + (1.0-fv(kp))*s_f))
       kink_c = cf
     endif
   endif
@@ -13239,7 +13249,7 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, fit_tol, A, A_bed,
   ! by a half, the biased ones by a half of a one-sided second difference, which
   ! is the same expression once the offsets are those the branch actually used.
   if (mode == 1) then
-    A_ref = r0 - 0.5*(rm + rp)
+    A_ref = r0 - (0.5*(rm + rp))
   else
     A_ref = 0.5*(r0 - 2.0*rm + rp)
   endif
@@ -13366,8 +13376,8 @@ pure subroutine dg_kink_branches(hv, fv, ok, lo, hi, fit_tol, s_g, s_f, sigma, c
     if (den > 0.0) then
       amax = 0.0
       do k = lo, hi-1
-        mk  = fv(k)  *s_g + (1.0 - fv(k))  *s_f
-        mk1 = fv(k+1)*s_g + (1.0 - fv(k+1))*s_f
+        mk  = (fv(k)  *s_g) + ((1.0 - fv(k))  *s_f)
+        mk1 = (fv(k+1)*s_g) + ((1.0 - fv(k+1))*s_f)
         amax = max(amax, abs((hv(k+1) - hv(k)) - 0.5*(mk + mk1)))
       enddo
       conf = min(conf, max(0.0, 1.0 - (amax/den)/fit_tol))
@@ -13400,7 +13410,7 @@ pure function dg_lin_area(d) result(a)
     endif
     if ((dv(k) > 0.0) .neqv. (dv(kn) > 0.0)) then
       t = dv(k) / (dv(k) - dv(kn))
-      n = n + 1 ; p(:,n) = v(:,k) + t*(v(:,kn) - v(:,k))
+      n = n + 1 ; p(:,n) = v(:,k) + (t*(v(:,kn) - v(:,k)))
     endif
   enddo
   a = 0.0
@@ -13500,8 +13510,8 @@ pure subroutine dg_kink_plane_2d(hw, fw, okw, lo, hi, tol, dqx, dqy, dq0, sigma,
     enddo ; enddo
   enddo
   if (any(nx == 0) .or. any(ny == 0)) return
-  dqx = gx(1)/real(nx(1)) - gx(2)/real(nx(2))
-  dqy = gy(1)/real(ny(1)) - gy(2)/real(ny(2))
+  dqx = (gx(1)/real(nx(1))) - (gx(2)/real(nx(2)))
+  dqy = (gy(1)/real(ny(1))) - (gy(2)/real(ny(2)))
   if ((abs(dqx) + abs(dqy)) <= 0.0) return
 
   ! Anchor on the most straddled cell available: it is the best conditioned place
@@ -13515,10 +13525,10 @@ pure subroutine dg_kink_plane_2d(hw, fw, okw, lo, hi, tol, dqx, dqy, dq0, sigma,
   enddo ; enddo
   if (best <= 0.0) return
 
-  dr(1) = dqx*real(pa)       + dqy*real(qa)
-  dr(2) = dqx*real(pa+1)     + dqy*real(qa)
-  dr(3) = dqx*real(pa)       + dqy*real(qa+1)
-  dr(4) = dqx*real(pa+1)     + dqy*real(qa+1)
+  dr(1) = (dqx*real(pa))       + (dqy*real(qa))
+  dr(2) = (dqx*real(pa+1))     + (dqy*real(qa))
+  dr(3) = (dqx*real(pa))       + (dqy*real(qa+1))
+  dr(4) = (dqx*real(pa+1))     + (dqy*real(qa+1))
   dq0 = dg_shift_to_frac(dr, fw(pa,qa))
 
   ! Does one line actually describe this neighbourhood?  Having placed it,
@@ -13538,10 +13548,10 @@ pure subroutine dg_kink_plane_2d(hw, fw, okw, lo, hi, tol, dqx, dqy, dq0, sigma,
   do q = lo, hi ; do p = lo, hi
     if (.not.okw(p,q)) cycle
     if ((fw(p,q) <= eps) .or. (fw(p,q) >= 1.0-eps)) cycle
-    dr(1) = dq0 + dqx*real(p)   + dqy*real(q)
-    dr(2) = dq0 + dqx*real(p+1) + dqy*real(q)
-    dr(3) = dq0 + dqx*real(p)   + dqy*real(q+1)
-    dr(4) = dq0 + dqx*real(p+1) + dqy*real(q+1)
+    dr(1) = dq0 + (dqx*real(p))   + (dqy*real(q))
+    dr(2) = dq0 + (dqx*real(p+1)) + (dqy*real(q))
+    dr(3) = dq0 + (dqx*real(p))   + (dqy*real(q+1))
+    dr(4) = dq0 + (dqx*real(p+1)) + (dqy*real(q+1))
     mis = abs(dg_lin_area(dr) - fw(p,q))
     amax = max(amax, mis)
   enddo ; enddo
@@ -13561,10 +13571,10 @@ pure function dg_kink_twist_at(dqx, dqy, dq0, p, q) result(w)
   integer, intent(in) :: p, q          !< Cell offsets
   real :: w                            !< Twist the kink implies [Z ~> m]
   real :: m(4)
-  m(1) = max(0.0, dq0 + dqx*real(p)   + dqy*real(q))
-  m(2) = max(0.0, dq0 + dqx*real(p+1) + dqy*real(q))
-  m(3) = max(0.0, dq0 + dqx*real(p)   + dqy*real(q+1))
-  m(4) = max(0.0, dq0 + dqx*real(p+1) + dqy*real(q+1))
+  m(1) = max(0.0, dq0 + (dqx*real(p))   + (dqy*real(q)))
+  m(2) = max(0.0, dq0 + (dqx*real(p+1)) + (dqy*real(q)))
+  m(3) = max(0.0, dq0 + (dqx*real(p))   + (dqy*real(q+1)))
+  m(4) = max(0.0, dq0 + (dqx*real(p+1)) + (dqy*real(q+1)))
   w = (m(4) - m(3)) - (m(2) - m(1))
 end function dg_kink_twist_at
 
@@ -13981,10 +13991,10 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
         kwant = gam * itau_xi
         kap = min(max(kwant - knat_xi, 0.0), rate_cap)
-        T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_dmp
-        T_node(i,j,1,2) = T_node(i,j,1,2) + 0.5*kap*A_dmp
-        T_node(i,j,2,1) = T_node(i,j,2,1) - 0.5*kap*A_dmp
-        T_node(i,j,2,2) = T_node(i,j,2,2) - 0.5*kap*A_dmp
+        T_node(i,j,1,1) = T_node(i,j,1,1) + (0.5*kap*A_dmp)
+        T_node(i,j,1,2) = T_node(i,j,1,2) + (0.5*kap*A_dmp)
+        T_node(i,j,2,1) = T_node(i,j,2,1) - (0.5*kap*A_dmp)
+        T_node(i,j,2,2) = T_node(i,j,2,2) - (0.5*kap*A_dmp)
         if (diag_on) then
           d_l2 = d_l2 + ((kap*A_dmp)**2) / 12.0
           d_gate = max(d_gate, gam) ; d_want = d_want + kwant
@@ -14023,10 +14033,10 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
         kwant = gam * itau_eta
         kap = min(max(kwant - knat_eta, 0.0), rate_cap)
-        T_node(i,j,1,1) = T_node(i,j,1,1) + 0.5*kap*A_dmp
-        T_node(i,j,2,1) = T_node(i,j,2,1) + 0.5*kap*A_dmp
-        T_node(i,j,1,2) = T_node(i,j,1,2) - 0.5*kap*A_dmp
-        T_node(i,j,2,2) = T_node(i,j,2,2) - 0.5*kap*A_dmp
+        T_node(i,j,1,1) = T_node(i,j,1,1) + (0.5*kap*A_dmp)
+        T_node(i,j,2,1) = T_node(i,j,2,1) + (0.5*kap*A_dmp)
+        T_node(i,j,1,2) = T_node(i,j,1,2) - (0.5*kap*A_dmp)
+        T_node(i,j,2,2) = T_node(i,j,2,2) - (0.5*kap*A_dmp)
         if (diag_on) then
           d_l2 = d_l2 + ((kap*A_dmp)**2) / 12.0
           d_gate = max(d_gate, gam) ; d_want = d_want + kwant
@@ -14118,10 +14128,10 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         kap = min(max(kwant - min(knat_xi, knat_eta), 0.0), rate_cap)
         ! +,-,-,+ : changes w by 4*(-0.25*kap*A_dmp) = -kap*A_dmp, and is exactly
         ! orthogonal to the cell mean and to both tilts.
-        T_node(i,j,1,1) = T_node(i,j,1,1) - 0.25*kap*A_dmp
-        T_node(i,j,2,2) = T_node(i,j,2,2) - 0.25*kap*A_dmp
-        T_node(i,j,2,1) = T_node(i,j,2,1) + 0.25*kap*A_dmp
-        T_node(i,j,1,2) = T_node(i,j,1,2) + 0.25*kap*A_dmp
+        T_node(i,j,1,1) = T_node(i,j,1,1) - (0.25*kap*A_dmp)
+        T_node(i,j,2,2) = T_node(i,j,2,2) - (0.25*kap*A_dmp)
+        T_node(i,j,2,1) = T_node(i,j,2,1) + (0.25*kap*A_dmp)
+        T_node(i,j,1,2) = T_node(i,j,1,2) + (0.25*kap*A_dmp)
         if (diag_on) then
           d_l2 = d_l2 + ((kap*A_dmp)**2) / 144.0
           d_gate = max(d_gate, gam) ; d_want = d_want + kwant
