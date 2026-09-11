@@ -12324,30 +12324,62 @@ pure real function subgrid_cell_mean_s(Phisub, h_nodal_cell, bed_corners, &
   Sbar = accum
 end function subgrid_cell_mean_s
 
+!> Sum four products, each rounded to working precision before any of them is added.
+!!
+!! Grouping a four-term sum into opposite pairs is enough to make it independent of
+!! the order the terms are written in, and that is all a quarter turn of the grid
+!! changes when the terms are plain values.  It is NOT enough when the terms are
+!! PRODUCTS and the compiler is allowed to contract, because a fused multiply-add
+!! carries one factor pair at full width into the sum while its partner is rounded
+!! first.  Which term gets that treatment is fixed by where it sits in the
+!! expression, and a quarter turn permutes the corners cyclically through those
+!! slots, so no arrangement of the source can make the two orientations agree: a
+!! four-cycle has no invariant pair of slots to assign the exact term to.
+!!
+!! Parentheses do not help.  -fprotect-parens stops the compiler REASSOCIATING
+!! across them, which is a different transformation; gfortran will still fuse a
+!! parenthesised product into a neighbouring add, and does so here as soon as it
+!! vectorises the corner loop.  Writing the products into ordinary local scalars
+!! does not help either -- they are forwarded straight back into the sum.
+!!
+!! Passing them through volatile storage does, because the sum then has to read
+!! values that have been through memory at working precision.  The cost is four
+!! stores and four loads per call, which is not measurable here: this runs once
+!! per cell per Runge-Kutta stage, not inside the velocity solve.
+!!
+!! With -ffp-contract=off, which is what the supported build uses, this is a no-op
+!! and the result is bit-for-bit what the plain expression gives.
+function dg_sum4_rounded(p1, p2, p3, p4) result(s)
+  real, intent(in) :: p1 !< First product, paired with p2 [arbitrary]
+  real, intent(in) :: p2 !< Second product, paired with p1 [arbitrary]
+  real, intent(in) :: p3 !< Third product, paired with p4 [arbitrary]
+  real, intent(in) :: p4 !< Fourth product, paired with p3 [arbitrary]
+  real :: s              !< (p1 + p2) + (p3 + p4), each term rounded first [arbitrary]
+  real, volatile, dimension(4) :: t ! Forces each product to working precision
+  t(1) = p1 ; t(2) = p2 ; t(3) = p3 ; t(4) = p4
+  s = (t(1) + t(2)) + (t(3) + t(4))
+end function dg_sum4_rounded
+
 !> Apply the per-cell tensor-product Q1 mass-matrix inverse:
 !! out(a,b) = sum_{a',b'} Minv_xi(a,a') * Minv_eta(b,b') * rhs(a',b').
-pure subroutine apply_nodal_DG_mass_inverse(Minv_xi_cell, Minv_eta_cell, rhs, out)
+subroutine apply_nodal_DG_mass_inverse(Minv_xi_cell, Minv_eta_cell, rhs, out)
   real, dimension(2,2), intent(in)  :: Minv_xi_cell  !< 2x2 inverse of xi mass-matrix factor [L-1]
   real, dimension(2,2), intent(in)  :: Minv_eta_cell !< 2x2 inverse of eta mass-matrix factor [L-1]
   real, dimension(2,2), intent(in)  :: rhs            !< Per-cell RHS at the 4 corners [Z L2 T-1]
   real, dimension(2,2), intent(out) :: out            !< M^-1 * rhs [Z T-1]
   integer :: a, b
   ! The four source corners are reduced as opposite pairs rather than accumulated
-  ! in loop order. A quarter turn of the grid permutes the corners cyclically,
+  ! in loop order.  A quarter turn of the grid permutes the corners cyclically,
   ! which would reorder a running sum; it maps each opposite pair onto the other,
-  ! which leaves this reduction unchanged.
-  !
-  ! Each product is written out in place and parenthesised rather than held in a
-  ! local array. The compiler scalarises a small local array and can then fuse the
-  ! multiply back into the following add, which makes one product of a pair exact
-  ! and the other rounded; the quarter turn exchanges the pair, so which one is
-  ! exact would change. A parenthesised product is rounded as a unit and cannot be
-  ! fused.
+  ! which leaves this reduction unchanged.  The terms are products, so they go
+  ! through dg_sum4_rounded rather than straight into the sum -- see there for why
+  ! parentheses are not enough once the compiler may contract.  Not pure, because
+  ! that helper cannot be: a pure procedure may not declare a volatile local.
   do b = 1, 2 ; do a = 1, 2
-    out(a,b) = (((Minv_xi_cell(a,1) * Minv_eta_cell(b,1)) * rhs(1,1)) + &
-                ((Minv_xi_cell(a,2) * Minv_eta_cell(b,2)) * rhs(2,2))) + &
-               (((Minv_xi_cell(a,2) * Minv_eta_cell(b,1)) * rhs(2,1)) + &
-                ((Minv_xi_cell(a,1) * Minv_eta_cell(b,2)) * rhs(1,2)))
+    out(a,b) = dg_sum4_rounded((Minv_xi_cell(a,1) * Minv_eta_cell(b,1)) * rhs(1,1), &
+                               (Minv_xi_cell(a,2) * Minv_eta_cell(b,2)) * rhs(2,2), &
+                               (Minv_xi_cell(a,2) * Minv_eta_cell(b,1)) * rhs(2,1), &
+                               (Minv_xi_cell(a,1) * Minv_eta_cell(b,2)) * rhs(1,2))
   enddo ; enddo
 end subroutine apply_nodal_DG_mass_inverse
 
