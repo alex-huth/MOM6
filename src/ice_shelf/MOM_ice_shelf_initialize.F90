@@ -23,6 +23,7 @@ public initialize_ice_thickness
 public initialize_ice_shelf_boundary_channel
 public initialize_ice_flow_from_file
 public initialize_bed_node_from_file
+public corner_cell_weights, nodal_cell_mean
 public initialize_ice_shelf_boundary_from_file
 public initialize_ice_C_basal_friction
 public initialize_ice_AGlen
@@ -133,6 +134,7 @@ subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, melt
   integer :: i, j, isc, jsc, iec, jec
   logical :: hmask_set
   logical :: nodal_thickness ! If true, read the thickness at B-grid corner nodes.
+  logical :: reentrant_x, reentrant_y ! True if the domain wraps in x or y
   real :: len_sidestress, udh
 
   call MOM_mesg("Initialize_ice_thickness_from_file: reading thickness")
@@ -213,6 +215,12 @@ subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, melt
               "LEN_SIDE_STRESS tapers the cell-averaged thickness, which "//&
               "INIT_ICE_THICKNESS_NODAL derives from the nodal field rather than reading, "//&
               "leaving the taper and the nodal thickness inconsistent.")
+    call get_param(PF, mdl, "REENTRANT_X", reentrant_x, &
+                 " If true, the domain is zonally reentrant.", &
+                 default=.false., do_not_log=.true.)
+    call get_param(PF, mdl, "REENTRANT_Y", reentrant_y, &
+                 " If true, the domain is meridionally reentrant.", &
+                 default=.false., do_not_log=.true.)
     allocate(h_node(G%IsdB:G%IedB, G%JsdB:G%JedB), source=0.0)
     call MOM_read_data(filename, trim(thickness_varname), h_node, G%Domain, &
                        position=CORNER, scale=US%m_to_Z)
@@ -227,7 +235,8 @@ subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, melt
         h_nodal(i,j,2,1) = h_node(I,   J-1)
         h_nodal(i,j,1,2) = h_node(I-1, J  )
         h_nodal(i,j,2,2) = h_node(I,   J  )
-        h_shelf(i,j) = corner_cell_mean(G, i, j, h_nodal(i,j,1,1), h_nodal(i,j,2,1), &
+        h_shelf(i,j) = corner_cell_mean(G, i, j, reentrant_x, reentrant_y, &
+                                        h_nodal(i,j,1,1), h_nodal(i,j,2,1), &
                                         h_nodal(i,j,1,2), h_nodal(i,j,2,2))
       endif
     enddo ; enddo
@@ -553,46 +562,81 @@ subroutine initialize_ice_flow_from_file(bed_elev,u_shelf, v_shelf,float_cond,&
 
 end subroutine initialize_ice_flow_from_file
 
+!> Per-corner integration weights of the Q1 basis against the separable-Jacobian
+!! element, w(a,b) = int_0^1 int_0^1 N(a,b) * a(eta) * d(xi) dxi deta, with
+!! d(xi) = dyW*(1-xi) + dyE*xi and a(eta) = dxS*(1-eta) + dxN*eta. Both the basis
+!! and the Jacobian separate, so each weight is a product of two 1D integrals:
+!!   int N_1(xi)*d(xi) dxi = dyW/3 + dyE/6,  int N_2(xi)*d(xi) dxi = dyW/6 + dyE/3
+!! and likewise in eta. The 2:1 bias towards a corner's own side is what carries
+!! the cell metric; on a uniform cell every weight is areaT/4.
+!! The weights sum to the cell area, so dividing by their sum gives a cell mean.
+pure subroutine corner_cell_weights(dxS, dxN, dyW, dyE, w_cell)
+  real, intent(in) :: dxS  !< South face length [L ~> m]
+  real, intent(in) :: dxN  !< North face length [L ~> m]
+  real, intent(in) :: dyW  !< West face length [L ~> m]
+  real, intent(in) :: dyE  !< East face length [L ~> m]
+  real, dimension(2,2), intent(out) :: w_cell !< Per-corner integration weights [L2 ~> m2]
+
+  w_cell(1,1) = (dyW/3.0 + dyE/6.0) * (dxS/3.0 + dxN/6.0)
+  w_cell(2,1) = (dyW/6.0 + dyE/3.0) * (dxS/3.0 + dxN/6.0)
+  w_cell(1,2) = (dyW/3.0 + dyE/6.0) * (dxS/6.0 + dxN/3.0)
+  w_cell(2,2) = (dyW/6.0 + dyE/3.0) * (dxS/6.0 + dxN/3.0)
+end subroutine corner_cell_weights
+
+!> Area-weighted cell mean of a field given at the four corners of a cell, using
+!! the integration weights from corner_cell_weights. The diagonal-pair grouping
+!! of both sums is deliberate: a 90 degree rotation permutes the corners
+!! cyclically, so pairing opposite corners keeps the result bit-for-bit
+!! rotation-invariant.
+pure real function nodal_cell_mean(h_cell, w_cell) result(Hbar)
+  real, dimension(2,2), intent(in) :: h_cell !< Corner values [A ~> a]
+  real, dimension(2,2), intent(in) :: w_cell !< Per-corner integration weights [L2 ~> m2]
+
+  real :: area  ! Sum of the corner weights, i.e. the cell area [L2 ~> m2]
+
+  area = ((w_cell(1,1) + w_cell(2,2)) + (w_cell(1,2) + w_cell(2,1)))
+  if (area > 0.0) then
+    Hbar = ( (w_cell(1,1)*h_cell(1,1) + w_cell(2,2)*h_cell(2,2)) + &
+             (w_cell(1,2)*h_cell(1,2) + w_cell(2,1)*h_cell(2,1)) ) / area
+  else
+    Hbar = 0.0
+  endif
+end function nodal_cell_mean
+
 !> Area-weighted cell mean of the bilinear interpolant of a field given at the
-!! four B-grid corners of cell (i,j), on the separable-Jacobian element
-!! a(eta)*d(xi). Uniform cells collapse to 0.25*sum(corners) bit-exactly.
-!!
-!! Pxm/Pxp and Pym/Pyp are the 1D half-cell integrals of d(xi) and a(eta)
-!! against the Q1 basis; expanded, Pxm = dyW/3 + dyE/6 and so on, which is the
-!! same quadrature as nodal_cell_mean/cell_mean_w in MOM_ice_shelf_dynamics.
-!! The two are written differently and are not bit-for-bit interchangeable.
-function corner_cell_mean(G, i, j, c11, c21, c12, c22) result(cmean)
+!! four B-grid corners of cell (i,j). Picks the cell's face lengths, with the
+!! same one-sided fallback at non-reentrant domain edges that init_nodal_DG_metric
+!! uses, and then applies the shared weights and reduction.
+function corner_cell_mean(G, i, j, reentrant_x, reentrant_y, c11, c21, c12, c22) result(cmean)
   type(ocean_grid_type), intent(in) :: G   !< The grid structure used by the ice shelf.
   integer,               intent(in) :: i   !< The i-index of the cell.
   integer,               intent(in) :: j   !< The j-index of the cell.
+  logical,               intent(in) :: reentrant_x !< True if the domain is zonally reentrant
+  logical,               intent(in) :: reentrant_y !< True if the domain is meridionally reentrant
   real,                  intent(in) :: c11 !< Corner value at (I-1,J-1) [Z ~> m].
   real,                  intent(in) :: c21 !< Corner value at (I,J-1) [Z ~> m].
   real,                  intent(in) :: c12 !< Corner value at (I-1,J) [Z ~> m].
   real,                  intent(in) :: c22 !< Corner value at (I,J) [Z ~> m].
   real :: cmean                            !< The area-weighted cell mean [Z ~> m].
 
-  real :: a0, a1, d0, d1     ! Per-cell metric scalars [L ~> m].
-  real :: Pxm, Pxp, Pym, Pyp ! 1D half-cell integrals of d(xi) and a(eta) [L ~> m].
+  real :: dxS, dxN, dyW, dyE      ! Face lengths [L ~> m]
+  real, dimension(2,2) :: w_cell  ! Per-corner integration weights [L2 ~> m2]
+  real, dimension(2,2) :: c_cell  ! Corner values in the (a,b) layout [Z ~> m]
 
-  if ((J-1 >= G%JsdB) .and. (j + G%jdg_offset > G%jsg)) then
-    a0 = 0.5*(G%dxCv(i,J-1) + G%dxCv(i,J))
-    a1 = G%dxCv(i,J) - G%dxCv(i,J-1)
+  if ((J-1 >= G%JsdB) .and. (reentrant_y .or. (j + G%jdg_offset > G%jsg))) then
+    dxS = G%dxCv(i,J-1) ; dxN = G%dxCv(i,J)
   else
-    a0 = G%dxCv(i,J) ; a1 = 0.0
+    dxS = G%dxCv(i,J)   ; dxN = G%dxCv(i,J)
   endif
-  if ((I-1 >= G%IsdB) .and. (i + G%idg_offset > G%isg)) then
-    d0 = 0.5*(G%dyCu(I-1,j) + G%dyCu(I,j))
-    d1 = G%dyCu(I,j) - G%dyCu(I-1,j)
+  if ((I-1 >= G%IsdB) .and. (reentrant_x .or. (i + G%idg_offset > G%isg))) then
+    dyW = G%dyCu(I-1,j) ; dyE = G%dyCu(I,j)
   else
-    d0 = G%dyCu(I,j) ; d1 = 0.0
+    dyW = G%dyCu(I,j)   ; dyE = G%dyCu(I,j)
   endif
 
-  Pxm = (0.5*d0) - (d1/12.0)
-  Pxp = (0.5*d0) + (d1/12.0)
-  Pym = (0.5*a0) - (a1/12.0)
-  Pyp = (0.5*a0) + (a1/12.0)
-  cmean = ( ((c11*(Pxm*Pym)) + (c22*(Pxp*Pyp))) + &
-            ((c21*(Pxp*Pym)) + (c12*(Pxm*Pyp))) ) / (a0*d0)
+  call corner_cell_weights(dxS, dxN, dyW, dyE, w_cell)
+  c_cell(1,1) = c11 ; c_cell(2,1) = c21 ; c_cell(1,2) = c12 ; c_cell(2,2) = c22
+  cmean = nodal_cell_mean(c_cell, w_cell)
 
 end function corner_cell_mean
 
@@ -612,6 +656,7 @@ subroutine initialize_bed_node_from_file(bed_node, bed_elev, G, US, PF)
   character(len=200) :: filename, inputdir, nodal_bed_file
   character(len=200) :: bed_node_varname
   character(len=40)  :: mdl = "initialize_bed_node_from_file"
+  logical :: reentrant_x, reentrant_y ! True if the domain wraps in x or y
   integer :: i, j
 
   call get_param(PF, mdl, "INPUTDIR", inputdir, default=".", do_not_log=.true.)
@@ -620,6 +665,12 @@ subroutine initialize_bed_node_from_file(bed_node, bed_elev, G, US, PF)
                  "The file from which the nodal (B-grid corner) bed elevation is read "//&
                  "when INIT_ICE_BED_NODAL=True.", &
                  default="ice_shelf_vel.nc")
+  call get_param(PF, mdl, "REENTRANT_X", reentrant_x, &
+                 " If true, the domain is zonally reentrant.", &
+                 default=.false., do_not_log=.true.)
+  call get_param(PF, mdl, "REENTRANT_Y", reentrant_y, &
+                 " If true, the domain is meridionally reentrant.", &
+                 default=.false., do_not_log=.true.)
   call get_param(PF, mdl, "BED_TOPO_VARNAME", bed_node_varname, &
                  "The name of the nodal bed elevation variable in BED_TOPO_FILE "//&
                  "when INIT_ICE_BED_NODAL=True.", &
@@ -637,7 +688,8 @@ subroutine initialize_bed_node_from_file(bed_node, bed_elev, G, US, PF)
   ! bilinear corner-node interpolant on the separable-Jacobian element.
   ! Uniform cells collapse to bed_elev = 0.25*sum(corners) bit-exactly.
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
-    bed_elev(i,j) = corner_cell_mean(G, i, j, bed_node(I-1,J-1), bed_node(I,J-1), &
+    bed_elev(i,j) = corner_cell_mean(G, i, j, reentrant_x, reentrant_y, &
+                                     bed_node(I-1,J-1), bed_node(I,J-1), &
                                      bed_node(I-1,J), bed_node(I,J))
   enddo ; enddo
   call pass_var(bed_elev, G%domain)

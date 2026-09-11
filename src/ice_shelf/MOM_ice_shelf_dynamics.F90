@@ -32,6 +32,7 @@ use MOM_checksums, only : hchksum, qchksum
 use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary_channel,initialize_ice_flow_from_file
 use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary_from_file,initialize_ice_C_basal_friction
 use MOM_ice_shelf_initialize, only : initialize_ice_AGlen, initialize_bed_node_from_file
+use MOM_ice_shelf_initialize, only : corner_cell_weights, nodal_cell_mean
 implicit none ; private
 
 #include <MOM_memory.h>
@@ -12013,17 +12014,7 @@ subroutine init_nodal_DG_metric(CS, G)
       CS%Minv_eta(i,j,2,1) = -M12 / det
     endif
 
-    ! Per-corner integration weight w(a,b) = int_0^1 int_0^1 N(a,b)*a(eta)*d(xi) dxi deta.
-    ! N(1,1) = (1-xi)(1-eta), etc. Closed-form by separation:
-    !   w(a,b) = (int N_a(xi)*d(xi) dxi) * (int N_b(eta)*a(eta) deta)
-    ! int N_1(xi)*d(xi) dxi = dyW/3 + dyE/6
-    ! int N_2(xi)*d(xi) dxi = dyW/6 + dyE/3
-    ! int N_1(eta)*a(eta) deta = dxS/3 + dxN/6
-    ! int N_2(eta)*a(eta) deta = dxS/6 + dxN/3
-    CS%cell_mean_w(i,j,1,1) = (dyW/3.0 + dyE/6.0) * (dxS/3.0 + dxN/6.0)
-    CS%cell_mean_w(i,j,2,1) = (dyW/6.0 + dyE/3.0) * (dxS/3.0 + dxN/6.0)
-    CS%cell_mean_w(i,j,1,2) = (dyW/3.0 + dyE/6.0) * (dxS/6.0 + dxN/3.0)
-    CS%cell_mean_w(i,j,2,2) = (dyW/6.0 + dyE/3.0) * (dxS/6.0 + dxN/3.0)
+    call corner_cell_weights(dxS, dxN, dyW, dyE, CS%cell_mean_w(i,j,:,:))
   enddo ; enddo
 
   ! Cache the orthogonalisation offsets for the hierarchical-limiter mode
@@ -12123,18 +12114,6 @@ subroutine pass_corner_field(h_nodal, G)
   h_nodal(:,:,2,2) = tmp(:,:,4)
 end subroutine pass_corner_field
 
-!> Compute the area-weighted cell mean of the 4 corner values via cell_mean_w.
-pure real function nodal_cell_mean(h_cell, w_cell) result(Hbar)
-  real, dimension(2,2), intent(in) :: h_cell, w_cell
-  real :: area
-  area = ((w_cell(1,1) + w_cell(2,2)) + (w_cell(1,2) + w_cell(2,1)))
-  if (area > 0.0) then
-    Hbar = ( (w_cell(1,1)*h_cell(1,1) + w_cell(2,2)*h_cell(2,2)) + &
-             (w_cell(1,2)*h_cell(1,2) + w_cell(2,1)*h_cell(2,1)) ) / area
-  else
-    Hbar = 0.0
-  endif
-end function nodal_cell_mean
 
 !> Publish ISS%h_shelf from CS%h_nodal as the area-weighted mean.
 subroutine recompute_h_shelf_from_nodal(CS, ISS, G)
