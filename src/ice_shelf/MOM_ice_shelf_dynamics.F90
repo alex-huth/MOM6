@@ -11327,6 +11327,15 @@ subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
 
   real, dimension(SZDIB_(G),SZDJB_(G)) :: S_corner ! Projected B-grid corner source [Z T-1]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: w_corner ! Total cell_mean_w summed at corner [L2]
+  ! Per-node 4-slot accumulators, slot k indexed by which of the 4 surrounding cells
+  ! contributes (1=SW, 2=SE, 3=NW, 4=NE), as for taudx_b and uret_b elsewhere in this
+  ! module. The cell loop is row-major, so summing into the node directly would add the
+  ! four contributions in an order that a quarter turn of the grid changes. Holding them
+  ! in slots and reducing in diagonal pairs below does not depend on that order. The
+  ! distinction is invisible for a uniform grid carrying a spatially constant source,
+  ! where all four contributions are the same number, and real otherwise.
+  real, dimension(SZDIB_(G),SZDJB_(G),4) :: S_corner_b ! Per-cell corner source [Z T-1]
+  real, dimension(SZDIB_(G),SZDJB_(G),4) :: w_corner_b ! Per-cell corner weight [L2]
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: S_loc ! Per-cell nodal source before sharing [Z T-1]
   real, dimension(SZDI_(G),SZDJ_(G)) :: m_eff ! Rate over the floating part of a cell [Z T-1]
   real :: w_contrib                                ! Per-cell-corner contribution weight [L2]
@@ -11377,6 +11386,8 @@ subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
 
   S_corner(:,:) = 0.0
   w_corner(:,:) = 0.0
+  S_corner_b(:,:,:) = 0.0
+  w_corner_b(:,:,:) = 0.0
 
   if (op == SRC_OP_SUBGRID) then
     ! Average the melt rate over the floating part of each corner's support, weighting each cell
@@ -11388,20 +11399,24 @@ subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
     do j = G%jsd, G%jed ; do i = G%isd, G%ied
       if (ISS%hmask(i,j) /= 1.0) cycle
       w_contrib = CS%cell_mean_w(i,j,1,1) * CS%xi_basal(i,j,1,1)
-      S_corner(I-1, J-1) = S_corner(I-1, J-1) + w_contrib * m_eff(i,j)
-      w_corner(I-1, J-1) = w_corner(I-1, J-1) + w_contrib
+      S_corner_b(I-1, J-1, 4) = w_contrib * m_eff(i,j)
+      w_corner_b(I-1, J-1, 4) = w_contrib
       w_contrib = CS%cell_mean_w(i,j,2,1) * CS%xi_basal(i,j,2,1)
-      S_corner(I,   J-1) = S_corner(I,   J-1) + w_contrib * m_eff(i,j)
-      w_corner(I,   J-1) = w_corner(I,   J-1) + w_contrib
+      S_corner_b(I,   J-1, 3) = w_contrib * m_eff(i,j)
+      w_corner_b(I,   J-1, 3) = w_contrib
       w_contrib = CS%cell_mean_w(i,j,1,2) * CS%xi_basal(i,j,1,2)
-      S_corner(I-1, J  ) = S_corner(I-1, J  ) + w_contrib * m_eff(i,j)
-      w_corner(I-1, J  ) = w_corner(I-1, J  ) + w_contrib
+      S_corner_b(I-1, J  , 2) = w_contrib * m_eff(i,j)
+      w_corner_b(I-1, J  , 2) = w_contrib
       w_contrib = CS%cell_mean_w(i,j,2,2) * CS%xi_basal(i,j,2,2)
-      S_corner(I,   J  ) = S_corner(I,   J  ) + w_contrib * m_eff(i,j)
-      w_corner(I,   J  ) = w_corner(I,   J  ) + w_contrib
+      S_corner_b(I,   J  , 1) = w_contrib * m_eff(i,j)
+      w_corner_b(I,   J  , 1) = w_contrib
     enddo ; enddo
 
     do j = G%JsdB, G%JedB ; do i = G%IsdB, G%IedB
+      S_corner(I,J) = (S_corner_b(I,J,1) + S_corner_b(I,J,4)) + &
+                      (S_corner_b(I,J,2) + S_corner_b(I,J,3))
+      w_corner(I,J) = (w_corner_b(I,J,1) + w_corner_b(I,J,4)) + &
+                      (w_corner_b(I,J,2) + w_corner_b(I,J,3))
       if (w_corner(I,J) > 0.0) S_corner(I,J) = S_corner(I,J) / w_corner(I,J)
     enddo ; enddo
 
@@ -11421,26 +11436,30 @@ subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
     if (ISS%hmask(i,j) /= 1.0) cycle
     ! Cell-local corner (a,b) = (1,1) is the SW corner, i.e. B-node (I-1, J-1).
     w_contrib = CS%cell_mean_w(i,j,1,1)
-    S_corner(I-1, J-1) = S_corner(I-1, J-1) + w_contrib * S_loc(i,j,1,1)
-    w_corner(I-1, J-1) = w_corner(I-1, J-1) + w_contrib
+    S_corner_b(I-1, J-1, 4) = w_contrib * S_loc(i,j,1,1)
+    w_corner_b(I-1, J-1, 4) = w_contrib
     ! (a,b) = (2,1) = SE corner, B-node (I, J-1)
     w_contrib = CS%cell_mean_w(i,j,2,1)
-    S_corner(I,   J-1) = S_corner(I,   J-1) + w_contrib * S_loc(i,j,2,1)
-    w_corner(I,   J-1) = w_corner(I,   J-1) + w_contrib
+    S_corner_b(I,   J-1, 3) = w_contrib * S_loc(i,j,2,1)
+    w_corner_b(I,   J-1, 3) = w_contrib
     ! (a,b) = (1,2) = NW corner, B-node (I-1, J)
     w_contrib = CS%cell_mean_w(i,j,1,2)
-    S_corner(I-1, J  ) = S_corner(I-1, J  ) + w_contrib * S_loc(i,j,1,2)
-    w_corner(I-1, J  ) = w_corner(I-1, J  ) + w_contrib
+    S_corner_b(I-1, J  , 2) = w_contrib * S_loc(i,j,1,2)
+    w_corner_b(I-1, J  , 2) = w_contrib
     ! (a,b) = (2,2) = NE corner, B-node (I, J)
     w_contrib = CS%cell_mean_w(i,j,2,2)
-    S_corner(I,   J  ) = S_corner(I,   J  ) + w_contrib * S_loc(i,j,2,2)
-    w_corner(I,   J  ) = w_corner(I,   J  ) + w_contrib
+    S_corner_b(I,   J  , 1) = w_contrib * S_loc(i,j,2,2)
+    w_corner_b(I,   J  , 1) = w_contrib
   enddo ; enddo
 
-  ! Normalise: at each B-grid node, S_corner becomes the cell_mean_w-weighted
-  ! average of ice-covered contributing cells. Corners with no contributing
-  ! ice cell get S_corner = 0 (no source there).
+  ! Reduce the 4 slots in diagonal pairs, then normalise: at each B-grid node,
+  ! S_corner becomes the cell_mean_w-weighted average of ice-covered contributing
+  ! cells. Corners with no contributing ice cell get S_corner = 0 (no source there).
   do j = G%JsdB, G%JedB ; do i = G%IsdB, G%IedB
+    S_corner(I,J) = (S_corner_b(I,J,1) + S_corner_b(I,J,4)) + &
+                    (S_corner_b(I,J,2) + S_corner_b(I,J,3))
+    w_corner(I,J) = (w_corner_b(I,J,1) + w_corner_b(I,J,4)) + &
+                    (w_corner_b(I,J,2) + w_corner_b(I,J,3))
     if (w_corner(I,J) > 0.0) S_corner(I,J) = S_corner(I,J) / w_corner(I,J)
   enddo ; enddo
 
