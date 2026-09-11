@@ -380,13 +380,13 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! f_ground_node, with no element integration or neighbor coupling. Requires
                             !! CISM_FRICTION (for f_ground_node). Pairs with CISM_TAUD='local'
                             !! to reproduce the all-local CISM/Leguy-2021 grounding-line setup.
-  logical :: fv_subgrid_gl_friction !< If true, the FV (non-DG) basal friction and the Coulomb
+  logical :: i2n_friction !< If true, the FV (non-DG) basal friction and the Coulomb
                             !! effective pressure are integrated over the sub-element grounding-line
                             !! partition selected by GROUNDING_LINE_SUBGRID_SCHEME, using the corner
                             !! thickness and flotation fields CS%H_corner and CS%fls_corner instead of
                             !! corner H with a cell-constant bed. Requires GROUNDING_LINE_INTERPOLATE.
-  logical :: fv_subgrid_gl_taud !< If true, the FV (non-DG) driving stress is integrated over the same
-                            !! sub-element partition used by FV_SUBGRID_GL_FRICTION, with the surface
+  logical :: i2n_taud !< If true, the FV (non-DG) driving stress is integrated over the same
+                            !! sub-element partition used by I2N_FRICTION, with the surface
                             !! elevation reconstructed as S = (1-r)*H + max(fls,0) so that its slope
                             !! kink lies exactly on the partition's grounding line. Requires
                             !! GROUNDING_LINE_INTERPOLATE.
@@ -1294,46 +1294,75 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     ! and the driving stress. Both parameters require GROUNDING_LINE_INTERPOLATE, which is what
     ! allocates Phisub and enables compute_ground_frac and the sub-element quadrature dispatch; without
     ! it there is no sub-cell partition for either term to integrate over.
-    call get_param(param_file, mdl, "FV_SUBGRID_GL_FRICTION", CS%fv_subgrid_gl_friction, &
+    call get_param(param_file, mdl, "I2N_FRICTION", CS%i2n_friction, &
                  "If true, integrate the finite-volume (non-DG) basal friction and the Coulomb "//&
                  "effective pressure over the sub-element grounding-line partition selected by "//&
                  "GROUNDING_LINE_SUBGRID_SCHEME, using the corner thickness and flotation deficit "//&
                  "obtained by interpolating the cell-centered fields with dual-cell Lagrange weights "//&
                  "over ice-covered cells (plus ice-free land lying below the ice). This replaces the "//&
                  "corner-thickness-with-cell-constant-bed flotation field, so the grounding line seen "//&
-                 "by the friction is the same one seen by FV_SUBGRID_GL_TAUD. The effective pressure "//&
+                 "by the friction is the same one seen by I2N_TAUD. The effective pressure "//&
                  "is evaluated at each grounded quadrature point as rho_ocean*g*min(fls, r*H). "//&
                  "Requires GROUNDING_LINE_INTERPOLATE=True.", &
                  default=.false.)
-    call get_param(param_file, mdl, "FV_SUBGRID_GL_TAUD", CS%fv_subgrid_gl_taud, &
+    call get_param(param_file, mdl, "I2N_TAUD", CS%i2n_taud, &
                  "If true, integrate the finite-volume (non-DG) driving stress over the same "//&
-                 "sub-element grounding-line partition used by FV_SUBGRID_GL_FRICTION. The surface "//&
+                 "sub-element grounding-line partition used by I2N_FRICTION. The surface "//&
                  "elevation is reconstructed as S = (1-r)*H + max(fls,0) from the same two corner "//&
                  "fields, so the slope kink lies exactly on the partition's grounding line and every "//&
                  "quadrature point takes one side of it; the cell-mean thickness multiplies the "//&
                  "resulting slope. Requires GROUNDING_LINE_INTERPOLATE=True.", &
                  default=.false.)
-    if ((CS%fv_subgrid_gl_friction .or. CS%fv_subgrid_gl_taud) .and. .not. CS%GL_regularize) &
-      call MOM_error(FATAL, "MOM_ice_shelf_dynamics: FV_SUBGRID_GL_FRICTION and FV_SUBGRID_GL_TAUD "//&
+    if ((CS%i2n_friction .or. CS%i2n_taud) .and. .not. CS%GL_regularize) &
+      call MOM_error(FATAL, "MOM_ice_shelf_dynamics: I2N_FRICTION and I2N_TAUD "//&
                  "integrate over the sub-cell grounding-line partition and require "//&
                  "GROUNDING_LINE_INTERPOLATE=True.")
-    if ((CS%fv_subgrid_gl_friction .or. CS%fv_subgrid_gl_taud) .and. CS%local_basal_friction) &
-      call MOM_error(FATAL, "MOM_ice_shelf_dynamics: FV_SUBGRID_GL_FRICTION and FV_SUBGRID_GL_TAUD "//&
-                 "assemble over the primal element with Q1 weighting, while CISM_FRICTION='local' is a "//&
-                 "nodal diagonal on the dual cell; mixing them mismatches the control volumes at the "//&
-                 "grounding line.")
-    if (CS%fv_subgrid_gl_friction .and. CS%gl_quad_friction) call MOM_error(FATAL, &
-                 "MOM_ice_shelf_dynamics: FV_SUBGRID_GL_FRICTION and CISM_FRICTION are two "//&
-                 "different sources of the grounded fraction and cannot both be used.")
-    if (CS%fv_subgrid_gl_taud .and. .not. CS%use_sep2) call MOM_error(FATAL, &
-                 "MOM_ice_shelf_dynamics: FV_SUBGRID_GL_TAUD integrates the surface-slope kink on "//&
+    ! The interpolate-to-nodes and CISM-style schemes are two different sources of the
+    ! grounded fraction, and 'local' is additionally a nodal diagonal on the dual cell
+    ! where I2N assembles over the primal element with Q1 weighting, so mixing them
+    ! mismatches the control volumes at the grounding line.
+    if (CS%i2n_friction .and. (CS%cism_friction /= CISM_OFF)) call MOM_error(FATAL, &
+                 "MOM_ice_shelf_dynamics: I2N_FRICTION and CISM_FRICTION are two different "//&
+                 "grounding-line treatments of the basal friction and are mutually exclusive; "//&
+                 "set CISM_FRICTION='off'.")
+    if (CS%i2n_taud .and. (CS%cism_taud /= CISM_OFF)) call MOM_error(FATAL, &
+                 "MOM_ice_shelf_dynamics: I2N_TAUD and CISM_TAUD are two different "//&
+                 "grounding-line treatments of the driving stress and are mutually exclusive; "//&
+                 "set CISM_TAUD='off'.")
+    if (CS%i2n_taud .and. .not. CS%use_sep2) call MOM_error(FATAL, &
+                 "MOM_ice_shelf_dynamics: I2N_TAUD integrates the surface-slope kink on "//&
                  "the geometric sub-element partition and currently requires "//&
-                 "GROUNDING_LINE_SUBGRID_SCHEME='SEP2'. FV_SUBGRID_GL_FRICTION supports both "//&
+                 "GROUNDING_LINE_SUBGRID_SCHEME='SEP2'. I2N_FRICTION supports both "//&
                  "schemes.")
-    if (CS%fv_subgrid_gl_taud .and. CS%FV_GL_one_sided) call MOM_error(FATAL, &
-                 "MOM_ice_shelf_dynamics: FV_SUBGRID_GL_TAUD replaces the cell-centroid surface slope "//&
+    if (CS%i2n_taud .and. CS%FV_GL_one_sided) call MOM_error(FATAL, &
+                 "MOM_ice_shelf_dynamics: I2N_TAUD replaces the cell-centroid surface slope "//&
                  "with a sub-element reconstruction, which has no one-sided analog; it cannot be used "//&
                  "with FV_GL_ONE_SIDED_TAUD.")
+
+    ! DG carries its own sub-cell thickness, so it normally supplies the grounded fraction and
+    ! the driving stress from that basis rather than deferring to a finite-volume scheme.
+    ! CISM_FRICTION and CISM_TAUD remain available under DG because they read the cell-mean
+    ! thickness and bed and so are well defined either way; the driving-stress dispatch below
+    ! sends the CISM_TAUD case to the FV path. The interpolate-to-nodes scheme instead rebuilds
+    ! a corner thickness from the cell means, which would silently discard the DG nodal state it
+    ! is meant to represent, so it is refused rather than ignored.
+    if (CS%use_DG_thickness .and. CS%i2n_friction) call MOM_error(FATAL, &
+                 "MOM_ice_shelf_dynamics: I2N_FRICTION reconstructs a corner thickness from the "//&
+                 "cell means, which would discard the DG(1) nodal thickness; it cannot be used "//&
+                 "with USE_DG_THICKNESS.")
+    if (CS%use_DG_thickness .and. CS%i2n_taud) call MOM_error(FATAL, &
+                 "MOM_ice_shelf_dynamics: I2N_TAUD reconstructs a corner surface from the cell "//&
+                 "means, which would discard the DG(1) nodal thickness; it cannot be used with "//&
+                 "USE_DG_THICKNESS.")
+    if (CS%use_DG_thickness .and. (CS%cism_friction /= CISM_OFF)) call MOM_error(WARNING, &
+                 "MOM_ice_shelf_dynamics: USE_DG_THICKNESS with CISM_FRICTION takes the grounded "//&
+                 "fraction from the cell-mean quadrant parameterization rather than the DG(1) "//&
+                 "nodal thickness; DG normally supplies the basal friction on its own basis.")
+    if (CS%use_DG_thickness .and. (CS%cism_taud /= CISM_OFF)) call MOM_error(WARNING, &
+                 "MOM_ice_shelf_dynamics: USE_DG_THICKNESS with CISM_TAUD routes the driving "//&
+                 "stress through the finite-volume path on the cell-mean thickness, discarding "//&
+                 "the DG(1) sub-cell surface slope; DG normally supplies the driving stress on "//&
+                 "its own basis.")
     call get_param(param_file, mdl, "ICE_SHELF_ADVECT_LIMITER", adv_limiter_str, &
                  "The TVD slope limiter used for the finite-volume ice thickness advection in "//&
                  "ice_shelf_advect_thickness_x/y. VAN_LEER is the original scheme; SUPERBEE is "//&
@@ -1591,7 +1620,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     endif
 
     ! Dual-cell Lagrange weights for the FV sub-element corner fields; grid-only, so once at init.
-    if (CS%fv_subgrid_gl_friction .or. CS%fv_subgrid_gl_taud) &
+    if (CS%i2n_friction .or. CS%i2n_taud) &
       call build_corner_lagrange_weights(CS, G)
 
     if ((trim(CS%ice_viscosity_compute) == "MODEL") .and. CS%visc_qps==1) then
@@ -3201,7 +3230,7 @@ subroutine update_grounded_geometry(CS, ISS, G)
   ! Corner thickness and flotation deficit for the FV sub-element paths. Built before
   ! compute_ground_frac so the grounded fraction is measured on the same flotation field the
   ! friction and driving stress integrate over.
-  if (CS%fv_subgrid_gl_friction .or. CS%fv_subgrid_gl_taud) &
+  if (CS%i2n_friction .or. CS%i2n_taud) &
     call build_corner_flotation_fields(CS, ISS, G)
   call compute_ground_frac(CS, ISS, G, CS%H_node)
 
@@ -5139,8 +5168,8 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
 
   ! Sub-element driving stress on the same grounding-line partition the friction integrates over;
   ! hand off and return so every caller routes through it.
-  if (CS%fv_subgrid_gl_taud) then
-    call calc_shelf_driving_stress_fv_subgrid(CS, ISS, G, US, taudx, taudy)
+  if (CS%i2n_taud) then
+    call calc_shelf_driving_stress_i2n(CS, ISS, G, US, taudx, taudy)
     return
   endif
 
@@ -5872,7 +5901,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   real :: rho_oi_ratio   ! density_ocean / density_ice [nondim]
   real :: rho_ice_g_LtoZ ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
   logical :: do_DG       ! Local flag for DG basal friction mode
-  logical :: fv_sub_fric ! Local flag for FV_SUBGRID_GL_FRICTION (corner H and fls fields)
+  logical :: fv_sub_fric ! Local flag for I2N_FRICTION (corner H and fls fields)
   logical :: grounded_qp ! Whether this quadrature point is grounded (for DG per-qp check)
   integer :: iq, jq, iphi, jphi, i, j, ilq, jlq, Itgt, Jtgt, qp, qpv
   logical :: visc_qp4
@@ -5898,7 +5927,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   do_newton_visc = use_newton .and. trim(CS%ice_viscosity_compute) == "MODEL"
 
   do_DG = CS%use_DG_thickness .and. present(h_shelf)
-  fv_sub_fric = CS%fv_subgrid_gl_friction .and. (.not. CS%use_DG_thickness)
+  fv_sub_fric = CS%i2n_friction
   if (do_DG) then
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
     rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
@@ -6224,7 +6253,7 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
                                           !! pressure) [Z ~> m]
   real, dimension(2,2), optional, intent(in) :: bed_corners !< Bed elevation at element corners [Z ~> m]
   real, dimension(2,2), optional, intent(in) :: fls_cell !< Flotation deficit r*h - bed at the 4 cell
-                                              !! corners (FV_SUBGRID_GL_FRICTION). When present the
+                                              !! corners (I2N_FRICTION). When present the
                                               !! sub-point flotation test and the effective pressure
                                               !! are taken from this field and h_nodal_cell supplies
                                               !! the matching corner thickness [Z ~> m]
@@ -6636,7 +6665,7 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
   real :: rho_oi_ratio   ! density_ocean / density_ice [nondim]
   real :: rho_ice_g_LtoZ ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
   logical :: do_DG       ! Local flag for DG basal friction mode
-  logical :: fv_sub_fric ! Local flag for FV_SUBGRID_GL_FRICTION (corner H and fls fields)
+  logical :: fv_sub_fric ! Local flag for I2N_FRICTION (corner H and fls fields)
   logical :: grounded_qp ! Whether this quadrature point is grounded
   real :: bcoef_loc, dnewt_loc ! Local (nodal-diagonal) basal Picard drag [R L2 Z T-1 ~> kg s-1] and
                          ! Newton tangent factor [R Z T ~> kg m-2 s] at a node (CISM_FRICTION='local')
@@ -6662,7 +6691,7 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
   do_newton_visc = CS%doing_newton .and. trim(CS%ice_viscosity_compute) == "MODEL"
 
   do_DG = CS%use_DG_thickness .and. present(h_shelf)
-  fv_sub_fric = CS%fv_subgrid_gl_friction .and. (.not. CS%use_DG_thickness)
+  fv_sub_fric = CS%i2n_friction
   if (do_DG) then
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
     rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
@@ -6956,7 +6985,7 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
                                           !! pressure) [Z ~> m]
   real, dimension(2,2), optional, intent(in) :: bed_corners !< Bed elevation at element corners [Z ~> m]
   real, dimension(2,2), optional, intent(in) :: fls_cell !< Flotation deficit r*h - bed at the 4 cell
-                                              !! corners (FV_SUBGRID_GL_FRICTION). When present the
+                                              !! corners (I2N_FRICTION). When present the
                                               !! sub-point flotation test and the effective pressure
                                               !! are taken from this field and h_nodal_cell supplies
                                               !! the matching corner thickness [Z ~> m]
@@ -7304,7 +7333,7 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
   real, dimension(2,2), optional, intent(in) :: h_nodal_cell !< Q1 thickness at the 4 cell corners [Z ~> m]
   real, dimension(2,2), optional, intent(in) :: bed_corners  !< Bed elevation at element corners [Z ~> m]
   real, dimension(2,2), optional, intent(in) :: fls_cell !< Flotation deficit r*h - bed at the 4 cell
-                                              !! corners (FV_SUBGRID_GL_FRICTION). When present the
+                                              !! corners (I2N_FRICTION). When present the
                                               !! partition and the effective pressure are both taken
                                               !! from this field and h_nodal_cell supplies the
                                               !! matching corner thickness [Z ~> m]
@@ -7505,7 +7534,7 @@ subroutine CG_diagonal_sep2_basal(CS, G, US, H, U_curr, V_curr, &
   real, dimension(2,2), optional, intent(in) :: h_nodal_cell !< Q1 thickness at the 4 cell corners [Z ~> m]
   real, dimension(2,2), optional, intent(in) :: bed_corners  !< Bed elevation at element corners [Z ~> m]
   real, dimension(2,2), optional, intent(in) :: fls_cell !< Flotation deficit r*h - bed at the 4 cell
-                                              !! corners (FV_SUBGRID_GL_FRICTION); see
+                                              !! corners (I2N_FRICTION); see
                                               !! CG_action_sep2_basal [Z ~> m]
 
   real, dimension(4)     :: hc, bedc  ! Corner thickness and bed, flattened SW,SE,NW,NE [Z ~> m]
@@ -8256,7 +8285,7 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
   real :: bed_corners(2,2) ! Bed elevation at the 4 B-grid corners of a cell [Z ~> m]
   real :: H_corners(2,2)   ! Ice thickness at the 4 B-grid corners (non-DG path) [Z ~> m]
   real :: fls_corners(2,2) ! Flotation deficit r*h - bed at the 4 B-grid corners [Z ~> m]
-  logical :: fv_sub        ! True on the FV sub-element path (CS%fv_subgrid_gl_friction)
+  logical :: fv_sub        ! True on the FV sub-element path (CS%i2n_friction)
   real :: d_min, d_max   ! Min/max over the 4 corners of the unclamped flotation
                          ! deficit r*h - bed [Z ~> m]
   real :: bed_min        ! Min bed elevation over the 4 corners [Z ~> m]
@@ -8288,7 +8317,7 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
 
   rhoi_rhow = CS%density_ice / CS%density_ocean_avg
   n_total = CS%n_sub_regularize * CS%n_sub_regularize * 4
-  fv_sub = CS%fv_subgrid_gl_friction .and. (.not. CS%use_DG_thickness)
+  fv_sub = CS%i2n_friction
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
 
@@ -9204,7 +9233,7 @@ subroutine update_velocity_masks(CS, G, hmask, umask, vmask, u_face_mask, v_face
 end subroutine update_velocity_masks
 
 !> Finite-volume driving stress integrated over the sub-element grounding-line partition
-!! (FV_SUBGRID_GL_TAUD). Every quadrature point lies strictly on one side of the sub-element
+!! (I2N_TAUD). Every quadrature point lies strictly on one side of the sub-element
 !! grounding line and takes that side's surface-slope branch, so no point straddles the kink.
 !!
 !! The surface is reconstructed from the same two corner fields the friction uses:
@@ -9230,7 +9259,7 @@ end subroutine update_velocity_masks
 !! there would put the kink on a slightly different curve and make S jump across the cut. Under SEP3
 !! the sub-point flotation test is bilinear, so the bilinear gradient is the consistent choice. The
 !! smooth term (1-r)*grad H is bilinear in both cases -- it carries no kink.
-subroutine calc_shelf_driving_stress_fv_subgrid(CS, ISS, G, US, taudx, taudy)
+subroutine calc_shelf_driving_stress_i2n(CS, ISS, G, US, taudx, taudy)
   type(ice_shelf_dyn_CS), intent(in)   :: CS  !< A pointer to the ice shelf control structure
   type(ice_shelf_state), intent(in)    :: ISS !< A structure describing the ice-shelf state
   type(ocean_grid_type), intent(inout) :: G   !< The grid structure used by the ice shelf.
@@ -9444,7 +9473,7 @@ subroutine calc_shelf_driving_stress_fv_subgrid(CS, ISS, G, US, taudx, taudy)
     endif
   enddo ; enddo
 
-end subroutine calc_shelf_driving_stress_fv_subgrid
+end subroutine calc_shelf_driving_stress_i2n
 
 !> Pre-compute the dual-cell Q1 (Lagrange) interpolation weights used to carry the cell-centered
 !! thickness and flotation deficit to B-grid corners for the FV_SUBGRID_GL_* paths. Node (I,J) is
