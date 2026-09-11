@@ -12331,17 +12331,23 @@ pure subroutine apply_nodal_DG_mass_inverse(Minv_xi_cell, Minv_eta_cell, rhs, ou
   real, dimension(2,2), intent(in)  :: Minv_eta_cell !< 2x2 inverse of eta mass-matrix factor [L-1]
   real, dimension(2,2), intent(in)  :: rhs            !< Per-cell RHS at the 4 corners [Z L2 T-1]
   real, dimension(2,2), intent(out) :: out            !< M^-1 * rhs [Z T-1]
-  integer :: a, b, ap, bp
-  real, dimension(2,2) :: p   ! Per-source-corner products, reduced in diagonal pairs
-  ! The four source corners are held and then reduced as opposite pairs rather
-  ! than accumulated in ap,bp loop order. A quarter turn of the grid permutes the
-  ! corners cyclically, which would reorder a running sum; it maps each opposite
-  ! pair onto the other, which leaves this reduction unchanged.
+  integer :: a, b
+  ! The four source corners are reduced as opposite pairs rather than accumulated
+  ! in loop order. A quarter turn of the grid permutes the corners cyclically,
+  ! which would reorder a running sum; it maps each opposite pair onto the other,
+  ! which leaves this reduction unchanged.
+  !
+  ! Each product is written out in place and parenthesised rather than held in a
+  ! local array. The compiler scalarises a small local array and can then fuse the
+  ! multiply back into the following add, which makes one product of a pair exact
+  ! and the other rounded; the quarter turn exchanges the pair, so which one is
+  ! exact would change. A parenthesised product is rounded as a unit and cannot be
+  ! fused.
   do b = 1, 2 ; do a = 1, 2
-    do bp = 1, 2 ; do ap = 1, 2
-      p(ap,bp) = Minv_xi_cell(a,ap) * Minv_eta_cell(b,bp) * rhs(ap,bp)
-    enddo ; enddo
-    out(a,b) = (p(1,1) + p(2,2)) + (p(2,1) + p(1,2))
+    out(a,b) = (((Minv_xi_cell(a,1) * Minv_eta_cell(b,1)) * rhs(1,1)) + &
+                ((Minv_xi_cell(a,2) * Minv_eta_cell(b,2)) * rhs(2,2))) + &
+               (((Minv_xi_cell(a,2) * Minv_eta_cell(b,1)) * rhs(2,1)) + &
+                ((Minv_xi_cell(a,1) * Minv_eta_cell(b,2)) * rhs(1,2)))
   enddo ; enddo
 end subroutine apply_nodal_DG_mass_inverse
 
@@ -13092,27 +13098,25 @@ pure function dg_d2_biased(f, b) result(A)
   real :: A                              !< Second difference [Z ~> m]
   select case (b)
     case (1) ; A = f(0) - (0.5*(f(-1) + f(1)))
-    case (2) ; A = 0.5*(f(0) - 2.0*f(1) + f(2))
-    case default ; A = 0.5*(f(0) - 2.0*f(-1) + f(-2))
+    case (2) ; A = 0.5*(f(0) - (2.0*f(1))+ f(2))
+    case default ; A = 0.5*(f(0) - (2.0*f(-1))+ f(-2))
   end select
 end function dg_d2_biased
 
-!> Biased first difference of the cell means in eta, at x offset p and y offset q.
-pure function dg_d1_eta(hw, p, q, by) result(g)
-  real, dimension(-4:4,-4:4), intent(in) :: hw !< Cell means on the gather [Z ~> m]
-  integer, intent(in) :: p  !< Offset along xi
-  integer, intent(in) :: q  !< Offset along eta
-  integer, intent(in) :: by !< Bias along eta
-  real :: g                 !< First difference [Z ~> m]
+!> Biased first-difference stencil weights on offsets -2..2, for one axis.
+pure function dg_d1_weights(b) result(w)
+  integer, intent(in) :: b    !< Bias along the axis: 1 centred, 2 forward, 3 backward
+  real, dimension(-2:2) :: w  !< First-difference stencil weights [nondim]
   ! Second-order and centred on the cell in every case: a first-order one-sided
   ! difference would estimate the tilt half a cell away, and the reference has
   ! to sit where the detector does or the cancellation degrades.
-  select case (by)
-    case (1) ; g = 0.5*(hw(p,q+1) - hw(p,q-1))
-    case (2) ; g = 0.5*(-3.0*hw(p,q) + 4.0*hw(p,q+1) - hw(p,q+2))
-    case default ; g = 0.5*( 3.0*hw(p,q) - 4.0*hw(p,q-1) + hw(p,q-2))
+  w(:) = 0.0
+  select case (b)
+    case (1) ; w(-1) = -0.5 ; w(1) = 0.5
+    case (2) ; w(0) = -1.5 ; w(1) = 2.0 ; w(2) = -0.5
+    case default ; w(0) = 1.5 ; w(-1) = -2.0 ; w(-2) = 0.5
   end select
-end function dg_d1_eta
+end function dg_d1_weights
 
 !> Mean-supported twist at offset (p,q): the cross difference of the cell means,
 !! each first difference taking the bias of its own axis.  This is the twist the
@@ -13125,13 +13129,36 @@ pure function dg_wref_at(hw, p, q, bx, by) result(wr)
   integer, intent(in) :: bx !< Bias along xi
   integer, intent(in) :: by !< Bias along eta
   real :: wr                !< Mean-supported twist [Z ~> m]
-  select case (bx)
-    case (1) ; wr = 0.5*(dg_d1_eta(hw,p+1,q,by) - dg_d1_eta(hw,p-1,q,by))
-    case (2) ; wr = 0.5*(-3.0*dg_d1_eta(hw,p,q,by) + 4.0*dg_d1_eta(hw,p+1,q,by) &
-                         - dg_d1_eta(hw,p+2,q,by))
-    case default ; wr = 0.5*( 3.0*dg_d1_eta(hw,p,q,by) - 4.0*dg_d1_eta(hw,p-1,q,by) &
-                             + dg_d1_eta(hw,p-2,q,by))
-  end select
+  real, dimension(-2:2) :: wxi, weta   ! Per-axis first-difference weights [nondim]
+  real, dimension(-2:2,-2:2) :: tm     ! Per-offset contribution to the twist [Z ~> m]
+  integer :: m, n, r
+  ! One representative per orbit of the quarter turn (m,n) -> (n,-m) acting on the
+  ! 5x5 stencil. The centre is its own orbit; the other 24 offsets form these six
+  ! orbits of four.
+  integer, dimension(6), parameter :: rep_m = (/ 1, 1, 2, 2, 1, 2 /)
+  integer, dimension(6), parameter :: rep_n = (/ 0, 1, 0, 1, 2, 2 /)
+
+  ! Summed as a single weighted stencil, not as a difference along xi of a
+  ! difference along eta. The nested form fixes an order on the two axes, and a
+  ! quarter turn of the grid exchanges them, so the same terms would be added in a
+  ! different order and the twist would not be reproducible under rotation.
+  ! Reducing each orbit of the turn as its two pairs of opposite offsets, and the
+  ! orbits in a fixed sequence, does not depend on that order: the turn maps each
+  ! orbit onto itself and exchanges its two pairs.
+  wxi = dg_d1_weights(bx) ; weta = dg_d1_weights(by)
+  tm(:,:) = 0.0
+  do n = -2, 2
+    if (weta(n) == 0.0) cycle
+    do m = -2, 2
+      if (wxi(m) == 0.0) cycle
+      tm(m,n) = (wxi(m)*weta(n)) * hw(p+m, q+n)
+    enddo
+  enddo
+  wr = tm(0,0)
+  do r = 1, 6
+    m = rep_m(r) ; n = rep_n(r)
+    wr = wr + ((tm(m,n) + tm(-m,-n)) + (tm(n,-m) + tm(-n,m)))
+  enddo
 end function dg_wref_at
 
 !> One-dimensional tilt detector, biased away from unavailable cells.
@@ -13210,19 +13237,19 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, fit_tol, A, A_bed,
     ! the operand order already matching.
     href  = (hv(0) + (hv(-1) + hv(1))) / 3.0
   elseif (all(ok(0:4))) then                    ! forward
-    A     = 0.5*(tv(0) - 2.0*tv(1) + tv(2))
-    A_bed = 0.5*(bv(0) - 2.0*bv(1) + bv(2))
-    r0 = 0.5*(-3.0*hv(0) + 4.0*hv(1) - hv(2))
-    rm = 0.5*(-3.0*hv(1) + 4.0*hv(2) - hv(3))
-    rp = 0.5*(-3.0*hv(2) + 4.0*hv(3) - hv(4))
+    A     = 0.5*(tv(0) - (2.0*tv(1))+ tv(2))
+    A_bed = 0.5*(bv(0) - (2.0*bv(1))+ bv(2))
+    r0 = 0.5*((-3.0*hv(0))+ (4.0*hv(1))- hv(2))
+    rm = 0.5*((-3.0*hv(1))+ (4.0*hv(2))- hv(3))
+    rp = 0.5*((-3.0*hv(2))+ (4.0*hv(3))- hv(4))
     km = 1 ; k0 = 0 ; kp = 2 ; rlo = 0 ; rhi = 4
     href  = ((hv(0) + hv(1)) + hv(2)) / 3.0 ; mode = 2
   elseif (all(ok(-4:0))) then                   ! backward
-    A     = 0.5*(tv(0) - 2.0*tv(-1) + tv(-2))
-    A_bed = 0.5*(bv(0) - 2.0*bv(-1) + bv(-2))
-    r0 = 0.5*( 3.0*hv(0) - 4.0*hv(-1) + hv(-2))
-    rm = 0.5*( 3.0*hv(-1) - 4.0*hv(-2) + hv(-3))
-    rp = 0.5*( 3.0*hv(-2) - 4.0*hv(-3) + hv(-4))
+    A     = 0.5*(tv(0) - (2.0*tv(-1))+ tv(-2))
+    A_bed = 0.5*(bv(0) - (2.0*bv(-1))+ bv(-2))
+    r0 = 0.5*( (3.0*hv(0))- (4.0*hv(-1))+ hv(-2))
+    rm = 0.5*( (3.0*hv(-1))- (4.0*hv(-2))+ hv(-3))
+    rp = 0.5*( (3.0*hv(-2))- (4.0*hv(-3))+ hv(-4))
     km = -1 ; k0 = 0 ; kp = -2 ; rlo = -4 ; rhi = 0
     href  = ((hv(0) + hv(-1)) + hv(-2)) / 3.0 ; mode = 3
   else
@@ -13238,9 +13265,9 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, fit_tol, A, A_bed,
     call dg_kink_branches(hv, fv, ok, rlo, rhi, fit_tol, s_g, s_f, sigma, cf, kv)
     if (kv) then
       sigma = sigma * cf
-      rm = ((1.0-sigma)*rm) + (sigma*(fv(km)*s_g + (1.0-fv(km))*s_f))
-      r0 = ((1.0-sigma)*r0) + (sigma*(fv(k0)*s_g + (1.0-fv(k0))*s_f))
-      rp = ((1.0-sigma)*rp) + (sigma*(fv(kp)*s_g + (1.0-fv(kp))*s_f))
+      rm = ((1.0-sigma)*rm) + (sigma*((fv(km)*s_g)+ ((1.0-fv(km))*s_f)))
+      r0 = ((1.0-sigma)*r0) + (sigma*((fv(k0)*s_g)+ ((1.0-fv(k0))*s_f)))
+      rp = ((1.0-sigma)*rp) + (sigma*((fv(kp)*s_g)+ ((1.0-fv(kp))*s_f)))
       kink_c = cf
     endif
   endif
@@ -13251,7 +13278,7 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, fit_tol, A, A_bed,
   if (mode == 1) then
     A_ref = r0 - (0.5*(rm + rp))
   else
-    A_ref = 0.5*(r0 - 2.0*rm + rp)
+    A_ref = 0.5*(r0 - (2.0*rm)+ rp)
   endif
 end subroutine dg_tilt_detector_1d
 
@@ -13378,9 +13405,9 @@ pure subroutine dg_kink_branches(hv, fv, ok, lo, hi, fit_tol, s_g, s_f, sigma, c
       do k = lo, hi-1
         mk  = (fv(k)  *s_g) + ((1.0 - fv(k))  *s_f)
         mk1 = (fv(k+1)*s_g) + ((1.0 - fv(k+1))*s_f)
-        amax = max(amax, abs((hv(k+1) - hv(k)) - 0.5*(mk + mk1)))
+        amax = max(amax, abs((hv(k+1) - hv(k)) - (0.5*(mk + mk1))))
       enddo
-      conf = min(conf, max(0.0, 1.0 - (amax/den)/fit_tol))
+      conf = min(conf, max(0.0, 1.0 - ((amax/den)/fit_tol)))
     endif
   endif
   valid = .true.
@@ -13416,7 +13443,7 @@ pure function dg_lin_area(d) result(a)
   a = 0.0
   do k = 1, n
     kn = 1 + mod(k, n)
-    a = a + (p(1,k)*p(2,kn) - p(1,kn)*p(2,k))
+    a = a + ((p(1,k)*p(2,kn))- (p(1,kn)*p(2,k)))
   enddo
   a = min(max(0.5*abs(a), 0.0), 1.0)
 end function dg_lin_area
@@ -13555,7 +13582,7 @@ pure subroutine dg_kink_plane_2d(hw, fw, okw, lo, hi, tol, dqx, dqy, dq0, sigma,
     mis = abs(dg_lin_area(dr) - fw(p,q))
     amax = max(amax, mis)
   enddo ; enddo
-  conf = max(0.0, 1.0 - amax / max(tol, tiny(1.0)))
+  conf = max(0.0, 1.0 - (amax / max(tol, tiny(1.0))))
   ! Valid means the branches were found, not that the fit is any good: a fit
   ! that is credible but poor must still hand back a confidence for the caller
   ! to interpolate on, rather than being reported as absent.
@@ -13815,6 +13842,10 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real, dimension(-4:4) :: wrx, wry ! Mean-supported twist along each axis [Z ~> m]
   integer :: bx, by, m              ! Bias along xi, along eta, and the trial index
   logical :: tw_ok                  ! True once an admissible bias pair is found
+  integer :: ntw, itw, tier         ! Admissible pairs in the tier in use, and loop indices
+  integer, dimension(4) :: bx_use, by_use ! Those pairs
+  real :: reach_w                   ! Grounding-line reach weight, worst over those pairs
+  real :: inv_ntw                   ! Reciprocal of the number of pairs [nondim]
   ! Offsets a bias reaches: S for the second difference, F for the first.
   integer, dimension(3), parameter :: Slo = (/ -2, 0, -4 /), Shi = (/ 2, 4, 0 /)
   integer, dimension(3), parameter :: Flo = (/ -1, 0, -2 /), Fhi = (/  1, 2, 0 /)
@@ -13823,6 +13854,9 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   ! Trial order: centred in both axes first, then centred in one, then neither.
   integer, dimension(9), parameter :: bx_try = (/ 1,1,1, 2,3, 2,2,3,3 /)
   integer, dimension(9), parameter :: by_try = (/ 1,2,3, 1,1, 2,3,2,3 /)
+  ! The trial list above is ordered by how much biasing it uses: entry 1 is
+  ! centred on both axes, entries 2-5 bias exactly one axis, entries 6-9 bias both.
+  integer, dimension(3), parameter :: tw_lo = (/ 1, 2, 6 /), tw_hi = (/ 1, 5, 9 /)
   real :: floor_A  ! Larger of the bed- and mean-supported floors [Z ~> m]
   real :: excess   ! One-sided excess over that floor [Z ~> m]
   real :: href     ! Cell-mean thickness used to normalize the gate [Z ~> m]
@@ -14061,14 +14095,26 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       ! takes its own bias; only the mean-supported reference is genuinely
       ! two-dimensional, and it is a product of two first differences which
       ! bias the same way.  Take the first admissible pair in preference order.
-      tw_ok = .false.
-      do m = 1, 9
-        bx = bx_try(m) ; by = by_try(m)
-        if (all(okw(Slo(bx):Shi(bx), Flo(by):Fhi(by))) .and. &
-            all(okw(Flo(bx):Fhi(bx), Slo(by):Shi(by)))) then
-          tw_ok = .true. ; exit
-        endif
+      ! Collect EVERY admissible pair in the least-biased tier that has one, rather
+      ! than the first entry that fits. Taking the first makes the result depend on
+      ! the order within a tier, and a quarter turn of the grid permutes that order,
+      ! so two orientations of the same problem can choose different stencils. The
+      ! turn carries the admissible set of a tier onto itself, so averaging over it
+      ! does not depend on the order. At most two pairs can fit at once: once an
+      ! axis loses its centred stencil, the cell that blocked it also blocks one of
+      ! that axis's two one-sided stencils, leaving one choice per axis.
+      ntw = 0
+      do tier = 1, 3
+        do m = tw_lo(tier), tw_hi(tier)
+          bx = bx_try(m) ; by = by_try(m)
+          if (all(okw(Slo(bx):Shi(bx), Flo(by):Fhi(by))) .and. &
+              all(okw(Flo(bx):Fhi(bx), Slo(by):Shi(by)))) then
+            ntw = ntw + 1 ; bx_use(ntw) = bx ; by_use(ntw) = by
+          endif
+        enddo
+        if (ntw > 0) exit
       enddo
+      tw_ok = (ntw > 0)
 
       excess = -1.0
       if (tw_ok) then
@@ -14081,23 +14127,36 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
           call dg_kink_plane_2d(hw, fw, okw, -2, 2, CS%dg_damp_kink_tol, &
                                 kqx, kqy, kq0, ksig, kconf, kw_ok)
         ksig = ksig * kconf
-        wrx(:) = 0.0 ; wry(:) = 0.0
-        do k = -2, 2
-          wrx(k) = dg_wref_at(hw, k, 0, bx, by)
-          wry(k) = dg_wref_at(hw, 0, k, bx, by)
-          if (kw_ok) then
-            wrx(k) = (1.0-ksig)*wrx(k) + ksig*dg_kink_twist_at(kqx, kqy, kq0, k, 0)
-            wry(k) = (1.0-ksig)*wry(k) + ksig*dg_kink_twist_at(kqx, kqy, kq0, 0, k)
-          endif
+        A_w = 0.0 ; A_w_bed = 0.0 ; A_w_ref = 0.0 ; href_w = 0.0 ; reach_w = 1.0
+        do itw = 1, ntw
+          bx = bx_use(itw) ; by = by_use(itw)
+          wrx(:) = 0.0 ; wry(:) = 0.0
+          do k = -2, 2
+            wrx(k) = dg_wref_at(hw, k, 0, bx, by)
+            wry(k) = dg_wref_at(hw, 0, k, bx, by)
+            if (kw_ok) then
+              wrx(k) = ((1.0-ksig)*wrx(k)) + (ksig*dg_kink_twist_at(kqx, kqy, kq0, k, 0))
+              wry(k) = ((1.0-ksig)*wry(k)) + (ksig*dg_kink_twist_at(kqx, kqy, kq0, 0, k))
+            endif
+          enddo
+          ! Response 1 - (cos(theta_x) + cos(theta_y))/2: zero on a uniform twist,
+          ! 2 on the checkerboard that no face jump can see.
+          A_w     = A_w     + 0.5*(dg_d2_biased(ww(:,0), bx) + dg_d2_biased(ww(0,:), by))
+          A_w_bed = A_w_bed + 0.5*(dg_d2_biased(bw(:,0), bx) + dg_d2_biased(bw(0,:), by))
+          A_w_ref = A_w_ref + 0.5*(dg_d2_biased(wrx, bx) + dg_d2_biased(wry, by))
+          href_w  = href_w  + (hw(0,0) + ((hw(Elo(bx),0) + hw(Ehi(bx),0)) + &
+                                          (hw(0,Elo(by)) + hw(0,Ehi(by))))) / 5.0
+          ! The reach exemption is a protection, so take the worst over the pairs
+          ! rather than their mean.
+          reach_w = min(reach_w, min(dg_gl_reach_wt(gwx, bx, CS%dg_damp_gl_reach), &
+                                     dg_gl_reach_wt(gwy, by, CS%dg_damp_gl_reach)))
         enddo
-        ! Response 1 - (cos(theta_x) + cos(theta_y))/2: zero on a uniform twist,
-        ! 2 on the checkerboard that no face jump can see.
-        A_w     = 0.5*(dg_d2_biased(ww(:,0), bx) + dg_d2_biased(ww(0,:), by))
-        A_w_bed = f_gnd(i,j) * &
-                  0.5*(dg_d2_biased(bw(:,0), bx) + dg_d2_biased(bw(0,:), by))
-        A_w_ref = 0.5*(dg_d2_biased(wrx, bx) + dg_d2_biased(wry, by))
-        href_w  = (hw(0,0) + ((hw(Elo(bx),0) + hw(Ehi(bx),0)) + &
-                              (hw(0,Elo(by)) + hw(0,Ehi(by))))) / 5.0
+        ! Averaged over the pairs TOGETHER, so that a smooth solution, on which
+        ! every pair gives A_w == A_w_ref, still cancels term by term.
+        inv_ntw = 1.0 / real(ntw)
+        A_w = A_w * inv_ntw ; A_w_ref = A_w_ref * inv_ntw
+        A_w_bed = f_gnd(i,j) * (A_w_bed * inv_ntw)
+        href_w = href_w * inv_ntw
         if (CS%dg_damp_excess_only) then
           A_dmp = dg_unexplained(A_w, A_w_ref, A_w_bed)
           excess = abs(A_dmp)
@@ -14117,9 +14176,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         ! blend had already reverted the reference to the uncorrected one --
         ! full strength against the worst floor, which is the combination this
         ! whole exercise exists to avoid.
-        gwt = kconf + (1.0 - kconf) * &
-              min(dg_gl_reach_wt(gwx, bx, CS%dg_damp_gl_reach), &
-                  dg_gl_reach_wt(gwy, by, CS%dg_damp_gl_reach))
+        gwt = kconf + ((1.0 - kconf) * reach_w)
         gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_w))
         ! The checkerboard twist alternates along BOTH axes, so it survives as
         ! long as either sweep is slow: credit the transport with the smaller of
