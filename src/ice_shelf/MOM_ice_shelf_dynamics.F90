@@ -832,6 +832,8 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
   ! Local variables
   real :: T_shelf_missing ! An ice shelf temperature to use where there is no ice shelf [C ~> degC]
   logical :: shelf_mass_is_dynamic, override_shelf_movement, active_shelf_dynamics
+  logical :: DG_thickness   ! If true, DG(1) carries the thickness (USE_DG_THICKNESS)
+  logical :: thickness_nodal ! If true, the thickness is read at nodes (INIT_ICE_THICKNESS_NODAL)
   character(len=40)  :: mdl = "MOM_ice_shelf_dyn"  ! This module's name.
   integer :: isd, ied, jsd, jed, IsdB, IedB, JsdB, JedB
 
@@ -922,10 +924,21 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%sy_shelf(isd:ied,jsd:jed), source=0.0)
     allocate(CS%bed_elev(isd:ied,jsd:jed), source=0.0)
     allocate(CS%bed_node(IsdB:IedB,JsdB:JedB), source=0.0)
-    allocate(CS%h_nodal(isd:ied,jsd:jed,1:2,1:2), source=0.0)
-    allocate(CS%Minv_xi(isd:ied,jsd:jed,1:2,1:2), source=0.0)
-    allocate(CS%Minv_eta(isd:ied,jsd:jed,1:2,1:2), source=0.0)
-    allocate(CS%cell_mean_w(isd:ied,jsd:jed,1:2,1:2), source=0.0)
+    ! The DG(1) nodal state and its metric tables are needed only by DG, apart from
+    ! h_nodal, which INIT_ICE_THICKNESS_NODAL fills transiently to derive the cell
+    ! mean. These are read here rather than in initialize_ice_shelf_dyn, which runs
+    ! after this routine, because they decide what gets allocated and restarted.
+    call get_param(param_file, mdl, "USE_DG_THICKNESS", DG_thickness, &
+                   default=.false., do_not_log=.true.)
+    call get_param(param_file, mdl, "INIT_ICE_THICKNESS_NODAL", thickness_nodal, &
+                   default=.false., do_not_log=.true.)
+    if (DG_thickness .or. thickness_nodal) &
+      allocate(CS%h_nodal(isd:ied,jsd:jed,1:2,1:2), source=0.0)
+    if (DG_thickness) then
+      allocate(CS%Minv_xi(isd:ied,jsd:jed,1:2,1:2), source=0.0)
+      allocate(CS%Minv_eta(isd:ied,jsd:jed,1:2,1:2), source=0.0)
+      allocate(CS%cell_mean_w(isd:ied,jsd:jed,1:2,1:2), source=0.0)
+    endif
     allocate(CS%h_source_rate(isd:ied,jsd:jed), source=0.0)
     allocate(CS%h_source_rate_bmb(isd:ied,jsd:jed), source=0.0)
     allocate(CS%xi_basal(isd:ied,jsd:jed,1:2,1:2), source=1.0)
@@ -985,15 +998,19 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     call register_restart_field(CS%bed_elev, "bed elevation", .true., restart_CS, &
                                 "bed elevation", "m", conversion=US%Z_to_m)
     ! Storage convention: h_shelf is the area-weighted cell mean Hbar derived from
-    ! h_nodal; h_nodal(:,:,a,b) holds the 4 Q1 nodal corner values per cell.
-    call register_restart_field(CS%h_nodal(:,:,1,1), "h_nodal_SW_DG", .true., restart_CS, &
-                                "DG(1) nodal Q1 thickness, SW corner", "m", conversion=US%Z_to_m)
-    call register_restart_field(CS%h_nodal(:,:,2,1), "h_nodal_SE_DG", .true., restart_CS, &
-                                "DG(1) nodal Q1 thickness, SE corner", "m", conversion=US%Z_to_m)
-    call register_restart_field(CS%h_nodal(:,:,1,2), "h_nodal_NW_DG", .true., restart_CS, &
-                                "DG(1) nodal Q1 thickness, NW corner", "m", conversion=US%Z_to_m)
-    call register_restart_field(CS%h_nodal(:,:,2,2), "h_nodal_NE_DG", .true., restart_CS, &
-                                "DG(1) nodal Q1 thickness, NE corner", "m", conversion=US%Z_to_m)
+    ! h_nodal; h_nodal(:,:,a,b) holds the 4 Q1 nodal corner values per cell. Only DG
+    ! carries this state between segments: without it the corners are either unused or
+    ! rebuilt from the file at every startup, so restarting them would be meaningless.
+    if (DG_thickness) then
+      call register_restart_field(CS%h_nodal(:,:,1,1), "h_nodal_SW_DG", .true., restart_CS, &
+                                  "DG(1) nodal Q1 thickness, SW corner", "m", conversion=US%Z_to_m)
+      call register_restart_field(CS%h_nodal(:,:,2,1), "h_nodal_SE_DG", .true., restart_CS, &
+                                  "DG(1) nodal Q1 thickness, SE corner", "m", conversion=US%Z_to_m)
+      call register_restart_field(CS%h_nodal(:,:,1,2), "h_nodal_NW_DG", .true., restart_CS, &
+                                  "DG(1) nodal Q1 thickness, NW corner", "m", conversion=US%Z_to_m)
+      call register_restart_field(CS%h_nodal(:,:,2,2), "h_nodal_NE_DG", .true., restart_CS, &
+                                  "DG(1) nodal Q1 thickness, NE corner", "m", conversion=US%Z_to_m)
+    endif
     call register_restart_field(CS%first_dir_restart_IS, "first_direction_IS", .false., restart_CS, &
                                 "Indicator of the first direction in split ice shelf calculations.", "nondim")
   endif
@@ -1613,7 +1630,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     enddo ; enddo
 
     ! Per-cell nodal DG(1) metric tables (Minv_xi, Minv_eta, cell_mean_w).
-    call init_nodal_DG_metric(CS, G)
+    if (CS%use_DG_thickness) call init_nodal_DG_metric(CS, G)
 
     if (CS%GL_regularize) then
       allocate(CS%Phisub(2,2,CS%n_sub_regularize,CS%n_sub_regularize,2,2), source=0.0)
@@ -2118,9 +2135,13 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     call update_OD_ffrac_uncoupled(CS, G, ISS%h_shelf(:,:))
   endif
 
-  ! Only the DG(1) paths read the nodal bed; without them it has served its purpose in
-  ! deriving CS%bed_elev. It is not a restart field, so it is rebuilt on every startup.
-  if ((.not. CS%use_DG_thickness) .and. associated(CS%bed_node)) deallocate(CS%bed_node)
+  ! Only the DG(1) paths read the nodal bed and thickness; without them each has served
+  ! its purpose in deriving the cell mean. Neither is a restart field in that case, so
+  ! both are rebuilt from the input file on every startup.
+  if (.not. CS%use_DG_thickness) then
+    if (associated(CS%bed_node)) deallocate(CS%bed_node)
+    if (associated(CS%h_nodal)) deallocate(CS%h_nodal)
+  endif
 
 end subroutine initialize_ice_shelf_dyn
 
