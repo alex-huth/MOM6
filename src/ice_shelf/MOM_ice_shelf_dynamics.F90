@@ -469,12 +469,6 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! cell's surface mass balance only ever changes its own
                                   !! thickness; if false it is averaged at shared corners
                                   !! (SRC_OP_AVERAGED). Both are exactly mass-conservative.
-  real, allocatable :: mu_lim_xi(:,:)     !< Cached orthogonalisation offset for the
-                                          !! xi-slope mode template, per cell [nondim].
-  real, allocatable :: mu_lim_eta(:,:)    !< Cached orthogonalisation offset for the
-                                          !! eta-slope mode template, per cell [nondim].
-  real, allocatable :: mu_lim_cross(:,:)  !< Cached orthogonalisation offset for the
-                                          !! cross mode template, per cell [nondim].
   real, pointer, dimension(:,:) :: dg_lim_phi_xi    => NULL() !< Per-cell xi-slope mode
                                                               !! scaling factor from the
                                                               !! last hierarchical-limiter
@@ -960,9 +954,6 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%dg_art_visc_cell_scale(isd:ied,jsd:jed), source=1.0)
     allocate(CS%dg_slow_idle_face_u(IsdB:IedB,jsd:jed), source=0.0)
     allocate(CS%dg_slow_idle_face_v(isd:ied,JsdB:JedB), source=0.0)
-    allocate(CS%mu_lim_xi(isd:ied,jsd:jed),    source=0.0)
-    allocate(CS%mu_lim_eta(isd:ied,jsd:jed),   source=0.0)
-    allocate(CS%mu_lim_cross(isd:ied,jsd:jed), source=0.0)
     allocate(CS%dg_lim_phi_xi(isd:ied,jsd:jed),     source=1.0)
     allocate(CS%dg_lim_phi_eta(isd:ied,jsd:jed),    source=1.0)
     allocate(CS%dg_lim_phi_cross(isd:ied,jsd:jed),  source=1.0)
@@ -9909,9 +9900,6 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_art_visc_cell_scale)) deallocate(CS%dg_art_visc_cell_scale)
   if (associated(CS%dg_slow_idle_face_u)) deallocate(CS%dg_slow_idle_face_u)
   if (associated(CS%dg_slow_idle_face_v)) deallocate(CS%dg_slow_idle_face_v)
-  if (allocated(CS%mu_lim_xi))    deallocate(CS%mu_lim_xi)
-  if (allocated(CS%mu_lim_eta))   deallocate(CS%mu_lim_eta)
-  if (allocated(CS%mu_lim_cross)) deallocate(CS%mu_lim_cross)
   if (associated(CS%dg_lim_phi_xi))     deallocate(CS%dg_lim_phi_xi)
   if (associated(CS%dg_lim_phi_eta))    deallocate(CS%dg_lim_phi_eta)
   if (associated(CS%dg_lim_phi_cross))  deallocate(CS%dg_lim_phi_cross)
@@ -12085,41 +12073,7 @@ subroutine init_nodal_DG_metric(CS, G)
 
     call corner_cell_weights(dxS, dxN, dyW, dyE, CS%cell_mean_w(i,j,:,:))
   enddo ; enddo
-
-  ! Cache the orthogonalisation offsets for the hierarchical-limiter mode
-  ! templates. The standard polynomial modes (xi-0.5, eta-0.5, (xi-0.5)(eta-0.5))
-  ! are not exactly orthogonal to the constant under non-uniform cell_mean_w
-  ! (curvilinear cells); subtracting their weighted-mean offset gives modes
-  ! that are exactly orthogonal to the constant, so per-mode scaling preserves
-  ! Hbar exactly. Offsets are tiny on near-Cartesian grids and zero on
-  ! perfectly uniform ones. Stored once at init since cell_mean_w is fixed.
-  if (allocated(CS%mu_lim_xi)) then
-    do j = jsd, jed ; do i = isd, ied
-      call compute_mu_lim_offsets(CS%cell_mean_w(i,j,:,:), &
-                                  CS%mu_lim_xi(i,j), CS%mu_lim_eta(i,j), CS%mu_lim_cross(i,j))
-    enddo ; enddo
-  endif
 end subroutine init_nodal_DG_metric
-
-!> Helper: orthogonalisation offsets so that the modal templates
-!! B_orth, C_orth, D_orth are exactly cell_mean_w-orthogonal to the constant
-!! mode (i.e., have zero weighted mean over the cell corners).
-pure subroutine compute_mu_lim_offsets(w_cell, mu_B, mu_C, mu_D)
-  real, dimension(2,2), intent(in)  :: w_cell  !< Per-cell cell_mean_w pre-normalised weights
-  real,                 intent(out) :: mu_B, mu_C, mu_D
-  real :: area
-  area = ((w_cell(1,1) + w_cell(2,2)) + (w_cell(1,2) + w_cell(2,1)))
-  if (area > 0.0) then
-    mu_B = (((-0.5)*w_cell(1,1) + (0.5)*w_cell(2,1)) + &
-            ((-0.5)*w_cell(1,2) + (0.5)*w_cell(2,2))) / area
-    mu_C = (((-0.5)*w_cell(1,1) + (-0.5)*w_cell(2,1)) + &
-            (( 0.5)*w_cell(1,2) + ( 0.5)*w_cell(2,2))) / area
-    mu_D = ((( 0.25)*w_cell(1,1) + (-0.25)*w_cell(2,1)) + &
-            ((-0.25)*w_cell(1,2) + ( 0.25)*w_cell(2,2))) / area
-  else
-    mu_B = 0.0 ; mu_C = 0.0 ; mu_D = 0.0
-  endif
-end subroutine compute_mu_lim_offsets
 
 !> For symmetric BGRID + reentrant domains, the wrap-mate B-nodes on either
 !! side of the periodic boundary are the same physical location, but each
