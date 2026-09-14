@@ -468,33 +468,6 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! cell's surface mass balance only ever changes its own
                                   !! thickness; if false it is averaged at shared corners
                                   !! (SRC_OP_AVERAGED). Both are exactly mass-conservative.
-  real, pointer, dimension(:,:) :: dg_lim_phi_xi    => NULL() !< Per-cell xi-slope mode
-                                                              !! scaling factor from the
-                                                              !! last hierarchical-limiter
-                                                              !! call [nondim].
-  real, pointer, dimension(:,:) :: dg_lim_phi_eta   => NULL() !< Per-cell eta-slope mode
-                                                              !! scaling factor [nondim].
-  real, pointer, dimension(:,:) :: dg_lim_phi_cross => NULL() !< Per-cell cross mode
-                                                              !! scaling factor [nondim].
-  real, pointer, dimension(:,:) :: dg_lim_mass_drift => NULL() !< Per-cell change in
-                                                              !! cell-mean thickness from
-                                                              !! the limiter [Z ~> m].
-                                                              !! Sanity check; should be
-                                                              !! ~machine epsilon.
-  real, pointer, dimension(:,:) :: dg_lim_phi => NULL()       !< Per-cell limiter-strength
-                                                              !! diagnostic [nondim, 0..1].
-                                                              !! For isotropic: the unique phi.
-                                                              !! For anisotropic: min over the
-                                                              !! three mode phis at this cell
-                                                              !! (= the most-limiting factor).
-  real, pointer, dimension(:,:) :: dg_lim_pk_factor => NULL() !< Park-Kim MLP-u2 smooth-extrema
-                                                              !! indicator [nondim, 0 or 1].
-                                                              !! 1 where the Park-Kim sign-
-                                                              !! consistency check flags the
-                                                              !! cell as a smooth extremum and
-                                                              !! grants full slack; 0 where the
-                                                              !! check rejects and strict MLP-u2
-                                                              !! bounds apply.
   logical :: dg_tilt_damp         !< If true, damp the grid-scale in-cell tilt mode,
                                   !! which is invisible to every jump-proportional
                                   !! mechanism in the scheme.
@@ -695,8 +668,6 @@ type, public :: ice_shelf_dyn_CS ; private
              id_h_jump_envelope = -1, id_h_jump_envelope_rel = -1, &
              id_h_overshoot_node = -1, id_h_overshoot_node_rel = -1, &
              id_s_overshoot_node = -1, id_s_overshoot_node_rel = -1, id_h_source_rate = -1, &
-             id_dg_lim_phi_xi = -1, id_dg_lim_phi_eta = -1, id_dg_lim_phi_cross = -1, &
-             id_dg_lim_mass_drift = -1, id_dg_lim_phi = -1, id_dg_lim_pk_factor = -1, &
              id_phi_x_FV = -1, id_phi_y_FV = -1, &
              id_dg_art_visc_coef_u = -1, id_dg_art_visc_coef_v = -1, &
              id_dg_art_visc_nu_u = -1, id_dg_art_visc_nu_v = -1, &
@@ -952,12 +923,6 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%dg_art_visc_cell_scale(isd:ied,jsd:jed), source=1.0)
     allocate(CS%dg_slow_idle_face_u(IsdB:IedB,jsd:jed), source=0.0)
     allocate(CS%dg_slow_idle_face_v(isd:ied,JsdB:JedB), source=0.0)
-    allocate(CS%dg_lim_phi_xi(isd:ied,jsd:jed),     source=1.0)
-    allocate(CS%dg_lim_phi_eta(isd:ied,jsd:jed),    source=1.0)
-    allocate(CS%dg_lim_phi_cross(isd:ied,jsd:jed),  source=1.0)
-    allocate(CS%dg_lim_mass_drift(isd:ied,jsd:jed), source=0.0)
-    allocate(CS%dg_lim_phi(isd:ied,jsd:jed),        source=1.0)
-    allocate(CS%dg_lim_pk_factor(isd:ied,jsd:jed),  source=0.0)
     allocate(CS%u_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%v_bdry_val(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%u_face_mask_bdry(IsdB:IedB,JsdB:JedB), source=-2.0)
@@ -2046,35 +2011,6 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          CS%diag%axesCv1, Time, &
          'As dg_eps_face_u but on v-faces.', &
          'yr-1', conversion=365.0*86400.0*US%s_to_T)
-      CS%id_dg_lim_phi_xi = register_diag_field('ice_shelf_model','dg_lim_phi_xi', &
-         CS%diag%axesT1, Time, &
-         'Per-cell xi-slope (east-west) mode scaling factor from the DG(1) hierarchical '//&
-         'limiter [0,1]. 1 = no limiting, 0 = mode fully collapsed.', 'nondim')
-      CS%id_dg_lim_phi_eta = register_diag_field('ice_shelf_model','dg_lim_phi_eta', &
-         CS%diag%axesT1, Time, &
-         'Per-cell eta-slope (north-south) mode scaling factor from the DG(1) hierarchical '//&
-         'limiter [0,1].', 'nondim')
-      CS%id_dg_lim_phi_cross = register_diag_field('ice_shelf_model','dg_lim_phi_cross', &
-         CS%diag%axesT1, Time, &
-         'Per-cell cross (saddle/twist) mode scaling factor from the DG(1) hierarchical '//&
-         'limiter [0,1].', 'nondim')
-      CS%id_dg_lim_mass_drift = register_diag_field('ice_shelf_model','dg_lim_mass_drift', &
-         CS%diag%axesT1, Time, &
-         'Per-cell change in cell-mean thickness produced by the DG(1) hierarchical limiter. '//&
-         'Should be ~machine epsilon when the orthogonalised mode templates are correct.', &
-         'm', conversion=US%Z_to_m)
-      CS%id_dg_lim_phi = register_diag_field('ice_shelf_model','dg_lim_phi', &
-         CS%diag%axesT1, Time, &
-         'Per-cell DG(1) limiter strength [0,1]. 1 = no limiting at this cell, 0 = full '//&
-         'collapse. For the isotropic single-phi variant this is the unique scaling factor; '//&
-         'for the anisotropic per-mode variant this is the min over (phi_xi, phi_eta, phi_cross), '//&
-         'i.e. the most-limiting direction.', 'nondim')
-      CS%id_dg_lim_pk_factor = register_diag_field('ice_shelf_model','dg_lim_pk_factor', &
-         CS%diag%axesT1, Time, &
-         'Park-Kim MLP-u2 smooth-extrema indicator from the DG(1) hierarchical limiter. '//&
-         '1 where the second-difference sign-consistency check across the 3-cell stencil in '//&
-         'both x and y flags the cell as a smooth extremum (full slack granted); 0 where the '//&
-         'check rejects and strict MLP-u2 vertex bounds apply.', 'nondim')
     else
       CS%id_phi_x_FV = register_diag_field('ice_shelf_model','phi_x_FV',CS%diag%axesCu1, Time, &
          'Van Leer slope-limiter factor at each u-face from ice_shelf_advect_thickness_x '//&
@@ -2868,18 +2804,6 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_phi_x_FV, CS%phi_x_FV, CS%diag)
     if (CS%id_phi_y_FV > 0 .and. associated(CS%phi_y_FV)) &
         call post_data(CS%id_phi_y_FV, CS%phi_y_FV, CS%diag)
-    if (CS%id_dg_lim_phi_xi > 0 .and. associated(CS%dg_lim_phi_xi)) &
-        call post_data(CS%id_dg_lim_phi_xi, CS%dg_lim_phi_xi, CS%diag)
-    if (CS%id_dg_lim_phi_eta > 0 .and. associated(CS%dg_lim_phi_eta)) &
-        call post_data(CS%id_dg_lim_phi_eta, CS%dg_lim_phi_eta, CS%diag)
-    if (CS%id_dg_lim_phi_cross > 0 .and. associated(CS%dg_lim_phi_cross)) &
-        call post_data(CS%id_dg_lim_phi_cross, CS%dg_lim_phi_cross, CS%diag)
-    if (CS%id_dg_lim_mass_drift > 0 .and. associated(CS%dg_lim_mass_drift)) &
-        call post_data(CS%id_dg_lim_mass_drift, CS%dg_lim_mass_drift, CS%diag)
-    if (CS%id_dg_lim_phi > 0 .and. associated(CS%dg_lim_phi)) &
-        call post_data(CS%id_dg_lim_phi, CS%dg_lim_phi, CS%diag)
-    if (CS%id_dg_lim_pk_factor > 0 .and. associated(CS%dg_lim_pk_factor)) &
-        call post_data(CS%id_dg_lim_pk_factor, CS%dg_lim_pk_factor, CS%diag)
     if (CS%id_dg_art_visc_coef_u > 0 .and. associated(CS%dg_art_visc_coef_u)) &
         call post_data(CS%id_dg_art_visc_coef_u, CS%dg_art_visc_coef_u, CS%diag)
     if (CS%id_dg_art_visc_coef_v > 0 .and. associated(CS%dg_art_visc_coef_v)) &
@@ -9897,12 +9821,6 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_art_visc_cell_scale)) deallocate(CS%dg_art_visc_cell_scale)
   if (associated(CS%dg_slow_idle_face_u)) deallocate(CS%dg_slow_idle_face_u)
   if (associated(CS%dg_slow_idle_face_v)) deallocate(CS%dg_slow_idle_face_v)
-  if (associated(CS%dg_lim_phi_xi))     deallocate(CS%dg_lim_phi_xi)
-  if (associated(CS%dg_lim_phi_eta))    deallocate(CS%dg_lim_phi_eta)
-  if (associated(CS%dg_lim_phi_cross))  deallocate(CS%dg_lim_phi_cross)
-  if (associated(CS%dg_lim_mass_drift)) deallocate(CS%dg_lim_mass_drift)
-  if (associated(CS%dg_lim_phi))        deallocate(CS%dg_lim_phi)
-  if (associated(CS%dg_lim_pk_factor))  deallocate(CS%dg_lim_pk_factor)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
   if (associated(CS%dg_damp_tend)) deallocate(CS%dg_damp_tend)
   if (associated(CS%dg_damp_gate)) deallocate(CS%dg_damp_gate)
