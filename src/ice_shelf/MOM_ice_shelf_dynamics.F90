@@ -218,10 +218,9 @@ type, public :: ice_shelf_dyn_CS ; private
                                                        !! cell-local corner (a in {1,2} = west/east, b in {1,2} =
                                                        !! south/north). Each cell owns its own 4 corner values;
                                                        !! jumps across faces are allowed (true DG).
-  real, pointer, dimension(:,:,:,:) :: Minv_xi => NULL() !< Per-cell 2x2 inverse of the 1D Q1 mass-matrix factor in
-                                                       !! the xi direction [L-1 ~> m-1].
-  real, pointer, dimension(:,:,:,:) :: Minv_eta => NULL() !< Per-cell 2x2 inverse of the 1D Q1 mass-matrix factor in
-                                                       !! the eta direction [L-1 ~> m-1].
+  real, pointer, dimension(:,:,:,:,:,:) :: Minv_nodal => NULL() !< Per-cell inverse of the tensor-product Q1
+                                                       !! mass matrix, Minv_nodal(i,j,a,b,p,q) = Minv_xi(a,p) *
+                                                       !! Minv_eta(b,q), from corner (p,q) to corner (a,b) [L-2 ~> m-2].
   real, pointer, dimension(:,:,:,:) :: cell_mean_w => NULL() !< Per-corner integration weight w(a,b) = int N(a,b)*J
                                                        !! over the reference cell [L2 ~> m2].
   real, pointer, dimension(:,:) :: h_source_rate => NULL() !< Accumulated cell-mean thickness source rate
@@ -937,8 +936,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     if (DG_thickness .or. thickness_nodal) &
       allocate(CS%h_nodal(isd:ied,jsd:jed,1:2,1:2), source=0.0)
     if (DG_thickness) then
-      allocate(CS%Minv_xi(isd:ied,jsd:jed,1:2,1:2), source=0.0)
-      allocate(CS%Minv_eta(isd:ied,jsd:jed,1:2,1:2), source=0.0)
+      allocate(CS%Minv_nodal(isd:ied,jsd:jed,1:2,1:2,1:2,1:2), source=0.0)
       allocate(CS%cell_mean_w(isd:ied,jsd:jed,1:2,1:2), source=0.0)
     endif
     allocate(CS%h_source_rate(isd:ied,jsd:jed), source=0.0)
@@ -1628,7 +1626,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       call bilinear_shape_fn_grid(G, i, j, CS%Phi(:,:,i,j), CS%Jac(:,i,j))
     enddo ; enddo
 
-    ! Per-cell nodal DG(1) metric tables (Minv_xi, Minv_eta, cell_mean_w).
+    ! Per-cell nodal DG(1) metric tables (Minv_nodal, cell_mean_w).
     if (CS%use_DG_thickness) call init_nodal_DG_metric(CS, G)
 
     if (CS%GL_regularize) then
@@ -9884,8 +9882,7 @@ subroutine ice_shelf_dyn_end(CS)
   deallocate(CS%t_bdry_val, CS%bed_elev)
   if (associated(CS%bed_node)) deallocate(CS%bed_node)
   if (associated(CS%h_nodal)) deallocate(CS%h_nodal)
-  if (associated(CS%Minv_xi)) deallocate(CS%Minv_xi)
-  if (associated(CS%Minv_eta)) deallocate(CS%Minv_eta)
+  if (associated(CS%Minv_nodal)) deallocate(CS%Minv_nodal)
   if (associated(CS%cell_mean_w)) deallocate(CS%cell_mean_w)
   if (associated(CS%h_source_rate)) deallocate(CS%h_source_rate)
   if (associated(CS%h_source_rate_bmb)) deallocate(CS%h_source_rate_bmb)
@@ -11630,8 +11627,8 @@ end subroutine check_xi_basal_consistency
 
 ! ===========================================================================
 ! Nodal DG(1) helpers. CS%h_nodal is the authoritative DG thickness state;
-! per-cell metrics come from G%dxCv / G%dyCu / G%areaT via the Minv_xi,
-! Minv_eta, cell_mean_w caches built in init_nodal_DG_metric.
+! per-cell metrics come from G%dxCv / G%dyCu / G%areaT via the Minv_nodal and
+! cell_mean_w caches built in init_nodal_DG_metric.
 ! ===========================================================================
 
 !> Read nodal-DG runtime parameters (positivity floor + driving-stress options).
@@ -12010,7 +12007,7 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
 
 end subroutine read_nodal_limiter_params
 
-!> Initialise the per-cell metric tables (Minv_xi, Minv_eta, cell_mean_w) from
+!> Initialise the per-cell metric tables (Minv_nodal, cell_mean_w) from
 !! the grid. Per-cell face lengths come from G%dxCv (south/north) and G%dyCu
 !! (west/east); the bilinear face-length interpolation is
 !!   a(eta) = dxS*(1-eta) + dxN*eta   on eta in [0,1]
@@ -12020,14 +12017,19 @@ end subroutine read_nodal_limiter_params
 !! the locally-orthogonal lat/lon grid: M = M_xi (x) M_eta with
 !! M_xi_{a,a'}  = int N_a(xi)*N_a'(xi)*d(xi) dxi
 !! M_eta_{b,b'} = int N_b(eta)*N_b'(eta)*a(eta) deta,
-!! where N_1 = 1-x, N_2 = x. The 2x2 inverses are analytic.
+!! where N_1 = 1-x, N_2 = x. The 2x2 inverses are analytic, and M^-1 = M_xi^-1 (x) M_eta^-1
+!! is stored as the full tensor.  The grid metrics are fixed for the run, so the products
+!! of the two factors are formed once here rather than at every Runge-Kutta stage.
 subroutine init_nodal_DG_metric(CS, G)
   type(ice_shelf_dyn_CS), intent(inout) :: CS
   type(ocean_grid_type),  intent(in)    :: G
 
   real :: dxS, dxN, dyW, dyE    ! face lengths [L ~> m]
-  real :: M11, M12, M22, det    ! mass-matrix entries and determinant
-  integer :: i, j, isd, ied, jsd, jed
+  real :: M11, M12, M22         ! mass-matrix entries [L ~> m]
+  real :: det                   ! mass-matrix determinant [L2 ~> m2]
+  real, dimension(2,2) :: Minv_xi  ! Inverse of the 1D mass-matrix factor along xi [L-1 ~> m-1]
+  real, dimension(2,2) :: Minv_eta ! Inverse of the 1D mass-matrix factor along eta [L-1 ~> m-1]
+  integer :: i, j, isd, ied, jsd, jed, a, b, p, q
 
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
 
@@ -12052,11 +12054,12 @@ subroutine init_nodal_DG_metric(CS, G)
     M22 = (dyW/12.0) + (dyE/4.0)
     M12 = (dyW + dyE)/12.0
     det = M11*M22 - M12*M12
+    Minv_xi(:,:) = 0.0
     if (det > 0.0) then
-      CS%Minv_xi(i,j,1,1) =  M22 / det
-      CS%Minv_xi(i,j,2,2) =  M11 / det
-      CS%Minv_xi(i,j,1,2) = -M12 / det
-      CS%Minv_xi(i,j,2,1) = -M12 / det
+      Minv_xi(1,1) =  M22 / det
+      Minv_xi(2,2) =  M11 / det
+      Minv_xi(1,2) = -M12 / det
+      Minv_xi(2,1) = -M12 / det
     endif
 
     ! M_eta: int_0^1 N_b*N_b'*a(eta) deta where a(eta) = dxS*(1-eta) + dxN*eta.
@@ -12064,12 +12067,17 @@ subroutine init_nodal_DG_metric(CS, G)
     M22 = (dxS/12.0) + (dxN/4.0)
     M12 = (dxS + dxN)/12.0
     det = M11*M22 - M12*M12
+    Minv_eta(:,:) = 0.0
     if (det > 0.0) then
-      CS%Minv_eta(i,j,1,1) =  M22 / det
-      CS%Minv_eta(i,j,2,2) =  M11 / det
-      CS%Minv_eta(i,j,1,2) = -M12 / det
-      CS%Minv_eta(i,j,2,1) = -M12 / det
+      Minv_eta(1,1) =  M22 / det
+      Minv_eta(2,2) =  M11 / det
+      Minv_eta(1,2) = -M12 / det
+      Minv_eta(2,1) = -M12 / det
     endif
+
+    do q = 1, 2 ; do p = 1, 2 ; do b = 1, 2 ; do a = 1, 2
+      CS%Minv_nodal(i,j,a,b,p,q) = Minv_xi(a,p) * Minv_eta(b,q)
+    enddo ; enddo ; enddo ; enddo
 
     call corner_cell_weights(dxS, dxN, dyW, dyE, CS%cell_mean_w(i,j,:,:))
   enddo ; enddo
@@ -12290,50 +12298,47 @@ end function subgrid_cell_mean_s
 !! slots, so no arrangement of the source can make the two orientations agree: a
 !! four-cycle has no invariant pair of slots to assign the exact term to.
 !!
-!! Parentheses do not help.  -fprotect-parens stops the compiler REASSOCIATING
-!! across them, which is a different transformation; gfortran will still fuse a
-!! parenthesised product into a neighbouring add, and does so here as soon as it
-!! vectorises the corner loop.  Writing the products into ordinary local scalars
-!! does not help either -- they are forwarded straight back into the sum.
+!! Parentheses do not help.  They stop the compiler from reassociating, not from
+!! contracting, and gfortran fuses a parenthesised product into a neighbouring add
+!! whenever it vectorises the expression, which it does for this corner loop however
+!! it is written: as a loop, unrolled by hand, or through a scalar temporary.
+!! Precomputing the metric factor of each product does not help either, since the
+!! product with the right-hand side is still a product.
 !!
-!! Passing them through volatile storage does, because the sum then has to read
-!! values that have been through memory at working precision.  The cost is four
-!! stores and four loads per call, which is not measurable here: this runs once
-!! per cell per Runge-Kutta stage, not inside the velocity solve.
+!! Passing the products through volatile storage does, because the sum then has to
+!! read values that have been through memory at working precision.  The cost is four
+!! stores and four loads per corner, outside the velocity solve.
 !!
-!! With -ffp-contract=off, which is what the supported build uses, this is a no-op
-!! and the result is bit-for-bit what the plain expression gives.
+!! With -ffp-contract=off (gfortran) or -fp-model source without -fma (Intel), this
+!! is a no-op and the result is bit-for-bit what the plain expression gives.
 function dg_sum4_rounded(p1, p2, p3, p4) result(s)
   real, intent(in) :: p1 !< First product, paired with p2 [arbitrary]
   real, intent(in) :: p2 !< Second product, paired with p1 [arbitrary]
   real, intent(in) :: p3 !< Third product, paired with p4 [arbitrary]
   real, intent(in) :: p4 !< Fourth product, paired with p3 [arbitrary]
   real :: s              !< (p1 + p2) + (p3 + p4), each term rounded first [arbitrary]
-  real, volatile, dimension(4) :: t ! Forces each product to working precision
+  real, volatile, dimension(4) :: t ! Forces each product to working precision [arbitrary]
   t(1) = p1 ; t(2) = p2 ; t(3) = p3 ; t(4) = p4
   s = (t(1) + t(2)) + (t(3) + t(4))
 end function dg_sum4_rounded
 
 !> Apply the per-cell tensor-product Q1 mass-matrix inverse:
-!! out(a,b) = sum_{a',b'} Minv_xi(a,a') * Minv_eta(b,b') * rhs(a',b').
-subroutine apply_nodal_DG_mass_inverse(Minv_xi_cell, Minv_eta_cell, rhs, out)
-  real, dimension(2,2), intent(in)  :: Minv_xi_cell  !< 2x2 inverse of xi mass-matrix factor [L-1]
-  real, dimension(2,2), intent(in)  :: Minv_eta_cell !< 2x2 inverse of eta mass-matrix factor [L-1]
-  real, dimension(2,2), intent(in)  :: rhs            !< Per-cell RHS at the 4 corners [Z L2 T-1]
-  real, dimension(2,2), intent(out) :: out            !< M^-1 * rhs [Z T-1]
+!! out(a,b) = sum_{p,q} Minv_nodal(a,b,p,q) * rhs(p,q).
+subroutine apply_nodal_DG_mass_inverse(Minv_cell, rhs, out)
+  real, dimension(2,2,2,2), intent(in)  :: Minv_cell !< Inverse mass matrix of this cell [L-2 ~> m-2]
+  real, dimension(2,2),     intent(in)  :: rhs       !< Per-cell RHS at the 4 corners [Z L2 T-1 ~> m3 s-1]
+  real, dimension(2,2),     intent(out) :: out       !< M^-1 * rhs [Z T-1 ~> m s-1]
   integer :: a, b
   ! The four source corners are reduced as opposite pairs rather than accumulated
   ! in loop order.  A quarter turn of the grid permutes the corners cyclically,
   ! which would reorder a running sum; it maps each opposite pair onto the other,
   ! which leaves this reduction unchanged.  The terms are products, so they go
   ! through dg_sum4_rounded rather than straight into the sum -- see there for why
-  ! parentheses are not enough once the compiler may contract.  Not pure, because
-  ! that helper cannot be: a pure procedure may not declare a volatile local.
+  ! nothing short of that survives contraction.  Not pure, because that helper
+  ! cannot be: a pure procedure may not declare a volatile local.
   do b = 1, 2 ; do a = 1, 2
-    out(a,b) = dg_sum4_rounded((Minv_xi_cell(a,1) * Minv_eta_cell(b,1)) * rhs(1,1), &
-                               (Minv_xi_cell(a,2) * Minv_eta_cell(b,2)) * rhs(2,2), &
-                               (Minv_xi_cell(a,2) * Minv_eta_cell(b,1)) * rhs(2,1), &
-                               (Minv_xi_cell(a,1) * Minv_eta_cell(b,2)) * rhs(1,2))
+    out(a,b) = dg_sum4_rounded(Minv_cell(a,b,1,1) * rhs(1,1), Minv_cell(a,b,2,2) * rhs(2,2), &
+                               Minv_cell(a,b,2,1) * rhs(2,1), Minv_cell(a,b,1,2) * rhs(1,2))
   enddo ; enddo
 end subroutine apply_nodal_DG_mass_inverse
 
@@ -14324,7 +14329,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   call dg_nodal_mode_damp_rate(CS, G, hmask, CS%h_nodal, time_step, T_node)
   do j = jsc, jec ; do i = isc, iec
     if (hmask(i,j) /= 1.0) cycle
-    call apply_nodal_DG_mass_inverse(CS%Minv_xi(i,j,:,:), CS%Minv_eta(i,j,:,:), &
+    call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), &
                                      rhs(i,j,:,:), dh)
     do b = 1, 2 ; do a = 1, 2
       CS%h_nodal(i,j,a,b) = h0(i,j,a,b) &
@@ -14340,7 +14345,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   call dg_nodal_mode_damp_rate(CS, G, hmask, h_curr, time_step, T_node)
   do j = jsc, jec ; do i = isc, iec
     if (hmask(i,j) /= 1.0) cycle
-    call apply_nodal_DG_mass_inverse(CS%Minv_xi(i,j,:,:), CS%Minv_eta(i,j,:,:), &
+    call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), &
                                      rhs(i,j,:,:), dh)
     do b = 1, 2 ; do a = 1, 2
       CS%h_nodal(i,j,a,b) = 0.5*h0(i,j,a,b) &
