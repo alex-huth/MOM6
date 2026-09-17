@@ -418,8 +418,6 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: use_DG_thickness     !< If true, use the DG(1) nodal thickness with unsplit advection.
   logical :: init_bed_nodal       !< If true, read the bed at B-grid nodes into CS%bed_node and set
                                   !! CS%bed_elev to its cell means. Required by USE_DG_THICKNESS.
-  logical :: init_thickness_nodal !< If true, CS%h_nodal was read at nodes, so it is not seeded
-                                  !! from the cell means.
   integer :: dg_basal_source_op   !< Sets the SRC_OP_* method (LOCAL, AVERAGED, or SUBGRID) for how much of a cell's
                                   !! basal melt is shared with neighbors it meets at a corner
   real, pointer, dimension(:,:,:,:) :: xi_basal => NULL() !< Floating share of corner (a,b)'s support
@@ -571,9 +569,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_h_nodal_SW = -1, id_h_nodal_SE = -1, id_h_nodal_NW = -1, id_h_nodal_NE = -1, &
              id_h_jump_node = -1, id_h_jump_node_rel = -1, &
              id_h_node_max = -1, id_h_node_min = -1, &
-             id_h_jump_envelope = -1, id_h_jump_envelope_rel = -1, &
-             id_h_overshoot_node = -1, id_h_overshoot_node_rel = -1, &
-             id_s_overshoot_node = -1, id_s_overshoot_node_rel = -1, id_h_source_rate = -1, &
+             id_h_jump_envelope = -1, id_h_source_rate = -1, &
              id_phi_x_FV = -1, id_phi_y_FV = -1, &
              id_dg_art_visc_coef_u = -1, id_dg_art_visc_coef_v = -1, &
              id_dg_art_visc_nu_u = -1, id_dg_art_visc_nu_v = -1, &
@@ -779,6 +775,9 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
                    default=.false., do_not_log=.true.)
     call get_param(param_file, mdl, "INIT_ICE_THICKNESS_NODAL", thickness_nodal, &
                    default=.false., do_not_log=.true.)
+    if (DG_thickness .and. .not. thickness_nodal) call MOM_error(FATAL, &
+        "MOM_ice_shelf_dynamics: USE_DG_THICKNESS initializes the DG(1) thickness from nodal "//&
+        "values; set INIT_ICE_THICKNESS_NODAL=True.")
     if (DG_thickness .or. thickness_nodal) &
       allocate(CS%h_nodal(isd:ied,jsd:jed,1:2,1:2), source=0.0)
     if (DG_thickness) then
@@ -1031,8 +1030,6 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "If true, read BED_TOPO_VARNAME at B-grid nodes and set the cell bed to the area-weighted"//&
                  "mean of their bilinear interpolant. Required by USE_DG_THICKNESS; optional otherwise.", &
                  default=.false.)
-    call get_param(param_file, mdl, "INIT_ICE_THICKNESS_NODAL", CS%init_thickness_nodal, &
-                 default=.false., do_not_log=.true.)
     if (CS%use_DG_thickness .and. .not. CS%init_bed_nodal) call MOM_error(FATAL, &
         "MOM_ice_shelf_dynamics: USE_DG_THICKNESS needs the bed at B-grid nodes to evaluate "//&
         "grad(b) inside an element; set INIT_ICE_BED_NODAL=True.")
@@ -1568,12 +1565,8 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         call pass_var(CS%bed_elev, G%domain, complete=.true.)
       endif
       if (CS%use_DG_thickness) then
-        ! DG(1) cold start: h_nodal is read at nodes or seeded from the cell means.
+        ! DG(1) cold start from the nodal thickness read by initialize_ice_thickness.
         call pass_var(ISS%h_shelf, G%domain)
-        if (.not. CS%init_thickness_nodal) then
-          CS%h_nodal(:,:,:,:) = 0.0
-          call initialize_h_nodal_from_cellmean(ISS%h_shelf, CS%h_nodal, ISS%hmask, G)
-        endif
         call nodal_positivity_limit(CS, G, ISS)
         call pass_corner_field(CS%h_nodal, G)
         call enforce_wrap_corner_consistency(CS, ISS, G)
@@ -1675,23 +1668,6 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          CS%diag%axesB1, Time, &
          'Range of the cell-mean thicknesses (hmask 1 and 3) at a B-grid node', &
          'm', conversion=US%Z_to_m)
-      CS%id_h_jump_envelope_rel = register_diag_field('ice_shelf_model','h_jump_envelope_rel', &
-         CS%diag%axesB1, Time, &
-         'h_jump_envelope over the mean of its range', 'nondim')
-      CS%id_h_overshoot_node = register_diag_field('ice_shelf_model','h_overshoot_node', &
-         CS%diag%axesB1, Time, &
-         'Largest distance of a DG(1) corner thickness outside the cell-mean range at a B-grid node', &
-         'm', conversion=US%Z_to_m)
-      CS%id_h_overshoot_node_rel = register_diag_field('ice_shelf_model','h_overshoot_node_rel', &
-         CS%diag%axesB1, Time, &
-         'h_overshoot_node over the mean of the range', 'nondim')
-      CS%id_s_overshoot_node = register_diag_field('ice_shelf_model','s_overshoot_node', &
-         CS%diag%axesB1, Time, &
-         'Largest distance of a DG(1) corner surface outside the cell-mean surface range at a B-grid node', &
-         'm', conversion=US%Z_to_m)
-      CS%id_s_overshoot_node_rel = register_diag_field('ice_shelf_model','s_overshoot_node_rel', &
-         CS%diag%axesB1, Time, &
-         's_overshoot_node over 0.5*(|Smax| + |Smin|)', 'nondim')
       CS%id_h_source_rate = register_diag_field('ice_shelf_model','h_source_rate',CS%diag%axesT1, Time, &
          'Cell-mean thickness source (basal + surface) used by the last DG advection step', &
          'm s-1', conversion=US%Z_to_m*US%s_to_T)
@@ -2070,17 +2046,6 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
                                                            ! from hmask=1 and 3 cells [Z ~> m]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: count_Bd     ! Cells in the envelope [nondim]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_env   ! Hmax_Bd - Hmin_Bd [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_env_rel ! h_jump_env over the envelope mean [nondim]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_over_n     ! Corner overshoot of the thickness envelope [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_over_n_rel ! h_over_n over the envelope mean [nondim]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: Smax_Bd, Smin_Bd ! Cell-mean surface envelope [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: s_over_n     ! Corner overshoot of the surface envelope [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: s_over_n_rel ! s_over_n over the envelope mean [nondim]
-  real :: cell_mean_s_d                            ! Cell-mean surface [Z ~> m]
-  real :: s_cSW, s_cSE, s_cNW, s_cNE               ! Corner surfaces at a B-node [Z ~> m]
-  real :: bed_B                                    ! Bed at the B-node [Z ~> m]
-  real :: over_b_s                                 ! Surface overshoot at a B-node [Z ~> m]
-  real :: over_b                                  ! Thickness overshoot at a B-node [Z ~> m]
   real :: h_cSW, h_cSE, h_cNW, h_cNE              ! Corner thicknesses at a B-node [Z ~> m]
   real :: Hb_SW, Hb_SE, Hb_NW, Hb_NE              ! Touching cells' mean thicknesses [Z ~> m]
   real :: hmax_b, hmin_b                          ! Max and min corner thickness [Z ~> m]
@@ -2241,17 +2206,11 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       if (CS%id_h_node_max      > 0) call post_data(CS%id_h_node_max,      h_node_mx,    CS%diag)
       if (CS%id_h_node_min      > 0) call post_data(CS%id_h_node_min,      h_node_mn,    CS%diag)
     endif
-    if ((CS%id_h_jump_envelope > 0 .or. CS%id_h_jump_envelope_rel > 0 .or. &
-         CS%id_h_overshoot_node > 0 .or. CS%id_h_overshoot_node_rel > 0 .or. &
-         CS%id_s_overshoot_node > 0 .or. CS%id_s_overshoot_node_rel > 0) .and. &
-        associated(CS%h_nodal)) then
-      ! Cell-mean thickness and surface envelopes at each B-node.
+    if ((CS%id_h_jump_envelope > 0) .and. associated(CS%h_nodal)) then
+      ! Cell-mean thickness envelope at each B-node.
       call pass_corner_field(CS%h_nodal, G)
-      rr = CS%density_ice / CS%density_ocean_avg
       Hmax_Bd(:,:) = -H_LARGE_D
       Hmin_Bd(:,:) =  H_LARGE_D
-      Smax_Bd(:,:) = -H_LARGE_D
-      Smin_Bd(:,:) =  H_LARGE_D
       count_Bd(:,:) = 0.0
       do j = G%jsd, G%jed ; do i = G%isd, G%ied
         if (ISS%hmask(i,j) == 1.0) then
@@ -2261,130 +2220,37 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         else
           cycle
         endif
-        if (rr*cell_mean_val_d - CS%bed_elev(i,j) > 0.0) then
-          cell_mean_s_d = cell_mean_val_d - CS%bed_elev(i,j)
-        else
-          cell_mean_s_d = (1.0 - rr)*cell_mean_val_d
-        endif
         if (i-1 >= G%IsdB .and. j-1 >= G%JsdB) then
           Hmax_Bd(i-1, j-1) = max(Hmax_Bd(i-1, j-1), cell_mean_val_d)
           Hmin_Bd(i-1, j-1) = min(Hmin_Bd(i-1, j-1), cell_mean_val_d)
-          Smax_Bd(i-1, j-1) = max(Smax_Bd(i-1, j-1), cell_mean_s_d)
-          Smin_Bd(i-1, j-1) = min(Smin_Bd(i-1, j-1), cell_mean_s_d)
           count_Bd(i-1, j-1) = count_Bd(i-1, j-1) + 1.0
         endif
         if (i <= G%IedB .and. j-1 >= G%JsdB) then
           Hmax_Bd(i,   j-1) = max(Hmax_Bd(i,   j-1), cell_mean_val_d)
           Hmin_Bd(i,   j-1) = min(Hmin_Bd(i,   j-1), cell_mean_val_d)
-          Smax_Bd(i,   j-1) = max(Smax_Bd(i,   j-1), cell_mean_s_d)
-          Smin_Bd(i,   j-1) = min(Smin_Bd(i,   j-1), cell_mean_s_d)
           count_Bd(i,   j-1) = count_Bd(i,   j-1) + 1.0
         endif
         if (i-1 >= G%IsdB .and. j <= G%JedB) then
           Hmax_Bd(i-1, j  ) = max(Hmax_Bd(i-1, j  ), cell_mean_val_d)
           Hmin_Bd(i-1, j  ) = min(Hmin_Bd(i-1, j  ), cell_mean_val_d)
-          Smax_Bd(i-1, j  ) = max(Smax_Bd(i-1, j  ), cell_mean_s_d)
-          Smin_Bd(i-1, j  ) = min(Smin_Bd(i-1, j  ), cell_mean_s_d)
           count_Bd(i-1, j  ) = count_Bd(i-1, j  ) + 1.0
         endif
         if (i <= G%IedB .and. j <= G%JedB) then
           Hmax_Bd(i,   j  ) = max(Hmax_Bd(i,   j  ), cell_mean_val_d)
           Hmin_Bd(i,   j  ) = min(Hmin_Bd(i,   j  ), cell_mean_val_d)
-          Smax_Bd(i,   j  ) = max(Smax_Bd(i,   j  ), cell_mean_s_d)
-          Smin_Bd(i,   j  ) = min(Smin_Bd(i,   j  ), cell_mean_s_d)
           count_Bd(i,   j  ) = count_Bd(i,   j  ) + 1.0
         endif
       enddo ; enddo
       call pass_var(Hmax_Bd,  G%domain, position=CORNER)
       call pass_var(Hmin_Bd,  G%domain, position=CORNER)
-      call pass_var(Smax_Bd,  G%domain, position=CORNER)
-      call pass_var(Smin_Bd,  G%domain, position=CORNER)
       call pass_var(count_Bd, G%domain, position=CORNER)
       h_jump_env(:,:)     = 0.0
-      h_jump_env_rel(:,:) = 0.0
       do J = G%JscB, G%JecB ; do I = G%IscB, G%IecB
         if (count_Bd(I,J) < 1.5) cycle
         if (Hmax_Bd(I,J) <= -H_LARGE_D + 1.0 .or. Hmin_Bd(I,J) >= H_LARGE_D - 1.0) cycle
         h_jump_env(I,J)     = Hmax_Bd(I,J) - Hmin_Bd(I,J)
-        h_jump_env_rel(I,J) = h_jump_env(I,J) / &
-                              max(CS%min_h_shelf, 0.5*(Hmax_Bd(I,J) + Hmin_Bd(I,J)))
       enddo ; enddo
-      if (CS%id_h_jump_envelope     > 0) call post_data(CS%id_h_jump_envelope,     h_jump_env,     CS%diag)
-      if (CS%id_h_jump_envelope_rel > 0) call post_data(CS%id_h_jump_envelope_rel, h_jump_env_rel, CS%diag)
-      ! Largest distance of a touching corner outside the thickness envelope.
-      if (CS%id_h_overshoot_node > 0 .or. CS%id_h_overshoot_node_rel > 0) then
-        h_over_n(:,:)     = 0.0
-        h_over_n_rel(:,:) = 0.0
-        do J = G%JscB, G%JecB ; do I = G%IscB, G%IecB
-          if (count_Bd(I,J) < 1.5) cycle
-          if (Hmax_Bd(I,J) <= -H_LARGE_D + 1.0 .or. Hmin_Bd(I,J) >= H_LARGE_D - 1.0) cycle
-          ii = I   ; jj = J     ; vSW = (ISS%hmask(ii,jj) == 1.0)
-          h_cSW = 0.0
-          if (vSW) h_cSW = CS%h_nodal(ii,jj,2,2)
-          ii = I+1 ; jj = J     ; vSE = (ISS%hmask(ii,jj) == 1.0)
-          h_cSE = 0.0
-          if (vSE) h_cSE = CS%h_nodal(ii,jj,1,2)
-          ii = I   ; jj = J+1   ; vNW = (ISS%hmask(ii,jj) == 1.0)
-          h_cNW = 0.0
-          if (vNW) h_cNW = CS%h_nodal(ii,jj,2,1)
-          ii = I+1 ; jj = J+1   ; vNE = (ISS%hmask(ii,jj) == 1.0)
-          h_cNE = 0.0
-          if (vNE) h_cNE = CS%h_nodal(ii,jj,1,1)
-          over_b = 0.0
-          if (vSW) over_b = max(over_b, h_cSW - Hmax_Bd(I,J), Hmin_Bd(I,J) - h_cSW)
-          if (vSE) over_b = max(over_b, h_cSE - Hmax_Bd(I,J), Hmin_Bd(I,J) - h_cSE)
-          if (vNW) over_b = max(over_b, h_cNW - Hmax_Bd(I,J), Hmin_Bd(I,J) - h_cNW)
-          if (vNE) over_b = max(over_b, h_cNE - Hmax_Bd(I,J), Hmin_Bd(I,J) - h_cNE)
-          h_over_n(I,J)     = over_b
-          h_over_n_rel(I,J) = over_b / max(CS%min_h_shelf, 0.5*(Hmax_Bd(I,J) + Hmin_Bd(I,J)))
-        enddo ; enddo
-        if (CS%id_h_overshoot_node     > 0) call post_data(CS%id_h_overshoot_node,     h_over_n,     CS%diag)
-        if (CS%id_h_overshoot_node_rel > 0) call post_data(CS%id_h_overshoot_node_rel, h_over_n_rel, CS%diag)
-      endif
-      ! The same for the corner surface, using the nodal bed, against the surface envelope.
-      if (CS%id_s_overshoot_node > 0 .or. CS%id_s_overshoot_node_rel > 0) then
-        call pass_var(CS%bed_node, G%domain, position=CORNER)
-        s_over_n(:,:)     = 0.0
-        s_over_n_rel(:,:) = 0.0
-        do J = G%JscB, G%JecB ; do I = G%IscB, G%IecB
-          if (count_Bd(I,J) < 1.5) cycle
-          if (Smax_Bd(I,J) <= -H_LARGE_D + 1.0 .or. Smin_Bd(I,J) >= H_LARGE_D - 1.0) cycle
-          bed_B = CS%bed_node(I,J)
-          ii = I   ; jj = J     ; vSW = (ISS%hmask(ii,jj) == 1.0)
-          s_cSW = 0.0
-          if (vSW) then
-            h_cSW = CS%h_nodal(ii,jj,2,2)
-            s_cSW = merge(h_cSW - bed_B, (1.0 - rr)*h_cSW, rr*h_cSW - bed_B > 0.0)
-          endif
-          ii = I+1 ; jj = J     ; vSE = (ISS%hmask(ii,jj) == 1.0)
-          s_cSE = 0.0
-          if (vSE) then
-            h_cSE = CS%h_nodal(ii,jj,1,2)
-            s_cSE = merge(h_cSE - bed_B, (1.0 - rr)*h_cSE, rr*h_cSE - bed_B > 0.0)
-          endif
-          ii = I   ; jj = J+1   ; vNW = (ISS%hmask(ii,jj) == 1.0)
-          s_cNW = 0.0
-          if (vNW) then
-            h_cNW = CS%h_nodal(ii,jj,2,1)
-            s_cNW = merge(h_cNW - bed_B, (1.0 - rr)*h_cNW, rr*h_cNW - bed_B > 0.0)
-          endif
-          ii = I+1 ; jj = J+1   ; vNE = (ISS%hmask(ii,jj) == 1.0)
-          s_cNE = 0.0
-          if (vNE) then
-            h_cNE = CS%h_nodal(ii,jj,1,1)
-            s_cNE = merge(h_cNE - bed_B, (1.0 - rr)*h_cNE, rr*h_cNE - bed_B > 0.0)
-          endif
-          over_b_s = 0.0
-          if (vSW) over_b_s = max(over_b_s, s_cSW - Smax_Bd(I,J), Smin_Bd(I,J) - s_cSW)
-          if (vSE) over_b_s = max(over_b_s, s_cSE - Smax_Bd(I,J), Smin_Bd(I,J) - s_cSE)
-          if (vNW) over_b_s = max(over_b_s, s_cNW - Smax_Bd(I,J), Smin_Bd(I,J) - s_cNW)
-          if (vNE) over_b_s = max(over_b_s, s_cNE - Smax_Bd(I,J), Smin_Bd(I,J) - s_cNE)
-          s_over_n(I,J)     = over_b_s
-          s_over_n_rel(I,J) = over_b_s / max(CS%min_h_shelf, 0.5*(abs(Smax_Bd(I,J)) + abs(Smin_Bd(I,J))))
-        enddo ; enddo
-        if (CS%id_s_overshoot_node     > 0) call post_data(CS%id_s_overshoot_node,     s_over_n,     CS%diag)
-        if (CS%id_s_overshoot_node_rel > 0) call post_data(CS%id_s_overshoot_node_rel, s_over_n_rel, CS%diag)
-      endif
+      call post_data(CS%id_h_jump_envelope, h_jump_env, CS%diag)
     endif
     if ((CS%id_h_jump_face_u > 0 .or. CS%id_h_jump_face_v > 0 .or. &
          CS%id_s_jump_face_u > 0 .or. CS%id_s_jump_face_v > 0 .or. &
@@ -11337,46 +11203,6 @@ subroutine recompute_h_shelf_from_nodal(CS, ISS, G)
     endif
   enddo ; enddo
 end subroutine recompute_h_shelf_from_nodal
-
-!> Seed h_nodal from h_shelf: each corner is the areaT-weighted mean of the ice-covered cells
-!! sharing it, giving a continuous field.
-subroutine initialize_h_nodal_from_cellmean(h_shelf, h_nodal, hmask, G)
-  type(ocean_grid_type), intent(inout) :: G
-  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: h_shelf
-  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(inout) :: h_nodal
-  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask
-
-  integer :: i, j, a, b, ic, jc, dx, dy, di_off, dj_off
-  real :: sum_area_h ! Area-weighted sum of h_shelf values [Z L2 ~> m3]
-  real :: sum_area   ! Sum of areas of contributing cells [L2 ~> m2]
-  real :: area_ic    ! Area of one contributing cell [L2 ~> m2]
-
-  ! Corner (a,b) is shared with the cells offset by (dx*di_off, dy*dj_off), dx,dy in {0,1}.
-  do j = G%jsc, G%jec ; do i = G%isc, G%iec
-    if (hmask(i,j) /= 1.0 .and. hmask(i,j) /= 3.0) cycle
-    do b = 1, 2 ; do a = 1, 2
-      di_off = 2*(a-1) - 1
-      dj_off = 2*(b-1) - 1
-      sum_area_h = 0.0 ; sum_area = 0.0
-      do dy = 0, 1 ; do dx = 0, 1
-        ic = i + dx*di_off
-        jc = j + dy*dj_off
-        if (ic < G%isd .or. ic > G%ied) cycle
-        if (jc < G%jsd .or. jc > G%jed) cycle
-        if (hmask(ic,jc) == 1.0 .or. hmask(ic,jc) == 3.0) then
-          area_ic = G%areaT(ic, jc)
-          sum_area_h = sum_area_h + area_ic * h_shelf(ic, jc)
-          sum_area   = sum_area   + area_ic
-        endif
-      enddo ; enddo
-      if (sum_area > 0.0) then
-        h_nodal(i,j,a,b) = sum_area_h / sum_area
-      else
-        h_nodal(i,j,a,b) = h_shelf(i,j)
-      endif
-    enddo ; enddo
-  enddo ; enddo
-end subroutine initialize_h_nodal_from_cellmean
 
 
 !> Positivity limiter: scale each cell's corner deviations from its mean so that the smallest

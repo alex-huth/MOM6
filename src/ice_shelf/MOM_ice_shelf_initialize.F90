@@ -156,7 +156,7 @@ subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, melt
   call get_param(PF, mdl, "INIT_ICE_THICKNESS_NODAL", nodal_thickness, &
                  "If true, read ICE_THICKNESS_VARNAME at B-grid nodes and set the cell thickness "//&
                  "to the area-weighted mean of their bilinear interpolant. The nodes also "//&
-                 "initialize USE_DG_THICKNESS. Requires the shelf mask in the file.", &
+                 "initialize USE_DG_THICKNESS, which requires this. Requires the shelf mask in the file.", &
                  default=.false.)
   call get_param(PF, mdl, "ICE_AREA_VARNAME", area_varname, &
                  "The name of the area variable in ICE_THICKNESS_FILE.", &
