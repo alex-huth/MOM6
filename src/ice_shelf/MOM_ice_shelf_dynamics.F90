@@ -202,9 +202,14 @@ type, public :: ice_shelf_dyn_CS ; private
                                                        !! across cell boundaries.
   real, pointer, dimension(:,:,:,:) :: h_nodal => NULL() !< DG(1) Q1 thickness at each cell's own corners,
                                                        !! h_nodal(i,j,a,b) with a = W/E, b = S/N [Z ~> m].
-  real, pointer, dimension(:,:,:,:,:,:) :: Minv_nodal => NULL() !< Per-cell inverse Q1 mass matrix,
-                                   !! Minv_nodal(i,j,a,b,p,q) = Minv_xi(a,p)*Minv_eta(b,q) [L-2 ~> m-2].
-  real, pointer, dimension(:,:,:,:) :: cell_mean_w => NULL() !< Corner weight w(a,b) = int N(a,b) dA [L2 ~> m2].
+  real, pointer, dimension(:,:,:,:,:,:) :: Minv_nodal => NULL() !< Inverse Q1 mass matrix of cell (i,j),
+                                   !! Minv_nodal(i,j,a,b,p,q) = Minv_xi(a,p)*Minv_eta(b,q). It maps the
+                                   !! right-hand side at corner (p,q) to the rate at corner (a,b);
+                                   !! a and p are 1 (W) or 2 (E), b and q are 1 (S) or 2 (N) [L-2 ~> m-2].
+  real, pointer, dimension(:,:,:,:) :: cell_mean_w => NULL() !< Integral over the cell of the basis function of
+                                   !! corner (a,b). The four sum to the cell area, and sum w*h / sum w is
+                                   !! the area-weighted cell mean of a corner field. Used for cell means,
+                                   !! nodal source projection and mass accounting [L2 ~> m2].
   real, pointer, dimension(:,:) :: h_source_rate => NULL() !< Cell-mean thickness source (basal + surface)
                                                        !! accumulated since the last DG advect step [Z T-1 ~> m s-1].
   real, pointer, dimension(:,:) :: h_source_rate_bmb => NULL() !< Basal part of h_source_rate [Z T-1 ~> m s-1].
@@ -417,47 +422,56 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! from the cell means.
   integer :: dg_basal_source_op   !< Sets the SRC_OP_* method (LOCAL, AVERAGED, or SUBGRID) for how much of a cell's
                                   !! basal melt is shared with neighbors it meets at a corner
-  real, pointer, dimension(:,:,:,:) :: xi_basal => NULL() !< Floating share of corner (a,b)'s support,
-                                  !! from the active sub-element partition; 1 where none applies [nondim].
+  real, pointer, dimension(:,:,:,:) :: xi_basal => NULL() !< Floating share of corner (a,b)'s support
+                                  !! from the active sub-element partition: 1 fully floating, 0 fully
+                                  !! grounded. 1 where no sub-element partition applies [nondim].
   logical :: dg_basal_source_sem2 !< If true, distribute the basal DG(1) source by CS%xi_basal (SEM2).
   logical :: dg_surface_source_local !< If true, apply the surface DG(1) source with SRC_OP_LOCAL,
                                   !! otherwise with SRC_OP_AVERAGED.
-  logical :: dg_tilt_damp         !< If true, damp the grid-scale in-cell tilt modes.
-  real :: dg_tilt_damp_r_hi       !< Normalized tilt detector excess at which damping reaches full strength [nondim].
-  logical :: dg_twist_damp        !< If true, damp the grid-scale in-cell twist mode.
-  real, pointer, dimension(:,:) :: dg_damp_tend => NULL() !< L2 cell norm of the mode-damper
+  ! DG(1) tilt/twist mode damper (dg_nodal_mode_damp_rate)
+  logical :: dg_tilt_damp         !< If true, the mode damper damps the grid-scale in-cell tilt modes.
+  real :: dg_tilt_damp_r_hi       !< Mode damper: normalized detector excess at which the gate is
+                                  !! fully open [nondim].
+  logical :: dg_twist_damp        !< If true, the mode damper damps the grid-scale in-cell twist mode.
+  real, pointer, dimension(:,:) :: dg_damp_tend => NULL() !< Mode damper: L2 cell norm of the
                                   !! correction rate [Z T-1 ~> m s-1].
-  real, pointer, dimension(:,:) :: dg_damp_gate => NULL() !< Largest mode-damper gate over the
+  real, pointer, dimension(:,:) :: dg_damp_gate => NULL() !< Mode damper: largest gate over the
                                   !! three modes [nondim].
-  real, pointer, dimension(:,:) :: dg_damp_want => NULL() !< Mode-damper rate requested, summed over
+  real, pointer, dimension(:,:) :: dg_damp_want => NULL() !< Mode damper: rate requested, summed over
                                   !! modes, before the transport credit [T-1 ~> s-1].
-  real, pointer, dimension(:,:) :: dg_damp_got => NULL() !< Mode-damper rate delivered, summed over
+  real, pointer, dimension(:,:) :: dg_damp_got => NULL() !< Mode damper: rate delivered, summed over
                                   !! modes [T-1 ~> s-1].
-  logical :: dg_damp_advective    !< If true, credit the removal rate the transport already gives.
-  real :: dg_damp_advective_c     !< Coefficient on c*|u_n|/dx in the dg_damp_advective credit [nondim].
-  real :: dg_damp_u_cut           !< Sweep speed setting the relaxation time dx/(2*c*u_cut)
-                                  !! when positive [L T-1 ~> m s-1].
-  real :: dg_damp_kink_tol        !< Grounded-fraction misfit at which the twist's kink
+  logical :: dg_damp_advective    !< Mode damper: if true, subtract the removal rate the upwind
+                                  !! transport already gives.
+  real :: dg_damp_advective_c     !< Mode damper: coefficient c in the rates c*U_CUT/dx and
+                                  !! c*|u_n|/dx [nondim].
+  real :: dg_damp_u_cut           !< Mode damper: speed whose upwind removal rate c*u_cut/dx the
+                                  !! damper supplies, less what the flow gives [L T-1 ~> m s-1].
+  real :: dg_damp_kink_tol        !< Mode damper: grounded-fraction misfit at which the twist's kink
                                   !! reconstruction loses all confidence [nondim].
-  real :: dg_damp_kink_fit_tol    !< Relative slope misfit at which the tilt's kink
+  real :: dg_damp_kink_fit_tol    !< Mode damper: relative slope misfit at which the tilt's kink
                                   !! reconstruction loses all confidence; <= 0 skips it [nondim].
-  logical :: dg_damp_kink_ref     !< If true, reconstruct the slope break at the flotation contour
-                                  !! instead of exempting the cell.
-  logical :: dg_damp_excess_only  !< If true, remove only the detector part no reference explains.
-  integer :: dg_damp_gl_reach     !< Grounding-line protection reach: 0 bisected cell, 1 detector
-                                  !! stencil, 2 full reference stencil.
-  logical :: dg_tilt_damp_dt_warned = .false. !< True once the short-relaxation warning is issued.
-  real :: dg_art_visc_advect_coef !< Coefficient on |u_face| in the artificial viscosity u_eff [nondim].
-  real :: dg_art_visc_strain_coef !< Coefficient on eps_e_face*dx_perp in the artificial viscosity u_eff [nondim].
-  real :: dg_art_visc_advect_L_ref !< If positive, scale the |u_face| term by dx_perp/L_ref so its
-                                  !! decay rate is resolution-independent [L ~> m].
-  real :: dg_art_visc_tau_floor   !< If positive, add dx_perp/tau_floor to u_eff [T ~> s].
-  real :: dg_art_visc_r_hi        !< Smoothness-gate ratio where the full c_max is reached [nondim].
-  real :: dg_art_visc_kcell       !< Per-cell bound on dt times the summed face decay rates;
-                                  !! SSP-RK2 needs < 2 [nondim].
-  real :: dg_slow_idle_u_tiny     !< Stagnant-jump (no jump damping) flag threshold for |u_face| [L T-1 ~> m s-1].
-  real :: dg_slow_idle_eps_tiny   !< Stagnant-jump (no jump damping) flag threshold for eps_e_face [T-1 ~> s-1].
-  real :: dg_slow_idle_s_tol      !< Stagnant-jump flag (no jump damping) threshold on |Delta h_eq| [Z ~> m].
+  logical :: dg_damp_kink_ref     !< Mode damper: if true, reconstruct the slope break at the flotation
+                                  !! contour instead of exempting the cell.
+  logical :: dg_damp_excess_only  !< Mode damper: if true, remove only the detector part no reference
+                                  !! explains.
+  integer :: dg_damp_gl_reach     !< Mode damper grounding-line protection reach: 0 bisected cell,
+                                  !! 1 detector stencil, 2 full reference stencil.
+  logical :: dg_tilt_damp_dt_warned = .false. !< Mode damper: true once the short-relaxation warning
+                                  !! is issued.
+  ! DG(1) artificial viscosity (DG1_nodal_spatial_operator)
+  real :: dg_art_visc_advect_coef !< Artificial viscosity: coefficient on |u_face| in u_eff [nondim].
+  real :: dg_art_visc_strain_coef !< Artificial viscosity: coefficient on eps_e_face*dx_perp in u_eff [nondim].
+  real :: dg_art_visc_advect_L_ref !< Artificial viscosity: if positive, scale the |u_face| term by
+                                  !! dx_perp/L_ref so its decay rate is resolution-independent [L ~> m].
+  real :: dg_art_visc_tau_floor   !< Artificial viscosity: if positive, add dx_perp/tau_floor to u_eff [T ~> s].
+  real :: dg_art_visc_r_hi        !< Artificial viscosity: surface jump over mean thickness at which the
+                                  !! face coefficient reaches 1 [nondim].
+  real :: dg_art_visc_kcell       !< Artificial viscosity: per-cell bound on dt times the summed face
+                                  !! decay rates; SSP-RK2 needs < 2 [nondim].
+  real :: dg_slow_idle_u_tiny     !< Artificial viscosity: stagnant-jump flag threshold on |u_face| [L T-1 ~> m s-1].
+  real :: dg_slow_idle_eps_tiny   !< Artificial viscosity: stagnant-jump flag threshold on eps_e_face [T-1 ~> s-1].
+  real :: dg_slow_idle_s_tol      !< Artificial viscosity: stagnant-jump flag threshold on |Delta h_eq| [Z ~> m].
   logical :: calve_to_mask       !< If true, calve off the ice shelf when it passes the edge of a mask.
   real :: min_thickness_simple_calve !< min. ice shelf thickness criteria for calving [Z ~> m].
   real :: T_shelf_missing   !< An ice shelf temperature to use where there is no ice shelf [C ~> degC]
@@ -10719,7 +10733,11 @@ subroutine accumulate_DG_source_rate(CS, i, j, rate, basal)
   if (basal) CS%h_source_rate_bmb(i,j) = CS%h_source_rate_bmb(i,j) + rate
 end subroutine accumulate_DG_source_rate
 
-!> Map a cell-mean source field to a Q1 nodal source with one SRC_OP_* operator.
+!> Map a cell-mean source field to a Q1 nodal source with one SRC_OP_* operator:
+!!  - SRC_OP_LOCAL: every corner of a cell takes that cell's own rate.
+!!  - SRC_OP_AVERAGED: each B-grid corner takes the cell_mean_w-weighted average of its ice cells.
+!!  - SRC_OP_SUBGRID: as AVERAGED but weighted by floating area (cell_mean_w*xi_basal), and each
+!!    cell's corner gets that average times its own xi_basal.
 subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
   type(ice_shelf_dyn_CS), intent(in)  :: CS  !< Ice shelf dynamics control structure.
   type(ice_shelf_state),  intent(in)  :: ISS !< Ice shelf state (hmask, h_shelf).
@@ -11102,16 +11120,18 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                  default=.true., do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_ADVECTIVE_C", CS%dg_damp_advective_c, &
-                 "Coefficient on the transport removal rate c*|u_n|/dx credited by "//&
-                 "DG1_TILT_DAMP_ADVECTIVE. 1 is exact at the grid scale for 1D advection; "//&
-                 "values below 1 credit less.", &
+                 "Coefficient c in the mode-damper rates c*gate*U_CUT/dx and c*|u_n|/dx (the "//&
+                 "latter credited by DG1_TILT_DAMP_ADVECTIVE). 1 is exact at the grid scale for "//&
+                 "1D upwind advection; values below 1 credit the flow with less.", &
                  units="nondim", default=0.5, &
                  do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_U_CUT", CS%dg_damp_u_cut, &
-                 "Sweep speed the mode damper brings the grid-scale mode up to. The rate is "//&
-                 "(c/dx)*max(0, gate*U_CUT - |u_n|) per direction, using sqrt(dx*dy) for the "//&
-                 "twist. Must be positive.", &
+                 "Sets the mode damper's strength as a speed: the damping rate is the rate at "//&
+                 "which upwind transport at speed gate*U_CUT would remove the mode, c*gate*U_CUT/dx. "//&
+                 "With DG1_TILT_DAMP_ADVECTIVE the rate the flow already gives, c*|u_n|/dx, is "//&
+                 "subtracted, so ice faster than gate*U_CUT is not damped. dx is the cell size "//&
+                 "along the mode (sqrt(dx*dy) for the twist). Must be positive.", &
                  units="m s-1", default=6.341958E-06, scale=US%m_s_to_L_T, &
                  do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
