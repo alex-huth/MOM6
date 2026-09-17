@@ -1318,7 +1318,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     call get_param(param_file, mdl, "ADVECT_SHELF", CS%advect_shelf, &
                  "If true, advect ice shelf and evolve thickness", &
                  default=.true.)
-    call read_nodal_limiter_params(param_file, mdl, CS, US)
+    call read_DG_params(param_file, mdl, CS, US)
     call get_param(param_file, mdl, "REENTRANT_X", CS%reentrant_x, &
                  " If true, the domain is zonally reentrant.", &
                  default=.false.)
@@ -10810,7 +10810,7 @@ end subroutine check_xi_basal_consistency
 ! ===========================================================================
 
 !> Read the DG(1) source, artificial-viscosity and mode-damping parameters.
-subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
+subroutine read_DG_params(param_file, mdl, CS, US)
   type(param_file_type),   intent(in)    :: param_file
   character(len=*),        intent(in)    :: mdl
   type(ice_shelf_dyn_CS),  intent(inout) :: CS
@@ -10984,7 +10984,7 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
   CS%dg_slow_idle_eps_tiny = 1.0e-12 * US%s_to_T
   CS%dg_slow_idle_s_tol    = 1.0     * US%m_to_Z
 
-end subroutine read_nodal_limiter_params
+end subroutine read_DG_params
 
 !> Build the per-cell tables Minv_nodal and cell_mean_w. On an orthogonal grid the Q1 mass
 !! matrix is M_xi (x) M_eta, with M_xi = int N_a N_a' d(xi) dxi, M_eta = int N_b N_b' a(eta) deta,
