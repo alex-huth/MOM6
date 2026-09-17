@@ -9303,23 +9303,13 @@ subroutine interpolate_H_to_B_DG(G, h_nodal, hmask, H_node, min_h_shelf)
       h_arr(:,:) = 0.0
       do l=1,2 ; jc=j-1+l ; do k=1,2 ; ic=i-1+k
         if (hmask(ic,jc) == 1.0 .or. hmask(ic,jc) == 3.0) then
-          if (k == 1 .and. l == 1) then
-            h_arr(k,l) = max(h_nodal(ic,jc,2,2), min_h_shelf)
-          elseif (k == 2 .and. l == 1) then
-            h_arr(k,l) = max(h_nodal(ic,jc,1,2), min_h_shelf)
-          elseif (k == 1 .and. l == 2) then
-            h_arr(k,l) = max(h_nodal(ic,jc,2,1), min_h_shelf)
-          else
-            h_arr(k,l) = max(h_nodal(ic,jc,1,1), min_h_shelf)
-          endif
+          h_arr(k,l) = max(h_nodal(ic,jc,3-k,3-l), min_h_shelf)
           num_h = num_h + 1
-        else
-          h_arr(k,l) = 0.0
-        endif
-        if (num_h > 0) then
-          H_node(i,j) = ((h_arr(1,1)+h_arr(2,2))+(h_arr(1,2)+h_arr(2,1))) / num_h
         endif
       enddo ; enddo
+      if (num_h > 0) then
+        H_node(i,j) = ((h_arr(1,1)+h_arr(2,2))+(h_arr(1,2)+h_arr(2,1))) / num_h
+      endif
     enddo
   enddo
 
