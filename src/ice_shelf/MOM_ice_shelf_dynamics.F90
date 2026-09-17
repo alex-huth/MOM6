@@ -447,6 +447,8 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: dg_damp_single_rule  !< Mode damper: if true, the agreement detector leaves a slope
                                   !! alone in a cell that has one stencil when that stencil
                                   !! crosses the grounding line.
+  logical :: dg_damp_filter       !< Mode damper: if true, high-pass the removal so that only
+                                  !! its grid-scale part is taken away.
   real :: dg_damp_rho_g           !< Mode damper: disagreement between the detector readings,
                                   !! relative to the part they agree on, at which the agreement
                                   !! gate is half open [nondim].
@@ -10964,6 +10966,16 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  default=.true., &
                  do_not_log=(CS%dg_damp_detector /= DAMP_DET_AGREE))
 
+  call get_param(param_file, mdl, "DG1_TILT_DAMP_FILTER", CS%dg_damp_filter, &
+                 "If true, apply a 1-2-1 high pass to the damper's removal before it is "//&
+                 "applied, along the direction of a tilt and along both axes for the twist.  "//&
+                 "The removal is an alternating pattern times a slowly changing envelope, and "//&
+                 "the slowly changing part moves the smooth field; the high pass takes that "//&
+                 "part out and leaves a pure zigzag exactly as it is.  It widens the damper's "//&
+                 "reach by one cell.", &
+                 default=.false., &
+                 do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
+
   call get_param(param_file, mdl, "DG1_TILT_DAMP_GATE", CS%dg_damp_gate_form, &
                  "Which gate scales the mode damping.  0 compares the detected zigzag with the "//&
                  "ice thickness, through DG1_TILT_DAMP_R_HI; that gate closes on thick ice, and "//&
@@ -12511,7 +12523,6 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real :: knat_xi, knat_eta ! Removal rate the transport already delivers on each axis [T-1 ~> s-1]
   real :: kwant     ! Rate the gate asks for, before the transport's share [T-1 ~> s-1]
   real :: itau_xi, itau_eta, itau_w ! Full rate per mode, from DG1_TILT_DAMP_U_CUT [T-1 ~> s-1]
-  real :: d_l2      ! Sum of squared corrections, for diagnostics [Z2 T-2 ~> m2 s-2]
   real :: d_ahat    ! Sum of squared detector outputs, for diagnostics [Z2 ~> m2]
   real :: d_spread  ! Largest reading spread over the three modes, for diagnostics [Z ~> m]
   real :: d_gate    ! Largest gate over the three modes [nondim]
@@ -12551,6 +12562,10 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real, dimension(-4:4) :: dlv ! Cell length along the direction examined [L ~> m]
   real, dimension(-4:4) :: dwx ! Cell width along the twist's row [L ~> m]
   real, dimension(-4:4) :: dwy ! Cell height along the twist's column [L ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: r_xi, r_eta, r_w ! Removal per mode, before the
+                                  ! optional high pass [Z T-1 ~> m s-1]
+  real :: rf_xi, rf_eta, rf_w ! The same after it [Z T-1 ~> m s-1]
+  integer :: isc_w, iec_w, jsc_w, jec_w ! Loop bounds, one cell wider with the high pass
   real :: gam      ! Gate fraction, 0 to 1 [nondim]
   real :: kap      ! Delivered rate for this cell and direction [T-1 ~> s-1]
   real :: rate_cap ! Largest rate the explicit step may carry [T-1 ~> s-1]
@@ -12623,11 +12638,23 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
                  (CS%bed_node(I,J-1) - CS%bed_node(I-1,J-1))
   enddo ; enddo
 
-  do j = jsc, jec ; do i = isc, iec
+  ! The high pass reads the removal of the neighbours, so the removal is built one cell beyond
+  ! the compute domain, and the stencils behind it reach two cells further still.  The bed tilts
+  ! stop one ring inside the data domain, which is what sets the halo this needs.
+  isc_w = isc ; iec_w = iec ; jsc_w = jsc ; jec_w = jec
+  if (CS%dg_damp_filter) then
+    if ((G%isc - G%isd < 4) .or. (G%jsc - G%jsd < 4)) call MOM_error(FATAL, &
+      "dg_nodal_mode_damp_rate: DG1_TILT_DAMP_FILTER needs a halo of at least 4 cells; "//&
+      "increase NIHALO/NJHALO or switch the filter off.")
+    isc_w = isc-1 ; iec_w = iec+1 ; jsc_w = jsc-1 ; jec_w = jec+1
+  endif
+  r_xi(:,:) = 0.0 ; r_eta(:,:) = 0.0 ; r_w(:,:) = 0.0
+
+  do j = jsc_w, jec_w ; do i = isc_w, iec_w
     if (hmask(i,j) /= 1.0) cycle
     href = hbar_c(i,j)
     if (href <= 0.0) cycle
-    d_l2 = 0.0 ; d_gate = 0.0 ; d_want = 0.0 ; d_got = 0.0
+    d_gate = 0.0 ; d_want = 0.0 ; d_got = 0.0
     d_ahat = 0.0 ; d_spread = 0.0
     dx_cell = 1.0 / G%IdxT(i,j) ; dy_cell = 1.0 / G%IdyT(i,j)
     ! Only a detector that reports the spread of its readings can open the agreement gate on
@@ -12696,12 +12723,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
                                       CS%dg_damp_slope_floor*dx_cell, CS%dg_damp_rho_g)
         kwant = gam * itau_xi
         kap = min(max(kwant - knat_xi, 0.0), rate_cap)
-        T_node(i,j,1,1) = T_node(i,j,1,1) + (0.5*kap*A_dmp)
-        T_node(i,j,1,2) = T_node(i,j,1,2) + (0.5*kap*A_dmp)
-        T_node(i,j,2,1) = T_node(i,j,2,1) - (0.5*kap*A_dmp)
-        T_node(i,j,2,2) = T_node(i,j,2,2) - (0.5*kap*A_dmp)
+        r_xi(i,j) = kap*A_dmp
         if (diag_on) then
-          d_l2 = d_l2 + ((kap*A_dmp)**2) / 12.0
           d_ahat = d_ahat + (A_dmp**2) ; d_spread = max(d_spread, A_spread)
           d_gate = max(d_gate, gam) ; d_want = d_want + kwant
           d_got = d_got + kap
@@ -12744,12 +12767,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
                                       CS%dg_damp_slope_floor*dy_cell, CS%dg_damp_rho_g)
         kwant = gam * itau_eta
         kap = min(max(kwant - knat_eta, 0.0), rate_cap)
-        T_node(i,j,1,1) = T_node(i,j,1,1) + (0.5*kap*A_dmp)
-        T_node(i,j,2,1) = T_node(i,j,2,1) + (0.5*kap*A_dmp)
-        T_node(i,j,1,2) = T_node(i,j,1,2) - (0.5*kap*A_dmp)
-        T_node(i,j,2,2) = T_node(i,j,2,2) - (0.5*kap*A_dmp)
+        r_eta(i,j) = kap*A_dmp
         if (diag_on) then
-          d_l2 = d_l2 + ((kap*A_dmp)**2) / 12.0
           d_ahat = d_ahat + (A_dmp**2) ; d_spread = max(d_spread, A_spread)
           d_gate = max(d_gate, gam) ; d_want = d_want + kwant
           d_got = d_got + kap
@@ -12871,23 +12890,52 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         ! the two rates, not their sum.
         kwant = gam * itau_w
         kap = min(max(kwant - min(knat_xi, knat_eta), 0.0), rate_cap)
-        ! Changes w by -kap*A_dmp, orthogonal to the mean and the tilts.
-        ! +,-,-,+ : changes w by 4*(-0.25*kap*A_dmp) = -kap*A_dmp, and is orthogonal to
-        ! the unweighted corner mean and to both tilts.  It is orthogonal to the cell
-        ! mean itself only where the corner weights are symmetric; the block below
-        ! removes whatever mean survives.
-        T_node(i,j,1,1) = T_node(i,j,1,1) - (0.25*kap*A_dmp)
-        T_node(i,j,2,2) = T_node(i,j,2,2) - (0.25*kap*A_dmp)
-        T_node(i,j,2,1) = T_node(i,j,2,1) + (0.25*kap*A_dmp)
-        T_node(i,j,1,2) = T_node(i,j,1,2) + (0.25*kap*A_dmp)
+        ! The corner pattern that carries this away is +,-,-,+ times a quarter of it, which
+        ! changes w by -kap*A_dmp and leaves the tilts and the unweighted corner mean alone.
+        r_w(i,j) = kap*A_dmp
         if (diag_on) then
-          d_l2 = d_l2 + ((kap*A_dmp)**2) / 144.0
           d_ahat = d_ahat + (A_dmp**2) ; d_spread = max(d_spread, A_spread)
           d_gate = max(d_gate, gam) ; d_want = d_want + kwant
           d_got = d_got + kap
         endif
       endif
     endif
+
+    if (diag_on) then
+      CS%dg_damp_ahat(i,j) = sqrt(d_ahat)
+      CS%dg_damp_spread(i,j) = d_spread
+      CS%dg_damp_gate(i,j) = d_gate
+      CS%dg_damp_want(i,j) = d_want ; CS%dg_damp_got(i,j) = d_got
+    endif
+  enddo ; enddo
+
+  ! Turn the removals into nodal rates.  The zigzag changes sign from each cell to the next, so
+  ! the field taken away must do the same.  Its sign does, but its size does not: the detector
+  ! and the rate both change from cell to cell, so the removal is an alternating pattern times a
+  ! slowly changing envelope, and such a product also moves the smooth field.  The optional
+  ! 1-2-1 high pass leaves a pure zigzag exactly as it is and takes out everything that changes
+  ! linearly from cell to cell.  It is the same second difference the centred stencil uses,
+  ! applied to the removal in place of the slopes.
+  do j = jsc, jec ; do i = isc, iec
+    if (hmask(i,j) /= 1.0) cycle
+    rf_xi = r_xi(i,j) ; rf_eta = r_eta(i,j) ; rf_w = r_w(i,j)
+    if (CS%dg_damp_filter) then
+      ! A slope is filtered along its own direction, the twist along both, which is the same
+      ! rule the stencils follow.  Where a neighbour is unusable the raw removal stands.
+      if (ice_ok(i-1,j) .and. ice_ok(i+1,j)) &
+        rf_xi = 0.25*((2.0*r_xi(i,j)) - (r_xi(i-1,j) + r_xi(i+1,j)))
+      if (ice_ok(i,j-1) .and. ice_ok(i,j+1)) &
+        rf_eta = 0.25*((2.0*r_eta(i,j)) - (r_eta(i,j-1) + r_eta(i,j+1)))
+      if (all(ice_ok(i-1:i+1,j-1:j+1))) &
+        rf_w = 0.0625*(((4.0*r_w(i,j)) - &
+                        (2.0*((r_w(i-1,j) + r_w(i+1,j)) + (r_w(i,j-1) + r_w(i,j+1))))) + &
+                       ((r_w(i-1,j-1) + r_w(i+1,j+1)) + (r_w(i-1,j+1) + r_w(i+1,j-1))))
+    endif
+
+    T_node(i,j,1,1) = ((0.5*rf_xi) + (0.5*rf_eta)) - (0.25*rf_w)
+    T_node(i,j,1,2) = ((0.5*rf_xi) - (0.5*rf_eta)) + (0.25*rf_w)
+    T_node(i,j,2,1) = ((0.5*rf_eta) - (0.5*rf_xi)) + (0.25*rf_w)
+    T_node(i,j,2,2) = (-(0.5*rf_xi) - (0.5*rf_eta)) - (0.25*rf_w)
 
     ! The damper changes only the tilts and the twist, so it must move no mass.  Each
     ! increment above adds one sign to two corners and the other sign to the other two,
@@ -12902,13 +12950,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     T_node(i,j,2,1) = T_node(i,j,2,1) - Tbar
     T_node(i,j,1,2) = T_node(i,j,1,2) - Tbar
 
-    if (diag_on) then
-      CS%dg_damp_tend(i,j) = sqrt(d_l2)
-      CS%dg_damp_ahat(i,j) = sqrt(d_ahat)
-      CS%dg_damp_spread(i,j) = d_spread
-      CS%dg_damp_gate(i,j) = d_gate
-      CS%dg_damp_want(i,j) = d_want ; CS%dg_damp_got(i,j) = d_got
-    endif
+    if (diag_on) &
+      CS%dg_damp_tend(i,j) = sqrt((((rf_xi**2) + (rf_eta**2)) / 12.0) + ((rf_w**2) / 144.0))
   enddo ; enddo
 
 end subroutine dg_nodal_mode_damp_rate
