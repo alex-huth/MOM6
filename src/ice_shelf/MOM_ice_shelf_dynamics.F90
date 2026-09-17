@@ -569,7 +569,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_h_nodal_SW = -1, id_h_nodal_SE = -1, id_h_nodal_NW = -1, id_h_nodal_NE = -1, &
              id_h_jump_node = -1, id_h_jump_node_rel = -1, &
              id_h_node_max = -1, id_h_node_min = -1, &
-             id_h_jump_envelope = -1, id_h_source_rate = -1, &
+             id_h_source_rate = -1, &
              id_phi_x_FV = -1, id_phi_y_FV = -1, &
              id_dg_art_visc_coef_u = -1, id_dg_art_visc_coef_v = -1, &
              id_dg_art_visc_nu_u = -1, id_dg_art_visc_nu_v = -1, &
@@ -1660,10 +1660,6 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          'DG(1) max corner thickness of the ice cells at a B-grid node', 'm', conversion=US%Z_to_m)
       CS%id_h_node_min = register_diag_field('ice_shelf_model','h_node_min',CS%diag%axesB1, Time, &
          'DG(1) min corner thickness of the ice cells at a B-grid node', 'm', conversion=US%Z_to_m)
-      CS%id_h_jump_envelope = register_diag_field('ice_shelf_model','h_jump_envelope', &
-         CS%diag%axesB1, Time, &
-         'Range of the cell-mean thicknesses (hmask 1 and 3) at a B-grid node', &
-         'm', conversion=US%Z_to_m)
       CS%id_h_source_rate = register_diag_field('ice_shelf_model','h_source_rate',CS%diag%axesT1, Time, &
          'Cell-mean thickness source (basal + surface) used by the last DG advection step', &
          'm s-1', conversion=US%Z_to_m*US%s_to_T)
@@ -2038,17 +2034,11 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
   real, dimension(SZDIB_(G),SZDJB_(G)) :: h_node_mx   ! Max corner thickness at a B-node [Z ~> m]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: h_node_mn   ! Min corner thickness at a B-node [Z ~> m]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_n_rel ! h_jump_n over the mean cell thickness [nondim]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: Hmax_Bd, Hmin_Bd ! Cell-mean thickness envelope at a B-node,
-                                                           ! from hmask=1 and 3 cells [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: count_Bd     ! Cells in the envelope [nondim]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_env   ! Hmax_Bd - Hmin_Bd [Z ~> m]
   real :: h_cSW, h_cSE, h_cNW, h_cNE              ! Corner thicknesses at a B-node [Z ~> m]
   real :: Hb_SW, Hb_SE, Hb_NW, Hb_NE              ! Touching cells' mean thicknesses [Z ~> m]
   real :: hmax_b, hmin_b                          ! Max and min corner thickness [Z ~> m]
   real :: Hbar_sum                                ! Sum of the touching cell means [Z ~> m]
   real :: Hbar_avg                                ! Mean of the touching cell means [Z ~> m]
-  real :: cell_mean_val_d                         ! One cell's envelope contribution [Z ~> m]
-  real, parameter :: H_LARGE_D = 1.0e30           ! Sentinel for no contributing cell [Z ~> m]
   integer :: n_valid                              ! Number of touching hmask=1 cells
   logical :: vSW, vSE, vNW, vNE                   ! True for touching hmask=1 cells
   integer :: ii, jj                               ! Touching-cell indices
@@ -2198,52 +2188,6 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       if (CS%id_h_jump_node_rel > 0) call post_data(CS%id_h_jump_node_rel, h_jump_n_rel, CS%diag)
       if (CS%id_h_node_max      > 0) call post_data(CS%id_h_node_max,      h_node_mx,    CS%diag)
       if (CS%id_h_node_min      > 0) call post_data(CS%id_h_node_min,      h_node_mn,    CS%diag)
-    endif
-    if ((CS%id_h_jump_envelope > 0) .and. associated(CS%h_nodal)) then
-      ! Cell-mean thickness envelope at each B-node.
-      call pass_corner_field(CS%h_nodal, G)
-      Hmax_Bd(:,:) = -H_LARGE_D
-      Hmin_Bd(:,:) =  H_LARGE_D
-      count_Bd(:,:) = 0.0
-      do j = G%jsd, G%jed ; do i = G%isd, G%ied
-        if (ISS%hmask(i,j) == 1.0) then
-          cell_mean_val_d = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
-        elseif (ISS%hmask(i,j) == 3.0) then
-          cell_mean_val_d = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
-        else
-          cycle
-        endif
-        if (i-1 >= G%IsdB .and. j-1 >= G%JsdB) then
-          Hmax_Bd(i-1, j-1) = max(Hmax_Bd(i-1, j-1), cell_mean_val_d)
-          Hmin_Bd(i-1, j-1) = min(Hmin_Bd(i-1, j-1), cell_mean_val_d)
-          count_Bd(i-1, j-1) = count_Bd(i-1, j-1) + 1.0
-        endif
-        if (i <= G%IedB .and. j-1 >= G%JsdB) then
-          Hmax_Bd(i,   j-1) = max(Hmax_Bd(i,   j-1), cell_mean_val_d)
-          Hmin_Bd(i,   j-1) = min(Hmin_Bd(i,   j-1), cell_mean_val_d)
-          count_Bd(i,   j-1) = count_Bd(i,   j-1) + 1.0
-        endif
-        if (i-1 >= G%IsdB .and. j <= G%JedB) then
-          Hmax_Bd(i-1, j  ) = max(Hmax_Bd(i-1, j  ), cell_mean_val_d)
-          Hmin_Bd(i-1, j  ) = min(Hmin_Bd(i-1, j  ), cell_mean_val_d)
-          count_Bd(i-1, j  ) = count_Bd(i-1, j  ) + 1.0
-        endif
-        if (i <= G%IedB .and. j <= G%JedB) then
-          Hmax_Bd(i,   j  ) = max(Hmax_Bd(i,   j  ), cell_mean_val_d)
-          Hmin_Bd(i,   j  ) = min(Hmin_Bd(i,   j  ), cell_mean_val_d)
-          count_Bd(i,   j  ) = count_Bd(i,   j  ) + 1.0
-        endif
-      enddo ; enddo
-      call pass_var(Hmax_Bd,  G%domain, position=CORNER)
-      call pass_var(Hmin_Bd,  G%domain, position=CORNER)
-      call pass_var(count_Bd, G%domain, position=CORNER)
-      h_jump_env(:,:)     = 0.0
-      do J = G%JscB, G%JecB ; do I = G%IscB, G%IecB
-        if (count_Bd(I,J) < 1.5) cycle
-        if (Hmax_Bd(I,J) <= -H_LARGE_D + 1.0 .or. Hmin_Bd(I,J) >= H_LARGE_D - 1.0) cycle
-        h_jump_env(I,J)     = Hmax_Bd(I,J) - Hmin_Bd(I,J)
-      enddo ; enddo
-      call post_data(CS%id_h_jump_envelope, h_jump_env, CS%diag)
     endif
     if ((CS%id_h_jump_face_u > 0 .or. CS%id_h_jump_face_v > 0 .or. &
          CS%id_s_jump_face_u > 0 .or. CS%id_s_jump_face_v > 0 .or. &
