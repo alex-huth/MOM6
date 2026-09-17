@@ -11275,19 +11275,6 @@ pure function dg1_wb_slope_mean(h_A, h_B, bed_qp, rhoi_rhow) result(m)
   endif
 end function dg1_wb_slope_mean
 
-!> Thickness jump equivalent to the surface jump, (h_B - h_A) on a uniform-flotation face and
-!! zero where the surface is continuous.
-pure function dg1_wb_equiv_jump(h_A, h_B, bed_qp, rhoi_rhow) result(dh_eq)
-  real, intent(in) :: h_A       !< Side-A face-QP thickness [Z ~> m]
-  real, intent(in) :: h_B       !< Side-B face-QP thickness [Z ~> m]
-  real, intent(in) :: bed_qp    !< Bed elevation at the face QP, single-valued [Z ~> m]
-  real, intent(in) :: rhoi_rhow !< Ice/ocean density ratio [nondim]
-  real :: dh_eq                 !< Well-balanced equivalent thickness jump [Z ~> m]
-  dh_eq = dg1_wb_surface_jump(h_A, h_B, bed_qp, rhoi_rhow) * &
-          dg1_wb_slope_mean(h_A, h_B, bed_qp, rhoi_rhow)
-end function dg1_wb_equiv_jump
-
-
 !> SSA effective strain rate sqrt(eps_xx^2 + eps_yy^2 + eps_xx*eps_yy + eps_xy^2).
 !! For DG(1) artificial-viscosity strain-scaled floor.
 pure function dg1_face_eps_eff(dudx, dudy, dvdx, dvdy) result(eps_e)
@@ -11340,8 +11327,6 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: dx_perp            ! Across-face length scale at the current face [L ~> m]
   real :: coef_face          ! Face viscosity coefficient [nondim]
   real :: u_eff_face_max     ! Max u_eff over the 2 face QPs, for the stability budget [L T-1 ~> m s-1]
-  real :: amp_qp             ! Jump-mode rate amplification [nondim]
-  real :: amp_face_max       ! Max amp_qp over the 2 face QPs [nondim]
   real :: ds_use             ! Surface jump at a face QP [Z ~> m]
   real :: ds_face_max        ! Max |ds_use| over the 2 face QPs [Z ~> m]
   real :: rate_face          ! Face jump-mode decay rate [T-1 ~> s-1]
@@ -11561,7 +11546,6 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     dh_eq_face_max = 0.0
     u_mag_face_max = 0.0
     u_eff_face_max = 0.0
-    amp_face_max = 0.0
     ds_face_max = 0.0
     do gp = 1, 2
       if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
@@ -11581,8 +11565,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       endif
       bed_qp = (t_co*CS%bed_node(i,j-1)) + (t_face*CS%bed_node(i,j))
       ds_use = dg1_wb_surface_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
-      dh_eq = dg1_wb_equiv_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
-      amp_qp = DG1_WB_JUMP_RATE_AMP
+      dh_eq = ds_use * dg1_wb_slope_mean(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
       u_floor_qp = CS%dg_art_visc_strain_coef * eps_e_face * dx_perp
       if (advect_grid_inv) then
         u_adv_qp = (CS%dg_art_visc_advect_coef * u_mag_qp) * (dx_perp * advect_inv_L)
@@ -11596,7 +11579,6 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
 
       dh_eq_face_max = max(dh_eq_face_max, abs(dh_eq))
       ds_face_max = max(ds_face_max, abs(ds_use))
-      amp_face_max = max(amp_face_max, amp_qp)
       u_eff_face_max = max(u_eff_face_max, u_eff_qp)
       u_mag_face_max = max(u_mag_face_max, u_mag_qp)
     enddo
@@ -11614,7 +11596,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     coef_face = sigma_face
     cK_E(i,j) = coef_face
     ! Jump-mode decay rate: node localization (x2) and consistent mass (x2) times amp.
-    rate_face = 4.0 * amp_face_max * coef_face * u_eff_face_max / dx_perp
+    rate_face = 4.0 * DG1_WB_JUMP_RATE_AMP * coef_face * u_eff_face_max / dx_perp
     rate_E(i,j) = rate_face
 
     ! Stagnant-jump diagnostic.
@@ -11732,7 +11714,6 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     dh_eq_face_max = 0.0
     u_mag_face_max = 0.0
     u_eff_face_max = 0.0
-    amp_face_max = 0.0
     ds_face_max = 0.0
     do gp = 1, 2
       if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
@@ -11752,8 +11733,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       endif
       bed_qp = (t_co*CS%bed_node(i-1,j)) + (t_face*CS%bed_node(i,j))
       ds_use = dg1_wb_surface_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
-      dh_eq = dg1_wb_equiv_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
-      amp_qp = DG1_WB_JUMP_RATE_AMP
+      dh_eq = ds_use * dg1_wb_slope_mean(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
       u_floor_qp = CS%dg_art_visc_strain_coef * eps_e_face * dx_perp
       if (advect_grid_inv) then
         u_adv_qp = (CS%dg_art_visc_advect_coef * u_mag_qp) * (dx_perp * advect_inv_L)
@@ -11767,7 +11747,6 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
 
       dh_eq_face_max = max(dh_eq_face_max, abs(dh_eq))
       ds_face_max = max(ds_face_max, abs(ds_use))
-      amp_face_max = max(amp_face_max, amp_qp)
       u_eff_face_max = max(u_eff_face_max, u_eff_qp)
       u_mag_face_max = max(u_mag_face_max, u_mag_qp)
     enddo
@@ -11783,7 +11762,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     endif
     coef_face = sigma_face
     cK_N(i,j) = coef_face
-    rate_face = 4.0 * amp_face_max * coef_face * u_eff_face_max / dx_perp
+    rate_face = 4.0 * DG1_WB_JUMP_RATE_AMP * coef_face * u_eff_face_max / dx_perp
     rate_N(i,j) = rate_face
 
     if (associated(CS%dg_slow_idle_face_v)) then
