@@ -2066,9 +2066,6 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
   real, dimension(SZDI_(G),SZDJB_(G)) :: un_fv    ! v-face |v| [L T-1 ~> m s-1]
   real, dimension(SZDIB_(G),SZDJ_(G)) :: eps_fu   ! u-face eps_e [T-1 ~> s-1]
   real, dimension(SZDI_(G),SZDJB_(G)) :: eps_fv   ! v-face eps_e [T-1 ~> s-1]
-  real :: u_mn_d, v_mn_d, u_pl_d, v_pl_d ! Side-averaged velocities [L T-1 ~> m s-1]
-  real :: dudx_d, dudy_d, dvdx_d, dvdy_d ! Face-midpoint velocity gradients [T-1 ~> s-1]
-  integer :: i_lo_d, i_hi_d, j_lo_d, j_hi_d ! Neighbour indices clipped to the data domain
   real :: Hbar_face_avg                           ! Mean thickness of the two cells [Z ~> m]
   real :: rr                                      ! Ice to ocean density ratio [nondim]
   real :: bed1, bed2                              ! Bed at the face endpoints [Z ~> m]
@@ -2332,30 +2329,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       do j = G%jsc, G%jec ; do I = G%IscB, G%IecB
         if (ISS%hmask(I,  j) /= 1.0 .and. ISS%hmask(I,  j) /= 3.0) cycle
         if (ISS%hmask(I+1,j) /= 1.0 .and. ISS%hmask(I+1,j) /= 3.0) cycle
-        i_lo_d = max(I-1, G%isd) ; i_hi_d = min(I+1, G%ied)
-        if (i_lo_d < I) then
-          u_mn_d = 0.25*((CS%u_shelf(i_lo_d,j-1) + CS%u_shelf(I,j-1)) + &
-                         (CS%u_shelf(i_lo_d,j  ) + CS%u_shelf(I,j  )))
-          v_mn_d = 0.25*((CS%v_shelf(i_lo_d,j-1) + CS%v_shelf(I,j-1)) + &
-                         (CS%v_shelf(i_lo_d,j  ) + CS%v_shelf(I,j  )))
-        else
-          u_mn_d = 0.5*(CS%u_shelf(I,j-1) + CS%u_shelf(I,j))
-          v_mn_d = 0.5*(CS%v_shelf(I,j-1) + CS%v_shelf(I,j))
-        endif
-        if (i_hi_d > I) then
-          u_pl_d = 0.25*((CS%u_shelf(I    ,j-1) + CS%u_shelf(i_hi_d,j-1)) + &
-                         (CS%u_shelf(I    ,j  ) + CS%u_shelf(i_hi_d,j  )))
-          v_pl_d = 0.25*((CS%v_shelf(I    ,j-1) + CS%v_shelf(i_hi_d,j-1)) + &
-                         (CS%v_shelf(I    ,j  ) + CS%v_shelf(i_hi_d,j  )))
-        else
-          u_pl_d = 0.5*(CS%u_shelf(I,j-1) + CS%u_shelf(I,j))
-          v_pl_d = 0.5*(CS%v_shelf(I,j-1) + CS%v_shelf(I,j))
-        endif
-        dudx_d = (u_pl_d - u_mn_d) / G%dxCu(I,j)
-        dvdx_d = (v_pl_d - v_mn_d) / G%dxCu(I,j)
-        dudy_d = (CS%u_shelf(I,j) - CS%u_shelf(I,j-1)) / G%dyCu(I,j)
-        dvdy_d = (CS%v_shelf(I,j) - CS%v_shelf(I,j-1)) / G%dyCu(I,j)
-        eps_fu(I,j) = dg1_face_eps_eff(dudx_d, dudy_d, dvdx_d, dvdy_d)
+        eps_fu(I,j) = dg1_eps_face_u(CS, G, I, j)
       enddo ; enddo
       call post_data(CS%id_dg_eps_face_u, eps_fu, CS%diag)
     endif
@@ -2364,30 +2338,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       do J = G%JscB, G%JecB ; do i = G%isc, G%iec
         if (ISS%hmask(i,J  ) /= 1.0 .and. ISS%hmask(i,J  ) /= 3.0) cycle
         if (ISS%hmask(i,J+1) /= 1.0 .and. ISS%hmask(i,J+1) /= 3.0) cycle
-        j_lo_d = max(J-1, G%jsd) ; j_hi_d = min(J+1, G%jed)
-        if (j_lo_d < J) then
-          u_mn_d = 0.25*((CS%u_shelf(i-1,j_lo_d) + CS%u_shelf(i,j_lo_d)) + &
-                         (CS%u_shelf(i-1,J     ) + CS%u_shelf(i,J     )))
-          v_mn_d = 0.25*((CS%v_shelf(i-1,j_lo_d) + CS%v_shelf(i,j_lo_d)) + &
-                         (CS%v_shelf(i-1,J     ) + CS%v_shelf(i,J     )))
-        else
-          u_mn_d = 0.5*(CS%u_shelf(i-1,J) + CS%u_shelf(i,J))
-          v_mn_d = 0.5*(CS%v_shelf(i-1,J) + CS%v_shelf(i,J))
-        endif
-        if (j_hi_d > J) then
-          u_pl_d = 0.25*((CS%u_shelf(i-1,J     ) + CS%u_shelf(i,J     )) + &
-                         (CS%u_shelf(i-1,j_hi_d) + CS%u_shelf(i,j_hi_d)))
-          v_pl_d = 0.25*((CS%v_shelf(i-1,J     ) + CS%v_shelf(i,J     )) + &
-                         (CS%v_shelf(i-1,j_hi_d) + CS%v_shelf(i,j_hi_d)))
-        else
-          u_pl_d = 0.5*(CS%u_shelf(i-1,J) + CS%u_shelf(i,J))
-          v_pl_d = 0.5*(CS%v_shelf(i-1,J) + CS%v_shelf(i,J))
-        endif
-        dudy_d = (u_pl_d - u_mn_d) / G%dyCv(i,J)
-        dvdy_d = (v_pl_d - v_mn_d) / G%dyCv(i,J)
-        dudx_d = (CS%u_shelf(i,J) - CS%u_shelf(i-1,J)) / G%dxCv(i,J)
-        dvdx_d = (CS%v_shelf(i,J) - CS%v_shelf(i-1,J)) / G%dxCv(i,J)
-        eps_fv(i,J) = dg1_face_eps_eff(dudx_d, dudy_d, dvdx_d, dvdy_d)
+        eps_fv(i,J) = dg1_eps_face_v(CS, G, i, J)
       enddo ; enddo
       call post_data(CS%id_dg_eps_face_v, eps_fv, CS%diag)
     endif
@@ -11279,6 +11230,187 @@ pure function dg1_face_eps_eff(dudx, dudy, dvdx, dvdy) result(eps_e)
                          ((dudx*dvdy) + (eps_xy*eps_xy)))))
 end function dg1_face_eps_eff
 
+!> Effective strain rate at the midpoint of u-face (I,j), from the cell-mean velocities on either
+!! side, one-sided where a neighbour is outside the data domain.
+pure function dg1_eps_face_u(CS, G, I, j) result(eps_e)
+  type(ice_shelf_dyn_CS), intent(in) :: CS !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in) :: G  !< The grid structure
+  integer,                intent(in) :: I  !< i-index of the face
+  integer,                intent(in) :: j  !< j-index of the face
+  real :: eps_e                            !< Effective strain rate [T-1 ~> s-1]
+  real :: u_mn, u_pl, v_mn, v_pl ! Cell-mean velocities on the minus/plus sides [L T-1 ~> m s-1]
+  real :: dudx, dudy, dvdx, dvdy ! Face-midpoint velocity gradients [T-1 ~> s-1]
+  integer :: i_lo, i_hi          ! Neighbour indices clipped to the data domain
+
+  i_lo = max(I-1, G%isd) ; i_hi = min(I+1, G%ied)
+  if (i_lo < I) then
+    u_mn = 0.25*((CS%u_shelf(i_lo,j-1) + CS%u_shelf(I,j-1)) + &
+                 (CS%u_shelf(i_lo,j  ) + CS%u_shelf(I,j  )))
+    v_mn = 0.25*((CS%v_shelf(i_lo,j-1) + CS%v_shelf(I,j-1)) + &
+                 (CS%v_shelf(i_lo,j  ) + CS%v_shelf(I,j  )))
+  else
+    u_mn = 0.5*(CS%u_shelf(I,j-1) + CS%u_shelf(I,j))
+    v_mn = 0.5*(CS%v_shelf(I,j-1) + CS%v_shelf(I,j))
+  endif
+  if (i_hi > I) then
+    u_pl = 0.25*((CS%u_shelf(I   ,j-1) + CS%u_shelf(i_hi,j-1)) + &
+                 (CS%u_shelf(I   ,j  ) + CS%u_shelf(i_hi,j  )))
+    v_pl = 0.25*((CS%v_shelf(I   ,j-1) + CS%v_shelf(i_hi,j-1)) + &
+                 (CS%v_shelf(I   ,j  ) + CS%v_shelf(i_hi,j  )))
+  else
+    u_pl = 0.5*(CS%u_shelf(I,j-1) + CS%u_shelf(I,j))
+    v_pl = 0.5*(CS%v_shelf(I,j-1) + CS%v_shelf(I,j))
+  endif
+  dudx = (u_pl - u_mn) / G%dxCu(I,j)
+  dvdx = (v_pl - v_mn) / G%dxCu(I,j)
+  dudy = (CS%u_shelf(I,j) - CS%u_shelf(I,j-1)) / G%dyCu(I,j)
+  dvdy = (CS%v_shelf(I,j) - CS%v_shelf(I,j-1)) / G%dyCu(I,j)
+  eps_e = dg1_face_eps_eff(dudx, dudy, dvdx, dvdy)
+end function dg1_eps_face_u
+
+!> Effective strain rate at the midpoint of v-face (i,J), as dg1_eps_face_u.
+pure function dg1_eps_face_v(CS, G, i, J) result(eps_e)
+  type(ice_shelf_dyn_CS), intent(in) :: CS !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in) :: G  !< The grid structure
+  integer,                intent(in) :: i  !< i-index of the face
+  integer,                intent(in) :: J  !< j-index of the face
+  real :: eps_e                            !< Effective strain rate [T-1 ~> s-1]
+  real :: u_mn, u_pl, v_mn, v_pl ! Cell-mean velocities on the minus/plus sides [L T-1 ~> m s-1]
+  real :: dudx, dudy, dvdx, dvdy ! Face-midpoint velocity gradients [T-1 ~> s-1]
+  integer :: j_lo, j_hi          ! Neighbour indices clipped to the data domain
+
+  j_lo = max(J-1, G%jsd) ; j_hi = min(J+1, G%jed)
+  if (j_lo < J) then
+    u_mn = 0.25*((CS%u_shelf(i-1,j_lo) + CS%u_shelf(i,j_lo)) + &
+                 (CS%u_shelf(i-1,J   ) + CS%u_shelf(i,J   )))
+    v_mn = 0.25*((CS%v_shelf(i-1,j_lo) + CS%v_shelf(i,j_lo)) + &
+                 (CS%v_shelf(i-1,J   ) + CS%v_shelf(i,J   )))
+  else
+    u_mn = 0.5*(CS%u_shelf(i-1,J) + CS%u_shelf(i,J))
+    v_mn = 0.5*(CS%v_shelf(i-1,J) + CS%v_shelf(i,J))
+  endif
+  if (j_hi > J) then
+    u_pl = 0.25*((CS%u_shelf(i-1,J   ) + CS%u_shelf(i,J   )) + &
+                 (CS%u_shelf(i-1,j_hi) + CS%u_shelf(i,j_hi)))
+    v_pl = 0.25*((CS%v_shelf(i-1,J   ) + CS%v_shelf(i,J   )) + &
+                 (CS%v_shelf(i-1,j_hi) + CS%v_shelf(i,j_hi)))
+  else
+    u_pl = 0.5*(CS%u_shelf(i-1,J) + CS%u_shelf(i,J))
+    v_pl = 0.5*(CS%v_shelf(i-1,J) + CS%v_shelf(i,J))
+  endif
+  dudy = (u_pl - u_mn) / G%dyCv(i,J)
+  dvdy = (v_pl - v_mn) / G%dyCv(i,J)
+  dudx = (CS%u_shelf(i,J) - CS%u_shelf(i-1,J)) / G%dxCv(i,J)
+  dvdx = (CS%v_shelf(i,J) - CS%v_shelf(i-1,J)) / G%dxCv(i,J)
+  eps_e = dg1_face_eps_eff(dudx, dudy, dvdx, dvdy)
+end function dg1_eps_face_v
+
+!> Artificial-viscosity quantities for one face between cells A and B: u_eff and the equivalent
+!! thickness jump at each face quadrature point, the face coefficient and jump-mode decay rate,
+!! and whether the face is a stagnant jump. Endpoint values are ordered along the face.
+subroutine dg1_art_visc_face(CS, bc_A, bc_B, hbc_A, hbc_B, h_A, h_B, bed, u, v, H_ref, dx_perp, &
+                             eps_e_face, rhoi_rhow, advect_grid_inv, advect_inv_L, inv_tau_floor, &
+                             ueff, dheq, coef_face, rate_face, idle)
+  type(ice_shelf_dyn_CS), intent(in)  :: CS    !< Ice shelf dynamics control structure
+  logical,                intent(in)  :: bc_A  !< True if cell A is a thickness boundary (hmask=3)
+  logical,                intent(in)  :: bc_B  !< True if cell B is a thickness boundary (hmask=3)
+  real,                   intent(in)  :: hbc_A !< Boundary thickness of cell A [Z ~> m]
+  real,                   intent(in)  :: hbc_B !< Boundary thickness of cell B [Z ~> m]
+  real, dimension(2),     intent(in)  :: h_A   !< Cell A corner thicknesses at the face ends [Z ~> m]
+  real, dimension(2),     intent(in)  :: h_B   !< Cell B corner thicknesses at the face ends [Z ~> m]
+  real, dimension(2),     intent(in)  :: bed   !< Bed at the face ends [Z ~> m]
+  real, dimension(2),     intent(in)  :: u     !< Zonal velocity at the face ends [L T-1 ~> m s-1]
+  real, dimension(2),     intent(in)  :: v     !< Meridional velocity at the face ends [L T-1 ~> m s-1]
+  real,                   intent(in)  :: H_ref !< Reference thickness for the gate [Z ~> m]
+  real,                   intent(in)  :: dx_perp !< Across-face length [L ~> m]
+  real,                   intent(in)  :: eps_e_face !< Effective strain rate at the face [T-1 ~> s-1]
+  real,                   intent(in)  :: rhoi_rhow !< Ice to ocean density ratio [nondim]
+  logical,                intent(in)  :: advect_grid_inv !< If true, scale the advective term by dx_perp/L_ref
+  real,                   intent(in)  :: advect_inv_L !< 1/DG1_ART_VISC_ADVECT_L_REF, or 0 [L-1 ~> m-1]
+  real,                   intent(in)  :: inv_tau_floor !< 1/DG1_ART_VISC_TAU_FLOOR, or 0 [T-1 ~> s-1]
+  real, dimension(2),     intent(out) :: ueff  !< u_eff at each face QP [L T-1 ~> m s-1]
+  real, dimension(2),     intent(out) :: dheq  !< Equivalent thickness jump at each face QP [Z ~> m]
+  real,                   intent(out) :: coef_face !< Face coefficient before the per-cell cap [nondim]
+  real,                   intent(out) :: rate_face !< Face jump-mode decay rate [T-1 ~> s-1]
+  logical,                intent(out) :: idle  !< True for a stagnant jump
+
+  ! 2-point Gauss-Legendre on [0,1], with 1-gp1 == gp2 and 1-gp2 == gp1 exactly.
+  real, parameter :: gp1 = 0.5 * (1.0 - sqrt(1.0/3.0))
+  real, parameter :: gp2 = 1.0 - gp1
+  real :: t_face, t_co       ! Position along the face and its complement [nondim]
+  real :: u_at_qp, v_at_qp   ! Velocity at a face QP [L T-1 ~> m s-1]
+  real :: u_mag_qp           ! Speed at a face QP [L T-1 ~> m s-1]
+  real :: h_A_qp, h_B_qp     ! Thickness on the two sides at a face QP [Z ~> m]
+  real :: bed_qp             ! Bed at a face QP [Z ~> m]
+  real :: ds_use             ! Surface jump at a face QP [Z ~> m]
+  real :: dh_eq              ! Equivalent thickness jump at a face QP [Z ~> m]
+  real :: u_floor_qp         ! Strain-rate term of u_eff [L T-1 ~> m s-1]
+  real :: u_adv_qp           ! Advective term of u_eff [L T-1 ~> m s-1]
+  real :: u_eff_qp           ! u_eff at a face QP [L T-1 ~> m s-1]
+  real :: dh_eq_face_max     ! Max |dh_eq| over the face QPs [Z ~> m]
+  real :: ds_face_max        ! Max |ds_use| over the face QPs [Z ~> m]
+  real :: u_eff_face_max     ! Max u_eff over the face QPs [L T-1 ~> m s-1]
+  real :: u_mag_face_max     ! Max speed over the face QPs [L T-1 ~> m s-1]
+  real :: r_face             ! Gate ratio max|[s]|/H_ref [nondim]
+  integer :: gp
+
+  dh_eq_face_max = 0.0
+  u_mag_face_max = 0.0
+  u_eff_face_max = 0.0
+  ds_face_max = 0.0
+  do gp = 1, 2
+    if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
+    t_co = 1.0 - t_face
+    u_at_qp = (t_co*u(1)) + (t_face*u(2))
+    v_at_qp = (t_co*v(1)) + (t_face*v(2))
+    u_mag_qp = sqrt((u_at_qp*u_at_qp) + (v_at_qp*v_at_qp))
+    if (bc_A) then
+      h_A_qp = hbc_A
+    else
+      h_A_qp = (t_co*h_A(1)) + (t_face*h_A(2))
+    endif
+    if (bc_B) then
+      h_B_qp = hbc_B
+    else
+      h_B_qp = (t_co*h_B(1)) + (t_face*h_B(2))
+    endif
+    bed_qp = (t_co*bed(1)) + (t_face*bed(2))
+    ds_use = dg1_wb_surface_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow)
+    dh_eq = ds_use * dg1_wb_slope_mean(h_A_qp, h_B_qp, bed_qp, rhoi_rhow)
+    u_floor_qp = CS%dg_art_visc_strain_coef * eps_e_face * dx_perp
+    if (advect_grid_inv) then
+      u_adv_qp = (CS%dg_art_visc_advect_coef * u_mag_qp) * (dx_perp * advect_inv_L)
+    else
+      u_adv_qp = CS%dg_art_visc_advect_coef * u_mag_qp
+    endif
+    u_eff_qp = (u_adv_qp + u_floor_qp) + (dx_perp * inv_tau_floor)
+
+    ueff(gp) = u_eff_qp
+    dheq(gp) = dh_eq
+
+    dh_eq_face_max = max(dh_eq_face_max, abs(dh_eq))
+    ds_face_max = max(ds_face_max, abs(ds_use))
+    u_eff_face_max = max(u_eff_face_max, u_eff_qp)
+    u_mag_face_max = max(u_mag_face_max, u_mag_qp)
+  enddo
+
+  ! Gate on the surface jump relative to the mean thickness.
+  r_face = ds_face_max / H_ref
+  if (r_face <= 0.0) then
+    coef_face = 0.0
+  elseif (r_face >= CS%dg_art_visc_r_hi) then
+    coef_face = 1.0
+  else
+    coef_face = r_face / CS%dg_art_visc_r_hi
+  endif
+  ! Jump-mode decay rate: node localization (x2) and consistent mass (x2) times amp.
+  rate_face = 4.0 * DG1_WB_JUMP_RATE_AMP * coef_face * u_eff_face_max / dx_perp
+
+  idle = (u_mag_face_max < CS%dg_slow_idle_u_tiny) .and. &
+         (eps_e_face < CS%dg_slow_idle_eps_tiny) .and. &
+         (dh_eq_face_max > CS%dg_slow_idle_s_tol)
+end subroutine dg1_art_visc_face
+
 !> DG(1) right-hand side M dh/dt = int grad(N).(u h) dA - int N (u.n) h_upwind ds + art visc,
 !! with 2x2 Gauss points in the cell and 2 per face. Specified-flux faces split their flux
 !! equally between the two corners.
@@ -11306,35 +11438,18 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: dxCv_S, dxCv_N, dyCu_W, dyCu_E
   real :: t_face, t_co
   real :: u_at_qp, v_at_qp, h_upwind, flux_qp, face_flux_total
-  real :: h_A_qp, h_B_qp     ! Face-QP corner thickness on the two sides of a DG face [Z ~> m]
-  real :: u_mag_qp           ! Velocity magnitude sqrt(u^2+v^2) at a face QP [L T-1 ~> m s-1]
   real :: visc_flux_qp       ! Artificial-viscosity face flux per QP [Z L2 T-1 ~> m3 s-1]
   real :: Hbar_A, Hbar_B     ! Cell-mean thickness on the two sides of a DG face [Z ~> m]
   real :: H_ref              ! Reference thickness for the gate ratio [Z ~> m]
-  real :: r_face             ! Gate ratio max|[s]|/H_ref [nondim]
-  real :: sigma_face         ! Gate min(r_face/r_hi, 1) [nondim]
-  real :: dx_perp            ! Across-face length scale at the current face [L ~> m]
   real :: coef_face          ! Face viscosity coefficient [nondim]
-  real :: u_eff_face_max     ! Max u_eff over the 2 face QPs, for the stability budget [L T-1 ~> m s-1]
-  real :: ds_use             ! Surface jump at a face QP [Z ~> m]
-  real :: ds_face_max        ! Max |ds_use| over the 2 face QPs [Z ~> m]
-  real :: rate_face          ! Face jump-mode decay rate [T-1 ~> s-1]
   real :: scale_AB           ! Smaller cap factor of the two cells [nondim]
-  real :: dh_eq              ! Equivalent thickness jump driving the viscosity flux [Z ~> m]
-  real :: bed_qp             ! Bed elevation at a face QP [Z ~> m]
   real :: rhoi_rhow_wb       ! Ice/ocean density ratio for the well-balanced jump [nondim]
-  real :: u_floor_qp         ! Strain-rate term of u_eff at a face QP [L T-1 ~> m s-1]
-  real :: u_adv_qp           ! Advective term of u_eff at a face QP [L T-1 ~> m s-1]
-  real :: u_eff_qp           ! u_eff at a face QP [L T-1 ~> m s-1]
   real :: advect_inv_L       ! 1/DG1_ART_VISC_ADVECT_L_REF, or 0 [L-1 ~> m-1]
   real :: inv_tau_floor      ! 1/DG1_ART_VISC_TAU_FLOOR, or 0 [T-1 ~> s-1]
   logical :: advect_grid_inv ! If true, scale the advective term by dx_perp/L_ref.
   real :: eps_e_face         ! Effective strain rate at the face midpoint [T-1 ~> s-1]
-  real :: dudx_f, dudy_f, dvdx_f, dvdy_f ! Face-midpoint velocity gradients [T-1 ~> s-1]
-  real :: u_mn, u_pl, v_mn, v_pl ! Cell-mean velocities on the minus/plus sides [L T-1 ~> m s-1]
-  real :: dh_eq_face_max     ! Max |Delta h_eq| over the 2 face QPs [Z ~> m]
-  real :: u_mag_face_max     ! Max |u_mag_qp| over the 2 face QPs [L T-1 ~> m s-1]
   logical :: valid_A_visc, valid_B_visc ! Side A/B is hmask 1 or 3.
+  logical :: idle_face      ! True for a stagnant-jump face
   ! Art-visc pass-1 results: face coefficient and rate, and per-QP u_eff and Delta h_eq.
   real, dimension(SZDIB_(G),SZDJ_(G))   :: cK_E, rate_E
   real, dimension(SZDI_(G),SZDJB_(G))   :: cK_N, rate_N
@@ -11346,7 +11461,6 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: S_K                ! Sum of a cell's face rates [T-1 ~> s-1]
   real, dimension(2,2,2,2) :: qv_vol ! Per-QP volume contribution to the 4 cell corners,
                                      ! indexed (qx,qy,a,b) [Z L2 T-1 ~> m3 s-1]
-  integer :: i_lo, i_hi, j_lo, j_hi  ! Neighbour indices clipped to the data domain
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_vol
   ! Face terms kept per direction and summed pairwise at the end, for rotation invariance.
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_advx, rhs_advy, rhs_viscx, rhs_viscy
@@ -11500,101 +11614,17 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       Hbar_B = nodal_cell_mean(h_nodal_in(i+1,j,:,:), CS%cell_mean_w(i+1,j,:,:))
     endif
     H_ref = max(CS%min_h_shelf, 0.5*(Hbar_A + Hbar_B))
-    dx_perp = G%dxCu(i,j)
 
-    ! Cell-mean velocities either side, one-sided where a neighbour is outside the data domain.
-    i_lo = max(i-1, G%isd) ; i_hi = min(i+1, G%ied)
-    if (CS%dg_art_visc_strain_coef > 0.0) then
-      if (i_lo < i) then
-        u_mn = 0.25*((CS%u_shelf(i_lo,j-1) + CS%u_shelf(i,j-1)) + &
-                     (CS%u_shelf(i_lo,j  ) + CS%u_shelf(i,j  )))
-        v_mn = 0.25*((CS%v_shelf(i_lo,j-1) + CS%v_shelf(i,j-1)) + &
-                     (CS%v_shelf(i_lo,j  ) + CS%v_shelf(i,j  )))
-      else
-        u_mn = 0.5*(CS%u_shelf(i,j-1) + CS%u_shelf(i,j))
-        v_mn = 0.5*(CS%v_shelf(i,j-1) + CS%v_shelf(i,j))
-      endif
-      if (i_hi > i) then
-        u_pl = 0.25*((CS%u_shelf(i   ,j-1) + CS%u_shelf(i_hi,j-1)) + &
-                     (CS%u_shelf(i   ,j  ) + CS%u_shelf(i_hi,j  )))
-        v_pl = 0.25*((CS%v_shelf(i   ,j-1) + CS%v_shelf(i_hi,j-1)) + &
-                     (CS%v_shelf(i   ,j  ) + CS%v_shelf(i_hi,j  )))
-      else
-        u_pl = 0.5*(CS%u_shelf(i,j-1) + CS%u_shelf(i,j))
-        v_pl = 0.5*(CS%v_shelf(i,j-1) + CS%v_shelf(i,j))
-      endif
-      dudx_f = (u_pl - u_mn) / dx_perp
-      dvdx_f = (v_pl - v_mn) / dx_perp
-      dudy_f = (CS%u_shelf(i,j) - CS%u_shelf(i,j-1)) / G%dyCu(i,j)
-      dvdy_f = (CS%v_shelf(i,j) - CS%v_shelf(i,j-1)) / G%dyCu(i,j)
-      eps_e_face = dg1_face_eps_eff(dudx_f, dudy_f, dvdx_f, dvdy_f)
-    else
-      eps_e_face = 0.0
-    endif
-
-    dh_eq_face_max = 0.0
-    u_mag_face_max = 0.0
-    u_eff_face_max = 0.0
-    ds_face_max = 0.0
-    do gp = 1, 2
-      if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
-      t_co = 1.0 - t_face
-      u_at_qp = (t_co*CS%u_shelf(i,j-1)) + (t_face*CS%u_shelf(i,j))
-      v_at_qp = (t_co*CS%v_shelf(i,j-1)) + (t_face*CS%v_shelf(i,j))
-      u_mag_qp = sqrt((u_at_qp*u_at_qp) + (v_at_qp*v_at_qp))
-      if (hmask(i,j) == 3.0) then
-        h_A_qp = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
-      else
-        h_A_qp = (t_co*h_nodal_in(i,  j,2,1)) + (t_face*h_nodal_in(i,  j,2,2))
-      endif
-      if (hmask(i+1,j) == 3.0) then
-        h_B_qp = max(CS%h_bdry_val(i+1,j), CS%min_h_shelf)
-      else
-        h_B_qp = (t_co*h_nodal_in(i+1,j,1,1)) + (t_face*h_nodal_in(i+1,j,1,2))
-      endif
-      bed_qp = (t_co*CS%bed_node(i,j-1)) + (t_face*CS%bed_node(i,j))
-      ds_use = dg1_wb_surface_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
-      dh_eq = ds_use * dg1_wb_slope_mean(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
-      u_floor_qp = CS%dg_art_visc_strain_coef * eps_e_face * dx_perp
-      if (advect_grid_inv) then
-        u_adv_qp = (CS%dg_art_visc_advect_coef * u_mag_qp) * (dx_perp * advect_inv_L)
-      else
-        u_adv_qp = CS%dg_art_visc_advect_coef * u_mag_qp
-      endif
-      u_eff_qp = (u_adv_qp + u_floor_qp) + (dx_perp * inv_tau_floor)
-
-      ueff_E(i,j,gp) = u_eff_qp
-      dheq_E(i,j,gp) = dh_eq
-
-      dh_eq_face_max = max(dh_eq_face_max, abs(dh_eq))
-      ds_face_max = max(ds_face_max, abs(ds_use))
-      u_eff_face_max = max(u_eff_face_max, u_eff_qp)
-      u_mag_face_max = max(u_mag_face_max, u_mag_qp)
-    enddo
-
-
-    ! Gate on the surface jump relative to the mean thickness.
-    r_face = ds_face_max / H_ref
-    if (r_face <= 0.0) then
-      sigma_face = 0.0
-    elseif (r_face >= CS%dg_art_visc_r_hi) then
-      sigma_face = 1.0
-    else
-      sigma_face = r_face / CS%dg_art_visc_r_hi
-    endif
-    coef_face = sigma_face
-    cK_E(i,j) = coef_face
-    ! Jump-mode decay rate: node localization (x2) and consistent mass (x2) times amp.
-    rate_face = 4.0 * DG1_WB_JUMP_RATE_AMP * coef_face * u_eff_face_max / dx_perp
-    rate_E(i,j) = rate_face
-
-    ! Stagnant-jump diagnostic.
+    eps_e_face = 0.0
+    if (CS%dg_art_visc_strain_coef > 0.0) eps_e_face = dg1_eps_face_u(CS, G, i, j)
+    call dg1_art_visc_face(CS, hmask(i,j) == 3.0, hmask(i+1,j) == 3.0, &
+             max(CS%h_bdry_val(i,j), CS%min_h_shelf), max(CS%h_bdry_val(i+1,j), CS%min_h_shelf), &
+             h_nodal_in(i,j,2,:), h_nodal_in(i+1,j,1,:), CS%bed_node(i,j-1:j), &
+             CS%u_shelf(i,j-1:j), CS%v_shelf(i,j-1:j), H_ref, G%dxCu(i,j), eps_e_face, &
+             rhoi_rhow_wb, advect_grid_inv, advect_inv_L, inv_tau_floor, &
+             ueff_E(i,j,:), dheq_E(i,j,:), cK_E(i,j), rate_E(i,j), idle_face)
     if (associated(CS%dg_slow_idle_face_u)) then
-      if (u_mag_face_max < CS%dg_slow_idle_u_tiny .and. &
-          eps_e_face     < CS%dg_slow_idle_eps_tiny .and. &
-          dh_eq_face_max > CS%dg_slow_idle_s_tol) then
-        CS%dg_slow_idle_face_u(i,j) = 1.0
-      endif
+      if (idle_face) CS%dg_slow_idle_face_u(i,j) = 1.0
     endif
   enddo ; enddo
 
@@ -11669,97 +11699,17 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       Hbar_B = nodal_cell_mean(h_nodal_in(i,j+1,:,:), CS%cell_mean_w(i,j+1,:,:))
     endif
     H_ref = max(CS%min_h_shelf, 0.5*(Hbar_A + Hbar_B))
-    dx_perp = G%dyCv(i,j)
 
-    j_lo = max(j-1, G%jsd) ; j_hi = min(j+1, G%jed)
-    if (CS%dg_art_visc_strain_coef > 0.0) then
-      if (j_lo < j) then
-        u_mn = 0.25*((CS%u_shelf(i-1,j_lo) + CS%u_shelf(i,j_lo)) + &
-                     (CS%u_shelf(i-1,j   ) + CS%u_shelf(i,j   )))
-        v_mn = 0.25*((CS%v_shelf(i-1,j_lo) + CS%v_shelf(i,j_lo)) + &
-                     (CS%v_shelf(i-1,j   ) + CS%v_shelf(i,j   )))
-      else
-        u_mn = 0.5*(CS%u_shelf(i-1,j) + CS%u_shelf(i,j))
-        v_mn = 0.5*(CS%v_shelf(i-1,j) + CS%v_shelf(i,j))
-      endif
-      if (j_hi > j) then
-        u_pl = 0.25*((CS%u_shelf(i-1,j   ) + CS%u_shelf(i,j   )) + &
-                     (CS%u_shelf(i-1,j_hi) + CS%u_shelf(i,j_hi)))
-        v_pl = 0.25*((CS%v_shelf(i-1,j   ) + CS%v_shelf(i,j   )) + &
-                     (CS%v_shelf(i-1,j_hi) + CS%v_shelf(i,j_hi)))
-      else
-        u_pl = 0.5*(CS%u_shelf(i-1,j) + CS%u_shelf(i,j))
-        v_pl = 0.5*(CS%v_shelf(i-1,j) + CS%v_shelf(i,j))
-      endif
-      dudy_f = (u_pl - u_mn) / dx_perp
-      dvdy_f = (v_pl - v_mn) / dx_perp
-      dudx_f = (CS%u_shelf(i,j) - CS%u_shelf(i-1,j)) / G%dxCv(i,j)
-      dvdx_f = (CS%v_shelf(i,j) - CS%v_shelf(i-1,j)) / G%dxCv(i,j)
-      eps_e_face = dg1_face_eps_eff(dudx_f, dudy_f, dvdx_f, dvdy_f)
-    else
-      eps_e_face = 0.0
-    endif
-
-    dh_eq_face_max = 0.0
-    u_mag_face_max = 0.0
-    u_eff_face_max = 0.0
-    ds_face_max = 0.0
-    do gp = 1, 2
-      if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
-      t_co = 1.0 - t_face
-      u_at_qp = (t_co*CS%u_shelf(i-1,j)) + (t_face*CS%u_shelf(i,j))
-      v_at_qp = (t_co*CS%v_shelf(i-1,j)) + (t_face*CS%v_shelf(i,j))
-      u_mag_qp = sqrt((u_at_qp*u_at_qp) + (v_at_qp*v_at_qp))
-      if (hmask(i,j) == 3.0) then
-        h_A_qp = max(CS%h_bdry_val(i,j), CS%min_h_shelf)
-      else
-        h_A_qp = (t_co*h_nodal_in(i,j,  1,2)) + (t_face*h_nodal_in(i,j,  2,2))
-      endif
-      if (hmask(i,j+1) == 3.0) then
-        h_B_qp = max(CS%h_bdry_val(i,j+1), CS%min_h_shelf)
-      else
-        h_B_qp = (t_co*h_nodal_in(i,j+1,1,1)) + (t_face*h_nodal_in(i,j+1,2,1))
-      endif
-      bed_qp = (t_co*CS%bed_node(i-1,j)) + (t_face*CS%bed_node(i,j))
-      ds_use = dg1_wb_surface_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
-      dh_eq = ds_use * dg1_wb_slope_mean(h_A_qp, h_B_qp, bed_qp, rhoi_rhow_wb)
-      u_floor_qp = CS%dg_art_visc_strain_coef * eps_e_face * dx_perp
-      if (advect_grid_inv) then
-        u_adv_qp = (CS%dg_art_visc_advect_coef * u_mag_qp) * (dx_perp * advect_inv_L)
-      else
-        u_adv_qp = CS%dg_art_visc_advect_coef * u_mag_qp
-      endif
-      u_eff_qp = (u_adv_qp + u_floor_qp) + (dx_perp * inv_tau_floor)
-
-      ueff_N(i,j,gp) = u_eff_qp
-      dheq_N(i,j,gp) = dh_eq
-
-      dh_eq_face_max = max(dh_eq_face_max, abs(dh_eq))
-      ds_face_max = max(ds_face_max, abs(ds_use))
-      u_eff_face_max = max(u_eff_face_max, u_eff_qp)
-      u_mag_face_max = max(u_mag_face_max, u_mag_qp)
-    enddo
-
-
-    r_face = ds_face_max / H_ref
-    if (r_face <= 0.0) then
-      sigma_face = 0.0
-    elseif (r_face >= CS%dg_art_visc_r_hi) then
-      sigma_face = 1.0
-    else
-      sigma_face = r_face / CS%dg_art_visc_r_hi
-    endif
-    coef_face = sigma_face
-    cK_N(i,j) = coef_face
-    rate_face = 4.0 * DG1_WB_JUMP_RATE_AMP * coef_face * u_eff_face_max / dx_perp
-    rate_N(i,j) = rate_face
-
+    eps_e_face = 0.0
+    if (CS%dg_art_visc_strain_coef > 0.0) eps_e_face = dg1_eps_face_v(CS, G, i, j)
+    call dg1_art_visc_face(CS, hmask(i,j) == 3.0, hmask(i,j+1) == 3.0, &
+             max(CS%h_bdry_val(i,j), CS%min_h_shelf), max(CS%h_bdry_val(i,j+1), CS%min_h_shelf), &
+             h_nodal_in(i,j,:,2), h_nodal_in(i,j+1,:,1), CS%bed_node(i-1:i,j), &
+             CS%u_shelf(i-1:i,j), CS%v_shelf(i-1:i,j), H_ref, G%dyCv(i,j), eps_e_face, &
+             rhoi_rhow_wb, advect_grid_inv, advect_inv_L, inv_tau_floor, &
+             ueff_N(i,j,:), dheq_N(i,j,:), cK_N(i,j), rate_N(i,j), idle_face)
     if (associated(CS%dg_slow_idle_face_v)) then
-      if (u_mag_face_max < CS%dg_slow_idle_u_tiny .and. &
-          eps_e_face     < CS%dg_slow_idle_eps_tiny .and. &
-          dh_eq_face_max > CS%dg_slow_idle_s_tol) then
-        CS%dg_slow_idle_face_v(i,j) = 1.0
-      endif
+      if (idle_face) CS%dg_slow_idle_face_v(i,j) = 1.0
     endif
   enddo ; enddo
 
