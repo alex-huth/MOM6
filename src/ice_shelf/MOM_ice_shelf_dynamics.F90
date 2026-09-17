@@ -1027,7 +1027,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "values per cell, advected with SSP-RK2.", &
                  default=.false.)
     call get_param(param_file, mdl, "INIT_ICE_BED_NODAL", CS%init_bed_nodal, &
-                 "If true, read BED_TOPO_VARNAME at B-grid nodes and set the cell bed to the area-weighted"//&
+                 "If true, read BED_TOPO_VARNAME at B-grid nodes and set the cell bed to the area-weighted "//&
                  "mean of their bilinear interpolant. Required by USE_DG_THICKNESS; optional otherwise.", &
                  default=.false.)
     if (CS%use_DG_thickness .and. .not. CS%init_bed_nodal) call MOM_error(FATAL, &
@@ -1039,8 +1039,8 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     if (present(solo_ice_sheet_in)) solo_ice_sheet = solo_ice_sheet_in
     CS%dg_basal_source_sem2 = .false.
     call get_param(param_file, mdl, "ICE_ONLY_BASAL_MELT", CS%ice_only_basal_melt, &
-                 "If true, the ice-only driver prescribes a basal melt (Serioussi & Morlighem 2018, eq 4; "//&
-                 "Leguy et a. 2021 eq 18): 0 at an ice-base depth of 50 m rising linearly to 30 m yr-1 at >=500 m.", &
+                 "If true, the ice-only driver prescribes a basal melt (Seroussi & Morlighem 2018, eq 4; "//&
+                 "Leguy et al. 2021 eq 18): 0 at an ice-base depth of 50 m rising linearly to 30 m yr-1 at >=500 m.", &
                  default=.false., do_not_log=.not.solo_ice_sheet)
     call get_param(param_file, mdl, "ICE_ONLY_BASAL_MELT_GLP", melt_glp_str, &
                  "How the ice-only basal melt is applied in grounding-line cells (Leguy et al. "//&
