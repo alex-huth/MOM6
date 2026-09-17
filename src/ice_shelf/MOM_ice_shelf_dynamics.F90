@@ -40,7 +40,7 @@ implicit none ; private
 public register_ice_shelf_dyn_restarts, initialize_ice_shelf_dyn, update_ice_shelf, IS_dynamics_post_data
 public ice_time_step_CFL, ice_shelf_dyn_end, change_in_draft, write_ice_shelf_energy
 public shelf_advance_front, ice_shelf_min_thickness_calve, calve_to_mask, volume_above_floatation
-public reset_DG_to_cellmean_at_cell, zero_DG_h_nodal, is_DG_thickness_active
+public reset_DG_to_cellmean_at_cell, zero_DG_h_nodal
 public DG_nodal_thickness_ptr
 public accumulate_DG_source_rate
 public calc_prescribed_basal_melt
@@ -882,9 +882,6 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                           ! recreate the bugs, or if false bugs are only used if actively selected.
   logical :: debug
   integer :: i, j, isd, ied, jsd, jed, Isdq, Iedq, Jsdq, Jedq, iters
-  logical :: valid_E, valid_W, valid_N, valid_S ! DG cold-start neighbour-mask checks
-  real :: h_E, h_W, h_N, h_S ! Effective neighbour cell-mean thickness for DG cold-start [Z ~> m]
-  logical :: slopes_from_file ! True if DG h_x, h_y were read from ICE_THICKNESS_FILE
   character(len=200) :: IS_energyfile  ! The name of the energy file.
   character(len=32) :: filename_appendix = '' ! FMS appendix to filename for ensemble runs
   character(len=16) :: inner_solver_str ! The type of inner solver to use for the SSA
@@ -1792,7 +1789,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     !IS_dynamics_post_data is called before update_ice_shelf
     if (CS%id_taudx_shelf>0 .or. CS%id_taudy_shelf>0) then
       if (CS%use_DG_thickness .and. (CS%cism_taud == CISM_OFF)) then
-        call calc_shelf_driving_stress_DG(CS, ISS, G, US, CS%taudx_shelf, CS%taudy_shelf, CS%OD_av)
+        call calc_shelf_driving_stress_DG(CS, ISS, G, CS%taudx_shelf, CS%taudy_shelf)
       else
         call calc_shelf_driving_stress(CS, ISS, G, US, CS%taudx_shelf, CS%taudy_shelf, CS%OD_av)
       endif
@@ -2864,7 +2861,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
   ! Calculate RHS. CISM_TAUD uses the FV driving stress on the cell means, even under DG.
   if (CS%use_DG_thickness .and. (CS%cism_taud == CISM_OFF)) then
-    call calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, CS%OD_av)
+    call calc_shelf_driving_stress_DG(CS, ISS, G, taudx, taudy)
   else
     call calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, CS%OD_av)
   endif
@@ -5693,7 +5690,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
               u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
               bathyT(i,j), dens_ratio, i, j, fB_e, use_newton, Usub, Vsub, &
               G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
-              use_DG=.true., h_shelf_cell=h_shelf(i,j), &
+              use_DG=.true., &
               h_nodal_cell=CS%h_nodal(i,j,:,:), &
               bed_corners=CS%bed_node(I-1:I,J-1:J))
         else
@@ -5744,7 +5741,7 @@ end subroutine CG_action
 subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta, V_delta, &
                                    bathyT, dens_ratio, i_elem, j_elem, fB_e, use_newton, Ucontr, Vcontr, &
                                    dxCv_S, dxCv_N, dyCu_W, dyCu_E, IareaT, &
-                                   use_DG, h_shelf_cell, h_nodal_cell, bed_corners, fls_cell)
+                                   use_DG, h_nodal_cell, bed_corners, fls_cell)
   type(ice_shelf_dyn_CS), intent(in) :: CS      !< Ice shelf control structure
   type(ocean_grid_type),  intent(in) :: G       !< The grid structure
   type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
@@ -5768,7 +5765,6 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
   real,                   intent(in) :: dyCu_E !< The cell height at the eastern (u-point) edge [L ~> m]
   real,                   intent(in) :: IareaT !< The inverse of the cell area at the tracer point [L-2 ~> m-2]
   logical,       optional, intent(in) :: use_DG       !< If true, use DG thickness and bed_node [nondim]
-  real,          optional, intent(in) :: h_shelf_cell  !< Cell-averaged ice thickness [Z ~> m]
   real, dimension(2,2), optional, intent(in) :: h_nodal_cell !< Q1 thickness at the 4 cell corners, used
                                           !! only as a flotation measure (sub-qp gate + effective
                                           !! pressure) [Z ~> m]
@@ -6430,7 +6426,7 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
             u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
             CS%bed_elev(i,j), dens_ratio, i, j, fB_e, u_diag_sub, v_diag_sub, &
             G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
-            use_DG=.true., h_shelf_cell=h_shelf(i,j), &
+            use_DG=.true., &
             h_nodal_cell=CS%h_nodal(i,j,:,:), &
             bed_corners=CS%bed_node(I-1:I,J-1:J))
       else
@@ -6477,7 +6473,7 @@ end subroutine matrix_diagonal
 subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, &
                                      bathyT, dens_ratio, i_elem, j_elem, fB_e, u_diag, v_diag, &
                                      dxCv_S, dxCv_N, dyCu_W, dyCu_E, IareaT, &
-                                     use_DG, h_shelf_cell, h_nodal_cell, bed_corners, fls_cell)
+                                     use_DG, h_nodal_cell, bed_corners, fls_cell)
   type(ice_shelf_dyn_CS), intent(in) :: CS      !< Ice shelf control structure
   type(ocean_grid_type),  intent(in) :: G       !< The grid structure
   type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
@@ -6498,7 +6494,6 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
   real,                   intent(in)  :: dyCu_E !< The cell height at the eastern (u-point) edge [L ~> m]
   real,                   intent(in)  :: IareaT !< The inverse of the cell area at the tracer point [L-2 ~> m-2]
   logical,       optional, intent(in) :: use_DG       !< If true, use DG thickness and bed_node [nondim]
-  real,          optional, intent(in) :: h_shelf_cell  !< Cell-averaged ice thickness [Z ~> m]
   real, dimension(2,2), optional, intent(in) :: h_nodal_cell !< Q1 thickness at the 4 cell corners, used
                                           !! only as a flotation measure (sub-qp gate + effective
                                           !! pressure) [Z ~> m]
@@ -7238,7 +7233,7 @@ subroutine IS_dynamics_post_data_2(CS, ISS, G)
   !Calculate flux divergence and its components
   if (CS%id_duHdx > 0 .or. CS%id_dvHdy > 0 .or. CS%id_fluxdiv > 0) then
     if (CS%use_DG_thickness) then
-      call interpolate_H_to_B_DG(G, ISS%h_shelf, CS%h_nodal, ISS%hmask, &
+      call interpolate_H_to_B_DG(G, CS%h_nodal, ISS%hmask, &
                                  H_node, CS%min_h_shelf)
     else
       call interpolate_H_to_B(G, ISS%h_shelf, ISS%hmask, H_node, CS%min_h_shelf)
@@ -9285,10 +9280,8 @@ end subroutine interpolate_H_to_B
 
 !> DG(1) version of interpolate_H_to_B: average the co-located corners of the
 !! ice-covered cells at each B-grid node.
-subroutine interpolate_H_to_B_DG(G, h_shelf, h_nodal, hmask, H_node, min_h_shelf)
+subroutine interpolate_H_to_B_DG(G, h_nodal, hmask, H_node, min_h_shelf)
   type(ocean_grid_type), intent(in) :: G  !< The grid structure used by the ice shelf.
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                         intent(in)    :: h_shelf !< Area-weighted cell-mean ice thickness Hbar [Z ~> m].
   real, dimension(SZDI_(G),SZDJ_(G),2,2), &
                          intent(in)    :: h_nodal !< Nodal Q1 thickness at 4 corners per cell [Z ~> m].
   real, dimension(SZDI_(G),SZDJ_(G)), &
@@ -9857,7 +9850,7 @@ end subroutine add_Neumann_face_DG
 !! flotation branch for s.
 subroutine add_taud_edge_correction_DG(face_length, face_sign, &
     h_loc_A, h_loc_B, h_ngh_A, h_ngh_B, b_corner_A, b_corner_B, &
-    rho, rhow, rhoi_rhow, grav, min_h_shelf, &
+    rho, rhoi_rhow, grav, min_h_shelf, &
     xquad, face_A, face_B)
   real, intent(in)    :: face_length      !< Face length [L ~> m]
   real, intent(in)    :: face_sign        !< +1 or -1, outward unit-normal component [nondim]
@@ -9868,8 +9861,7 @@ subroutine add_taud_edge_correction_DG(face_length, face_sign, &
   real, intent(in)    :: b_corner_A       !< bed depth at face endpoint A [Z ~> m]
   real, intent(in)    :: b_corner_B       !< bed depth at face endpoint B [Z ~> m]
   real, intent(in)    :: rho              !< Ice density [R ~> kg m-3]
-  real, intent(in)    :: rhow             !< Ocean density [R ~> kg m-3]
-  real, intent(in)    :: rhoi_rhow        !< rho / rhow [nondim]
+  real, intent(in)    :: rhoi_rhow        !< Ice to ocean density ratio [nondim]
   real, intent(in)    :: grav             !< Gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
   real, intent(in)    :: min_h_shelf      !< Lower clamp on h [Z ~> m]
   real, dimension(2), intent(in) :: xquad !< 2-point Gauss-Legendre nodes on [0,1] [nondim]
@@ -9916,17 +9908,14 @@ end subroutine add_taud_edge_correction_DG
 !> DG(1) driving stress: the volume integral int phi*(-rho*g*h*grad(s)) dA (2x2 Gauss, or
 !! SEP2/SEP3 sub-element quadrature in grounding-line cells), plus the interior-face jump
 !! term (add_taud_edge_correction_DG) and the ice-front Neumann term (add_Neumann_face_DG).
-subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
+subroutine calc_shelf_driving_stress_DG(CS, ISS, G, taudx, taudy)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
   type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe the ice-shelf state
   type(ocean_grid_type),  intent(inout) :: G  !< The grid structure used by the ice shelf.
-  type(unit_scale_type),  intent(in)    :: US !< A structure containing unit conversion factors
   real, dimension(SZDIB_(G),SZDJB_(G)), &
                           intent(inout) :: taudx  !< X-direction driving stress at q-points [R L3 Z T-2 ~> kg m s-2]
   real, dimension(SZDIB_(G),SZDJB_(G)), &
                           intent(inout) :: taudy  !< Y-direction driving stress at q-points [R L3 Z T-2 ~> kg m s-2]
-  real, dimension(SZDI_(G),SZDJ_(G)), &
-                          intent(in)    :: OD  !< Ocean floor depth at tracer points [Z ~> m].
 
   real :: rho        ! Ice density [R ~> kg m-3]
   real :: rhow       ! Reference ocean density [R ~> kg m-3]
@@ -10012,7 +10001,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         call calc_shelf_driving_stress_DG_subgrid(CS, CS%Phisub, &
             CS%h_nodal(i,j,:,:), bed_corners, &
             dxCv_S, dxCv_N, dyCu_W, dyCu_E, &
-            rho, rhow, rhoi_rhow, grav, vol_dx, vol_dy, &
+            rho, rhoi_rhow, grav, vol_dx, vol_dy, &
             CS%sx_shelf(i,j), CS%sy_shelf(i,j), calc_slope_diag)
       endif
     else
@@ -10111,7 +10100,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         CS%h_nodal(i,j,1,1),   CS%h_nodal(i,j,1,2), &
         CS%h_nodal(i-1,j,2,1), CS%h_nodal(i-1,j,2,2), &
         bed_corners(1,1), bed_corners(1,2), &
-        rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
+        rho, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
         face_dx_W_A, face_dx_W_B)
     endif
 
@@ -10129,7 +10118,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         CS%h_nodal(i,j,2,1),   CS%h_nodal(i,j,2,2), &
         CS%h_nodal(i+1,j,1,1), CS%h_nodal(i+1,j,1,2), &
         bed_corners(2,1), bed_corners(2,2), &
-        rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
+        rho, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
         face_dx_E_A, face_dx_E_B)
     endif
 
@@ -10147,7 +10136,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         CS%h_nodal(i,j,1,1),   CS%h_nodal(i,j,2,1), &
         CS%h_nodal(i,j-1,1,2), CS%h_nodal(i,j-1,2,2), &
         bed_corners(1,1), bed_corners(2,1), &
-        rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
+        rho, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
         face_dy_S_A, face_dy_S_B)
     endif
 
@@ -10165,7 +10154,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         CS%h_nodal(i,j,1,2),   CS%h_nodal(i,j,2,2), &
         CS%h_nodal(i,j+1,1,1), CS%h_nodal(i,j+1,2,1), &
         bed_corners(1,2), bed_corners(2,2), &
-        rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
+        rho, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
         face_dy_N_A, face_dy_N_B)
     endif
 
@@ -10200,7 +10189,7 @@ end subroutine calc_shelf_driving_stress_DG
 subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
     h_nodal_cell, bed_corners, &
     dxCv_S, dxCv_N, dyCu_W, dyCu_E, &
-    rho, rhow, rhoi_rhow, grav, vol_dx, vol_dy, sx_shelf, sy_shelf, calc_slope_diag)
+    rho, rhoi_rhow, grav, vol_dx, vol_dy, sx_shelf, sy_shelf, calc_slope_diag)
   type(ice_shelf_dyn_CS), intent(in) :: CS    !< Ice shelf control structure
   real, dimension(:,:,:,:,:,:), intent(in) :: Phisub !< Sub-grid quadrature weights [nondim]
   real, dimension(2,2), intent(in) :: h_nodal_cell !< Q1 nodal thickness at the 4 corners [Z ~> m]
@@ -10210,8 +10199,7 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
   real, intent(in) :: dyCu_W         !< Cell y-length on west face [L ~> m]
   real, intent(in) :: dyCu_E         !< Cell y-length on east face [L ~> m]
   real, intent(in) :: rho            !< Ice density [R ~> kg m-3]
-  real, intent(in) :: rhow           !< Ocean density [R ~> kg m-3]
-  real, intent(in) :: rhoi_rhow      !< rho/rhow [nondim]
+  real, intent(in) :: rhoi_rhow      !< Ice to ocean density ratio [nondim]
   real, intent(in) :: grav           !< Gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
   real, dimension(2,2), intent(out) :: vol_dx !< Per-corner x volume integral [R L3 Z T-2 ~> kg m s-2]
   real, dimension(2,2), intent(out) :: vol_dy !< Per-corner y volume integral [R L3 Z T-2 ~> kg m s-2]
@@ -10227,7 +10215,6 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
   real :: slope_w_total
   real, dimension(2,2,2,2) :: qp_dx, qp_dy
   real :: h_gp, dhdx_gp, dhdy_gp
-  real :: hg_gp  ! Thickness at the sub-qp for the flotation test [Z ~> m]
   real :: bed_gp, dbdx_gp, dbdy_gp
   real :: dbdx_ref, dbdy_ref
   real :: dsdx_gp, dsdy_gp
@@ -10276,10 +10263,7 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
       dbdy_gp = dbdy_ref / d
 
       ! Local flotation test, even with GL_couple.
-      hg_gp = ((Phisub(qx,qy,i,j,1,1)*h_nodal_cell(1,1)) + (Phisub(qx,qy,i,j,2,2)*h_nodal_cell(2,2))) + &
-              ((Phisub(qx,qy,i,j,1,2)*h_nodal_cell(1,2)) + (Phisub(qx,qy,i,j,2,1)*h_nodal_cell(2,1)))
-      hg_gp = max(hg_gp, CS%min_h_shelf)
-      is_grounded = (rhoi_rhow * hg_gp - bed_gp > 0.0)
+      is_grounded = (rhoi_rhow * h_gp - bed_gp > 0.0)
 
       if (is_grounded) then
         dsdx_gp = dhdx_gp - dbdx_gp
@@ -10480,15 +10464,6 @@ subroutine reset_DG_to_cellmean_at_cell(CS, i, j, h_shelf_value)
   if (.not. CS%use_DG_thickness) return
   CS%h_nodal(i,j,:,:) = h_shelf_value
 end subroutine reset_DG_to_cellmean_at_cell
-
-!> True if CS is associated and uses DG(1) thickness.
-function is_DG_thickness_active(CS) result(active)
-  type(ice_shelf_dyn_CS), pointer :: CS
-  logical :: active
-  active = .false.
-  if (.not. associated(CS)) return
-  active = CS%use_DG_thickness
-end function is_DG_thickness_active
 
 !> Pointer to CS%h_nodal, for INIT_ICE_THICKNESS_NODAL; null if CS is not associated.
 function DG_nodal_thickness_ptr(CS) result(h_nodal)
@@ -11234,50 +11209,6 @@ subroutine nodal_positivity_limit(CS, G, ISS)
 
   call pass_corner_field(CS%h_nodal, G)
 end subroutine nodal_positivity_limit
-
-!> Cell mean of the surface elevation over the Phisub sub-quadrature points, with a flotation
-!! test at each point.
-pure real function subgrid_cell_mean_s(Phisub, h_nodal_cell, bed_corners, &
-                                       rhoi_rhow, min_h_shelf) result(Sbar)
-  real, dimension(:,:,:,:,:,:), intent(in) :: Phisub  !< Sub-grid quadrature weights [nondim]
-  real, dimension(2,2),         intent(in) :: h_nodal_cell !< Q1 nodal thickness [Z ~> m]
-  real, dimension(2,2),         intent(in) :: bed_corners  !< Bed depth at the 4 cell corners
-                                                           !! [Z ~> m]
-  real, intent(in) :: rhoi_rhow   !< Ice/ocean density ratio [nondim]
-  real, intent(in) :: min_h_shelf !< Positivity floor for thickness [Z ~> m]
-
-  real :: h_gp        ! Bilinear-interpolated thickness at a sub-QP [Z ~> m]
-  real :: bed_gp      ! Bilinear-interpolated bed depth at a sub-QP [Z ~> m]
-  real :: s_gp        ! Surface elevation at a sub-QP [Z ~> m]
-  real :: subarea     ! Reference-cell area of one sub-cell [nondim]
-  real :: accum       ! Running area-weighted sum of s [Z ~> m]
-  integer :: nsub, ii, jj, qx, qy
-  logical :: is_grounded
-
-  nsub    = size(Phisub, 3)
-  subarea = 1.0 / real(nsub)**2
-
-  accum = 0.0
-  do jj = 1, nsub ; do ii = 1, nsub ; do qy = 1, 2 ; do qx = 1, 2
-    h_gp = ((Phisub(qx,qy,ii,jj,1,1) * h_nodal_cell(1,1)) + &
-            (Phisub(qx,qy,ii,jj,2,2) * h_nodal_cell(2,2))) + &
-           ((Phisub(qx,qy,ii,jj,1,2) * h_nodal_cell(1,2)) + &
-            (Phisub(qx,qy,ii,jj,2,1) * h_nodal_cell(2,1)))
-    h_gp = max(h_gp, min_h_shelf)
-    bed_gp = ((Phisub(qx,qy,ii,jj,1,1) * bed_corners(1,1)) + &
-              (Phisub(qx,qy,ii,jj,2,2) * bed_corners(2,2))) + &
-             ((Phisub(qx,qy,ii,jj,1,2) * bed_corners(1,2)) + &
-              (Phisub(qx,qy,ii,jj,2,1) * bed_corners(2,1)))
-    is_grounded = (rhoi_rhow * h_gp - bed_gp > 0.0)
-    if (is_grounded) then
-      s_gp = h_gp - bed_gp
-    else
-      s_gp = (1.0 - rhoi_rhow) * h_gp
-    endif
-    accum = accum + ((0.25 * subarea) * s_gp)
-  enddo ; enddo ; enddo ; enddo
-  Sbar = accum
-end function subgrid_cell_mean_s
 
 !> (p1 + p2) + (p3 + p4) with each product rounded before the sum. A fused multiply-add keeps
 !! one product unrounded, and a quarter turn cycles the corners through the slots, so no
@@ -12236,9 +12167,9 @@ pure subroutine dg_kink_plane_2d(hw, fw, okw, lo, hi, tol, dqx, dqy, dq0, sigma,
   real,    intent(out) :: conf   !< How far the single-line fit is to be trusted, 0 to 1 [nondim]
   logical, intent(out) :: valid  !< False if either branch or the anchor is missing
   real, parameter :: eps = 1.0e-9
-  real :: gx(2), gy(2), sx, sy, best, dr(4), mis, amax
+  real :: gx(2), gy(2), best, dr(4), mis, amax
   integer :: p, q, b, nx(2), ny(2), pa, qa
-  logical :: ing, inf, m1, m2
+  logical :: m1, m2
 
   dqx = 0.0 ; dqy = 0.0 ; dq0 = 0.0 ; conf = 0.0 ; valid = .false.
   sigma = maxval(fw(lo:hi,lo:hi)) - minval(fw(lo:hi,lo:hi))
