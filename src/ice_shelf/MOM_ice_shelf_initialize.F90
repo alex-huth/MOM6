@@ -23,7 +23,7 @@ public initialize_ice_thickness
 public initialize_ice_shelf_boundary_channel
 public initialize_ice_flow_from_file
 public initialize_bed_node_from_file
-public corner_cell_weights, nodal_cell_mean
+public corner_cell_weights, nodal_cell_mean, cell_face_lengths
 public initialize_ice_shelf_boundary_from_file
 public initialize_ice_C_basal_friction
 public initialize_ice_AGlen
@@ -587,8 +587,33 @@ pure real function nodal_cell_mean(h_cell, w_cell) result(Hbar)
   endif
 end function nodal_cell_mean
 
+!> South, north, west and east face lengths of cell (i,j). At a non-reentrant west or south domain
+!! edge the east or north length is used for both.
+subroutine cell_face_lengths(G, i, j, reentrant_x, reentrant_y, dxS, dxN, dyW, dyE)
+  type(ocean_grid_type), intent(in)  :: G   !< The grid structure used by the ice shelf.
+  integer,               intent(in)  :: i   !< The i-index of the cell.
+  integer,               intent(in)  :: j   !< The j-index of the cell.
+  logical,               intent(in)  :: reentrant_x !< True if the domain is zonally reentrant
+  logical,               intent(in)  :: reentrant_y !< True if the domain is meridionally reentrant
+  real,                  intent(out) :: dxS !< South face length [L ~> m]
+  real,                  intent(out) :: dxN !< North face length [L ~> m]
+  real,                  intent(out) :: dyW !< West face length [L ~> m]
+  real,                  intent(out) :: dyE !< East face length [L ~> m]
+
+  if ((J-1 >= G%JsdB) .and. (reentrant_y .or. (j + G%jdg_offset > G%jsg))) then
+    dxS = G%dxCv(i,J-1) ; dxN = G%dxCv(i,J)
+  else
+    dxS = G%dxCv(i,J)   ; dxN = G%dxCv(i,J)
+  endif
+  if ((I-1 >= G%IsdB) .and. (reentrant_x .or. (i + G%idg_offset > G%isg))) then
+    dyW = G%dyCu(I-1,j) ; dyE = G%dyCu(I,j)
+  else
+    dyW = G%dyCu(I,j)   ; dyE = G%dyCu(I,j)
+  endif
+end subroutine cell_face_lengths
+
 !> Area-weighted cell mean of the bilinear interpolant of the B-grid corner values of cell (i,j),
-!! with the face lengths chosen as in init_nodal_DG_metric.
+!! with the face lengths from cell_face_lengths.
 function corner_cell_mean(G, i, j, reentrant_x, reentrant_y, c11, c21, c12, c22) result(cmean)
   type(ocean_grid_type), intent(in) :: G   !< The grid structure used by the ice shelf.
   integer,               intent(in) :: i   !< The i-index of the cell.
@@ -605,17 +630,7 @@ function corner_cell_mean(G, i, j, reentrant_x, reentrant_y, c11, c21, c12, c22)
   real, dimension(2,2) :: w_cell  ! Per-corner integration weights [L2 ~> m2]
   real, dimension(2,2) :: c_cell  ! Corner values in the (a,b) layout [Z ~> m]
 
-  if ((J-1 >= G%JsdB) .and. (reentrant_y .or. (j + G%jdg_offset > G%jsg))) then
-    dxS = G%dxCv(i,J-1) ; dxN = G%dxCv(i,J)
-  else
-    dxS = G%dxCv(i,J)   ; dxN = G%dxCv(i,J)
-  endif
-  if ((I-1 >= G%IsdB) .and. (reentrant_x .or. (i + G%idg_offset > G%isg))) then
-    dyW = G%dyCu(I-1,j) ; dyE = G%dyCu(I,j)
-  else
-    dyW = G%dyCu(I,j)   ; dyE = G%dyCu(I,j)
-  endif
-
+  call cell_face_lengths(G, i, j, reentrant_x, reentrant_y, dxS, dxN, dyW, dyE)
   call corner_cell_weights(dxS, dxN, dyW, dyE, w_cell)
   c_cell(1,1) = c11 ; c_cell(2,1) = c21 ; c_cell(1,2) = c12 ; c_cell(2,2) = c22
   cmean = nodal_cell_mean(c_cell, w_cell)

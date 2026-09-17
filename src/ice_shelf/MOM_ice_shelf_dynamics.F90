@@ -32,7 +32,7 @@ use MOM_checksums, only : hchksum, qchksum
 use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary_channel,initialize_ice_flow_from_file
 use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary_from_file,initialize_ice_C_basal_friction
 use MOM_ice_shelf_initialize, only : initialize_ice_AGlen, initialize_bed_node_from_file
-use MOM_ice_shelf_initialize, only : corner_cell_weights, nodal_cell_mean
+use MOM_ice_shelf_initialize, only : corner_cell_weights, nodal_cell_mean, cell_face_lengths
 implicit none ; private
 
 #include <MOM_memory.h>
@@ -11004,17 +11004,7 @@ subroutine init_nodal_DG_metric(CS, G)
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
 
   do j = jsd, jed ; do i = isd, ied
-    ! Use the east/north face length alone at non-reentrant west/south domain edges.
-    if ((J-1 >= G%JsdB) .and. (CS%reentrant_y .or. (j + G%jdg_offset > G%jsg))) then
-      dxS = G%dxCv(i,J-1) ; dxN = G%dxCv(i,J)
-    else
-      dxS = G%dxCv(i,J)   ; dxN = G%dxCv(i,J)
-    endif
-    if ((I-1 >= G%IsdB) .and. (CS%reentrant_x .or. (i + G%idg_offset > G%isg))) then
-      dyW = G%dyCu(I-1,j) ; dyE = G%dyCu(I,j)
-    else
-      dyW = G%dyCu(I,j)   ; dyE = G%dyCu(I,j)
-    endif
+    call cell_face_lengths(G, i, j, CS%reentrant_x, CS%reentrant_y, dxS, dxN, dyW, dyE)
 
     !M_xi: int_0^1 N_a*N_a'*d(xi) dxi where d(xi) = dyW*(1-xi) + dyE*xi.
     ! Closed-form: M11 = dyW/4 + dyE/12, M22 = dyW/12 + dyE/4, M12 = dyW/12 + dyE/12.
