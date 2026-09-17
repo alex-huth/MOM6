@@ -1565,7 +1565,6 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         ! DG(1) cold start from the nodal thickness read by initialize_ice_thickness.
         call pass_var(ISS%h_shelf, G%domain)
         call nodal_positivity_limit(CS, G, ISS)
-        call pass_corner_field(CS%h_nodal, G)
         call enforce_wrap_corner_consistency(CS, ISS, G)
         call recompute_h_shelf_from_nodal(CS, ISS, G)
       endif
@@ -12685,7 +12684,6 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
 
   ! Stage 1: positivity limit, spatial operator, M^-1, Euler step.
   call nodal_positivity_limit(CS, G, ISS)
-  call pass_corner_field(CS%h_nodal, G)
   call DG1_nodal_spatial_operator(CS, G, hmask, CS%h_nodal, rhs, uh_ice, vh_ice, time_step)
 
   ! Two independent floors on the delivered relaxation time, warned once each.
@@ -12784,7 +12782,6 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
 
   ! Final positivity limit.
   call nodal_positivity_limit(CS, G, ISS)
-  call pass_corner_field(CS%h_nodal, G)
 
   ! Average uh_ice, vh_ice over the 2 stages (SSP-RK2 equal weight).
   uh_ice(:,:) = 0.5 * uh_ice(:,:)
