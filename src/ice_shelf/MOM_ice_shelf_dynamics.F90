@@ -12231,6 +12231,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real :: rate_cap ! Largest rate the explicit step may carry [T-1 ~> s-1]
   real :: rhoi_rhow ! Ice/ocean density ratio for the flotation test [nondim]
   real :: one_m_r  ! 1 - rho_i/rho_w, the floating-ice ds/dh [nondim]
+  real :: Tbar     ! Cell mean of the nodal increment, removed so the damper moves no mass
+                   ! [Z T-1 ~> m s-1]
   real, dimension(SZDI_(G),SZDJ_(G)) :: f_gnd ! CS%ground_frac clipped to [0,1] [nondim]
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed
 
@@ -12493,8 +12495,10 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         kwant = gam * itau_w
         kap = min(max(kwant - min(knat_xi, knat_eta), 0.0), rate_cap)
         ! Changes w by -kap*A_dmp, orthogonal to the mean and the tilts.
-        ! +,-,-,+ : changes w by 4*(-0.25*kap*A_dmp) = -kap*A_dmp, and is exactly
-        ! orthogonal to the cell mean and to both tilts.
+        ! +,-,-,+ : changes w by 4*(-0.25*kap*A_dmp) = -kap*A_dmp, and is orthogonal to
+        ! the unweighted corner mean and to both tilts.  It is orthogonal to the cell
+        ! mean itself only where the corner weights are symmetric; the block below
+        ! removes whatever mean survives.
         T_node(i,j,1,1) = T_node(i,j,1,1) - (0.25*kap*A_dmp)
         T_node(i,j,2,2) = T_node(i,j,2,2) - (0.25*kap*A_dmp)
         T_node(i,j,2,1) = T_node(i,j,2,1) + (0.25*kap*A_dmp)
@@ -12506,6 +12510,19 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         endif
       endif
     endif
+
+    ! The damper changes only the tilts and the twist, so it must move no mass.  Each
+    ! increment above adds one sign to two corners and the other sign to the other two,
+    ! which has no cell mean only where the two face lengths across the cell agree.  A
+    ! latitude-longitude or tripolar grid does not give that, because corner_cell_weights
+    ! builds the weights from the four face lengths, so remove whatever mean survives.
+    ! The four corners are written out rather than swept by a 2x2 loop, which the
+    ! compiler vectorizes into fused products that a grid rotation would not reproduce.
+    Tbar = nodal_cell_mean(T_node(i,j,:,:), CS%cell_mean_w(i,j,:,:))
+    T_node(i,j,1,1) = T_node(i,j,1,1) - Tbar
+    T_node(i,j,2,2) = T_node(i,j,2,2) - Tbar
+    T_node(i,j,2,1) = T_node(i,j,2,1) - Tbar
+    T_node(i,j,1,2) = T_node(i,j,1,2) - Tbar
 
     if (diag_on) then
       CS%dg_damp_tend(i,j) = sqrt(d_l2)
