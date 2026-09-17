@@ -40,7 +40,7 @@ implicit none ; private
 public register_ice_shelf_dyn_restarts, initialize_ice_shelf_dyn, update_ice_shelf, IS_dynamics_post_data
 public ice_time_step_CFL, ice_shelf_dyn_end, change_in_draft, write_ice_shelf_energy
 public shelf_advance_front, ice_shelf_min_thickness_calve, calve_to_mask, volume_above_floatation
-public reset_DG_to_cellmean_at_cell, reset_DG_to_cellmean_bulk, is_DG_thickness_active
+public reset_DG_to_cellmean_at_cell, zero_DG_h_nodal, is_DG_thickness_active
 public DG_nodal_thickness_ptr
 public accumulate_DG_source_rate
 public calc_prescribed_basal_melt
@@ -60,13 +60,9 @@ integer, parameter :: INNER_CR = 3       !< Conjugate residual
 ! fB is formed and the sentinel is never produced.
 real, parameter :: FB_NO_COULOMB_DRAG = -1.0 !< fB value meaning zero effective pressure [(T L-1)^CF_PostPeak]
 
-!> Jump-mode rate amplification factor for the per-face stability budget of the
-!! DG(1) artificial viscosity. The semi-discrete decay rate of the face-node jump
-!! mode is lambda = 4 * amp * c * u_eff / dx_perp, where the factor 4 collects the
-!! node-localization (x2) and consistent-mass (x2) amplifications relative to the
-!! cell-mean rate, and amp = 0.5*(dh/ds|_A + dh/ds|_B) * (ds/dh|_A + ds/dh|_B)
-!! collects the flotation-branch flux Jacobian. With the harmonic slope mean of
-!! dg1_wb_slope_mean, amp = (2/(g_A+g_B)) * (g_A+g_B) = 2 exactly at every face.
+!> Flotation-branch amplification in the DG(1) artificial-viscosity jump-mode rate
+!! lambda = 4*amp*c*u_eff/dx_perp. The harmonic slope mean of dg1_wb_slope_mean
+!! makes amp exactly 2 at every face [nondim].
 real, parameter :: DG1_WB_JUMP_RATE_AMP = 2.0
 
 ! CISM-style grounding-line treatment modes (CISM_FRICTION, CISM_TAUD)
@@ -98,19 +94,12 @@ integer, parameter :: LIMITER_SUPERBEE = 1  !< Superbee limiter (least diffusive
 integer, parameter :: LIMITER_MINMOD = 2    !< Minmod limiter (most diffusive)
 integer, parameter :: LIMITER_MC = 3        !< Monotonized-central limiter (between Van Leer and superbee)
 
-! Cross-cell operators for the DG(1) Q1 nodal thickness source, i.e. how much of a cell's source
-! is shared with the neighbours it meets at a corner (DG_BASAL_SOURCE_SCHEME,
-! DG_SURFACE_SOURCE_LOCAL). All are exactly mass-conservative.
-integer, parameter :: SRC_OP_AVERAGED = 0 !< Each corner takes the cell_mean_w-weighted average of
-                                        !! the cells sharing it, giving a source that is continuous
-                                        !! across cell faces.
-integer, parameter :: SRC_OP_LOCAL = 1  !< Each corner of a cell takes that cell's own rate, so no
-                                        !! source crosses a cell face.
-integer, parameter :: SRC_OP_SUBGRID = 2 !< Sub-element weighted: the melt rate is averaged over the
-                                        !! floating part of each corner's support and delivered to
-                                        !! each cell in proportion to its own floating fraction
-                                        !! there, so a grounded corner neither donates nor receives.
-                                        !! Requires the SEM2 nodal floating fractions.
+! How the DG(1) nodal thickness source is shared between cells meeting at a corner.
+! All are exactly mass-conservative.
+integer, parameter :: SRC_OP_AVERAGED = 0 !< Corner takes the cell_mean_w-weighted average of its cells
+integer, parameter :: SRC_OP_LOCAL = 1  !< Corner takes its own cell's rate; nothing crosses a face
+integer, parameter :: SRC_OP_SUBGRID = 2 !< Averaged over the floating part of each corner's support
+                                        !! and returned by floating fraction. Needs xi_basal.
 
 ! Grounding-line treatment of the prescribed ice-only basal melt (ICE_ONLY_BASAL_MELT_GLP).
 ! Named after Leguy, Lipscomb & Asay-Davis (2021) sec. 2.3 and Seroussi & Morlighem (2018) sec. 2.
@@ -121,10 +110,8 @@ integer, parameter :: MELT_GLP_FCMP = 1 !< Flotation-condition melt: full rate w
 integer, parameter :: MELT_GLP_PMP = 2  !< Partial melt: the rate is scaled by the floating area
                                         !! fraction of the cell. Equivalent to Seroussi's SEM1.
 integer, parameter :: MELT_GLP_NMP = 3  !< No melt: zero rate in every partly grounded cell.
-integer, parameter :: MELT_GLP_SEM2 = 4 !< Sub-element melt 2 of Seroussi & Morlighem (2018): the
-                                        !! cell total is the same as PMP, but it is distributed
-                                        !! within the cell in proportion to the nodal floating
-                                        !! fraction instead of uniformly. DG only.
+integer, parameter :: MELT_GLP_SEM2 = 4 !< Seroussi & Morlighem (2018) SEM2: PMP's cell total,
+                                        !! distributed by nodal floating fraction. DG only.
 
 
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
@@ -213,32 +200,16 @@ type, public :: ice_shelf_dyn_CS ; private
                                                        !! such that the bilinear interpolant over each cell
                                                        !! integrates to the cell-averaged bed_elev. Continuous
                                                        !! across cell boundaries.
-  real, pointer, dimension(:,:,:,:) :: h_nodal => NULL() !< DG(1) nodal Q1 thickness per cell at the
-                                                       !! 4 corners [Z ~> m]. h_nodal(i,j,a,b) is the value at
-                                                       !! cell-local corner (a in {1,2} = west/east, b in {1,2} =
-                                                       !! south/north). Each cell owns its own 4 corner values;
-                                                       !! jumps across faces are allowed (true DG).
-  real, pointer, dimension(:,:,:,:,:,:) :: Minv_nodal => NULL() !< Per-cell inverse of the tensor-product Q1
-                                                       !! mass matrix, Minv_nodal(i,j,a,b,p,q) = Minv_xi(a,p) *
-                                                       !! Minv_eta(b,q), from corner (p,q) to corner (a,b) [L-2 ~> m-2].
-  real, pointer, dimension(:,:,:,:) :: cell_mean_w => NULL() !< Per-corner integration weight w(a,b) = int N(a,b)*J
-                                                       !! over the reference cell [L2 ~> m2].
-  real, pointer, dimension(:,:) :: h_source_rate => NULL() !< Accumulated cell-mean thickness source rate
-                                                       !! from external modules (basal melt + surface SMB)
-                                                       !! since the last DG advect step [Z T-1 ~> m s-1].
-                                                       !! Consumed inside ice_shelf_advect_DG1_nodal: projected
-                                                       !! to a continuous Q1 nodal source field and added to
-                                                       !! each SSP-RK2 stage RHS. Reset to zero after consumption.
-  real, pointer, dimension(:,:) :: h_source_rate_bmb => NULL() !< The basal (ice-shelf melt) part of
-                                                       !! h_source_rate, accumulated in parallel with it since the
-                                                       !! last DG advect step [Z T-1 ~> m s-1]. The surface part is
-                                                       !! h_source_rate - h_source_rate_bmb. Kept as a separate
-                                                       !! buffer rather than replacing h_source_rate so that the
-                                                       !! default single-projection path is unchanged and its
-                                                       !! summation order (and hence its answers) is preserved.
-  real, pointer, dimension(:,:) :: h_source_rate_last => NULL() !< Snapshot of h_source_rate as consumed by the
-                                                       !! most recent DG advect step [Z T-1 ~> m s-1], kept for
-                                                       !! diagnostic posting after h_source_rate has been zeroed.
+  real, pointer, dimension(:,:,:,:) :: h_nodal => NULL() !< DG(1) Q1 thickness at each cell's own corners,
+                                                       !! h_nodal(i,j,a,b) with a = W/E, b = S/N [Z ~> m].
+  real, pointer, dimension(:,:,:,:,:,:) :: Minv_nodal => NULL() !< Per-cell inverse Q1 mass matrix,
+                                   !! Minv_nodal(i,j,a,b,p,q) = Minv_xi(a,p)*Minv_eta(b,q) [L-2 ~> m-2].
+  real, pointer, dimension(:,:,:,:) :: cell_mean_w => NULL() !< Corner weight w(a,b) = int N(a,b) dA [L2 ~> m2].
+  real, pointer, dimension(:,:) :: h_source_rate => NULL() !< Cell-mean thickness source (basal + surface)
+                                                       !! accumulated since the last DG advect step [Z T-1 ~> m s-1].
+  real, pointer, dimension(:,:) :: h_source_rate_bmb => NULL() !< Basal part of h_source_rate [Z T-1 ~> m s-1].
+  real, pointer, dimension(:,:) :: h_source_rate_last => NULL() !< h_source_rate used by the last DG advect
+                                                       !! step, kept for diagnostics [Z T-1 ~> m s-1].
   real, pointer, dimension(:,:) :: C_basal_friction => NULL()!< Coefficient in sliding law tau_b = C u^(n_basal_fric),
                                !! units of [R L Z T-2 (s m-1)^(n_basal_fric) ~> Pa (s m-1)^(n_basal_fric)]
   real, pointer, dimension(:,:) :: coef_prefactor => NULL() !< Pre-computed area*C_basal_friction*L_T_to_m_s for
@@ -439,133 +410,54 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! a better way to do it, but any difference will be negligible).
   real :: thresh_float_col_depth !< The water column depth over which the shelf if considered to be floating
   logical :: moving_shelf_front  !< Specify whether to advance shelf front (and calve).
-  logical :: use_DG_thickness     !< If true, use DG(1) representation for ice thickness with
-                                  !! unsplit advection scheme and sub-element driving stress quadrature.
-  logical :: init_bed_nodal       !< If true, read bed elevation at B-grid nodes from BED_TOPO_FILE
-                                  !! into CS%bed_node and derive CS%bed_elev as the area-weighted
-                                  !! cell mean of their bilinear interpolant. Skips
-                                  !! the cell-averaged BED_TOPO_FILE read in
-                                  !! initialize_ice_flow_from_file. Required by USE_DG_THICKNESS.
-  logical :: init_thickness_nodal !< If true, ICE_THICKNESS_VARNAME was read at B-grid nodes and
-                                  !! CS%h_nodal was filled during initialize_ice_thickness, so the
-                                  !! cell-mean seeding of h_nodal is skipped.
-  integer :: dg_basal_source_op   !< The cross-cell operator applied to the basal part of the
-                                  !! DG(1) thickness source, one of the SRC_OP_* parameters.
-                                  !! Decides how much of a cell's basal melt is shared with the
-                                  !! neighbours it meets at a corner.
-  real, pointer, dimension(:,:,:,:) :: xi_basal => NULL() !< Nodal floating fraction: the share of
-                                  !! corner (a,b)'s support that is floating [nondim]. Built from
-                                  !! whichever sub-element grounding-line partition is active, so
-                                  !! that melt keys off the same geometry the basal friction does.
-                                  !! Identically 1 wherever no sub-element treatment applies.
-  logical :: dg_basal_source_sem2 !< If true, the basal part of the DG(1) thickness source is
-                                  !! distributed within each cell in proportion to the nodal
-                                  !! floating fraction CS%xi_basal (the SEM2 scheme of Seroussi &
-                                  !! Morlighem 2018) rather than uniformly. Set by
-                                  !! ICE_ONLY_BASAL_MELT_GLP = "SEM2".
-  logical :: dg_surface_source_local !< If true, the surface part of the DG(1) thickness source is
-                                  !! applied as a piecewise-constant field (SRC_OP_LOCAL), so a
-                                  !! cell's surface mass balance only ever changes its own
-                                  !! thickness; if false it is averaged at shared corners
-                                  !! (SRC_OP_AVERAGED). Both are exactly mass-conservative.
-  logical :: dg_tilt_damp         !< If true, damp the grid-scale in-cell tilt mode,
-                                  !! which is invisible to every jump-proportional
-                                  !! mechanism in the scheme.
-  real :: dg_tilt_damp_r_hi       !< Normalized tilt-Laplacian excess at which the tilt
-                                  !! damping reaches full strength [nondim].
-  logical :: dg_twist_damp        !< If true, damp the grid-scale component of the DG(1)
-                                  !! in-cell xy-twist degree of freedom.
-  real, pointer, dimension(:,:) :: dg_damp_tend => NULL() !< Rate at which the mode damper is
-                                  !! removing in-cell thickness structure, as the L2 norm over
-                                  !! the cell of the correction it applies [Z T-1 ~> m s-1].
-  real, pointer, dimension(:,:) :: dg_damp_gate => NULL() !< Largest gate fraction the mode
-                                  !! damper opened in a cell, over its three modes [nondim].
-  real, pointer, dimension(:,:) :: dg_damp_want => NULL() !< Rate the mode damper's gate asked
-                                  !! for, summed over its three modes, before the transport's
-                                  !! share is credited [T-1 ~> s-1].
-  real, pointer, dimension(:,:) :: dg_damp_got => NULL() !< Rate the mode damper actually
-                                  !! delivered, summed over its three modes [T-1 ~> s-1].
-  logical :: dg_damp_advective    !< If true, the mode damper subtracts the removal rate the
-                                  !! transport already delivers, so it acts only where the
-                                  !! flow is too slow to remove the mode unaided.
-  real :: dg_damp_advective_c     !< Coefficient on c*|u_n|/dx in that subtraction [nondim].
-  real :: dg_damp_u_cut           !< Sweep speed the mode damper brings the grid-scale mode up
-                                  !! to, giving a per-cell,
-                                  !! per-direction relaxation time dx/(2*c*u_cut) when
-                                  !! positive [L T-1 ~> m s-1].
-  real :: dg_damp_kink_tol        !< Grounded-fraction misfit at which confidence in the
-                                  !! single-line reconstruction of the flotation break falls
-                                  !! to zero, so the reference reverts to the mean-supported
-                                  !! one [nondim].
-  real :: dg_damp_kink_fit_tol    !< Relative slope misfit at which confidence in the TILT's
-                                  !! two-branch reconstruction of the flotation break falls to
-                                  !! zero, the counterpart of dg_damp_kink_tol for the twist.
-                                  !! Non-positive skips the test [nondim].
-  logical :: dg_damp_kink_ref     !< If true, the mode damper's reference is told where the
-                                  !! flotation contour is and reconstructs the slope break
-                                  !! across it, instead of the cell being exempted.
-  logical :: dg_damp_excess_only  !< If true, the mode damper removes only the part of its
-                                  !! detector that no reference explains, rather than the
-                                  !! whole detector once a threshold is crossed.
-  integer :: dg_damp_gl_reach     !< How far the grounding-line protection in the mode
-                                  !! damper extends: 0 the bisected cell alone, 1 the cells
-                                  !! whose tilt enters the detector, 2 the full reach of the
-                                  !! mean-supported reference.
-  logical :: dg_tilt_damp_dt_warned = .false. !< True once the short-relaxation-time
-                                  !! warning has been issued, so it is not repeated.
-  real :: dg_art_visc_advect_coef !< Dimensionless multiplier on the |u_face| advective
-                                  !! contribution to u_eff in the DG(1) artificial viscosity
-                                  !! [nondim]. Per face, u_eff = advect_coef * |u_face|
-                                  !! + strain_coef * eps_e_face * dx_perp. advect_coef = 1
-                                  !! (default) preserves the original formulation;
-                                  !! advect_coef = 0 drops the |u| term entirely so damping
-                                  !! is purely strain-rate-based (yielding a strictly grid-
-                                  !! invariant damping timescale at the cost of leaving fast
-                                  !! advective regions undamped if eps_e_face is also small).
-  real :: dg_art_visc_strain_coef !< Dimensionless coefficient on the velocity-independent
-                                  !! strain-rate-scaled diffusivity floor for the DG(1)
-                                  !! artificial viscosity [nondim]. Per-face floor velocity is
-                                  !! u_floor = strain_coef * eps_e_face * dx_perp, where
-                                  !! eps_e_face is the SSA effective strain rate at the face
-                                  !! midpoint (2D second invariant). Added to |u_face| in the
-                                  !! flux so jumps are still damped at shear-margin / stagnant-
-                                  !! interior faces where |u_face| ~ 0 but strain rate is
-                                  !! nonzero. strain_coef = 0 (default) recovers the pure
-                                  !! velocity-magnitude scaling.
-  real :: dg_art_visc_advect_L_ref !< Reference length that renders the |u_face| advective
-                                  !! contribution to u_eff grid-invariant [L ~> m]. When
-                                  !! positive, the advective term becomes advect_coef *
-                                  !! |u_face| * (dx_perp/L_ref), so its jump-mode decay rate
-                                  !! 4*amp*c*advect_coef*|u_face|/L_ref no longer carries a
-                                  !! 1/dx_perp and is the same at every resolution, matching
-                                  !! the strain-rate term (whose dx_perp already cancels).
-                                  !! Non-positive (default) recovers the legacy advect_coef *
-                                  !! |u_face|, whose damping timescale scales with dx_perp.
-  real :: dg_art_visc_tau_floor   !< Absolute damping timescale for the DG(1) artificial
-                                  !! viscosity [T ~> s]. When positive, dx_perp/tau_floor is
-                                  !! added to u_eff, giving a jump-mode decay rate floor of
-                                  !! 4*amp*c/tau_floor that is independent of both resolution
-                                  !! and flow speed, so jumps are still damped where |u_face|
-                                  !! and eps_e_face are both small (stagnant grounded ice).
-                                  !! Non-positive (default) disables the floor.
-  real :: dg_art_visc_r_hi        !< Smoothness-gate saturation threshold on the gate ratio
-                                  !! r_face [nondim]; faces at or above this receive the
-                                  !! full c_max.
-  real :: dg_art_visc_kcell       !< Per-cell stability budget for the DG(1) artificial
-                                  !! viscosity [nondim]: the sum over a cell's faces of the
-                                  !! jump-mode decay rates times dt is held below this by
-                                  !! rescaling the cell's face coefficients. SSP-RK2
-                                  !! requires < 2.
-  real :: dg_slow_idle_u_tiny     !< Stagnant-jump diagnostic threshold on face-speed
-                                  !! magnitude [L T-1]. A face is flagged if |u_face| <
-                                  !! this value AND eps_e_face < eps_tiny AND |Delta h_eq|
-                                  !! > s_tol; persistent flags mark regions where neither
-                                  !! the |u| nor the strain-rate term damps the jump mode.
-  real :: dg_slow_idle_eps_tiny   !< Stagnant-jump diagnostic threshold on face strain rate
-                                  !! [T-1]. See dg_slow_idle_u_tiny.
-  real :: dg_slow_idle_s_tol      !< Stagnant-jump diagnostic threshold on |Delta h_eq|
-                                  !! (well-balanced thickness-equivalent surface jump) [Z].
-                                  !! See dg_slow_idle_u_tiny.
+  logical :: use_DG_thickness     !< If true, use the DG(1) nodal thickness with unsplit advection.
+  logical :: init_bed_nodal       !< If true, read the bed at B-grid nodes into CS%bed_node and set
+                                  !! CS%bed_elev to its cell means. Required by USE_DG_THICKNESS.
+  logical :: init_thickness_nodal !< If true, CS%h_nodal was read at nodes, so it is not seeded
+                                  !! from the cell means.
+  integer :: dg_basal_source_op   !< Sets the SRC_OP_* method (LOCAL, AVERAGED, or SUBGRID) for how much of a cell's
+                                  !! basal melt is shared with neighbors it meets at a corner
+  real, pointer, dimension(:,:,:,:) :: xi_basal => NULL() !< Floating share of corner (a,b)'s support,
+                                  !! from the active sub-element partition; 1 where none applies [nondim].
+  logical :: dg_basal_source_sem2 !< If true, distribute the basal DG(1) source by CS%xi_basal (SEM2).
+  logical :: dg_surface_source_local !< If true, apply the surface DG(1) source with SRC_OP_LOCAL,
+                                  !! otherwise with SRC_OP_AVERAGED.
+  logical :: dg_tilt_damp         !< If true, damp the grid-scale in-cell tilt modes.
+  real :: dg_tilt_damp_r_hi       !< Normalized tilt detector excess at which damping reaches full strength [nondim].
+  logical :: dg_twist_damp        !< If true, damp the grid-scale in-cell twist mode.
+  real, pointer, dimension(:,:) :: dg_damp_tend => NULL() !< L2 cell norm of the mode-damper
+                                  !! correction rate [Z T-1 ~> m s-1].
+  real, pointer, dimension(:,:) :: dg_damp_gate => NULL() !< Largest mode-damper gate over the
+                                  !! three modes [nondim].
+  real, pointer, dimension(:,:) :: dg_damp_want => NULL() !< Mode-damper rate requested, summed over
+                                  !! modes, before the transport credit [T-1 ~> s-1].
+  real, pointer, dimension(:,:) :: dg_damp_got => NULL() !< Mode-damper rate delivered, summed over
+                                  !! modes [T-1 ~> s-1].
+  logical :: dg_damp_advective    !< If true, credit the removal rate the transport already gives.
+  real :: dg_damp_advective_c     !< Coefficient on c*|u_n|/dx in the dg_damp_advective credit [nondim].
+  real :: dg_damp_u_cut           !< Sweep speed setting the relaxation time dx/(2*c*u_cut)
+                                  !! when positive [L T-1 ~> m s-1].
+  real :: dg_damp_kink_tol        !< Grounded-fraction misfit at which the twist's kink
+                                  !! reconstruction loses all confidence [nondim].
+  real :: dg_damp_kink_fit_tol    !< Relative slope misfit at which the tilt's kink
+                                  !! reconstruction loses all confidence; <= 0 skips it [nondim].
+  logical :: dg_damp_kink_ref     !< If true, reconstruct the slope break at the flotation contour
+                                  !! instead of exempting the cell.
+  logical :: dg_damp_excess_only  !< If true, remove only the detector part no reference explains.
+  integer :: dg_damp_gl_reach     !< Grounding-line protection reach: 0 bisected cell, 1 detector
+                                  !! stencil, 2 full reference stencil.
+  logical :: dg_tilt_damp_dt_warned = .false. !< True once the short-relaxation warning is issued.
+  real :: dg_art_visc_advect_coef !< Coefficient on |u_face| in the artificial viscosity u_eff [nondim].
+  real :: dg_art_visc_strain_coef !< Coefficient on eps_e_face*dx_perp in the artificial viscosity u_eff [nondim].
+  real :: dg_art_visc_advect_L_ref !< If positive, scale the |u_face| term by dx_perp/L_ref so its
+                                  !! decay rate is resolution-independent [L ~> m].
+  real :: dg_art_visc_tau_floor   !< If positive, add dx_perp/tau_floor to u_eff [T ~> s].
+  real :: dg_art_visc_r_hi        !< Smoothness-gate ratio where the full c_max is reached [nondim].
+  real :: dg_art_visc_kcell       !< Per-cell bound on dt times the summed face decay rates;
+                                  !! SSP-RK2 needs < 2 [nondim].
+  real :: dg_slow_idle_u_tiny     !< Stagnant-jump (no jump damping) flag threshold for |u_face| [L T-1 ~> m s-1].
+  real :: dg_slow_idle_eps_tiny   !< Stagnant-jump (no jump damping) flag threshold for eps_e_face [T-1 ~> s-1].
+  real :: dg_slow_idle_s_tol      !< Stagnant-jump flag (no jump damping) threshold on |Delta h_eq| [Z ~> m].
   logical :: calve_to_mask       !< If true, calve off the ice shelf when it passes the edge of a mask.
   real :: min_thickness_simple_calve !< min. ice shelf thickness criteria for calving [Z ~> m].
   real :: T_shelf_missing   !< An ice shelf temperature to use where there is no ice shelf [C ~> degC]
@@ -680,49 +572,22 @@ type, public :: ice_shelf_dyn_CS ; private
              id_s_jump_face_u_signed = -1, id_s_jump_face_v_signed = -1, &
              id_un_face_u = -1, id_un_face_v = -1, &
              id_dg_eps_face_u = -1, id_dg_eps_face_v = -1
-  real, pointer, dimension(:,:) :: dg_art_visc_coef_u => NULL() !< Per-face DG(1) artificial-
-                                                       !! viscosity coefficient on u-faces
-                                                       !! [nondim] (post per-cell CFL
-                                                       !! scaling), from the last spatial-
-                                                       !! operator call. Diagnostic only.
-  real, pointer, dimension(:,:) :: dg_art_visc_coef_v => NULL() !< As dg_art_visc_coef_u but
-                                                       !! on v-faces [nondim].
-  real, pointer, dimension(:,:) :: dg_art_visc_nu_u => NULL() !< Per-face effective DG(1)
-                                                       !! artificial viscosity on u-faces
-                                                       !! [m2 s-1], = c_face*u_eff*dx_perp
-                                                       !! (post per-cell CFL scaling).
-                                                       !! Comparable to a physical diffusivity:
-                                                       !! the face flux equals nu * [h_eq] /
-                                                       !! dx_perp * dy_face. Distinguishes
-                                                       !! gate-active-but-quiet faces from
-                                                       !! gate-active-and-damping faces.
-  real, pointer, dimension(:,:) :: dg_art_visc_nu_v => NULL() !< As dg_art_visc_nu_u but on
-                                                       !! v-faces [m2 s-1].
-  real, pointer, dimension(:,:) :: dg_art_visc_cell_scale => NULL() !< Per-cell DG(1)
-                                                       !! artificial-viscosity cap throttle
-                                                       !! factor [nondim]; 1 where the
-                                                       !! per-cell stability budget is slack,
-                                                       !! kcell/(S_K*dt) < 1 where the cap
-                                                       !! rescales the cell's face
-                                                       !! coefficients.
-  real, pointer, dimension(:,:) :: dg_slow_idle_face_u => NULL() !< Stagnant-jump indicator on
-                                                       !! u-faces [nondim, 0 or 1]. 1 where
-                                                       !! |u_face| < u_tiny AND eps_e_face
-                                                       !! < eps_tiny AND |Delta h_eq| > s_tol
-                                                       !! at the last spatial-operator call,
-                                                       !! flagging faces where neither the
-                                                       !! advective nor the strain-rate
-                                                       !! damping channel acts. Persistent
-                                                       !! non-zero values indicate that a
-                                                       !! constant velocity-floor B1 may
-                                                       !! be warranted.
-  real, pointer, dimension(:,:) :: dg_slow_idle_face_v => NULL() !< As dg_slow_idle_face_u but
-                                                       !! on v-faces [nondim, 0 or 1].
-  real, pointer, dimension(:,:) :: phi_x_FV => NULL() !< Van Leer slope-limiter factor at each u-face
+  real, pointer, dimension(:,:) :: dg_art_visc_coef_u => NULL() !< DG(1) art-visc coefficient on u-faces
+                                                       !! after the per-cell cap [nondim].
+  real, pointer, dimension(:,:) :: dg_art_visc_coef_v => NULL() !< DG(1) art-visc coefficient on v-faces
+                                                       !! after the per-cell cap [nondim].
+  real, pointer, dimension(:,:) :: dg_art_visc_nu_u => NULL() !< DG(1) art viscosity c_face*u_eff*dx_perp
+                                                       !! on u-faces after the cap [L2 T-1 ~> m2 s-1].
+  real, pointer, dimension(:,:) :: dg_art_visc_nu_v => NULL() !< DG(1) art viscosity c_face*u_eff*dx_perp
+                                                       !! on v-faces after the cap [L2 T-1 ~> m2 s-1].
+  real, pointer, dimension(:,:) :: dg_art_visc_cell_scale => NULL() !< Per-cell art-visc cap factor,
+                                                       !! 1 where the budget is slack [nondim].
+  real, pointer, dimension(:,:) :: dg_slow_idle_face_u => NULL() !< 1 on u-faces where |u_face|, eps_e_face
+                                                       !! and |Delta h_eq| pass the stagnant-jump thresholds [nondim].
+  real, pointer, dimension(:,:) :: dg_slow_idle_face_v => NULL() !< 1 on v-faces where |u_face|, eps_e_face
+                                                       !! and |Delta h_eq| pass the stagnant-jump thresholds [nondim].
+  real, pointer, dimension(:,:) :: phi_x_FV => NULL() !< Slope-limiter factor at each u-face
                                                        !! from ice_shelf_advect_thickness_x [nondim],
-                                                       !! in [0,2]. Faces where the limiter branch was
-                                                       !! not taken (incomplete stencil, inactive face)
-                                                       !! report 1.0.
   real, pointer, dimension(:,:) :: phi_y_FV => NULL() !< Van Leer slope-limiter factor at each v-face
                                                        !! from ice_shelf_advect_thickness_y [nondim].
   !>@}
@@ -876,9 +741,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%area_node(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%OD_av(isd:ied,jsd:jed), source=0.0)
     allocate(CS%ground_frac(isd:ied,jsd:jed), source=0.0)
-    ! Unconditionally: this runs before read_nodal_limiter_params, so the
-    ! damper's own flags are not set yet and cannot be tested here.  The
-    ! diagnostics are registered against those flags later, once they are known.
+    ! Unconditional: the damper flags are not read yet.
     allocate(CS%dg_damp_tend(isd:ied,jsd:jed), source=0.0)
     allocate(CS%dg_damp_gate(isd:ied,jsd:jed), source=0.0)
     allocate(CS%dg_damp_want(isd:ied,jsd:jed), source=0.0)
@@ -896,10 +759,8 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%sy_shelf(isd:ied,jsd:jed), source=0.0)
     allocate(CS%bed_elev(isd:ied,jsd:jed), source=0.0)
     allocate(CS%bed_node(IsdB:IedB,JsdB:JedB), source=0.0)
-    ! The DG(1) nodal state and its metric tables are needed only by DG, apart from
-    ! h_nodal, which INIT_ICE_THICKNESS_NODAL fills transiently to derive the cell
-    ! mean. These are read here rather than in initialize_ice_shelf_dyn, which runs
-    ! after this routine, because they decide what gets allocated and restarted.
+    ! Read early because they decide what is allocated and restarted. INIT_ICE_THICKNESS_NODAL
+    ! also needs h_nodal, briefly, to derive the cell mean.
     call get_param(param_file, mdl, "USE_DG_THICKNESS", DG_thickness, &
                    default=.false., do_not_log=.true.)
     call get_param(param_file, mdl, "INIT_ICE_THICKNESS_NODAL", thickness_nodal, &
@@ -959,10 +820,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
                                 "ice thickness at the boundary", "m", conversion=US%Z_to_m)
     call register_restart_field(CS%bed_elev, "bed elevation", .true., restart_CS, &
                                 "bed elevation", "m", conversion=US%Z_to_m)
-    ! Storage convention: h_shelf is the area-weighted cell mean Hbar derived from
-    ! h_nodal; h_nodal(:,:,a,b) holds the 4 Q1 nodal corner values per cell. Only DG
-    ! carries this state between segments: without it the corners are either unused or
-    ! rebuilt from the file at every startup, so restarting them would be meaningless.
+    ! Under DG, h_shelf is derived from h_nodal, so only the corners need restarting.
     if (DG_thickness) then
       call register_restart_field(CS%h_nodal(:,:,1,1), "h_nodal_SW_DG", .true., restart_CS, &
                                   "DG(1) nodal Q1 thickness, SW corner", "m", conversion=US%Z_to_m)
@@ -1152,17 +1010,12 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     CS%gl_quad_friction     = (CS%cism_friction /= CISM_OFF)
     CS%local_basal_friction = (CS%cism_friction == CISM_LOCAL)
     call get_param(param_file, mdl, "USE_DG_THICKNESS", CS%use_DG_thickness, &
-                 "If true, use a DG(1) polynomial representation for ice thickness "//&
-                 "with unsplit RK2 advection and sub-element Gauss quadrature for "//&
-                 "driving stress. Requires h_x and h_y slope moments.", &
+                 "If true, represent ice thickness as discontinuous bilinear (DG(1)) corner "//&
+                 "values per cell, advected with SSP-RK2.", &
                  default=.false.)
     call get_param(param_file, mdl, "INIT_ICE_BED_NODAL", CS%init_bed_nodal, &
-                 "If true, read the bed elevation directly at B-grid nodes from "//&
-                 "BED_TOPO_VARNAME in BED_TOPO_FILE into CS%bed_node, and derive the "//&
-                 "cell-centered CS%bed_elev as the area-weighted cell mean of the "//&
-                 "bilinear interpolant of the four surrounding nodes, instead of reading "//&
-                 "a cell-averaged bed. The nodal bed is what USE_DG_THICKNESS needs; "//&
-                 "without DG it is discarded after initialization.", &
+                 "If true, read BED_TOPO_VARNAME at B-grid nodes and set the cell bed to the area-weighted"//&
+                 "mean of their bilinear interpolant. Required by USE_DG_THICKNESS; optional otherwise.", &
                  default=.false.)
     call get_param(param_file, mdl, "INIT_ICE_THICKNESS_NODAL", CS%init_thickness_nodal, &
                  default=.false., do_not_log=.true.)
@@ -1170,39 +1023,20 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         "MOM_ice_shelf_dynamics: USE_DG_THICKNESS needs the bed at B-grid nodes to evaluate "//&
         "grad(b) inside an element; set INIT_ICE_BED_NODAL=True.")
 
-    ! Prescribed basal melt for the ice-only driver. In a coupled run the melt rate comes from
-    ! the ocean through shelf_calc_flux and these are ignored.
+    ! Prescribed basal melt for the ice-only driver.
     solo_ice_sheet = .false.
     if (present(solo_ice_sheet_in)) solo_ice_sheet = solo_ice_sheet_in
     CS%dg_basal_source_sem2 = .false.
     call get_param(param_file, mdl, "ICE_ONLY_BASAL_MELT", CS%ice_only_basal_melt, &
-                 "If true, the ice-only (solo ice sheet) driver applies a prescribed basal melt "//&
-                 "rate under floating ice, following Leguy et al. (2021, The Cryosphere "//&
-                 "15:3229-3253) eq. 18, which is the same profile as Seroussi & Morlighem (2018, "//&
-                 "The Cryosphere 12:3085-3096) eq. 4 and the MISMIP+ Ice1r experiment. The melt "//&
-                 "rate ramps linearly from 0 at an ice-base depth of 50 m to 30 m yr-1 at 500 m "//&
-                 "and is constant below that. Ignored in coupled runs, where the melt rate is "//&
-                 "supplied by the ocean.", &
+                 "If true, the ice-only driver prescribes a basal melt (Serioussi & Morlighem 2018, eq 4; "//&
+                 "Leguy et a. 2021 eq 18): 0 at an ice-base depth of 50 m rising linearly to 30 m yr-1 at >=500 m.", &
                  default=.false., do_not_log=.not.solo_ice_sheet)
     call get_param(param_file, mdl, "ICE_ONLY_BASAL_MELT_GLP", melt_glp_str, &
-                 "How the prescribed ice-only basal melt is applied in cells that contain the "//&
-                 "grounding line. 'FMP' applies the full fully-floating rate in every ice-covered "//&
-                 "cell. 'FCMP' applies the full rate where the cell centre satisfies the "//&
-                 "flotation condition and none elsewhere. 'PMP' scales the rate by the floating "//&
-                 "area fraction of the cell, so the total melt is proportional to the floating "//&
-                 "area; this is the partial-melt parameterization of Leguy et al. (2021) sec. 2.3 "//&
-                 "and is equivalent to the sub-element melt 1 (SEM1) scheme of Seroussi & "//&
-                 "Morlighem (2018). 'NMP' applies no melt in any partly grounded cell. Applying "//&
-                 "the full rate in partly grounded cells melts grounded ice and is known to drive "//&
-                 "spurious grounding-line retreat, so FMP is provided mainly as a baseline. "//&
-                 "'SEM2' is the sub-element melt 2 scheme of Seroussi & Morlighem (2018): the "//&
-                 "cell total is the same as PMP, but it is distributed within the cell in "//&
-                 "proportion to the nodal floating fraction rather than uniformly, so a corner "//&
-                 "whose surroundings are grounded receives little or none of it. SEM2 needs "//&
-                 "nodal thickness degrees of freedom and so requires USE_DG_THICKNESS, and it "//&
-                 "needs sub-element grounding-line geometry, so it requires either "//&
-                 "GROUNDING_LINE_INTERPOLATE or CISM_FRICTION. "//&
-                 "Requires ICE_ONLY_BASAL_MELT.", &
+                 "How the ice-only basal melt is applied in grounding-line cells (Leguy et al. "//&
+                 "2021; Seroussi & Morlighem 2018). 'FMP': full rate. 'FCMP': full rate where the "//&
+                 "cell centre floats. 'PMP': rate times the floating fraction. 'NMP': none in "//&
+                 "partly grounded cells. 'SEM2': PMP's cell total, distributed by nodal floating "//&
+                 "fraction; requires USE_DG_THICKNESS and GROUNDING_LINE_INTERPOLATE or CISM_FRICTION.", &
                  default="FMP", do_not_log=.not.CS%ice_only_basal_melt)
     select case (trim(melt_glp_str))
       case ("FMP")  ; CS%ice_only_melt_glp = MELT_GLP_FMP
@@ -1216,30 +1050,20 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     end select
     CS%dg_basal_source_sem2 = (CS%ice_only_melt_glp == MELT_GLP_SEM2)
     call get_param(param_file, mdl, "ICE_ONLY_BASAL_MELT_SCALE", CS%ice_only_melt_scale, &
-                 "A factor multiplying the whole prescribed ice-only basal melt profile. The "//&
-                 "default of 1 gives the moderate-melt rate of Leguy et al. (2021) eq. 18, "//&
-                 "saturating at 30 m yr-1; 5 gives their high-melt experiments (sec. 4.3), "//&
-                 "saturating at 150 m yr-1. The scaling leaves the 50 m and 500 m ice-base "//&
-                 "depths at which the ramp starts and saturates unchanged, moving only the "//&
-                 "magnitude. Requires ICE_ONLY_BASAL_MELT.", &
+                 "Factor on the prescribed ice-only basal melt rate; 5 gives the high-melt experiments of "//&
+                 "Leguy et al. (2021).", &
                  units="nondim", default=1.0, do_not_log=.not.CS%ice_only_basal_melt)
     if (CS%ice_only_melt_scale < 0.0) call MOM_error(FATAL, &
-                 "MOM_ice_shelf_dynamics: ICE_ONLY_BASAL_MELT_SCALE must be non-negative; a "//&
-                 "negative value would turn the prescribed melt into freeze-on everywhere.")
+                 "MOM_ice_shelf_dynamics: ICE_ONLY_BASAL_MELT_SCALE must be non-negative.")
     if (CS%ice_only_basal_melt .and. .not.solo_ice_sheet) call MOM_error(FATAL, &
                  "MOM_ice_shelf_dynamics: ICE_ONLY_BASAL_MELT is only meaningful for the ice-only "//&
                  "driver; in a coupled run the basal melt rate is supplied by the ocean.")
     if (CS%ice_only_melt_glp == MELT_GLP_SEM2) then
       if (.not.CS%use_DG_thickness) call MOM_error(FATAL, &
-                 "MOM_ice_shelf_dynamics: ICE_ONLY_BASAL_MELT_GLP = 'SEM2' distributes melt "//&
-                 "between the nodes of a cell and so requires USE_DG_THICKNESS. A finite-volume "//&
-                 "cell has a single thickness and can only express the cell-mean scaling of PMP.")
+                 "MOM_ice_shelf_dynamics: ICE_ONLY_BASAL_MELT_GLP = 'SEM2' requires USE_DG_THICKNESS.")
       if (.not.(CS%GL_regularize .or. CS%gl_quad_friction)) call MOM_error(FATAL, &
-                 "MOM_ice_shelf_dynamics: ICE_ONLY_BASAL_MELT_GLP = 'SEM2' needs a sub-element "//&
-                 "grounding line to measure the nodal floating fractions against, so it requires "//&
-                 "either GROUNDING_LINE_INTERPOLATE or CISM_FRICTION. With neither, the "//&
-                 "grounded fraction is the binary flotation state of the cell centre and SEM2 "//&
-                 "would degenerate to FMP or NMP.")
+                 "MOM_ice_shelf_dynamics: ICE_ONLY_BASAL_MELT_GLP = 'SEM2' requires "//&
+                 "GROUNDING_LINE_INTERPOLATE or CISM_FRICTION.")
     endif
     call get_param(param_file, mdl, "CISM_TAUD", cism_taud_str, &
                  "How the finite-volume (non-DG) driving stress treats the grounding line, "//&
@@ -1319,13 +1143,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "with a sub-element reconstruction, which has no one-sided analog; it cannot be used "//&
                  "with FV_GL_ONE_SIDED_TAUD.")
 
-    ! DG carries its own sub-cell thickness, so it normally supplies the grounded fraction and
-    ! the driving stress from that basis rather than deferring to a finite-volume scheme.
-    ! CISM_FRICTION and CISM_TAUD remain available under DG because they read the cell-mean
-    ! thickness and bed and so are well defined either way; the driving-stress dispatch below
-    ! sends the CISM_TAUD case to the FV path. The interpolate-to-nodes scheme instead rebuilds
-    ! a corner thickness from the cell means, which would silently discard the DG nodal state it
-    ! is meant to represent, so it is refused rather than ignored.
+    ! CISM_* only read cell means, so they work under DG. I2N would discard the nodal thickness.
     if (CS%use_DG_thickness .and. CS%i2n_friction) call MOM_error(FATAL, &
                  "MOM_ice_shelf_dynamics: I2N_FRICTION reconstructs a corner thickness from the "//&
                  "cell means, which would discard the DG(1) nodal thickness; it cannot be used "//&
@@ -1736,10 +1554,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         call pass_var(CS%bed_elev, G%domain, complete=.true.)
       endif
       if (CS%use_DG_thickness) then
-        ! Nodal DG(1) cold-start. Under INIT_ICE_THICKNESS_NODAL, CS%h_nodal was already
-        ! filled from the corner field by initialize_ice_thickness; otherwise project the
-        ! cell means. The DG(0) hybrid always takes the flat cell-mean branch, since
-        ! corner values would introduce slopes it cannot carry.
+        ! DG(1) cold start: h_nodal is read at nodes or seeded from the cell means.
         call pass_var(ISS%h_shelf, G%domain)
         if (.not. CS%init_thickness_nodal) then
           CS%h_nodal(:,:,:,:) = 0.0
@@ -1791,25 +1606,16 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
        'mask for v-nodes', 'none')
     if ((CS%dg_tilt_damp .or. CS%dg_twist_damp) .and. associated(CS%dg_damp_tend)) then
       CS%id_dg_damp_tend = register_diag_field('ice_shelf_model','dg_mode_damp_tend', &
-         CS%diag%axesT1, Time, 'rate at which the DG(1) mode damper is removing in-cell '//&
-         'thickness structure, as the L2 norm over the cell of the correction it applies; '//&
-         'zero wherever the term is inactive, and directly comparable with a melt rate', &
+         CS%diag%axesT1, Time, 'L2 cell norm of the DG(1) tilt-mode-damper thickness correction rate', &
          'm s-1', conversion=US%Z_to_m*US%s_to_T)
       CS%id_dg_damp_gate = register_diag_field('ice_shelf_model','dg_mode_damp_gate', &
-         CS%diag%axesT1, Time, 'largest gate fraction the DG(1) mode damper opened in a '//&
-         'cell over its three modes; 0 shut, 1 saturated. Says WHERE the term wants to act, '//&
-         'as against dg_mode_damp_tend which says how much it actually does', 'none')
+         CS%diag%axesT1, Time, 'largest DG(1) tilt-mode-damper gate over its three modes, 0 to 1', 'none')
       CS%id_dg_damp_want = register_diag_field('ice_shelf_model','dg_mode_damp_rate_want', &
-         CS%diag%axesT1, Time, 'rate the DG(1) mode damper''s gate asked for, summed over its '//&
-         'three modes, before the transport''s share is credited. Zero exactly where the gate '//&
-         'is shut', 's-1', conversion=US%s_to_T)
+         CS%diag%axesT1, Time, 'DG(1) tilt-mode-damper rate requested, summed over modes, before '//&
+         'the transport credit', 's-1', conversion=US%s_to_T)
       CS%id_dg_damp_got = register_diag_field('ice_shelf_model','dg_mode_damp_rate_got', &
-         CS%diag%axesT1, Time, 'rate the DG(1) mode damper actually delivered, summed over its '//&
-         'three modes. Its ratio to dg_mode_damp_rate_want is the share the term supplied and '//&
-         'the complement is what DG1_TILT_DAMP_ADVECTIVE credited to the flow; posting the two '//&
-         'rates rather than the ratio is what makes that share correct under time averaging, '//&
-         'since a ratio averaged over steps when the gate was shut is pulled toward zero by '//&
-         'them', 's-1', conversion=US%s_to_T)
+         CS%diag%axesT1, Time, 'DG(1) tilt-mode-damper rate delivered, summed over modes', &
+         's-1', conversion=US%s_to_T)
     endif
 
     CS%id_ground_frac = register_diag_field('ice_shelf_model','ice_ground_frac',CS%diag%axesT1, Time, &
@@ -1833,192 +1639,136 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
 
     if (CS%use_DG_thickness) then
       CS%id_bed_node = register_diag_field('ice_shelf_model','bed_node',CS%diag%axesB1, Time, &
-         'Bed elevation at B-grid nodes (DG bilinear reconstruction)', 'm', conversion=US%Z_to_m)
+         'Bed elevation at B-grid nodes', 'm', conversion=US%Z_to_m)
       CS%id_h_nodal_SW = register_diag_field('ice_shelf_model','h_nodal_SW',CS%diag%axesT1, Time, &
-         'DG(1) nodal Q1 thickness at SW cell corner', 'm', conversion=US%Z_to_m)
+         'DG(1) thickness at SW cell corner', 'm', conversion=US%Z_to_m)
       CS%id_h_nodal_SE = register_diag_field('ice_shelf_model','h_nodal_SE',CS%diag%axesT1, Time, &
-         'DG(1) nodal Q1 thickness at SE cell corner', 'm', conversion=US%Z_to_m)
+         'DG(1) thickness at SE cell corner', 'm', conversion=US%Z_to_m)
       CS%id_h_nodal_NW = register_diag_field('ice_shelf_model','h_nodal_NW',CS%diag%axesT1, Time, &
-         'DG(1) nodal Q1 thickness at NW cell corner', 'm', conversion=US%Z_to_m)
+         'DG(1) thickness at NW cell corner', 'm', conversion=US%Z_to_m)
       CS%id_h_nodal_NE = register_diag_field('ice_shelf_model','h_nodal_NE',CS%diag%axesT1, Time, &
-         'DG(1) nodal Q1 thickness at NE cell corner', 'm', conversion=US%Z_to_m)
+         'DG(1) thickness at NE cell corner', 'm', conversion=US%Z_to_m)
       CS%id_h_jump_node = register_diag_field('ice_shelf_model','h_jump_node',CS%diag%axesB1, Time, &
-         'DG(1) max-minus-min of co-located corner thickness across up to 4 touching cells '//&
-         '(hmask=1 only) at each B-grid node', 'm', conversion=US%Z_to_m)
-      CS%id_h_jump_node_rel = register_diag_field('ice_shelf_model','h_jump_node_rel',CS%diag%axesB1, Time, &
-         'DG(1) B-node jump as a fraction of the mean cell-mean thickness over the touching cells '//&
-         '(hmask=1 only)', 'nondim')
-      CS%id_h_node_max = register_diag_field('ice_shelf_model','h_node_max',CS%diag%axesB1, Time, &
-         'DG(1) maximum co-located corner thickness across up to 4 touching cells (hmask=1 only) '//&
-         'at each B-grid node. Paired with h_node_min, separates a high-side spike (h_node_max '//&
-         'large vs neighbor cell means) from a low-side pit (h_node_min small) at the same node.', &
+         'DG(1) max minus min corner thickness of the ice cells at a B-grid node', &
          'm', conversion=US%Z_to_m)
+      CS%id_h_jump_node_rel = register_diag_field('ice_shelf_model','h_jump_node_rel',CS%diag%axesB1, Time, &
+         'h_jump_node over the mean thickness of those cells', 'nondim')
+      CS%id_h_node_max = register_diag_field('ice_shelf_model','h_node_max',CS%diag%axesB1, Time, &
+         'DG(1) max corner thickness of the ice cells at a B-grid node', 'm', conversion=US%Z_to_m)
       CS%id_h_node_min = register_diag_field('ice_shelf_model','h_node_min',CS%diag%axesB1, Time, &
-         'DG(1) minimum co-located corner thickness across up to 4 touching cells (hmask=1 only) '//&
-         'at each B-grid node. See h_node_max.', 'm', conversion=US%Z_to_m)
+         'DG(1) min corner thickness of the ice cells at a B-grid node', 'm', conversion=US%Z_to_m)
       CS%id_h_jump_envelope = register_diag_field('ice_shelf_model','h_jump_envelope', &
          CS%diag%axesB1, Time, &
-         'Per-B-node cell-mean envelope width Hmax_B - Hmin_B, built over hmask=1 and hmask=3 '//&
-         '(Dirichlet) cells touching the node. Reports the local roughness of the cell-mean '//&
-         'thickness field around each B-node.', &
+         'Range of the cell-mean thicknesses (hmask 1 and 3) at a B-grid node', &
          'm', conversion=US%Z_to_m)
       CS%id_h_jump_envelope_rel = register_diag_field('ice_shelf_model','h_jump_envelope_rel', &
          CS%diag%axesB1, Time, &
-         'h_jump_envelope normalised by the mean of the contributing cell means.', 'nondim')
+         'h_jump_envelope over the mean of its range', 'nondim')
       CS%id_h_overshoot_node = register_diag_field('ice_shelf_model','h_overshoot_node', &
          CS%diag%axesB1, Time, &
-         'Per-B-node Barth-Jespersen overshoot: max over the touching DG(1) corner values of '//&
-         'max(0, h_corner - Hmax_B, Hmin_B - h_corner), where [Hmin_B, Hmax_B] is the envelope '//&
-         'of cell-mean thicknesses over the cells touching the node. Nonzero only where a DG '//&
-         'corner has wandered outside the local neighbor-mean envelope (true sub-cell '//&
-         'discontinuous mode, i.e. an unphysical overshoot rather than a faithful resolved '//&
-         'sharp gradient).', &
+         'Largest distance of a DG(1) corner thickness outside the cell-mean range at a B-grid node', &
          'm', conversion=US%Z_to_m)
       CS%id_h_overshoot_node_rel = register_diag_field('ice_shelf_model','h_overshoot_node_rel', &
          CS%diag%axesB1, Time, &
-         'h_overshoot_node normalised by 0.5*(Hmax_B + Hmin_B).', 'nondim')
+         'h_overshoot_node over the mean of the range', 'nondim')
       CS%id_s_overshoot_node = register_diag_field('ice_shelf_model','s_overshoot_node', &
          CS%diag%axesB1, Time, &
-         'Per-B-node Barth-Jespersen overshoot in the surface-elevation field: max over the '//&
-         'touching DG(1) corner s values of max(0, s_corner - Smax_B, Smin_B - s_corner), with '//&
-         'corner s computed by per-side flotation from h_corner and bed_node, and [Smin_B, '//&
-         'Smax_B] the envelope of cell-mean surfaces (Hbar projected with cell-center bed via '//&
-         'flotation) over the cells touching the node. The s-space analogue of h_overshoot_node: '//&
-         'isolates the driving-stress-relevant spurious surface mode from the harmless '//&
-         'thickness-only overshoot that disappears across the grounding line under flotation.', &
+         'Largest distance of a DG(1) corner surface outside the cell-mean surface range at a B-grid node', &
          'm', conversion=US%Z_to_m)
       CS%id_s_overshoot_node_rel = register_diag_field('ice_shelf_model','s_overshoot_node_rel', &
          CS%diag%axesB1, Time, &
-         's_overshoot_node normalised by 0.5*(|Smax_B| + |Smin_B|).', 'nondim')
+         's_overshoot_node over 0.5*(|Smax| + |Smin|)', 'nondim')
       CS%id_h_source_rate = register_diag_field('ice_shelf_model','h_source_rate',CS%diag%axesT1, Time, &
-         'Cell-mean thickness source rate (basal melt + surface SMB) consumed by the last DG advect step', &
+         'Cell-mean thickness source (basal + surface) used by the last DG advection step', &
          'm s-1', conversion=US%Z_to_m*US%s_to_T)
       CS%id_dg_art_visc_coef_u = register_diag_field('ice_shelf_model','dg_art_visc_coef_u', &
          CS%diag%axesCu1, Time, &
-         'Per-face DG(1) artificial-viscosity coefficient on u-faces (post per-cell CFL '//&
-         'scaling) from the last spatial-operator call. Smooth faces report ~0 (smoothness '//&
-         'gate off); shocky faces report up to DG1_ART_VISC_C_MAX; cells whose summed face '//&
-         'rates would exceed the per-cell stability budget are scaled below c_max.', 'nondim')
+         'DG(1) artificial-viscosity coefficient on u-faces, after the per-cell cap.'//&
+         'Ranges from 0 to DG1_ART_VISC_C_MAX]', 'nondim')
       CS%id_dg_art_visc_coef_v = register_diag_field('ice_shelf_model','dg_art_visc_coef_v', &
          CS%diag%axesCv1, Time, &
-         'Per-face DG(1) artificial-viscosity coefficient on v-faces. See dg_art_visc_coef_u.', &
-         'nondim')
+         'DG(1) artificial-viscosity coefficient on v-faces, after the per-cell cap' //&
+         'Ranges from 0 to DG1_ART_VISC_C_MAX]', 'nondim')
       CS%id_dg_art_visc_nu_u = register_diag_field('ice_shelf_model','dg_art_visc_nu_u', &
          CS%diag%axesCu1, Time, &
-         'Per-face effective DG(1) artificial viscosity on u-faces (post per-cell CFL scaling), '//&
-         'nu = c_face * u_eff_face_mean * dx_perp, with u_eff = |u_face| + '//&
-         'DG1_ART_VISC_STRAIN_COEF * eps_e_face * dx_perp. Comparable to a physical '//&
-         'diffusivity: face flux = nu * [h_eq] / dx_perp * dy_face. Distinguishes '//&
-         'gate-active-but-quiet faces (low u_eff -> small nu despite c_face = c_max) from '//&
-         'gate-active-and-damping faces (large u_eff -> large nu). Use with c_face to '//&
-         'separate gate response from actual damping rate.', &
+         'DG(1) artificial viscosity c_face*u_eff*dx_perp on u-faces, after the per-cell cap', &
          'm2 s-1', conversion=US%L_T_to_m_s*US%L_to_m)
       CS%id_dg_art_visc_nu_v = register_diag_field('ice_shelf_model','dg_art_visc_nu_v', &
          CS%diag%axesCv1, Time, &
-         'As dg_art_visc_nu_u but on v-faces.', &
+         'DG(1) artificial viscosity c_face*u_eff*dx_perp on v-faces, after the per-cell cap', &
          'm2 s-1', conversion=US%L_T_to_m_s*US%L_to_m)
       CS%id_dg_art_visc_cell_scale = register_diag_field('ice_shelf_model', &
          'dg_art_visc_cell_scale', CS%diag%axesT1, Time, &
-         'Per-cell DG(1) artificial-viscosity cap throttle factor (1 = stability cap '//&
-         'dormant; < 1 = cap engaged, all face coefficients of the cell rescaled by '//&
-         'this value so the summed jump-mode decay rates stay within the SSP-RK2 '//&
-         'budget DG1_ART_VISC_KCELL).', 'nondim')
+         'DG(1) artificial-viscosity cap factor: 1 where the DG1_ART_VISC_KCELL cap is inactive, '//&
+         '< 1 cap engaged and face coefficients scaled by this factor', 'nondim')
       CS%id_dg_slow_idle_face_u = register_diag_field('ice_shelf_model','dg_slow_idle_face_u', &
          CS%diag%axesCu1, Time, &
-         'DG(1) stagnant-jump indicator on u-faces (0 or 1). 1 where |u_face| and the SSA '//&
-         'effective strain rate are both below internal tiny thresholds while the well-'//&
-         'balanced equivalent jump exceeds a tolerance. Diagnostic for whether the '//&
-         'velocity-magnitude + strain-rate damping channels both starve simultaneously; '//&
-         'persistent non-zero values motivate adding a constant velocity floor.', 'nondim')
+         '1 on u-faces with a jump where speed and strain rate — and their damping — are negligible','nondim')
       CS%id_dg_slow_idle_face_v = register_diag_field('ice_shelf_model','dg_slow_idle_face_v', &
          CS%diag%axesCv1, Time, &
-         'DG(1) stagnant-jump indicator on v-faces. See dg_slow_idle_face_u.', 'nondim')
+         '1 on v-faces with a jump where speed and strain rate — and their damping — are negligible','nondim')
       CS%id_h_jump_face_u = register_diag_field('ice_shelf_model','h_jump_face_u', &
          CS%diag%axesCu1, Time, &
-         'DG(1) broken-Q1 thickness jump across u-faces (max |[h]| over the 2 face nodes). '//&
-         'Localises the inter-element discontinuity to a single face, unlike the B-node '//&
-         'max-min h_jump_node which conflates the up-to-4 faces meeting at a corner.', &
+         'DG(1) thickness jump across u-faces, max |[h]| over the 2 face nodes', &
          'm', conversion=US%Z_to_m)
       CS%id_h_jump_face_v = register_diag_field('ice_shelf_model','h_jump_face_v', &
          CS%diag%axesCv1, Time, &
-         'DG(1) broken-Q1 thickness jump across v-faces (max |[h]| over the 2 face nodes).', &
+         'DG(1) thickness jump across v-faces, max |[h]| over the 2 face nodes', &
          'm', conversion=US%Z_to_m)
       CS%id_s_jump_face_u = register_diag_field('ice_shelf_model','s_jump_face_u', &
          CS%diag%axesCu1, Time, &
-         'DG(1) surface-elevation jump across u-faces (max |[s]| over the 2 face nodes, '//&
-         'per-side flotation). This is the quantity the sub-grid driving stress consumes '//&
-         '(jump_factor = rho*g*{h}*[s]); unlike [h] it accounts for the nonlinear '//&
-         'grounded/floating thickness-to-surface map across the grounding line.', &
+         'DG(1) surface jump across u-faces, max |[s]| over the 2 face nodes', &
          'm', conversion=US%Z_to_m)
       CS%id_s_jump_face_v = register_diag_field('ice_shelf_model','s_jump_face_v', &
          CS%diag%axesCv1, Time, &
-         'DG(1) surface-elevation jump across v-faces (max |[s]| over the 2 face nodes, '//&
-         'per-side flotation).', 'm', conversion=US%Z_to_m)
+         'DG(1) surface jump across v-faces, max |[s]| over the 2 face nodes', &
+         'm', conversion=US%Z_to_m)
       CS%id_s_jump_face_u_rel = register_diag_field('ice_shelf_model','s_jump_face_u_rel', &
          CS%diag%axesCu1, Time, &
-         'Surface-elevation jump on u-faces relative to mean cell thickness, '//&
-         '|[s]| / max(min_h_shelf, 0.5*(Hbar_A + Hbar_B)). Approximates the relative '//&
-         'driving-stress contamination from spurious broken-Q1 jumps; healthy shelf '//&
-         'regions should sit well below 0.05 (steep grounded slopes can tolerate more).', &
+         's_jump_face_u (max |[s]| over the 2 face nodes) over the mean thickness of the two cells', &
          'nondim')
       CS%id_s_jump_face_v_rel = register_diag_field('ice_shelf_model','s_jump_face_v_rel', &
          CS%diag%axesCv1, Time, &
-         'As s_jump_face_u_rel but on v-faces.', 'nondim')
+         's_jump_face_v (max |[s]| over the 2 face nodes) over the mean thickness of the two cells', 'nondim')
       CS%id_h_jump_face_u_signed = register_diag_field('ice_shelf_model','h_jump_face_u_signed', &
          CS%diag%axesCu1, Time, &
-         'Signed DG(1) thickness jump on u-faces, mean over the 2 face nodes of '//&
-         '(h_plus - h_minus) with plus = east cell, minus = west cell. Positive when the '//&
-         'east-side cell is thicker. Pair adjacent signed jumps to detect 2dx oscillations '//&
-         '(sign-flip pattern) vs. resolved gradients (consistent sign).', &
+         'DG(1) thickness jump east minus west on u-faces, mean over the 2 face nodes', &
          'm', conversion=US%Z_to_m)
       CS%id_h_jump_face_v_signed = register_diag_field('ice_shelf_model','h_jump_face_v_signed', &
          CS%diag%axesCv1, Time, &
-         'Signed DG(1) thickness jump on v-faces, mean over the 2 face nodes of '//&
-         '(h_plus - h_minus) with plus = north cell, minus = south cell.', &
+         'DG(1) thickness jump north minus south on v-faces, mean over the 2 face nodes', &
          'm', conversion=US%Z_to_m)
       CS%id_s_jump_face_u_signed = register_diag_field('ice_shelf_model','s_jump_face_u_signed', &
          CS%diag%axesCu1, Time, &
-         'Signed surface-elevation jump on u-faces, mean over the 2 face nodes of '//&
-         '(s_plus - s_minus) with per-side flotation and plus = east cell. This is the '//&
-         'quantity the DG(1) artificial viscosity actually responds to (via the '//&
-         'well-balanced equivalent thickness jump); flips in sign cell-to-cell along a '//&
-         'shear margin indicate under-damped oscillations.', &
+         'DG(1) surface jump east minus west on u-faces, mean over the 2 face nodes', &
          'm', conversion=US%Z_to_m)
       CS%id_s_jump_face_v_signed = register_diag_field('ice_shelf_model','s_jump_face_v_signed', &
          CS%diag%axesCv1, Time, &
-         'Signed surface-elevation jump on v-faces, mean over the 2 face nodes of '//&
-         '(s_plus - s_minus) with per-side flotation and plus = north cell.', &
+         'DG(1) surface jump north minus south on v-faces, mean over the 2 face nodes', &
          'm', conversion=US%Z_to_m)
       CS%id_un_face_u = register_diag_field('ice_shelf_model','un_face_u', &
          CS%diag%axesCu1, Time, &
-         'Face-normal ice speed |u.n| on u-faces (mean of the 2 endpoint B-node u_shelf '//&
-         'values). Pair with h_jump_face_u / s_jump_face_u to test whether jumps accumulate '//&
-         'at shear-margin faces where u.n ~ 0.', 'm s-1', conversion=US%L_T_to_m_s)
+         '|u| on u-faces, mean of the 2 face nodes', 'm s-1', conversion=US%L_T_to_m_s)
       CS%id_un_face_v = register_diag_field('ice_shelf_model','un_face_v', &
          CS%diag%axesCv1, Time, &
-         'Face-normal ice speed |v.n| on v-faces (mean of the 2 endpoint B-node v_shelf '//&
-         'values). Pair with h_jump_face_v / s_jump_face_v.', 'm s-1', conversion=US%L_T_to_m_s)
+         '|v| on v-faces, mean of the 2 face nodes', 'm s-1', conversion=US%L_T_to_m_s)
       CS%id_dg_eps_face_u = register_diag_field('ice_shelf_model','dg_eps_face_u', &
          CS%diag%axesCu1, Time, &
-         'Effective SSA strain rate eps_e at u-face midpoints, computed by the same '//&
-         'boundary-aware stencil used by the DG(1) artificial viscosity. Multiply by '//&
-         'DG1_ART_VISC_STRAIN_COEF * dxCu to get the strain-driven velocity floor '//&
-         '(u_floor = alpha*eps_e*dx_perp); compare with un_face_u to see where the floor '//&
-         'beats advection. Posted unconditionally so it can be used to tune '//&
-         'DG1_ART_VISC_STRAIN_COEF before turning the viscosity on.', &
+         'SSA effective strain rate at u-faces, as used by the DG(1) artificial viscosity', &
          'yr-1', conversion=365.0*86400.0*US%s_to_T)
       CS%id_dg_eps_face_v = register_diag_field('ice_shelf_model','dg_eps_face_v', &
          CS%diag%axesCv1, Time, &
-         'As dg_eps_face_u but on v-faces.', &
+         'SSA effective strain rate at v-faces, as used by the DG(1) artificial viscosity', &
          'yr-1', conversion=365.0*86400.0*US%s_to_T)
     else
       CS%id_phi_x_FV = register_diag_field('ice_shelf_model','phi_x_FV',CS%diag%axesCu1, Time, &
-         'Van Leer slope-limiter factor at each u-face from ice_shelf_advect_thickness_x '//&
+         'Slope-limiter factor at each u-face from ice_shelf_advect_thickness_x '//&
          '(1=no clip / smooth balanced, 0=full clip, 2=max compressive; faces where the limiter '//&
          'branch was not taken report 1.0)', 'nondim')
       CS%id_phi_y_FV = register_diag_field('ice_shelf_model','phi_y_FV',CS%diag%axesCv1, Time, &
-         'Van Leer slope-limiter factor at each v-face from ice_shelf_advect_thickness_y '//&
-         '(range [0,2])', 'nondim')
+         'Slope-limiter factor at each v-face from ice_shelf_advect_thickness_y '//&
+         '(1=no clip / smooth balanced, 0=full clip, 2=max compressive; faces where the limiter '//&
+         'branch was not taken report 1.0)', 'nondim')
     endif
 
     CS%id_duHdx = register_diag_field('ice_shelf_model','duHdx',CS%diag%axesT1, Time, &
@@ -2051,8 +1801,6 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     !Update these variables so that they are nonzero in case
     !IS_dynamics_post_data is called before update_ice_shelf
     if (CS%id_taudx_shelf>0 .or. CS%id_taudy_shelf>0) then
-      ! Match the solver's dispatch: with CISM_TAUD the FV driving stress is used even
-      ! under DG advection, so the diagnostic taud is consistent with what the solver applied.
       if (CS%use_DG_thickness .and. (CS%cism_taud == CISM_OFF)) then
         call calc_shelf_driving_stress_DG(CS, ISS, G, US, CS%taudx_shelf, CS%taudy_shelf, CS%OD_av)
       else
@@ -2068,9 +1816,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     call update_OD_ffrac_uncoupled(CS, G, ISS%h_shelf(:,:))
   endif
 
-  ! Only the DG(1) paths read the nodal bed and thickness; without them each has served
-  ! its purpose in deriving the cell mean. Neither is a restart field in that case, so
-  ! both are rebuilt from the input file on every startup.
+  ! Without DG the nodal bed and thickness were only needed to derive the cell means.
   if (.not. CS%use_DG_thickness) then
     if (associated(CS%bed_node)) deallocate(CS%bed_node)
     if (associated(CS%h_nodal)) deallocate(CS%h_nodal)
@@ -2300,64 +2046,59 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
                                                   !! [R L T-1 ~> Pa s m-1]
   real, dimension(SZDI_(G),SZDJ_(G))   :: surf_slope ! the surface slope of the ice shelf/sheet [nondim]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: ice_speed ! ice sheet flow speed [L T-1 ~> m s-1]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_n     ! max-min of co-located DG(1) corner thickness
-                                                       !! across the up to 4 cells (hmask=1) touching each
-                                                       !! B-grid node [Z ~> m], 0 where <2 touching cells
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_node_mx   ! per-B-node max of co-located DG(1) corner
-                                                       ! thickness across touching hmask=1 cells [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_node_mn   ! per-B-node min of co-located DG(1) corner
-                                                       ! thickness across touching hmask=1 cells [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_n_rel ! h_jump_n normalised by the mean cell-mean
-                                                       !! thickness over the same touching cells [nondim]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: Hmax_Bd, Hmin_Bd ! per-B-node cell-mean envelope built from
-                                                           !! hmask=1 and hmask=3 cells, identical to
-                                                           !! the one used by the nodal AFC limiter
-                                                           !! [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: count_Bd     ! number of contributing cells per B-node [nondim]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_env   ! Hmax_B - Hmin_B at each B-node [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_env_rel ! Envelope width / mean Hbar [nondim]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_over_n     ! BJ-overshoot magnitude at each B-node [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_over_n_rel ! Overshoot normalised by envelope mean [nondim]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: Smax_Bd, Smin_Bd ! Per-B-node cell-mean surface envelope [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: s_over_n     ! BJ-overshoot magnitude in s at each B-node [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: s_over_n_rel ! s-overshoot normalised by envelope mean [nondim]
-  real :: cell_mean_s_d                            ! Cell-mean surface contribution [Z ~> m]
-  real :: s_cSW, s_cSE, s_cNW, s_cNE               ! Corner surface elevations at a B-node [Z ~> m]
-  real :: bed_B                                    ! Bed elevation at the B-node, single-valued [Z ~> m]
-  real :: over_b_s                                 ! Per-corner BJ violation in s at a B-node [Z ~> m]
-  real :: over_b                                  ! Per-corner BJ-bound violation [Z ~> m]
-  real :: h_cSW, h_cSE, h_cNW, h_cNE              ! corner thickness candidates at a B-node [Z ~> m]
-  real :: Hb_SW, Hb_SE, Hb_NW, Hb_NE              ! cell-mean thickness for each touching cell [Z ~> m]
-  real :: hmax_b, hmin_b                          ! max and min of valid corner candidates [Z ~> m]
-  real :: Hbar_sum                                ! sum of valid cell-mean thicknesses [Z ~> m]
-  real :: Hbar_avg                                ! arithmetic mean of valid cell-mean thicknesses [Z ~> m]
-  real :: cell_mean_val_d                         ! envelope contribution from one cell [Z ~> m]
-  real, parameter :: H_LARGE_D = 1.0e30           ! Sentinel for "no contributing cell"
-  integer :: n_valid                              ! number of touching cells with hmask==1 [nondim]
-  logical :: vSW, vSE, vNW, vNE                   ! per-touching-cell validity flags
-  integer :: ii, jj                               ! touching-cell indices on the T-grid
-  real, dimension(SZDIB_(G),SZDJ_(G)) :: hjump_fu ! per-u-face DG(1) thickness jump max|[h]| [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJ_(G)) :: sjump_fu ! per-u-face surface-elevation jump max|[s]| [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJ_(G)) :: sjump_fu_rel ! per-u-face |[s]|/Hbar_avg [nondim]
-  real, dimension(SZDIB_(G),SZDJ_(G)) :: hjump_fu_sgn ! signed u-face [h] = mean(h_plus - h_minus) [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJ_(G)) :: sjump_fu_sgn ! signed u-face [s] = mean(s_plus - s_minus) [Z ~> m]
-  real, dimension(SZDIB_(G),SZDJ_(G)) :: un_fu    ! per-u-face |u.n| [L T-1 ~> m s-1]
-  real, dimension(SZDI_(G),SZDJB_(G)) :: hjump_fv ! per-v-face DG(1) thickness jump max|[h]| [Z ~> m]
-  real, dimension(SZDI_(G),SZDJB_(G)) :: sjump_fv ! per-v-face surface-elevation jump max|[s]| [Z ~> m]
-  real, dimension(SZDI_(G),SZDJB_(G)) :: sjump_fv_rel ! per-v-face |[s]|/Hbar_avg [nondim]
-  real, dimension(SZDI_(G),SZDJB_(G)) :: hjump_fv_sgn ! signed v-face [h] = mean(h_plus - h_minus) [Z ~> m]
-  real, dimension(SZDI_(G),SZDJB_(G)) :: sjump_fv_sgn ! signed v-face [s] = mean(s_plus - s_minus) [Z ~> m]
-  real, dimension(SZDI_(G),SZDJB_(G)) :: un_fv    ! per-v-face |v.n| [L T-1 ~> m s-1]
-  real, dimension(SZDIB_(G),SZDJ_(G)) :: eps_fu   ! per-u-face eps_e [T-1 ~> s-1]
-  real, dimension(SZDI_(G),SZDJB_(G)) :: eps_fv   ! per-v-face eps_e [T-1 ~> s-1]
-  real :: u_mn_d, v_mn_d, u_pl_d, v_pl_d ! Side-averaged velocities for eps_e [L T-1 ~> m s-1]
+  ! DG(1) jump diagnostics. B-node quantities gather the co-located corners of the touching
+  ! hmask=1 cells; face quantities compare the two sides at the face's endpoint nodes.
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_n     ! Max-min corner thickness at a B-node [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_node_mx   ! Max corner thickness at a B-node [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_node_mn   ! Min corner thickness at a B-node [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_n_rel ! h_jump_n over the mean cell thickness [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: Hmax_Bd, Hmin_Bd ! Cell-mean thickness envelope at a B-node,
+                                                           ! from hmask=1 and 3 cells [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: count_Bd     ! Cells in the envelope [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_env   ! Hmax_Bd - Hmin_Bd [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_env_rel ! h_jump_env over the envelope mean [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_over_n     ! Corner overshoot of the thickness envelope [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_over_n_rel ! h_over_n over the envelope mean [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: Smax_Bd, Smin_Bd ! Cell-mean surface envelope [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: s_over_n     ! Corner overshoot of the surface envelope [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: s_over_n_rel ! s_over_n over the envelope mean [nondim]
+  real :: cell_mean_s_d                            ! Cell-mean surface [Z ~> m]
+  real :: s_cSW, s_cSE, s_cNW, s_cNE               ! Corner surfaces at a B-node [Z ~> m]
+  real :: bed_B                                    ! Bed at the B-node [Z ~> m]
+  real :: over_b_s                                 ! Surface overshoot at a B-node [Z ~> m]
+  real :: over_b                                  ! Thickness overshoot at a B-node [Z ~> m]
+  real :: h_cSW, h_cSE, h_cNW, h_cNE              ! Corner thicknesses at a B-node [Z ~> m]
+  real :: Hb_SW, Hb_SE, Hb_NW, Hb_NE              ! Touching cells' mean thicknesses [Z ~> m]
+  real :: hmax_b, hmin_b                          ! Max and min corner thickness [Z ~> m]
+  real :: Hbar_sum                                ! Sum of the touching cell means [Z ~> m]
+  real :: Hbar_avg                                ! Mean of the touching cell means [Z ~> m]
+  real :: cell_mean_val_d                         ! One cell's envelope contribution [Z ~> m]
+  real, parameter :: H_LARGE_D = 1.0e30           ! Sentinel for no contributing cell [Z ~> m]
+  integer :: n_valid                              ! Number of touching hmask=1 cells
+  logical :: vSW, vSE, vNW, vNE                   ! True for touching hmask=1 cells
+  integer :: ii, jj                               ! Touching-cell indices
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: hjump_fu ! u-face max|[h]| [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: sjump_fu ! u-face max|[s]| [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: sjump_fu_rel ! u-face max|[s]| over the face mean thickness [nondim]
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: hjump_fu_sgn ! u-face mean signed [h] [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: sjump_fu_sgn ! u-face mean signed [s] [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: un_fu    ! u-face |u| [L T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJB_(G)) :: hjump_fv ! v-face max|[h]| [Z ~> m]
+  real, dimension(SZDI_(G),SZDJB_(G)) :: sjump_fv ! v-face max|[s]| [Z ~> m]
+  real, dimension(SZDI_(G),SZDJB_(G)) :: sjump_fv_rel ! v-face max|[s]| over the face mean thickness [nondim]
+  real, dimension(SZDI_(G),SZDJB_(G)) :: hjump_fv_sgn ! v-face mean signed [h] [Z ~> m]
+  real, dimension(SZDI_(G),SZDJB_(G)) :: sjump_fv_sgn ! v-face mean signed [s] [Z ~> m]
+  real, dimension(SZDI_(G),SZDJB_(G)) :: un_fv    ! v-face |v| [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: eps_fu   ! u-face eps_e [T-1 ~> s-1]
+  real, dimension(SZDI_(G),SZDJB_(G)) :: eps_fv   ! v-face eps_e [T-1 ~> s-1]
+  real :: u_mn_d, v_mn_d, u_pl_d, v_pl_d ! Side-averaged velocities [L T-1 ~> m s-1]
   real :: dudx_d, dudy_d, dvdx_d, dvdy_d ! Face-midpoint velocity gradients [T-1 ~> s-1]
-  integer :: i_lo_d, i_hi_d, j_lo_d, j_hi_d ! Boundary-aware neighbour indices
-  real :: Hbar_face_avg                           ! 0.5*(Hbar_A + Hbar_B) per face [Z ~> m]
-  real :: rr                                      ! ice/ocean density ratio [nondim]
-  real :: bed1, bed2                              ! bed elevation at the 2 face-endpoint nodes [Z ~> m]
-  real :: h_m1, h_p1, h_m2, h_p2                  ! minus/plus side corner thickness at nodes 1,2 [Z ~> m]
-  real :: s_m1, s_p1, s_m2, s_p2                  ! minus/plus side surface elevation at nodes 1,2 [Z ~> m]
+  integer :: i_lo_d, i_hi_d, j_lo_d, j_hi_d ! Neighbour indices clipped to the data domain
+  real :: Hbar_face_avg                           ! Mean thickness of the two cells [Z ~> m]
+  real :: rr                                      ! Ice to ocean density ratio [nondim]
+  real :: bed1, bed2                              ! Bed at the face endpoints [Z ~> m]
+  real :: h_m1, h_p1, h_m2, h_p2                  ! Minus/plus corner thickness at endpoints 1,2 [Z ~> m]
+  real :: s_m1, s_p1, s_m2, s_p2                  ! Minus/plus corner surface at endpoints 1,2 [Z ~> m]
 
   integer :: i, j
 
@@ -2431,9 +2172,6 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       ! Each contributes its DG(1) corner that is co-located at (I,J):
       !   SW -> h_nodal(I,  J,  2,2)   SE -> h_nodal(I+1,J,  1,2)
       !   NW -> h_nodal(I,  J+1,2,1)   NE -> h_nodal(I+1,J+1,1,1)
-      ! Fixed traversal order is required so the result is bitwise identical
-      ! under any horizontal decomposition (halo cells produce the same value)
-      ! and under a 90 deg rotation of the grid (the labelling rotates with i,j).
       do J=G%JscB,G%JecB ; do I=G%IscB,G%IecB
         ii = I   ; jj = J     ; vSW = (ISS%hmask(ii,jj) == 1.0)
         h_cSW = 0.0 ; Hb_SW = 0.0
@@ -2493,9 +2231,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
          CS%id_h_overshoot_node > 0 .or. CS%id_h_overshoot_node_rel > 0 .or. &
          CS%id_s_overshoot_node > 0 .or. CS%id_s_overshoot_node_rel > 0) .and. &
         associated(CS%h_nodal)) then
-      ! Per-B-node cell-mean envelope width Hmax_B - Hmin_B and (for s-overshoot)
-      ! the analogous surface envelope [Smin_B, Smax_B], built from the cell-mean
-      ! thickness projected with the cell-center bed under flotation.
+      ! Cell-mean thickness and surface envelopes at each B-node.
       call pass_corner_field(CS%h_nodal, G)
       rr = CS%density_ice / CS%density_ocean_avg
       Hmax_Bd(:,:) = -H_LARGE_D
@@ -2561,12 +2297,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       enddo ; enddo
       if (CS%id_h_jump_envelope     > 0) call post_data(CS%id_h_jump_envelope,     h_jump_env,     CS%diag)
       if (CS%id_h_jump_envelope_rel > 0) call post_data(CS%id_h_jump_envelope_rel, h_jump_env_rel, CS%diag)
-      ! BJ-overshoot per B-node: max over the up-to-4 touching DG(1) corner values of
-      ! how far the corner sits outside the local cell-mean envelope [Hmin_B, Hmax_B].
-      ! Nonzero only where the DG(1) corner has overshot the neighbor cell-mean
-      ! envelope, i.e. the discontinuous mode is doing more than just resolve a sharp
-      ! gradient between neighbouring cells. Uses Hmax_Bd / Hmin_Bd built above and
-      ! the same corner-gathering pattern as h_jump_node.
+      ! Largest distance of a touching corner outside the thickness envelope.
       if (CS%id_h_overshoot_node > 0 .or. CS%id_h_overshoot_node_rel > 0) then
         h_over_n(:,:)     = 0.0
         h_over_n_rel(:,:) = 0.0
@@ -2596,12 +2327,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         if (CS%id_h_overshoot_node     > 0) call post_data(CS%id_h_overshoot_node,     h_over_n,     CS%diag)
         if (CS%id_h_overshoot_node_rel > 0) call post_data(CS%id_h_overshoot_node_rel, h_over_n_rel, CS%diag)
       endif
-      ! BJ-overshoot in the surface-elevation field. Corner s computed by per-side
-      ! flotation from h_corner and the B-node bed (single-valued at the node, so all
-      ! co-located corners share bed_B), then compared against the cell-mean s envelope.
-      ! Discriminator for the driving-stress-relevant spurious surface mode: small
-      ! s-overshoot with large h-overshoot is the harmless flotation-only effect, large
-      ! s-overshoot is a real spurious surface oscillation that corrupts driving stress.
+      ! The same for the corner surface, using the nodal bed, against the surface envelope.
       if (CS%id_s_overshoot_node > 0 .or. CS%id_s_overshoot_node_rel > 0) then
         call pass_var(CS%bed_node, G%domain, position=CORNER)
         s_over_n(:,:)     = 0.0
@@ -2650,12 +2376,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
          CS%id_s_jump_face_u > 0 .or. CS%id_s_jump_face_v > 0 .or. &
          CS%id_s_jump_face_u_rel > 0 .or. CS%id_s_jump_face_v_rel > 0 .or. &
          CS%id_un_face_u > 0 .or. CS%id_un_face_v > 0) .and. associated(CS%h_nodal)) then
-      ! Per-face inter-element jump of the broken-Q1 thickness, split onto u-faces
-      ! (Cu) and v-faces (Cv) and reported in both thickness [h] and surface
-      ! elevation [s]. Unlike h_jump_node (max-min over the up-to-4 corners at a
-      ! B-node), this attributes the discontinuity to a single face, so it can be
-      ! correlated against un_face to test whether jumps accumulate at shear-margin
-      ! faces where u.n ~ 0 (the advectively-uncoupled, undamped jump mode).
+      ! Thickness and surface jumps across each face, with the face speed.
       call pass_corner_field(CS%h_nodal, G)
       call pass_var(CS%bed_node, G%domain, position=CORNER)
       call pass_vector(CS%u_shelf, CS%v_shelf, G%domain, TO_ALL, BGRID_NE)
@@ -2664,8 +2385,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       hjump_fu_sgn(:,:) = 0.0 ; sjump_fu_sgn(:,:) = 0.0
       hjump_fv(:,:) = 0.0 ; sjump_fv(:,:) = 0.0 ; sjump_fv_rel(:,:) = 0.0 ; un_fv(:,:) = 0.0
       hjump_fv_sgn(:,:) = 0.0 ; sjump_fv_sgn(:,:) = 0.0
-      ! u-faces: minus side = west cell (I,j) east edge, plus side = east cell
-      ! (I+1,j) west edge; endpoint nodes 1=south (I,j-1), 2=north (I,j).
+      ! u-faces: minus = west cell, plus = east cell; node 1 south, 2 north.
       do j = G%jsc, G%jec ; do I = G%IscB, G%IecB
         if (ISS%hmask(I,j) /= 1.0) cycle
         if (ISS%hmask(I+1,j) /= 1.0) cycle
@@ -2688,8 +2408,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         sjump_fu_rel(I,j) = sjump_fu(I,j) / Hbar_face_avg
         un_fu(I,j) = abs(0.5*(CS%u_shelf(I,j-1) + CS%u_shelf(I,j)))
       enddo ; enddo
-      ! v-faces: minus side = south cell (i,J) north edge, plus side = north cell
-      ! (i,J+1) south edge; endpoint nodes 1=west (i-1,J), 2=east (i,J).
+      ! v-faces: minus = south cell, plus = north cell; node 1 west, 2 east.
       do J = G%JscB, G%JecB ; do i = G%isc, G%iec
         if (ISS%hmask(i,J) /= 1.0) cycle
         if (ISS%hmask(i,J+1) /= 1.0) cycle
@@ -2731,9 +2450,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       if (CS%id_un_face_u > 0) call post_data(CS%id_un_face_u, un_fu, CS%diag)
       if (CS%id_un_face_v > 0) call post_data(CS%id_un_face_v, un_fv, CS%diag)
     endif
-    ! Per-face SSA effective strain rate eps_e using the same boundary-aware stencil
-    ! as the DG(1) artificial viscosity. Posted unconditionally of art_visc on/off so
-    ! it can be used to tune DG1_ART_VISC_STRAIN_COEF in advance.
+    ! Face eps_e with the art-visc stencil, posted even when art visc is off.
     if (CS%id_dg_eps_face_u > 0) then
       eps_fu(:,:) = 0.0
       do j = G%jsc, G%jec ; do I = G%IscB, G%IecB
@@ -3158,21 +2875,12 @@ subroutine update_grounded_geometry(CS, ISS, G)
     enddo ; enddo
   endif
 
-  ! Set CS%ground_frac in GL-regularize cells to the fraction of sub-grid integration
-  ! points that are grounded (case 2: GL_regularize=True). Other cases leave ground_frac
-  ! at the binary or running-mean value already set upstream. H_node is needed by the
-  ! non-DG branch of compute_ground_frac and by CG_action_subgrid_basal in the velocity solve.
-  ! Computed before the driving-stress call so that the DG nsub switch and the non-DG
-  ! Neumann test see the freshly-computed fractional ground_frac in the current outer
-  ! iteration rather than lagged by one.
+  ! Fractional ground_frac in GL_regularize cells, before the driving stress uses it.
+  ! H_node is read by the non-DG compute_ground_frac and CG_action_subgrid_basal.
   if (CS%GL_regularize .and. .not. CS%use_DG_thickness) then
     call interpolate_H_to_B(G, ISS%h_shelf, ISS%hmask, CS%H_node, CS%min_h_shelf)
   endif
-  ! Refresh the continuous flotation-gate field before any grounded/floating
-  ! decisions are made for this outer solve (h is frozen for its duration).
-  ! Corner thickness and flotation deficit for the FV sub-element paths. Built before
-  ! compute_ground_frac so the grounded fraction is measured on the same flotation field the
-  ! friction and driving stress integrate over.
+  ! FV sub-element corner fields, so ground_frac uses the same flotation field.
   if (CS%i2n_friction .or. CS%i2n_taud) &
     call build_corner_flotation_fields(CS, ISS, G)
   call compute_ground_frac(CS, ISS, G, CS%H_node)
@@ -3274,9 +2982,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   if (.not. CS%grounded_geom_current) call update_grounded_geometry(CS, ISS, G)
   CS%grounded_geom_current = .false.
 
-  ! Calculate RHS. With CISM_TAUD, use the FV (non-DG) driving stress even under DG
-  ! thickness advection. This feeds the driving stress the cell-mean thickness, discarding
-  ! the DG sub-cell slope.
+  ! Calculate RHS. CISM_TAUD uses the FV driving stress on the cell means, even under DG.
   if (CS%use_DG_thickness .and. (CS%cism_taud == CISM_OFF)) then
     call calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, CS%OD_av)
   else
@@ -4806,13 +4512,7 @@ subroutine shelf_advance_front(CS, ISS, G, hmask, uh_ice, vh_ice, calving)
               h_reference = h_reference / tot_flux
               !h_reference = h_reference / real(n_flux)
               partial_vol = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j) + tot_flux
-              ! The partial-fill overwrites h_shelf with the donor cell mean;
-              ! set the DG nodal field to that same donor mean so
-              ! nodal_cell_mean matches ISS%h_shelf. Leaving the corners at
-              ! 0 (the prior code path) collapses Hmin_B at this cell's 4
-              ! B-nodes to 0, which lets neighbour ice cells show corner
-              ! jumps as large as their own Hbar through the nodal limiter
-              ! envelope.
+              ! Keep the DG corners equal to the new cell mean.
               if (CS%use_DG_thickness) then
                 CS%h_nodal(i,j,:,:) = h_reference
               endif
@@ -5946,8 +5646,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
           grounded_qp = merge(CS%ground_frac(i,j) >= 1.0, CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
         endif
         if (grounded_qp) then
-          ! DG mode: per-Gauss-point grounding check and fB computation. h_gp is used
-          ! only as a flotation measure (gate + effective pressure).
+          ! DG: h_gp is only used for flotation and the effective pressure.
           if (do_DG) then
             h_gp = ((CS%h_nodal(i,j,1,1) * (xquad(3-iq) * xquad(3-jq))) + &
                     (CS%h_nodal(i,j,2,2) * (xquad(iq)   * xquad(jq))))  + &
@@ -6108,8 +5807,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
               h_nodal_cell=CS%H_corner(I-1:I,J-1:J), &
               fls_cell=CS%fls_corner(I-1:I,J-1:J))
         elseif (do_DG) then
-          ! h_nodal_cell is used inside only as a flotation measure (sub-qp gate +
-          ! effective pressure).
+          ! h_nodal_cell is only used for flotation and the effective pressure.
           call CG_action_subgrid_basal(CS, G, US, Phisub, Hcell, &
               u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
               u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
@@ -6847,9 +6545,7 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
             h_nodal_cell=CS%H_corner(I-1:I,J-1:J), &
             fls_cell=CS%fls_corner(I-1:I,J-1:J))
       elseif (do_DG) then
-        ! h_nodal_cell is used inside only as a flotation measure (sub-qp gate +
-        ! effective pressure), so the gate field is passed (h_flot under
-        ! DG_GL_GATE_CONTINUOUS).
+        ! h_nodal_cell is only used for flotation and the effective pressure.
         call CG_diagonal_subgrid_basal(CS, G, US, Phisub, Hcell, &
             u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
             CS%bed_elev(i,j), dens_ratio, i, j, fB_e, u_diag_sub, v_diag_sub, &
@@ -9707,11 +9403,8 @@ subroutine interpolate_H_to_B(G, h_shelf, hmask, H_node, min_h_shelf)
 
 end subroutine interpolate_H_to_B
 
-!> DG(1)-aware variant of interpolate_H_to_B. Each B-grid corner is shared
-!! by up to four T-cells; in each cell we evaluate the nodal Q1 thickness
-!! at the corresponding reference corner and average over the cells that
-!! contribute (using the same hmask + min_h_shelf floor rules as
-!! interpolate_H_to_B).
+!> DG(1) version of interpolate_H_to_B: average the co-located corners of the
+!! ice-covered cells at each B-grid node.
 subroutine interpolate_H_to_B_DG(G, h_shelf, h_nodal, hmask, H_node, min_h_shelf)
   type(ocean_grid_type), intent(in) :: G  !< The grid structure used by the ice shelf.
   real, dimension(SZDI_(G),SZDJ_(G)), &
@@ -9731,26 +9424,13 @@ subroutine interpolate_H_to_B_DG(G, h_shelf, h_nodal, hmask, H_node, min_h_shelf
 
   H_node(:,:) = 0.0
 
-  ! Nodal Q1 reconstruction at B-grid node (i,j). The node is shared by up
-  ! to 4 T-cells; each cell contributes the value at its own corresponding
-  ! corner (R5 / R25 of nodal plan):
-  !   cell (i,  j  ) at its NE = h_nodal(i,  j,  2,2)
-  !   cell (i+1,j  ) at its NW = h_nodal(i+1,j,  1,2)
-  !   cell (i,  j+1) at its SE = h_nodal(i,  j+1,2,1)
-  !   cell (i+1,j+1) at its SW = h_nodal(i+1,j+1,1,1)
-  ! Loop indexing (k,l) maps to (ic=i-1+k, jc=j-1+l); see comment block in
-  ! the original modal version for the reference-corner mapping.
+  ! Cell (ic,jc) = (i-1+k,j-1+l) touches node (i,j) at its corner (3-k,3-l).
   do j=jsc-1,jec
     do i=isc-1,iec
       num_h = 0
       h_arr(:,:) = 0.0
       do l=1,2 ; jc=j-1+l ; do k=1,2 ; ic=i-1+k
         if (hmask(ic,jc) == 1.0 .or. hmask(ic,jc) == 3.0) then
-          ! For cell (ic,jc), pick the corner at reference (xi,eta) =
-          !   (k=1,l=1) -> (+0.5,+0.5) -> NE -> h_nodal(ic,jc,2,2)
-          !   (k=2,l=1) -> (-0.5,+0.5) -> NW -> h_nodal(ic,jc,1,2)
-          !   (k=1,l=2) -> (+0.5,-0.5) -> SE -> h_nodal(ic,jc,2,1)
-          !   (k=2,l=2) -> (-0.5,-0.5) -> SW -> h_nodal(ic,jc,1,1)
           if (k == 1 .and. l == 1) then
             h_arr(k,l) = max(h_nodal(ic,jc,2,2), min_h_shelf)
           elseif (k == 2 .and. l == 1) then
@@ -10243,14 +9923,8 @@ end subroutine ice_shelf_advect_temp_y
 
 
 
-!> Accumulate the ice-front Neumann face contribution for one face of one
-!! element into the per-corner accumulators face_A, face_B. Used by the
-!! strong-form driving stress at external (ocean) boundary faces.
-!! Integrand at each face Gauss point:
-!!   face_sign * 1/2 * face_length * phi * (P_ice - P_ocean)
-!! where P_ice = 1/2 rho g h^2 and P_ocean = 1/2 rhow g d_ocean^2.
-!! face_sign is the outward unit-normal component on the relevant axis
-!! (-1 on W/S faces, +1 on E/N faces) and absorbs the n-dot-axis sign.
+!> Add the ice-front Neumann term int phi*(P_ice - P_ocean)*n dS on one face of a cell
+!! to its two endpoint corners, with P_ice = rho*g*h^2/2 and P_ocean = rhow*g*d^2/2.
 subroutine add_Neumann_face_DG(face_length, face_sign, &
     h_corner_A, h_corner_B, b_corner_A, b_corner_B, &
     h_bdry_val, loc_is_bc, rho, rhow, rhoi_rhow, grav, min_h_shelf, &
@@ -10298,23 +9972,9 @@ subroutine add_Neumann_face_DG(face_length, face_sign, &
   enddo
 end subroutine add_Neumann_face_DG
 
-!> Accumulate the interior-face edge correction for one face of one element
-!! into the per-corner accumulators face_A, face_B. Used by the DG(1) driving
-!! stress at interior hmask=1 / hmask=1 (or hmask=3) faces. The broken-Q1
-!! thickness jump at the face contributes a distributional Dirac source the
-!! per-cell volume quadrature misses; adding this term restores the correct
-!! weak-form RHS. Per face Gauss point:
-!!   face_sign * 1/4 * face_length * phi * rho*g*{h}*[s]
-!! where {h} = 1/2*(h_loc + h_ngh), [s] = s_loc - s_ngh, and each side's
-!! surface elevation s uses its own flotation test:
-!!   grounded side: s = h - b
-!!   floating side: s = (1 - rho_i/rho_w) * h
-!! At uniformly-grounded faces this reduces to rho*g*{h}*[h] = [P]; at
-!! uniformly-floating faces to (1 - rho_i/rho_w)*[P]; at mixed-flotation
-!! faces it remains distributionally correct (the per-side-P difference
-!! formula does not, missing terms of order 1/2*rho*g*r*h^2).
-!! The 1/4 prefactor is the product of the 1/2 Gauss weight on [0,1] and
-!! the 1/2 per-cell share of the inter-cell edge integral.
+!> Add this cell's half of the interior-face term -1/2 int phi*rho*g*{h}*[s]*n dS, which the
+!! cell volume integral misses because s jumps across the face. Each side takes its own
+!! flotation branch for s.
 subroutine add_taud_edge_correction_DG(face_length, face_sign, &
     h_loc_A, h_loc_B, h_ngh_A, h_ngh_B, b_corner_A, b_corner_B, &
     rho, rhow, rhoi_rhow, grav, min_h_shelf, &
@@ -10352,8 +10012,6 @@ subroutine add_taud_edge_correction_DG(face_length, face_sign, &
     h_ngh = ((1.0 - t_face)*hN_A) + (t_face*hN_B)
     b_loc = ((1.0 - t_face)*b_A) + (t_face*b_B)
 
-    ! Per-side surface elevation: each side takes its own flotation branch on its
-    ! own h against the shared face bed.
     if (rhoi_rhow * h_loc - b_loc > 0.0) then
       s_loc = h_loc - b_loc                          ! grounded
     else
@@ -10366,40 +10024,18 @@ subroutine add_taud_edge_correction_DG(face_length, face_sign, &
     endif
 
     h_avg = 0.5 * (h_loc + h_ngh)
-    ! Universal Dirac integrand: rho * grav * {h} * [s]. Reduces to [P_eff]
-    ! at uniformly-grounded and uniformly-floating faces; remains correct
-    ! at mixed-flotation faces where [P_per-side] would miss terms.
     jump_factor = rho * grav * h_avg * (s_loc - s_ngh)
 
     phi_A = 1.0 - t_face ; phi_B = t_face
+    !0.25 is the Gauss weight times the cell's half share of the inter-cell edge integral
     face_A = face_A + (face_sign * 0.25 * face_length * phi_A * jump_factor)
     face_B = face_B + (face_sign * 0.25 * face_length * phi_B * jump_factor)
   enddo
 end subroutine add_taud_edge_correction_DG
 
-!> DG(1) driving stress, assembled as the three-piece decomposition of
-!! Huth et al., MOM6-IS_JAMES sec. 2.5.2:
-!!
-!!   R^d = strong-form volume + interior-face edge correction + ice-front Neumann.
-!!
-!! The volume integral is
-!!   int phi * (-rho*g*h*grad(s)) dA,
-!! evaluated at 2x2 Gauss points (or on the SEP2 sub-element partition, or
-!! nsub x nsub x 2x2 sub-Gauss, in the GL band when GL_regularize is on) using
-!! the Q1 nodal basis for h, grad(h) and corner bed_node for b, grad(b).
-!!
-!! s is broken across interior faces because each side takes its own flotation
-!! branch on its own h, so the per-cell volume quadrature alone cannot see the
-!! full gradient of s. The distributional derivative supplies the missing
-!! face-localized term, added at every interior hmask=1/hmask=1 face as
-!!   -1/2 * int phi * rho*g*{h}*[s] * n dS,
-!! with {h} the face average, split half and half between the two cells
-!! (add_taud_edge_correction_DG).
-!!
-!! The ice-front Neumann BC (ocean back-pressure) is added as an explicit face
-!! integral
-!!   int phi * (1/2*rho*g*h^2 - 1/2*rhow*g*d_ocean^2) * n dS
-!! over external boundary faces (add_Neumann_face_DG). Walls contribute nothing.
+!> DG(1) driving stress: the volume integral int phi*(-rho*g*h*grad(s)) dA (2x2 Gauss, or
+!! SEP2/SEP3 sub-element quadrature in grounding-line cells), plus the interior-face jump
+!! term (add_taud_edge_correction_DG) and the ice-front Neumann term (add_Neumann_face_DG).
 subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
   type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe the ice-shelf state
@@ -10417,14 +10053,11 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   real :: rhoi_rhow  ! Ice/ocean density ratio [nondim]
   real :: grav       ! Gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
   real :: h_gp                  ! Ice thickness at a qp [Z ~> m]
-  real :: hg_gp                 ! Gate thickness at a qp for the flotation test [Z ~> m]
   real :: dhdx_gp, dhdy_gp      ! Thickness gradients in physical coords [Z L-1 ~> nondim]
   real :: bed_gp                ! Bed depth at a qp [Z ~> m]
   real :: dbdx_gp, dbdy_gp      ! Bed-depth gradients in physical coords [Z L-1 ~> nondim]
   real :: dbdx_ref, dbdy_ref    ! Bed-depth gradients in reference coords [Z ~> m]
   real :: dsdx_gp, dsdy_gp      ! Surface gradients in physical coords [nondim]
-                                ! Note: CS%bed_node is depth-positive (matches CS%bed_elev),
-                                ! so for grounded ice s = h - bed and grad(s) = grad(h) - grad(bed).
   real :: a_qp, d_qp            ! Per-qp interpolated cell-edge spacings [L ~> m]
   real :: weight                ! Per-qp quadrature weight including Jacobian [L2 ~> m2]
   real :: phi_val               ! Bilinear nodal basis value at a qp [nondim]
@@ -10433,8 +10066,6 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   real :: dyCu_W, dyCu_E        ! Cell-edge spacings on west and east faces [L ~> m]
   real :: fx_gp, fy_gp          ! Driving-force density at a qp [R Z L T-2 ~> kg m-1 s-2]
 
-  ! Face contribution dispatch flags (per-face quadrature is delegated to
-  ! add_Neumann_face_DG / add_taud_edge_correction_DG).
   logical :: is_ext_bdry         ! True if the face is an external (ocean) boundary
   logical :: loc_is_bc           ! True if local cell has hmask==3 (Dirichlet thickness BC)
   real :: face_dx_W_A, face_dx_W_B  ! West face x-stress contrib to nodes A,B [R L3 Z T-2 ~> kg m s-2]
@@ -10452,12 +10083,8 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
   real, dimension(2,2) :: weight_gp ! Per-QP Jacobian a*d [L2 ~> m2]
   real :: slope_w_sum  ! Sum of per-QP Jacobian weights [L2 ~> m2]
 
-  real, dimension(SZDIB_(G),SZDJB_(G),4) :: taudx_b, taudy_b
-                                           !< Per-node 4-slot driving-stress
-                                           !! accumulator, slot k indexed by which
-                                           !! of the 4 surrounding cells contributes
-                                           !! (1=SW, 2=SE, 3=NW, 4=NE)
-                                           !! [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(SZDIB_(G),SZDJB_(G),4) :: taudx_b, taudy_b ! Node driving stress from each
+                                           ! surrounding cell, 1=SW, 2=SE, 3=NW, 4=NE [R L3 Z T-2 ~> kg m s-2]
   real, dimension(2) :: xquad
   integer :: i, j, iq, jq, isc, iec, jsc, jec, m, n
   integer :: i_off, j_off, gisc, giec, gjsc, gjec
@@ -10482,16 +10109,6 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
 
   calc_slope_diag = (CS%id_sx_shelf > 0 .or. CS%id_sy_shelf > 0 .or. CS%id_surf_slope_mag_shelf > 0)
 
-  ! Driving-stress branch gating. By default the driving stress keeps its own-h
-  ! flotation tests even under DG_GL_GATE_CONTINUOUS: per-side own-h branching is
-  ! algebraically s = max(h - b, (1-r)*h), continuous in h, so the assembled force
-  ! is continuous in the state. Gating the branch with h_flot instead makes s (and
-  ! especially the face Dirac term rho*g*{h}*[s], which switches between [h] and
-  ! (1-r)*[h]) jump discontinuously whenever the gate sign at a face flips while
-  ! the local h is off flotation. That force discontinuity acts as a stiff spring
-  ! pinning the steady grounding line at the configuration where the gate flips
-  ! (node-average deficit = 0, i.e. GL locked at cell faces).
-
   do j=jsc-1,jec+1 ; do i=isc-1,iec+1
     if (ISS%hmask(i,j) /= 1 .and. ISS%hmask(i,j) /= 3) cycle
 
@@ -10503,11 +10120,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
     dxCv_S = G%dxCv(i,J-1) ; dxCv_N = G%dxCv(i,J)
     dyCu_W = G%dyCu(I-1,j) ; dyCu_E = G%dyCu(I,j)
 
-    ! Volume integral: subgrid dispatch in the GL band, main-grid 2x2 Gauss otherwise.
-    ! The subgrid quadrature exists to resolve the kink of THIS integrand, whose
-    ! branch tests use the cell's own h_nodal; a bilinear deficit attains its
-    ! extrema at the corners, so the own-h flotation contour intersects the cell
-    ! iff ground_frac says the cell straddles flotation.
+    ! Volume integral: sub-element quadrature where the cell straddles flotation.
     use_subgrid_cell = CS%GL_regularize .and. &
                        (CS%ground_frac(i,j) > 0.0) .and. (CS%ground_frac(i,j) < 1.0)
     if (use_subgrid_cell) then
@@ -10597,16 +10210,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
       endif
     endif
 
-    ! Face contributions. Two cases per face:
-    ! (1) is_ext_bdry: ice-front Neumann
-    !       +integral phi * (P_ice - P_ocean) * n dS
-    !     with the natural n sign (-W, +E, -S, +N).
-    ! (2) Interior hmask=1/hmask=1 face: the edge correction
-    !       -1/2 * integral phi * rho*g*{h}*[s] * n dS
-    !     that the per-cell volume quadrature cannot see, because s jumps
-    !     across the face. Each adjacent cell contributes its own half; the
-    !     two halves sum to the full edge integral at the shared B-node.
-    ! Walls and other (hmask=3 / hmask=0 interior) faces contribute nothing.
+    ! Face terms: Neumann at ice fronts, the jump term at faces to ice. Walls add nothing.
     face_dx_W_A = 0.0 ; face_dx_W_B = 0.0
     face_dx_E_A = 0.0 ; face_dx_E_B = 0.0
     face_dy_S_A = 0.0 ; face_dy_S_B = 0.0
@@ -10685,8 +10289,6 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
         face_dy_N_A, face_dy_N_B)
     endif
 
-    ! Combine cell-volume integral with face contributions (ice-front Neumann
-    ! and, when enabled, mixed-form scale-aware interior face flux).
     cell_dx_node(1,1) = vol_dx(1,1) + face_dx_W_A
     cell_dy_node(1,1) = vol_dy(1,1) + face_dy_S_A
     cell_dx_node(2,1) = vol_dx(2,1) + face_dx_E_A
@@ -10713,12 +10315,8 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, US, taudx, taudy, OD)
 
 end subroutine calc_shelf_driving_stress_DG
 
-!> Strong-form (non-IBP) subgrid volume integral of the driving stress for
-!! the DG path, used in the grounding-line band when GL_regularize is on.
-!! Evaluates int phi * (-rho*g*h*grad(s)) dA over nsub x nsub sub-cells,
-!! with per-sub-QP floating/grounded selector via the local h_gp vs bed_gp
-!! comparison. No face integrals here; the ice-front Neumann is applied at
-!! the main-grid cell edges by the caller.
+!> DG(1) driving-stress volume integral over the nsub x nsub SEP3 sub-cells, with a
+!! flotation test at each sub-quadrature point. The caller adds the face terms.
 subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
     h_nodal_cell, bed_corners, &
     dxCv_S, dxCv_N, dyCu_W, dyCu_E, &
@@ -10749,7 +10347,7 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
   real :: slope_w_total
   real, dimension(2,2,2,2) :: qp_dx, qp_dy
   real :: h_gp, dhdx_gp, dhdy_gp
-  real :: hg_gp  ! Gate thickness at the sub-qp for the flotation test [Z ~> m]
+  real :: hg_gp  ! Thickness at the sub-qp for the flotation test [Z ~> m]
   real :: bed_gp, dbdx_gp, dbdy_gp
   real :: dbdx_ref, dbdy_ref
   real :: dsdx_gp, dsdy_gp
@@ -10797,11 +10395,7 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
       dbdx_gp = dbdx_ref / a
       dbdy_gp = dbdy_ref / d
 
-      ! Sub-QP-local floating/grounded selector. For the strong form we use
-      ! the local hydrostatic test even when CS%GL_couple is true, because
-      ! the whole point of the subgrid is to resolve sub-cell GL position
-      ! that a cell-mean ground_frac smears. The test uses the gate thickness
-      ! (h_flot under DG_GL_GATE_CONTINUOUS); magnitudes keep h_nodal_cell.
+      ! Local flotation test, even with GL_couple.
       hg_gp = ((Phisub(qx,qy,i,j,1,1)*h_nodal_cell(1,1)) + (Phisub(qx,qy,i,j,2,2)*h_nodal_cell(2,2))) + &
               ((Phisub(qx,qy,i,j,1,2)*h_nodal_cell(1,2)) + (Phisub(qx,qy,i,j,2,1)*h_nodal_cell(2,1)))
       hg_gp = max(hg_gp, CS%min_h_shelf)
@@ -10854,10 +10448,8 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
 
 end subroutine calc_shelf_driving_stress_DG_subgrid
 
-!> SEP2 driving-stress volume integral for a grounding-line cell in the DG strong path.
-!! Integrates -rho*g*h*grad(s) on the sep2_cell_qps partition: every QP lies strictly on
-!! one side of the sub-element grounding line and takes that side's grad(s) branch, so no
-!! QP straddles the surface-slope kink. Surface-slope diagnostics use the same QPs.
+!> DG(1) driving-stress volume integral on the SEP2 partition of a grounding-line cell.
+!! Each QP lies on one side of the cut and takes that side's grad(s) branch.
 subroutine calc_shelf_driving_stress_DG_sep2(CS, h_nodal_cell, bed_corners, &
     dxCv_S, dxCv_N, dyCu_W, dyCu_E, rho, rhoi_rhow, grav, vol_dx, vol_dy, &
     sx_shelf, sy_shelf, calc_slope_diag)
@@ -10911,9 +10503,7 @@ subroutine calc_shelf_driving_stress_DG_sep2(CS, h_nodal_cell, bed_corners, &
   fls(:) = (rhoi_rhow * hc(:)) - bedc(:)
   call sep2_cell_qps(fls, nqp, beta, wref, qpg)
 
-  ! Per-triangle P1 gradients of the two corner fields. These must use the same interpolant that
-  ! sep2_cell_qps cut on, or the branch below is taken on one contour while the slopes come from
-  ! another and the surface jumps across the cut; see sep2_fan_gradient.
+  ! P1 fan gradients, the same interpolant sep2_cell_qps cut on.
   call sep2_fan_gradient(hc,   dhxi, dheta)
   call sep2_fan_gradient(bedc, dbxi, dbeta)
 
@@ -10930,7 +10520,6 @@ subroutine calc_shelf_driving_stress_DG_sep2(CS, h_nodal_cell, bed_corners, &
       dhdx_gp = dhxi(t) / a ; dhdy_gp = dheta(t) / d
       dbdx_gp = dbxi(t) / a ; dbdy_gp = dbeta(t) / d
 
-      ! The QP inherits its piece's flotation state; friction and taud branch identically.
       if (qpg(k,t)) then
         dsdx_gp = dhdx_gp - dbdx_gp
         dsdy_gp = dhdy_gp - dbdy_gp
@@ -10999,10 +10588,8 @@ subroutine calc_shelf_driving_stress_DG_sep2(CS, h_nodal_cell, bed_corners, &
 
 end subroutine calc_shelf_driving_stress_DG_sep2
 
-!> Zero the DG(1) slope coefficients h_x, h_y at a single cell. No-op when
-!! DG(1) thickness is not active. Used by external modules (e.g. melt /
-!! water-flux ablation in MOM_ice_shelf) to keep the DG state self-consistent
-!! when h_shelf at that cell is overwritten outside the advect step.
+!> Set all DG(1) corners of cell (i,j) to h_shelf_value, for when h_shelf is overwritten
+!! outside the advection.
 subroutine reset_DG_to_cellmean_at_cell(CS, i, j, h_shelf_value)
   type(ice_shelf_dyn_CS), pointer    :: CS !< Ice shelf dynamics control structure.
   integer,                intent(in) :: i  !< i index of the cell to reset.
@@ -11014,8 +10601,7 @@ subroutine reset_DG_to_cellmean_at_cell(CS, i, j, h_shelf_value)
   CS%h_nodal(i,j,:,:) = h_shelf_value
 end subroutine reset_DG_to_cellmean_at_cell
 
-!> Return .true. when the ice-shelf dynamics CS is associated and DG(1)
-!! thickness is enabled. Lets external modules guard DG-only paths.
+!> True if CS is associated and uses DG(1) thickness.
 function is_DG_thickness_active(CS) result(active)
   type(ice_shelf_dyn_CS), pointer :: CS
   logical :: active
@@ -11024,9 +10610,7 @@ function is_DG_thickness_active(CS) result(active)
   active = CS%use_DG_thickness
 end function is_DG_thickness_active
 
-!> Return a pointer to the Q1 nodal thickness array, so that the thickness
-!! initialization in MOM_ice_shelf can fill it directly under
-!! INIT_ICE_THICKNESS_NODAL. Returns null if the CS is not associated.
+!> Pointer to CS%h_nodal, for INIT_ICE_THICKNESS_NODAL; null if CS is not associated.
 function DG_nodal_thickness_ptr(CS) result(h_nodal)
   type(ice_shelf_dyn_CS),           pointer :: CS !< The ice shelf dynamics control structure
   real, dimension(:,:,:,:),         pointer :: h_nodal !< Q1 nodal thickness [Z ~> m]
@@ -11035,26 +10619,17 @@ function DG_nodal_thickness_ptr(CS) result(h_nodal)
   h_nodal => CS%h_nodal
 end function DG_nodal_thickness_ptr
 
-!> Reset all 4 nodal corners of every cell to zero (typical use: pre-init
-!! cleanup before populating from a cell-mean field). No-op when DG(1)
-!! thickness is not active.
-subroutine reset_DG_to_cellmean_bulk(CS)
+!> Zero every DG(1) corner.
+subroutine zero_DG_h_nodal(CS)
   type(ice_shelf_dyn_CS), pointer :: CS !< Ice shelf dynamics control structure.
 
   if (.not. associated(CS)) return
   if (.not. CS%use_DG_thickness) return
   CS%h_nodal(:,:,:,:) = 0.0
-end subroutine reset_DG_to_cellmean_bulk
+end subroutine zero_DG_h_nodal
 
-!> Return the grounded area fraction of cell (i,j) from whichever sub-element grounding-line
-!! scheme is active: the analytic quadrant fraction of Leguy et al. (2021) when
-!! CISM_FRICTION is set, and the sub-element sampled fraction otherwise. With no
-!! sub-element scheme active, CS%ground_frac is the binary flotation state of the cell centre,
-!! so this returns 0 or 1 and any scheme built on it degenerates to a binary treatment.
-!! Centralized here because both the prescribed melt parameterizations and the sub-element
-!! nodal source weights must read the same grounded geometry the friction does; if they read
-!! different partitions, melt would switch on at a different sub-cell location than friction
-!! switches off.
+!> Grounded area fraction of cell (i,j) from the partition the friction uses: the quadrant
+!! fraction under CISM_FRICTION, otherwise CS%ground_frac (binary without a sub-element scheme).
 pure function grounded_frac_cell(CS, i, j) result(fg)
   type(ice_shelf_dyn_CS), intent(in) :: CS !< Ice shelf dynamics control structure.
   integer,                intent(in) :: i  !< i index of the cell.
@@ -11069,29 +10644,10 @@ pure function grounded_frac_cell(CS, i, j) result(fg)
   fg = min(max(fg, 0.0), 1.0)
 end function grounded_frac_cell
 
-!> Set ISS%water_flux from the prescribed depth-dependent basal melt profile of Leguy et al.
-!! (2021) eq. 18, which is the profile used for the MISMIP+ Ice1r experiment and is identical
-!! to Seroussi & Morlighem (2018) eq. 4:
-!!
-!!     m = 0                            for z_d > -50 m
-!!     m = -(1/15) * (z_d + 50) m yr-1  for -500 m < z_d < -50 m
-!!     m = 30 m yr-1                    for z_d < -500 m
-!!
-!! where z_d is the ice-shelf basal elevation (negative below sea level) and m is positive for
-!! melting. Writing z_d in terms of the flotation draft d = (rho_i/rho_w) * h, so that
-!! z_d = -d, the profile is the clamped ramp m = min(max((d - 50)/15, 0), 30) m yr-1, which is
-!! continuous at both breakpoints.
-!!
-!! The profile is a property of freely floating ice, so the draft is taken from flotation
-!! rather than from the bed: using the bed elevation would give grounded cells a melt rate set
-!! by how deep their bed is. How the rate is applied in cells that contain the grounding line
-!! is set by CS%ice_only_melt_glp; see the MELT_GLP_* parameters. The whole profile is scaled by
-!! CS%ice_only_melt_scale, which is 5 for the high-melt experiments of Leguy et al. sec. 4.3.
-!!
-!! This routine only fills ISS%water_flux. The thickness change, the melt-away handling and the
-!! DG source accumulation are all left to change_thickness_using_melt, so the ice-only path and
-!! the coupled path share exactly one implementation of those. No-op unless the run is ice-only
-!! and ICE_ONLY_BASAL_MELT is set.
+!> Set ISS%water_flux from the MISMIP+ Ice1r melt profile (Leguy et al. 2021 eq. 18; Seroussi &
+!! Morlighem 2018 eq. 4), m = min(max((d - 50 m)/15, 0), 30) m yr-1 with the flotation draft
+!! d = (rho_i/rho_w)*h, scaled by CS%ice_only_melt_scale. Grounding-line cells follow
+!! CS%ice_only_melt_glp. The thickness change itself is left to change_thickness_using_melt.
 subroutine calc_prescribed_basal_melt(CS, ISS, G, US)
   type(ice_shelf_dyn_CS), pointer       :: CS  !< Ice shelf dynamics control structure.
   type(ice_shelf_state),  intent(inout) :: ISS !< Ice shelf state (hmask, h_shelf, water_flux).
@@ -11116,11 +10672,6 @@ subroutine calc_prescribed_basal_melt(CS, ISS, G, US)
   d_min = 50.0 * US%m_to_Z
   d_max = 500.0 * US%m_to_Z
   m_max = (30.0 / (365.0*86400.0)) * US%m_to_Z * US%T_to_s
-  ! Leguy et al. (2021) sec. 4.3 repeats the whole experiment set with eq. 18 multiplied by 5.
-  ! Scaling the saturated rate scales the entire profile, since the ramp below is written as a
-  ! fraction of it: s*clamp((d-d_min)/(d_max-d_min), 0, 1)*m_max is the same curve with the
-  ! breakpoints at 50 m and 500 m untouched and only the magnitude moved. Applied as its own
-  ! multiply, and exactly 1.0 by default, so the default path is bitwise unchanged.
   m_max = m_max * CS%ice_only_melt_scale
   I_d_range = 1.0 / (d_max - d_min)
 
@@ -11130,51 +10681,29 @@ subroutine calc_prescribed_basal_melt(CS, ISS, G, US)
     endif
 
     draft = rhoi_rhow * ISS%h_shelf(i,j)
-    ! The clamped ramp. Written as a fraction of the saturated rate so that the two breakpoints
-    ! are exact: the melt rate is 0 at draft = d_min and m_max at draft = d_max.
     melt_rate = m_max * min(max((draft - d_min) * I_d_range, 0.0), 1.0)
 
-    ! Grounding-line treatment. CS%ground_frac / CS%f_ground_cell give the grounded area
-    ! fraction on whatever sub-element partition is active; without one they are binary and
-    ! FCMP, PMP and NMP all collapse to the same cell-centre test.
+    !Apply according to chosen grounding line melt parameterization
     fg = grounded_frac_cell(CS, i, j)
     select case (CS%ice_only_melt_glp)
       case (MELT_GLP_FMP)
-        ! Full rate everywhere, including partly grounded cells.
       case (MELT_GLP_FCMP)
-        ! Flotation condition evaluated at the cell centre, as in Leguy et al. (2021) sec. 2.3.
-        ! The ice floats where the flotation draft does not reach the bed.
         floating = (CS%bed_elev(i,j) - rhoi_rhow * max(ISS%h_shelf(i,j), CS%min_h_shelf)) >= 0.0
         if (.not. floating) melt_rate = 0.0
       case (MELT_GLP_PMP, MELT_GLP_SEM2)
-        ! Scale by the floating area fraction, so the total melt applied to the cell is
-        ! proportional to its floating area. SEM2 shares this cell total with PMP -- the two
-        ! differ only in how the total is distributed inside the cell, which is applied later by
-        ! the nodal source projection -- so scaling here keeps ISS%water_flux, and every
-        ! diagnostic and mass budget that reads it, consistent with what the ice actually loses.
+        ! SEM2 has PMP's cell total; only its in-cell distribution differs.
         melt_rate = melt_rate * (1.0 - fg)
       case (MELT_GLP_NMP)
-        ! No melt in any cell that is even partly grounded.
         if (fg > 0.0) melt_rate = 0.0
     end select
 
-    ! ISS%water_flux is a mass flux from the ice into the ocean, positive for melting.
     ISS%water_flux(i,j) = melt_rate * CS%density_ice
   enddo ; enddo
 end subroutine calc_prescribed_basal_melt
 
-!> Accumulate a cell-mean ice-thickness source rate (positive for accumulation,
-!! negative for melt) at cell (i,j) into the DG source buffer. The buffer is
-!! consumed by the next ice_shelf_advect_DG1_nodal call, projected onto a
-!! continuous Q1 nodal field, and applied inside the SSP-RK2 stages. No-op
-!! when DG(1) thickness is not active.
-!!
-!! Basal contributions are additionally accumulated into CS%h_source_rate_bmb so
-!! that the basal and surface parts can be given different nodal treatments. The
-!! combined buffer CS%h_source_rate is still accumulated exactly as before, so the
-!! default single-projection path retains its summation order and its answers; the
-!! surface part is recovered as h_source_rate - h_source_rate_bmb only on the paths
-!! that need it.
+!> Add a cell-mean thickness source rate (positive for accumulation) at cell (i,j) to the
+!! buffer applied by the next ice_shelf_advect_DG1_nodal, and to the basal buffer if basal.
+!! Surface rate is recoverable as h_source_rate - h_source_rate_bmb
 subroutine accumulate_DG_source_rate(CS, i, j, rate, basal)
   type(ice_shelf_dyn_CS), pointer    :: CS !< Ice shelf dynamics control structure.
   integer,                intent(in) :: i  !< i index of the cell.
@@ -11190,30 +10719,7 @@ subroutine accumulate_DG_source_rate(CS, i, j, rate, basal)
   if (basal) CS%h_source_rate_bmb(i,j) = CS%h_source_rate_bmb(i,j) + rate
 end subroutine accumulate_DG_source_rate
 
-!> Apply one cross-cell operator to one cell-mean source field, producing a Q1 nodal source.
-!!
-!! SRC_OP_LOCAL is piecewise constant: every corner of a cell takes that cell's own rate, so no
-!! source crosses a cell face. SRC_OP_AVERAGED makes each B-grid corner the cell_mean_w-weighted
-!! average of the up-to-4 contributing cells that share it, giving a source that is continuous
-!! across faces and so does not provoke the DG limiter where rates differ sharply between
-!! neighbours.
-!!
-!! Both are exactly mass-conservative, because the corner weights are a partition of unity,
-!! sum_ab cell_mean_w = areaT. For SRC_OP_LOCAL the nodal cell mean of a constant is that
-!! constant, so each cell keeps its own source exactly. For SRC_OP_AVERAGED the volume deposited
-!! at corner P is (sum_c w_c(P)) * S_P = sum_c w_c(P) * src_c, so summing over corners recovers
-!! sum_c areaT_c * src_c. That identity holds only because the same set of cells appears in the
-!! numerator and in the denominator, which is why the contributor pool is defined in exactly one
-!! place below.
-!!
-!! Only hmask=1 cells contribute. Cells with hmask=3 (Dirichlet thickness BC) hold a source of
-!! zero by construction, so including them would add nothing to the numerator while still adding
-!! their cell_mean_w to the denominator, diluting the projected source at shared corners and
-!! silently losing the corresponding mass from the global integral. Excluding them means each
-!! hmask=1 cell's full source is applied to its own area; mass that a climate model would deposit
-!! on hmask=3 cells still flows into ISS%mass_hole via the accounting in shelf_calc_flux.
-!!
-!! The caller is responsible for having updated the halo of src before calling.
+!> Map a cell-mean source field to a Q1 nodal source with one SRC_OP_* operator.
 subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
   type(ice_shelf_dyn_CS), intent(in)  :: CS  !< Ice shelf dynamics control structure.
   type(ice_shelf_state),  intent(in)  :: ISS !< Ice shelf state (hmask, h_shelf).
@@ -11228,20 +10734,14 @@ subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
                                              !! the cell in proportion to CS%xi_basal instead of
                                              !! uniformly (the SEM2 in-cell distribution).
 
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: S_corner ! Projected B-grid corner source [Z T-1]
-  real, dimension(SZDIB_(G),SZDJB_(G)) :: w_corner ! Total cell_mean_w summed at corner [L2]
-  ! Per-node 4-slot accumulators, slot k indexed by which of the 4 surrounding cells
-  ! contributes (1=SW, 2=SE, 3=NW, 4=NE), as for taudx_b and uret_b elsewhere in this
-  ! module. The cell loop is row-major, so summing into the node directly would add the
-  ! four contributions in an order that a quarter turn of the grid changes. Holding them
-  ! in slots and reducing in diagonal pairs below does not depend on that order. The
-  ! distinction is invisible for a uniform grid carrying a spatially constant source,
-  ! where all four contributions are the same number, and real otherwise.
-  real, dimension(SZDIB_(G),SZDJB_(G),4) :: S_corner_b ! Per-cell corner source [Z T-1]
-  real, dimension(SZDIB_(G),SZDJB_(G),4) :: w_corner_b ! Per-cell corner weight [L2]
-  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: S_loc ! Per-cell nodal source before sharing [Z T-1]
-  real, dimension(SZDI_(G),SZDJ_(G)) :: m_eff ! Rate over the floating part of a cell [Z T-1]
-  real :: w_contrib                                ! Per-cell-corner contribution weight [L2]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: S_corner ! Projected B-grid corner source [Z T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: w_corner ! Total cell_mean_w at a corner [L2 ~> m2]
+  ! Slots by contributing cell (1=SW, 2=SE, 3=NW, 4=NE), summed in diagonal pairs for rotation invariance.
+  real, dimension(SZDIB_(G),SZDJB_(G),4) :: S_corner_b ! Per-cell corner source [Z L2 T-1 ~> m3 s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G),4) :: w_corner_b ! Per-cell corner weight [L2 ~> m2]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: S_loc ! Nodal source before sharing [Z T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: m_eff ! Rate over the floating part of a cell [Z T-1 ~> m s-1]
+  real :: w_contrib                                ! Corner contribution weight [L2 ~> m2]
   real :: w_sum                                    ! The DG area of a cell, sum_ab w [L2 ~> m2]
   real :: wxi_sum                                  ! The floating DG area, sum_ab w*xi [L2 ~> m2]
   logical :: xi_on                                 ! True when the SEM2 distribution is in use
@@ -11249,11 +10749,7 @@ subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
 
   xi_on = .false. ; if (present(use_xi)) xi_on = use_xi
 
-  ! In-cell distribution. Without xi a cell's source is uniform over the cell. With xi the same
-  ! cell total is instead distributed in proportion to the nodal floating fraction, so a corner
-  ! whose support is grounded receives none of it. m_eff is the rate over the floating part: the
-  ! cell total divided by the floating DG area, so that sum_ab w*S_loc recovers the cell total
-  ! exactly whatever xi looks like, and no separate normalisation step is needed.
+  ! In-cell distribution: uniform, or with xi (proportional to nodal floating fraction)
   m_eff(:,:) = 0.0
   S_loc(:,:,:,:) = 0.0
   do j = G%jsd, G%jed ; do i = G%isd, G%ied
@@ -11265,8 +10761,6 @@ subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
                  (CS%cell_mean_w(i,j,2,2) * CS%xi_basal(i,j,2,2))) + &
                 ((CS%cell_mean_w(i,j,2,1) * CS%xi_basal(i,j,2,1)) + &
                  (CS%cell_mean_w(i,j,1,2) * CS%xi_basal(i,j,1,2)))
-      ! A cell with no floating area has no melt to place; its total is already zero under any
-      ! grounding-line melt parameterization, so leaving m_eff at zero loses nothing.
       if (wxi_sum > 0.0) m_eff(i,j) = (w_sum * src(i,j)) / wxi_sum
       do b = 1, 2 ; do a = 1, 2
         S_loc(i,j,a,b) = m_eff(i,j) * CS%xi_basal(i,j,a,b)
@@ -11279,6 +10773,7 @@ subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
 
   S_node(:,:,:,:) = 0.0
 
+  ! -- LOCAL --
   if (op == SRC_OP_LOCAL) then
     do j = G%jsc, G%jec ; do i = G%isc, G%iec
       if (ISS%hmask(i,j) /= 1.0) cycle
@@ -11287,29 +10782,30 @@ subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
     return
   endif
 
+  ! -- SUBGRID --
   S_corner(:,:) = 0.0
   w_corner(:,:) = 0.0
   S_corner_b(:,:,:) = 0.0
   w_corner_b(:,:,:) = 0.0
 
   if (op == SRC_OP_SUBGRID) then
-    ! Average the melt rate over the floating part of each corner's support, weighting each cell
-    ! by the floating area it contributes there. A fully grounded corner has xi = 0, so it adds
-    ! nothing to either sum and receives nothing back: it neither dilutes its floating neighbours
-    ! nor picks up their melt. A consequence worth knowing is that when the rate is spatially
-    ! uniform this operator reduces identically to SRC_OP_LOCAL, so it redistributes only genuine
-    ! differences in melt rate and never geometry alone.
+    ! Average over the floating part of each corner's support; grounded corners (xi = 0) neither
+    ! give nor receive. A uniform rate reduces to SRC_OP_LOCAL.
     do j = G%jsd, G%jed ; do i = G%isd, G%ied
       if (ISS%hmask(i,j) /= 1.0) cycle
+      !SW corner
       w_contrib = CS%cell_mean_w(i,j,1,1) * CS%xi_basal(i,j,1,1)
       S_corner_b(I-1, J-1, 4) = w_contrib * m_eff(i,j)
       w_corner_b(I-1, J-1, 4) = w_contrib
+      !SE corner
       w_contrib = CS%cell_mean_w(i,j,2,1) * CS%xi_basal(i,j,2,1)
       S_corner_b(I,   J-1, 3) = w_contrib * m_eff(i,j)
       w_corner_b(I,   J-1, 3) = w_contrib
+      !NW corner
       w_contrib = CS%cell_mean_w(i,j,1,2) * CS%xi_basal(i,j,1,2)
       S_corner_b(I-1, J  , 2) = w_contrib * m_eff(i,j)
       w_corner_b(I-1, J  , 2) = w_contrib
+      !NE corner
       w_contrib = CS%cell_mean_w(i,j,2,2) * CS%xi_basal(i,j,2,2)
       S_corner_b(I,   J  , 1) = w_contrib * m_eff(i,j)
       w_corner_b(I,   J  , 1) = w_contrib
@@ -11333,31 +10829,29 @@ subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
     return
   endif
 
-  ! Accumulate contributions from every hmask=1 T-cell to its 4 B-grid corners, weighted by
-  ! CS%cell_mean_w.
+  ! -- AVERAGED --
+  ! Weighted contributions of each hmask=1 cell to its 4 B-grid corners.
   do j = G%jsd, G%jed ; do i = G%isd, G%ied
     if (ISS%hmask(i,j) /= 1.0) cycle
-    ! Cell-local corner (a,b) = (1,1) is the SW corner, i.e. B-node (I-1, J-1).
+    !SW corner
     w_contrib = CS%cell_mean_w(i,j,1,1)
     S_corner_b(I-1, J-1, 4) = w_contrib * S_loc(i,j,1,1)
     w_corner_b(I-1, J-1, 4) = w_contrib
-    ! (a,b) = (2,1) = SE corner, B-node (I, J-1)
+    !SE corner
     w_contrib = CS%cell_mean_w(i,j,2,1)
     S_corner_b(I,   J-1, 3) = w_contrib * S_loc(i,j,2,1)
     w_corner_b(I,   J-1, 3) = w_contrib
-    ! (a,b) = (1,2) = NW corner, B-node (I-1, J)
+    !NW corner
     w_contrib = CS%cell_mean_w(i,j,1,2)
     S_corner_b(I-1, J  , 2) = w_contrib * S_loc(i,j,1,2)
     w_corner_b(I-1, J  , 2) = w_contrib
-    ! (a,b) = (2,2) = NE corner, B-node (I, J)
+    !NE corner
     w_contrib = CS%cell_mean_w(i,j,2,2)
     S_corner_b(I,   J  , 1) = w_contrib * S_loc(i,j,2,2)
     w_corner_b(I,   J  , 1) = w_contrib
   enddo ; enddo
 
-  ! Reduce the 4 slots in diagonal pairs, then normalise: at each B-grid node,
-  ! S_corner becomes the cell_mean_w-weighted average of ice-covered contributing
-  ! cells. Corners with no contributing ice cell get S_corner = 0 (no source there).
+  ! Weighted average at each B-grid node; zero where no ice cell contributes.
   do j = G%JsdB, G%JedB ; do i = G%IsdB, G%IedB
     S_corner(I,J) = (S_corner_b(I,J,1) + S_corner_b(I,J,4)) + &
                     (S_corner_b(I,J,2) + S_corner_b(I,J,3))
@@ -11366,9 +10860,6 @@ subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
     if (w_corner(I,J) > 0.0) S_corner(I,J) = S_corner(I,J) / w_corner(I,J)
   enddo ; enddo
 
-  ! Distribute B-grid corner values to DG cell-local corner indices for the
-  ! hmask=1 cells the advect step will update. hmask=3 cells are held to
-  ! their Dirichlet h_bdry_val and do not consume S_node.
   do j = G%jsc, G%jec ; do i = G%isc, G%iec
     if (ISS%hmask(i,j) /= 1.0) cycle
     S_node(i,j,1,1) = S_corner(I-1, J-1)
@@ -11378,15 +10869,8 @@ subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
   enddo ; enddo
 end subroutine project_source_to_nodes
 
-!> Build the Q1 nodal source field S_node consumed by ice_shelf_advect_DG1_nodal, applying the
-!! basal and surface parts of the accumulated cell-mean source with their own cross-cell
-!! operators (DG_BASAL_SOURCE_SCHEME and DG_SURFACE_SOURCE_LOCAL).
-!!
-!! When both parts use the same operator the combined buffer CS%h_source_rate is projected in a
-!! single pass. This is not merely an optimization: projection is linear, so projecting the parts
-!! separately and summing gives the same answer in exact arithmetic but rounds differently, and
-!! the single pass is what keeps the uniform-operator configurations reproducing their previous
-!! answers bitwise.
+!> Build the nodal source S_node for ice_shelf_advect_DG1_nodal, projecting the basal and surface
+!! parts with their own operators, or the combined buffer in one pass when their operators agree.
 subroutine project_h_source_rate_to_nodes(CS, ISS, G, S_node)
   type(ice_shelf_dyn_CS), intent(in)    :: CS  !< Ice shelf dynamics control structure.
   type(ice_shelf_state),  intent(in)    :: ISS !< Ice shelf state (hmask, h_shelf).
@@ -11394,8 +10878,8 @@ subroutine project_h_source_rate_to_nodes(CS, ISS, G, S_node)
   real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out) :: S_node !< Q1 nodal source per
                                              !! cell at the 4 corners [Z T-1 ~> m s-1].
 
-  real, dimension(SZDI_(G),SZDJ_(G)) :: src_smb ! Surface part of the source rate [Z T-1]
-  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: S_smb ! Surface part of the nodal source [Z T-1]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: src_smb ! Surface part of the source rate [Z T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: S_smb ! Surface part of the nodal source [Z T-1 ~> m s-1]
   integer :: surface_op ! The cross-cell operator applied to the surface source
   integer :: i, j, a, b
 
@@ -11404,20 +10888,16 @@ subroutine project_h_source_rate_to_nodes(CS, ISS, G, S_node)
 
   call pass_var(CS%h_source_rate, G%domain)
 
-  ! The uniform-operator fast path is only available when the basal part needs no sub-element
-  ! distribution; with SEM2 the two parts differ inside the cell even if their operators agree.
+  ! One pass when both parts share an operator and SEM2 is off.
   if ((CS%dg_basal_source_op == surface_op) .and. .not.CS%dg_basal_source_sem2) then
     call project_source_to_nodes(CS, ISS, G, CS%h_source_rate, surface_op, S_node)
     return
   endif
 
-  ! The two parts need different operators, so project them separately and sum. The surface part
-  ! is recovered by difference rather than accumulated in its own buffer, so that the combined
-  ! buffer above keeps the exact summation order of the uniform-operator path. The difference is
-  ! formed over the full data domain after both halos are current, so src_smb needs no halo
-  ! update of its own.
+  ! Otherwise project the parts separately and sum. src_smb is formed on the data domain.
   call pass_var(CS%h_source_rate_bmb, G%domain)
 
+  ! Calculate surface part
   src_smb(:,:) = 0.0
   do j = G%jsd, G%jed ; do i = G%isd, G%ied
     src_smb(i,j) = CS%h_source_rate(i,j) - CS%h_source_rate_bmb(i,j)
@@ -11434,15 +10914,8 @@ subroutine project_h_source_rate_to_nodes(CS, ISS, G, S_node)
   enddo ; enddo
 end subroutine project_h_source_rate_to_nodes
 
-!> Verify that a projected Q1 nodal source carries exactly the cell-mean source it was built
-!! from. The DG mass measure of a cell is sum_ab cell_mean_w(a,b)*h(a,b), so the volume a nodal
-!! source deposits in cell (i,j) per unit time is sum_ab cell_mean_w(a,b)*S_node(a,b). Any
-!! projection that redistributes a source between cells must leave the global sum of that
-!! quantity equal to the global sum of the intended per-cell totals; a mismatch means the
-!! projection itself is creating or destroying mass, which no downstream limiter will repair.
-!! The intended per-cell area is taken as sum_ab cell_mean_w rather than G%areaT so that the
-!! check isolates the projection and does not report the (unrelated) difference between the
-!! DG metric and the grid area on a non-uniform grid. Debug-only; costs two reproducing sums.
+!> Debug check that the global sum_ab cell_mean_w*S_node equals the global sum_ab cell_mean_w*S_cell,
+!! i.e. that the source projection conserves mass.
 subroutine check_nodal_source_conservation(CS, ISS, G, S_cell, S_node, label)
   type(ice_shelf_dyn_CS), intent(in) :: CS   !< Ice shelf dynamics control structure.
   type(ice_shelf_state),  intent(in) :: ISS  !< Ice shelf state (hmask).
@@ -11453,8 +10926,8 @@ subroutine check_nodal_source_conservation(CS, ISS, G, S_cell, S_node, label)
                                              !! rate at the 4 corners [Z T-1 ~> m s-1].
   character(len=*),       intent(in) :: label !< Text identifying the caller in the message.
 
-  real, dimension(SZDI_(G),SZDJ_(G)) :: tmp_node ! Per-cell nodal source integral [Z L2 T-1]
-  real, dimension(SZDI_(G),SZDJ_(G)) :: tmp_cell ! Per-cell intended source integral [Z L2 T-1]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: tmp_node ! Per-cell nodal source integral [Z L2 T-1 ~> m3 s-1]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: tmp_cell ! Per-cell intended source integral [Z L2 T-1 ~> m3 s-1]
   real :: total_node ! Global integral of the projected nodal source [m3 s-1]
   real :: total_cell ! Global integral of the intended cell-mean source [m3 s-1]
   real :: denom      ! Larger of the two integrals in magnitude, for a relative error [m3 s-1]
@@ -11482,8 +10955,6 @@ subroutine check_nodal_source_conservation(CS, ISS, G, S_cell, S_node, label)
   total_node = reproducing_sum(tmp_node, isr, ier, jsr, jer, unscale=unscale)
   total_cell = reproducing_sum(tmp_cell, isr, ier, jsr, jer, unscale=unscale)
 
-  ! Both integrals are legitimately zero when there is no melt and no accumulation, so report
-  ! an absolute statement in that case rather than dividing by zero.
   denom = max(abs(total_cell), abs(total_node))
   if (is_root_pe()) then
     if (denom > 0.0) then
@@ -11497,17 +10968,8 @@ subroutine check_nodal_source_conservation(CS, ISS, G, S_cell, S_node, label)
   endif
 end subroutine check_nodal_source_conservation
 
-!> Debug check that the nodal floating fractions agree with the cell grounded fraction that
-!! compute_ground_frac derives independently. By partition of unity,
-!! sum_ab w_ab * xi_ab = sum_ab int_float N_ab = int_float 1 = A_float, so every backend must
-!! satisfy sum_ab w_ab * xi_ab == (1 - ground_frac) * sum_ab w_ab. The two sides come from
-!! different code paths -- one shape-function weighted, one the scalar area fraction -- so this
-!! catches a mis-indexed corner or a wrong quadrature weight, which the source-conservation check
-!! cannot: a wrong xi still conserves mass exactly, it merely puts the melt in the wrong place.
-!!
-!! The identity is exact on a uniform grid. Off-uniform it is only approximate, because the SEP3
-!! grounded fraction is an unweighted sub-point count and the quadrant one an unweighted mean of
-!! four quadrant areas, while xi carries cell_mean_w. A real error shows up far above that gap.
+!> Debug check of sum_ab w*xi = (1 - ground_frac)*sum_ab w, which holds by partition of unity
+!! (exactly on a uniform grid). A mis-indexed xi still conserves mass, so only this catches it.
 subroutine check_xi_basal_consistency(CS, ISS, G)
   type(ice_shelf_dyn_CS), intent(in) :: CS   !< Ice shelf dynamics control structure.
   type(ice_shelf_state),  intent(in) :: ISS  !< Ice shelf state (hmask).
@@ -11544,12 +11006,11 @@ end subroutine check_xi_basal_consistency
 
 
 ! ===========================================================================
-! Nodal DG(1) helpers. CS%h_nodal is the authoritative DG thickness state;
-! per-cell metrics come from G%dxCv / G%dyCu / G%areaT via the Minv_nodal and
-! cell_mean_w caches built in init_nodal_DG_metric.
+! Nodal DG(1) helpers. CS%h_nodal is the DG thickness state; the per-cell
+! metrics Minv_nodal and cell_mean_w are built in init_nodal_DG_metric.
 ! ===========================================================================
 
-!> Read nodal-DG runtime parameters (positivity floor + driving-stress options).
+!> Read the DG(1) source, artificial-viscosity and mode-damping parameters.
 subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
   type(param_file_type),   intent(in)    :: param_file
   character(len=*),        intent(in)    :: mdl
@@ -11561,22 +11022,12 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
 
   call get_param(param_file, mdl, "DG_BASAL_SOURCE_SCHEME", src_scheme_str, &
                  "How the basal (melt) part of the DG(1) thickness source is shared between "//&
-                 "cells at a shared corner. 'AVERAGED' projects the cell-mean rates onto a "//&
-                 "continuous Q1 nodal field, so each corner carries the cell_mean_w-weighted "//&
-                 "average of the cells sharing it and part of a cell's melt is deposited in its "//&
-                 "neighbours. 'LOCAL' applies a piecewise-constant source, so every corner of a "//&
-                 "cell receives that cell's own rate and melt never crosses a cell face. Both "//&
-                 "are exactly mass-conservative. AVERAGED gives a smoother source and so "//&
-                 "provokes less DG limiting where melt rates differ sharply between neighbours, "//&
-                 "but it spreads melt across the grounding line, thinning grounded ice with melt "//&
-                 "computed for an adjacent floating cell -- including into cells that are "//&
-                 "entirely grounded. 'SUBGRID' averages the melt rate over the floating part of "//&
-                 "each corner's support and gives each cell back a share in proportion to its "//&
-                 "own floating fraction there, so a grounded corner neither donates nor "//&
-                 "receives; when the melt rate is spatially uniform it reduces identically to "//&
-                 "LOCAL, redistributing only genuine differences in rate and never geometry "//&
-                 "alone. SUBGRID requires ICE_ONLY_BASAL_MELT_GLP = 'SEM2'. "//&
-                 "Requires USE_DG_THICKNESS.", &
+                 "cells at a corner. 'AVERAGED': each corner takes the weighted average of its "//&
+                 "cells, which spreads melt across the grounding line. 'LOCAL': each corner takes "//&
+                 "its own cell's rate. 'SUBGRID': the rate is averaged over the floating part of "//&
+                 "each corner's support and returned by floating fraction, so grounded corners "//&
+                 "neither give nor receive; requires ICE_ONLY_BASAL_MELT_GLP = 'SEM2'. All are "//&
+                 "mass-conservative. Requires USE_DG_THICKNESS.", &
                  default="AVERAGED", do_not_log=.not.CS%use_DG_thickness)
   select case (trim(src_scheme_str))
     case ("AVERAGED") ; CS%dg_basal_source_op = SRC_OP_AVERAGED
@@ -11587,91 +11038,49 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
                           "but got '"//trim(src_scheme_str)//"'.")
   end select
   if ((CS%dg_basal_source_op == SRC_OP_SUBGRID) .and. .not.CS%dg_basal_source_sem2) &
-    call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG_BASAL_SOURCE_SCHEME = 'SUBGRID' weights "//&
-                   "the sharing at each corner by the nodal floating fraction, which is "//&
-                   "identically one unless ICE_ONLY_BASAL_MELT_GLP = 'SEM2'. Without SEM2 it "//&
-                   "would be algebraically identical to 'AVERAGED'; set that instead.")
+    call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG_BASAL_SOURCE_SCHEME = 'SUBGRID' requires "//&
+                   "ICE_ONLY_BASAL_MELT_GLP = 'SEM2'; without it, it is identical to 'AVERAGED'.")
 
   call get_param(param_file, mdl, "DG_SURFACE_SOURCE_LOCAL", CS%dg_surface_source_local, &
-                 "If true, apply the surface (mass balance) part of the DG(1) thickness source "//&
-                 "as a piecewise-constant field, so a cell's surface mass balance only ever "//&
-                 "changes its own thickness. If false, the cell-mean rates are projected onto a "//&
-                 "continuous Q1 nodal field and each corner carries the weighted average of the "//&
-                 "cells sharing it. Both are exactly mass-conservative. Unlike basal melt, "//&
-                 "surface mass balance has no grounding line to respect, so the smoother "//&
-                 "averaged form is usually the appropriate choice. Requires USE_DG_THICKNESS.", &
+                 "If true, each corner takes its own cell's surface mass balance. If false, "//&
+                 "each corner takes the weighted average of its cells. Both are "//&
+                 "mass-conservative. Requires USE_DG_THICKNESS.", &
                  default=.false., do_not_log=.not.CS%use_DG_thickness)
 
-  ! The DG(0) hybrid has no slope/jump dofs: force the artificial viscosity off so
-  ! all downstream art-visc parameters are suppressed via their c_max==0 conditions.
 
   call get_param(param_file, mdl, "DG1_ART_VISC_ADVECT_COEF", CS%dg_art_visc_advect_coef, &
-                 "Dimensionless multiplier on the |u_face| advective contribution to u_eff "//&
-                 "in the DG(1) artificial viscosity. Per face, u_eff = advect_coef*|u_face| "//&
-                 "+ strain_coef*eps_e_face*dx_perp. advect_coef = 1 (default) preserves the "//&
-                 "original formulation; advect_coef = 0 (the default) drops the |u| term "//&
-                 "entirely so the damping timescale is set purely by strain rate "//&
-                 "(grid-invariant by construction).", &
+                 "Coefficient on |u_face| in the DG(1) artificial-viscosity velocity "//&
+                 "u_eff = ADVECT_COEF*|u_face| + STRAIN_COEF*eps_e_face*dx_perp.", &
                  units="nondim", default=0.0, &
                  do_not_log=.not.CS%use_DG_thickness)
 
   call get_param(param_file, mdl, "DG1_ART_VISC_STRAIN_COEF", CS%dg_art_visc_strain_coef, &
-                 "Dimensionless coefficient on a velocity-independent strain-rate-scaled "//&
-                 "diffusivity floor for the DG(1) artificial viscosity. Per face, "//&
-                 "u_floor = strain_coef * eps_e_face * dx_perp is added to |u_face| in "//&
-                 "the face flux, where eps_e_face is the 2D SSA second invariant at the "//&
-                 "face midpoint. Closes the shear-margin failure mode of pure |u_face| "//&
-                 "scaling (jumps excited by stretching but advectively uncoupled across "//&
-                 "the face). strain_coef = 0 (default) disables the floor. Typical O(1); "//&
-                 "the design rule 8*STRAIN_COEF = 1 sets the stagnant-region "//&
-                 "damping time equal to the local strain time.", &
+                 "Coefficient on eps_e_face*dx_perp in the DG(1) artificial-viscosity velocity, "//&
+                 "where eps_e_face is the SSA effective strain rate at the face. It damps jumps "//&
+                 "where |u_face| is small. 8*STRAIN_COEF = 1 sets the damping time to the "//&
+                 "strain time.", &
                  units="nondim", default=0.0, &
                  do_not_log=.not.CS%use_DG_thickness)
 
   call get_param(param_file, mdl, "DG1_ART_VISC_ADVECT_L_REF", CS%dg_art_visc_advect_L_ref, &
-                 "Reference length that makes the |u_face| advective term of the DG(1) "//&
-                 "artificial viscosity grid-invariant. When positive, that term becomes "//&
-                 "ADVECT_COEF*|u_face|*(dx_perp/L_REF), so the jump-mode decay rate it "//&
-                 "produces, 4*amp*C_MAX*ADVECT_COEF*|u_face|/L_REF, carries no 1/dx_perp "//&
-                 "and is therefore the same at every resolution - matching the strain-rate "//&
-                 "term, whose dx_perp already cancels against the rate's 1/dx_perp. With "//&
-                 "the legacy form the advective damping timescale is proportional to "//&
-                 "dx_perp, so a fixed C_MAX damps roughly N times more slowly on an N-times "//&
-                 "coarser grid and the balance between the u_eff terms shifts with "//&
-                 "resolution. Setting L_REF to the grid spacing of the resolution the "//&
-                 "coefficients were tuned at reproduces that tuning there and carries it to "//&
-                 "the others. Non-positive (the default) recovers the legacy "//&
-                 "ADVECT_COEF*|u_face|.", &
+                 "If positive, the |u_face| term of the DG(1) artificial viscosity becomes "//&
+                 "ADVECT_COEF*|u_face|*dx_perp/L_REF, making its damping rate "//&
+                 "resolution-independent. Non-positive uses ADVECT_COEF*|u_face|.", &
                  units="m", default=-1.0, scale=US%m_to_L, &
                  do_not_log=.not.CS%use_DG_thickness)
 
   call get_param(param_file, mdl, "DG1_ART_VISC_TAU_FLOOR", CS%dg_art_visc_tau_floor, &
-                 "Absolute damping timescale for the DG(1) artificial viscosity. When "//&
-                 "positive, dx_perp/TAU_FLOOR is added to u_eff, so every active face has a "//&
-                 "jump-mode decay rate of at least 4*amp*C_MAX/TAU_FLOOR - independent of "//&
-                 "resolution, timestep, and flow speed. This is the only u_eff term that "//&
-                 "survives where |u_face| and eps_e_face are both small, as in stagnant "//&
-                 "grounded interior ice, which the advective and strain-rate terms leave "//&
-                 "undamped however large C_MAX is made. With amp = 2 (WB_HARMONIC) the "//&
-                 "floor rate is 8*C_MAX/TAU_FLOOR, so C_MAX = 0.0625 and TAU_FLOOR = 1 yr "//&
-                 "give a 2 yr jump e-folding time. Non-positive (the default) disables the "//&
-                 "floor.", &
+                 "If positive, add dx_perp/TAU_FLOOR to the DG(1) artificial-viscosity u_eff, "//&
+                 "giving every active face a jump decay rate of at least 8*C_MAX/TAU_FLOOR, "//&
+                 "including on stagnant ice. Non-positive disables it.", &
                  units="s", default=-1.0, scale=US%s_to_T, &
                  do_not_log=.not.CS%use_DG_thickness)
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP", CS%dg_tilt_damp, &
-                 "If true, damp the grid-scale component of the DG(1) in-cell tilt "//&
-                 "degrees of freedom. Every dissipative mechanism in the scheme is "//&
-                 "proportional to a face jump, and a tilt that alternates in sign between "//&
-                 "adjacent cells contributes exactly zero to every jump -- on a chain, "//&
-                 "[[h]] = (hbar_j+1 - hbar_j) - (t_j + t_j+1)/2, whose tilt factor "//&
-                 "(1 + exp(i*theta))/2 vanishes identically at theta = pi. That mode is "//&
-                 "therefore invisible to the upwind flux and to the artificial viscosity "//&
-                 "alike, while still supplying a spurious surface gradient to the "//&
-                 "momentum balance. This term damps it directly, at a rate that is zero "//&
-                 "on a uniform tilt so it does not overlap with the artificial viscosity, "//&
-                 "and by a correction that is equal and opposite on the two nodes of each "//&
-                 "tilt so it moves no mass.", &
+                 "If true, damp the grid-scale DG(1) in-cell tilt. A tilt alternating between "//&
+                 "cells gives no face jump, so the upwind flux and the artificial viscosity "//&
+                 "cannot see it, yet it adds a spurious surface slope. The correction is zero "//&
+                 "on a uniform tilt and moves no mass.", &
                  default=.true., do_not_log=(.not.CS%use_DG_thickness))
   if (.not.CS%use_DG_thickness) CS%dg_tilt_damp = .false.
   if (CS%use_DG_thickness .and. .not.CS%GL_regularize) call MOM_error(FATAL, &
@@ -11680,281 +11089,121 @@ subroutine read_nodal_limiter_params(param_file, mdl, CS, US)
     "and the mode damping grades itself on it.")
 
   call get_param(param_file, mdl, "DG1_TWIST_DAMP", CS%dg_twist_damp, &
-                 "If true, also damp the grid-scale component of the DG(1) in-cell "//&
-                 "xy-twist. The twist enters the along-face variation of the jump through "//&
-                 "the SUM of the two sides, so a twist alternating between diagonal "//&
-                 "neighbours is invisible to every face jump by the same argument as the "//&
-                 "tilt. It differs in that w*xi*eta integrates to zero over the cell, so "//&
-                 "it supplies no net driving stress and reaches the momentum balance only "//&
-                 "at second order. Its size is bed-dependent: a separable bed (MISMIP+) "//&
-                 "forces no twist at all and the median twist there is 1.4% of the tilt, "//&
-                 "whereas a continental bed gives 35%. Uses DG1_TILT_DAMP_U_CUT and "//&
-                 "DG1_TILT_DAMP_R_HI, the two modes being of comparable magnitude.", &
+                 "If true, also damp the grid-scale DG(1) in-cell twist, which is invisible "//&
+                 "to the face jumps for the same reason as the tilt. It gives no net driving "//&
+                 "stress. Uses DG1_TILT_DAMP_U_CUT and DG1_TILT_DAMP_R_HI.", &
                  default=.true., do_not_log=(.not.CS%use_DG_thickness))
   if (.not.CS%use_DG_thickness) CS%dg_twist_damp = .false.
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_ADVECTIVE", CS%dg_damp_advective, &
-                 "If true, the mode damper supplies only the DEFICIT between the rate it "//&
-                 "wants and the rate the transport already delivers, so it switches itself "//&
-                 "off wherever the flow is fast enough to remove the mode unaided. The "//&
-                 "premise that this mode is invisible to every dissipative mechanism is "//&
-                 "true of the face JUMP and false of the OPERATOR: an alternating tilt is "//&
-                 "not an eigenvector, it couples immediately into the cell mean, whose own "//&
-                 "jump at that wavenumber is maximal. Taking the eigenvalues of DG(1) "//&
-                 "upwind advection, the damping rate RISES monotonically with wavenumber "//&
-                 "and reaches its maximum of |u_n|/dx at exactly the grid scale, where the "//&
-                 "tilt's weight in the jump is zero -- the grid-scale tilt is the "//&
-                 "best-damped mode in pure transport, not an undamped one. What is true is "//&
-                 "narrower: that rate is proportional to |u_n|, so it vanishes across a "//&
-                 "confined stream or on stagnant ice, which is a LOCAL gap and not a "//&
-                 "global one. The subtraction is per direction, since the xi damper's "//&
-                 "clock is |u| and the eta damper's is |v|, and across a stream only the "//&
-                 "second one vanishes.", &
+                 "If true, the mode damper supplies only the rate the transport does not "//&
+                 "already deliver, per direction. Upwind transport removes the grid-scale "//&
+                 "mode at about |u_n|/dx, so the damper mainly acts on slow ice.", &
                  default=.true., do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_ADVECTIVE_C", CS%dg_damp_advective_c, &
-                 "Coefficient on the transport's own removal rate c*|u_n|/dx that "//&
-                 "DG1_TILT_DAMP_ADVECTIVE subtracts. The eigenvalue analysis gives exactly "//&
-                 "1 at the grid scale, but the rate degrades away from it -- 0.67 at "//&
-                 "0.9*pi and 0.33 at 0.75*pi -- and the analysis is one-dimensional, "//&
-                 "constant-coefficient and pure advection, whereas the scheme adds "//&
-                 "SSP-RK2, the artificial viscosity and sources. Below 1 is the "//&
-                 "conservative side: it credits the transport with less than it delivers "//&
-                 "and leaves the term doing more.", &
+                 "Coefficient on the transport removal rate c*|u_n|/dx credited by "//&
+                 "DG1_TILT_DAMP_ADVECTIVE. 1 is exact at the grid scale for 1D advection; "//&
+                 "values below 1 credit less.", &
                  units="nondim", default=0.5, &
                  do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_U_CUT", CS%dg_damp_u_cut, &
-                 "If positive, set the mode damper's relaxation time per cell and per "//&
-                 "direction as dx/(2*c*U_CUT), "//&
-                 "which is then ignored. The rate becomes "//&
-                 "kappa = (c/dx)*max(0, gate*U_CUT - |u_n|), a speed DEFICIT divided by the "//&
-                 "cell size, so U_CUT is simply the sweep speed the term brings the "//&
-                 "grid-scale mode up to: where the ice already moves that fast the term "//&
-                 "adds nothing. A time cannot be grid-invariant and a speed can. Both the "//&
-                 "rate the transport supplies, |u_n|/dx, and the harm the mode does, a "//&
-                 "spurious surface slope of order mu*t/dx, scale as 1/dx, so holding U_CUT "//&
-                 "fixed is the resolution-consistent choice while a fixed TAU is too long "//&
-                 "by exactly the refinement factor. It also resolves per direction, which "//&
-                 "matters on any grid whose cells are not square: the xi mode is swept out "//&
-                 "over dx and the eta mode over dy, and on a continental grid those "//&
-                 "differ. The twist, alternating along both axes, uses sqrt(dx*dy).", &
+                 "Sweep speed the mode damper brings the grid-scale mode up to. The rate is "//&
+                 "(c/dx)*max(0, gate*U_CUT - |u_n|) per direction, using sqrt(dx*dy) for the "//&
+                 "twist. Must be positive.", &
                  units="m s-1", default=6.341958E-06, scale=US%m_s_to_L_T, &
                  do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_EXCESS_ONLY", CS%dg_damp_excess_only, &
                  "If true, the mode damper removes only the part of its detector that no "//&
-                 "reference accounts for, instead of removing the whole detector once the "//&
-                 "unexplained part crosses a threshold. The two agree exactly on the mode "//&
-                 "the term exists to remove, because a tilt reconstructed from cell means "//&
-                 "is identically zero on an alternating tilt AND on an alternating mean, "//&
-                 "so the reference vanishes there and the whole detector IS unexplained. "//&
-                 "They differ wherever the true solution has structure the means already "//&
-                 "show: at a grounding line in MISMIP3d the detector reads 48 m against a "//&
-                 "reference of 34 m, and the old form then damps all 48. Note this does "//&
-                 "NOT relax the tilt onto the reference: the operator is a second "//&
-                 "difference, so any disagreement that varies linearly from cell to cell "//&
-                 "is left alone and only CURVATURE in the disagreement is removed.", &
+                 "reference explains, instead of the whole detector once a threshold is "//&
+                 "crossed. The two agree on a pure alternating mode.", &
                  default=.true., do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_KINK_REF", CS%dg_damp_kink_ref, &
-                 "If true, the mode damper's mean-supported reference reconstructs the "//&
-                 "slope break at the grounding line instead of averaging across it, and "//&
-                 "the cells that would otherwise be exempted are damped normally. The "//&
-                 "reference fails at a grounding line because a centred difference of "//&
-                 "cell means cannot represent a kink; that is what the exemption exists "//&
-                 "to work around, and what this removes instead. Where the break is is "//&
-                 "known sub-cell from the grounded fraction, so the reference can be told: "//&
-                 "for a profile that is piecewise linear with a break at fraction f of a "//&
-                 "cell, the rise across that cell is exactly f*s_g + (1-f)*s_f, the two "//&
-                 "branch slopes weighted by how much of the cell each occupies. One "//&
-                 "expression covers every cell -- wholly grounded returns s_g, wholly "//&
-                 "floating s_f -- and it is continuous in f, so nothing switches. Blended "//&
-                 "against the centred form by the span max(f)-min(f) over the window, it "//&
-                 "leaves smooth regions bitwise unchanged. Measured: a pure kink leaves "//&
-                 "4e-16 of excess against 75% of |A| for the centred form, a mode of "//&
-                 "amplitude T on a kink reads exactly 2T rather than anywhere from 0 to "//&
-                 "5T, and the gain stops modulating as the grounding line sweeps a cell, "//&
-                 "0% against 180%. That last is corrugation: a gain varying with sub-cell "//&
-                 "position creates spurious equilibria a cell apart and traps a migrating "//&
-                 "grounding line, which no smaller rate would fix. Where the branch "//&
-                 "slopes cannot be built -- fewer than two cells wholly on a side, as in "//&
-                 "a valley a couple of cells across -- the cell falls back to "//&
-                 "DG1_TILT_DAMP_GL_REACH, which is then doing the job it is good at on a "//&
-                 "far smaller set of cells.", &
+                 "If true, the mode damper's reference reconstructs the slope break at the "//&
+                 "grounding line from the grounded fraction, with rise f*s_g + (1-f)*s_f across "//&
+                 "a cell, instead of exempting those cells. Where the branch slopes cannot be "//&
+                 "built, it falls back to DG1_TILT_DAMP_GL_REACH.", &
                  default=.true., do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_KINK_TOL", CS%dg_damp_kink_tol, &
-                 "Grounded-fraction misfit at which the twist's single-line reconstruction "//&
-                 "of the flotation break stops being trusted. The reconstruction fits ONE "//&
-                 "straight break across the neighbourhood, which a curving or disconnected "//&
-                 "grounding line is not, so having placed the line it predicts every "//&
-                 "straddling cell's grounded fraction and compares with what the partition "//&
-                 "reported; confidence ramps linearly from one at no misfit to zero at this "//&
-                 "value, and at zero the reference is exactly the mean-supported one that "//&
-                 "was there before. The check is not a formality: against a grounding line "//&
-                 "curving with a radius of four to eight cells the single-line reference is "//&
-                 "WORSE than the one it replaces, by more than the amplitude of the mode it "//&
-                 "is meant to isolate, while the mean-supported reference's error is roughly "//&
-                 "constant because it assumes no geometry to be wrong about. In that test "//&
-                 "the misfit was at most 0.16 wherever the kink model won and at least 0.23 "//&
-                 "wherever it lost, hence the default; the evidence is one sweep of radii, "//&
-                 "so it is exposed rather than hard-coded.", &
+                 "Grounded-fraction misfit at which confidence in the twist's straight-line "//&
+                 "reconstruction of the grounding line falls to zero, reverting to the "//&
+                 "mean-supported reference.", &
                  units="nondim", default=0.2, &
                  do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_KINK_FIT_TOL", CS%dg_damp_kink_fit_tol, &
-                 "Relative slope misfit at which the TILT's two-branch reconstruction of "//&
-                 "the flotation break stops being trusted, the counterpart of "//&
-                 "DG1_TILT_DAMP_KINK_TOL for the twist. Non-positive, the default, skips "//&
-                 "the test and leaves answers bitwise unchanged. Without it the tilt's "//&
-                 "confidence rests on a count of how many clean cells each branch had, "//&
-                 "which is a sufficiency test and not a fit test: a flotation transition "//&
-                 "that refinement has RESOLVED offers plenty of clean cells on both sides "//&
-                 "and is still the wrong shape for a single sharp break, so confidence "//&
-                 "grows exactly where the model becomes less appropriate. Measured on "//&
-                 "MISMIP+, below about 4 km the residual the reference leaves near the "//&
-                 "grounding line stops alternating and turns coherent -- the lag-1 "//&
-                 "correlation of the detector runs -0.61, -0.50, -0.40, -0.17, +0.13 from "//&
-                 "10 km to 2 km while away from the line it holds near -0.6 -- and the "//&
-                 "term spends most of its effort there for a 1.8% reduction in what it "//&
-                 "targets. With this set, the model predicts each cell's rise as "//&
-                 "f*s_g + (1-f)*s_f, compares the implied centre-to-centre differences "//&
-                 "with the cell means, and ramps confidence linearly from one at no "//&
-                 "misfit to zero at this fraction of the largest branch slope. Confidence "//&
-                 "can only FALL, and a falling confidence reverts the reference toward the "//&
-                 "mean-supported one AND closes the gate toward the grounding-line "//&
-                 "exemption together, so a misread cell is damped less rather than damped "//&
-                 "against a reference it should not trust. 0.2 matches the twist's "//&
-                 "default.", &
+                 "Relative slope misfit at which confidence in the tilt's two-branch "//&
+                 "reconstruction of the grounding line falls to zero, reverting the reference "//&
+                 "and closing the gate. Non-positive skips the test.", &
                  units="nondim", default=-1.0, &
                  do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_GL_REACH", CS%dg_damp_gl_reach, &
-                 "How far the mode damper's grounding-line protection extends from the "//&
-                 "cell the flotation contour crosses. 0 protects that cell alone, 1 the "//&
-                 "cells whose tilt enters the detector, 2 the full reach of the "//&
-                 "mean-supported reference; the reach follows whichever stencil bias the "//&
-                 "detector selected. The bisected cell is not the only one a grounding "//&
-                 "line disqualifies: the reference is built from cell means, which cannot "//&
-                 "represent a slope break, so |A| exceeds the floor over the whole "//&
-                 "neighbourhood of the grounding line and not just at its own cell. In "//&
-                 "MISMIP3d Stnd at 10 km, which is uniform in y and forces no "//&
-                 "jump-invisible mode at all, reach 0 leaves the four cells around the "//&
-                 "grounding line carrying essentially all of the term's work and moves "//&
-                 "the steady grounding line 30 km seaward of the undamped run; reach 1 "//&
-                 "cuts that work sevenfold and reach 2 by a factor of 500. Reach 0 also "//&
-                 "asks a question one cell cannot answer robustly. It can only test "//&
-                 "whether the grounded fraction is fractional, and that fraction is "//&
-                 "counted at sub-quadrature points which sit INSIDE the sub-cells, so a "//&
-                 "flotation contour lying within about a tenth of a cell of a face flips "//&
-                 "no sub-point and the fraction steps cleanly from one to zero with "//&
-                 "nothing bisected anywhere. The protection then vanishes for as long as "//&
-                 "the grounding line rests there, which at a steady state is the whole "//&
-                 "run. Reach 1 and 2 instead ask whether the window spans both grounded "//&
-                 "and floating content, which is the same question asked of data that "//&
-                 "can answer it.", &
+                 "Reach of the mode damper's grounding-line protection: 0 the cell the "//&
+                 "flotation contour crosses, 1 the cells in the detector stencil, 2 the full "//&
+                 "reference stencil. 1 and 2 test whether the window has both grounded and "//&
+                 "floating ice.", &
                  default=1, do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
   if ((CS%dg_damp_gl_reach < 0) .or. (CS%dg_damp_gl_reach > 2)) call MOM_error(FATAL, &
     "DG1_TILT_DAMP_GL_REACH must be 0, 1 or 2.")
 
 
-  ! Delivered relaxation time. Deliberately independent of the artificial
-  ! viscosity. TAU_FLOOR is the AV's floor for STAGNANT ice, where the advective
-  ! clock 8*c_max*u_eff/dx has vanished; this mode has no such clock at all
-  ! (across a stream u_n = v ~ 0, so the intrinsic slope relaxation 6|u_n|/dx is
-  ! absent rather than slow), so there is nothing for it to match. Slaving them
-  ! also gave TAU_FLOOR two unrelated jobs: retuning the AV silently retuned
-  ! this term by the same factor.
-  !
-  ! The term removes a quantity whose correct value is zero, so its rate is not
-  ! set by any physical parameter -- it need only be fast against the run and
-  ! slow against the numerics. One year clears both by about four orders in a
-  ! typical spin-up. It is a fixed time rather than a multiple of dt on purpose:
-  ! a dt-proportional relaxation would do different physics at each dt and
-  ! destroy dt-convergence testing. The dt safety check is a warning instead,
-  ! issued once from the advection routine where the true step is known.
-  ! The damping rate comes entirely from DG1_TILT_DAMP_U_CUT, which sets it per cell and
-  ! per direction as dx/(2*c*U_CUT). A fixed relaxation time cannot be grid-invariant.
   if ((CS%dg_tilt_damp .or. CS%dg_twist_damp) .and. (CS%dg_damp_u_cut <= 0.0)) &
     call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG1_TILT_DAMP_U_CUT must be positive; "//&
                    "it sets the damping rate, which would otherwise be zero.")
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_R_HI", CS%dg_tilt_damp_r_hi, &
-                 "Normalized tilt-Laplacian excess at which the damping rate is "//&
-                 "delivered in full. The gate variable is "//&
-                 "(ds/dh)*(|A| - max(|A_bed|,|A_ref|))/h, "//&
-                 "where A = t_j - (t_j-1 + t_j+1)/2 is the discrete Laplacian of the "//&
-                 "per-cell tilt, A_bed is the same operator on the bed (zero on a "//&
-                 "floating cell, which owes the bed no structure), A_ref is that same "//&
-                 "operator on the tilt implied by the neighbouring cell means (real "//&
-                 "structure the conservative data already justify, such as a shear "//&
-                 "margin), and ds/dh is 1 on "//&
-                 "grounded ice and 1 - rho_i/rho_w on floating ice, so a shelf zigzag is "//&
-                 "gated by the surface gradient it actually produces. A is O(dx^3) on a "//&
-                 "smooth solution, so a fixed threshold means the same thing at every "//&
-                 "resolution, as for DG1_ART_VISC_R_HI. Note it is NOT the same scale as "//&
-                 "that parameter: A is a tilt, not a jump, and typical values are two "//&
-                 "orders larger.", &
+                 "Gate value at which the mode damping is at full strength. The gate is "//&
+                 "(ds/dh)*(|A| - max(|A_bed|,|A_ref|))/h, where A is the discrete Laplacian of "//&
+                 "the cell tilt, A_bed and A_ref the same for the bed and for the tilt implied "//&
+                 "by the cell means, and ds/dh is 1 grounded and 1 - rho_i/rho_w floating.", &
                  units="nondim", default=0.02, &
                  do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
 
   call get_param(param_file, mdl, "DG1_ART_VISC_R_HI", CS%dg_art_visc_r_hi, &
-                 "Saturation threshold of the DG(1) artificial-viscosity smoothness "//&
-                 "gate: faces whose surface-cliff height, as a fraction of the local "//&
-                 "mean thickness, reaches this receive the full coefficient. The ratio "//&
-                 "is O(dx^2) on smooth solutions, so a fixed threshold classifies "//&
-                 "smoothness resolution-invariantly.", &
+                 "Face surface jump, relative to the mean thickness, at which the DG(1) "//&
+                 "artificial viscosity reaches its full coefficient.", &
                  units="nondim", default=0.005, &
                  do_not_log=.not.CS%use_DG_thickness)
   call get_param(param_file, mdl, "DG1_ART_VISC_KCELL", CS%dg_art_visc_kcell, &
-                 "Per-cell stability budget for the DG(1) artificial viscosity: the "//&
-                 "sum over a cell's faces of the jump-mode decay rates "//&
-                 "(4*amp*c*u_eff/dx_perp) times dt is limited to this value by "//&
-                 "rescaling the cell's face coefficients. SSP-RK2 requires < 2; "//&
-                 "the default 1.0 leaves a 2x margin.", &
+                 "Bound on dt times a cell's summed face jump decay rates "//&
+                 "(4*amp*c*u_eff/dx_perp); the face coefficients are scaled down to meet it. "//&
+                 "SSP-RK2 requires < 2.", &
                  units="nondim", default=1.0, &
                  do_not_log=.not.CS%use_DG_thickness)
   if (CS%use_DG_thickness .and. (CS%dg_art_visc_r_hi <= 0.0)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics, initialize_ice_shelf_dyn: DG1_ART_VISC_R_HI must be positive.")
 
-  ! Stagnant-jump diagnostic thresholds. Internal constants, not user knobs.
+  ! Stagnant-jump diagnostic thresholds.
   CS%dg_slow_idle_u_tiny   = 1.0e-9  * US%m_s_to_L_T
   CS%dg_slow_idle_eps_tiny = 1.0e-12 * US%s_to_T
   CS%dg_slow_idle_s_tol    = 1.0     * US%m_to_Z
 
 end subroutine read_nodal_limiter_params
 
-!> Initialise the per-cell metric tables (Minv_nodal, cell_mean_w) from
-!! the grid. Per-cell face lengths come from G%dxCv (south/north) and G%dyCu
-!! (west/east); the bilinear face-length interpolation is
-!!   a(eta) = dxS*(1-eta) + dxN*eta   on eta in [0,1]
-!!   d(xi)  = dyW*(1-xi)  + dyE*xi    on xi  in [0,1]
-!! with face-length aliases dxS = G%dxCv(i,J-1), dxN = G%dxCv(i,J),
-!! dyW = G%dyCu(I-1,j), dyE = G%dyCu(I,j). Mass-matrix factors are analytic for
-!! the locally-orthogonal lat/lon grid: M = M_xi (x) M_eta with
-!! M_xi_{a,a'}  = int N_a(xi)*N_a'(xi)*d(xi) dxi
-!! M_eta_{b,b'} = int N_b(eta)*N_b'(eta)*a(eta) deta,
-!! where N_1 = 1-x, N_2 = x. The 2x2 inverses are analytic, and M^-1 = M_xi^-1 (x) M_eta^-1
-!! is stored as the full tensor.  The grid metrics are fixed for the run, so the products
-!! of the two factors are formed once here rather than at every Runge-Kutta stage.
+!> Build the per-cell tables Minv_nodal and cell_mean_w. On an orthogonal grid the Q1 mass
+!! matrix is M_xi (x) M_eta, with M_xi = int N_a N_a' d(xi) dxi, M_eta = int N_b N_b' a(eta) deta,
+!! d(xi) = dyW*(1-xi) + dyE*xi and a(eta) = dxS*(1-eta) + dxN*eta. Its inverse is the product of
+!! the analytic 2x2 inverses.
 subroutine init_nodal_DG_metric(CS, G)
   type(ice_shelf_dyn_CS), intent(inout) :: CS
   type(ocean_grid_type),  intent(in)    :: G
 
-  real :: dxS, dxN, dyW, dyE    ! face lengths [L ~> m]
-  real :: M11, M12, M22         ! mass-matrix entries [L ~> m]
-  real :: det                   ! mass-matrix determinant [L2 ~> m2]
-  real, dimension(2,2) :: Minv_xi  ! Inverse of the 1D mass-matrix factor along xi [L-1 ~> m-1]
-  real, dimension(2,2) :: Minv_eta ! Inverse of the 1D mass-matrix factor along eta [L-1 ~> m-1]
+  real :: dxS, dxN, dyW, dyE    ! Face lengths [L ~> m]
+  real :: M11, M12, M22         ! 1D mass-matrix entries [L ~> m]
+  real :: det                   ! 1D mass-matrix determinant [L2 ~> m2]
+  real, dimension(2,2) :: Minv_xi  ! Inverse 1D mass matrix along xi [L-1 ~> m-1]
+  real, dimension(2,2) :: Minv_eta ! Inverse 1D mass matrix along eta [L-1 ~> m-1]
   integer :: i, j, isd, ied, jsd, jed, a, b, p, q
 
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
 
   do j = jsd, jed ; do i = isd, ied
-    ! Face lengths with one-sided fallback at non-reentrant domain edges. For
-    ! reentrant domains the wrap halo carries valid dxCv/dyCu, so use the
-    ! two-sided metric even at the global west/south edge cell.
+    ! Use the east/north face length alone at non-reentrant west/south domain edges.
     if ((J-1 >= G%JsdB) .and. (CS%reentrant_y .or. (j + G%jdg_offset > G%jsg))) then
       dxS = G%dxCv(i,J-1) ; dxN = G%dxCv(i,J)
     else
@@ -11966,7 +11215,7 @@ subroutine init_nodal_DG_metric(CS, G)
       dyW = G%dyCu(I,j)   ; dyE = G%dyCu(I,j)
     endif
 
-    ! M_xi: int_0^1 N_a*N_a'*d(xi) dxi where d(xi) = dyW*(1-xi) + dyE*xi.
+    !M_xi: int_0^1 N_a*N_a'*d(xi) dxi where d(xi) = dyW*(1-xi) + dyE*xi.
     ! Closed-form: M11 = dyW/4 + dyE/12, M22 = dyW/12 + dyE/4, M12 = dyW/12 + dyE/12.
     M11 = (dyW/4.0) + (dyE/12.0)
     M22 = (dyW/12.0) + (dyE/4.0)
@@ -12001,15 +11250,8 @@ subroutine init_nodal_DG_metric(CS, G)
   enddo ; enddo
 end subroutine init_nodal_DG_metric
 
-!> For symmetric BGRID + reentrant domains, the wrap-mate B-nodes on either
-!! side of the periodic boundary are the same physical location, but each
-!! cell adjacent to the boundary stores its own DG corner there. At IC we
-!! want the two wrap-shared corners to hold the same value (a continuous
-!! initial field). FMS pass_var with position=CORNER does not always
-!! reconcile owned wrap-edge B-nodes for symmetric grids, and the IC node
-!! file may have small asymmetries at the wrap. Force consistency by
-!! having the PE owning the global west (south) edge adopt the wrap-mate's
-!! value from its halo. Halos are then re-passed.
+!> At initialization on a symmetric reentrant grid, copy the DG corners across the wrap so both
+!! cells at a periodic boundary node start with the same value.
 subroutine enforce_wrap_corner_consistency(CS, ISS, G)
   type(ice_shelf_dyn_CS), intent(inout) :: CS
   type(ice_shelf_state),  intent(in)    :: ISS
@@ -12040,13 +11282,11 @@ subroutine enforce_wrap_corner_consistency(CS, ISS, G)
     enddo
   endif
 
-  ! pass_corner_field is collective; every PE must call regardless of
-  ! whether it touched its data.
+  ! Collective, so every PE calls it.
   call pass_corner_field(CS%h_nodal, G)
 end subroutine enforce_wrap_corner_consistency
 
-!> Halo-exchange the per-cell 4-corner nodal field. Each corner slot is a
-!! cell-centered scalar (A-grid).
+!> Halo update of a per-cell corner field, each corner as a cell-centered scalar.
 subroutine pass_corner_field(h_nodal, G)
   type(ocean_grid_type),  intent(in) :: G
   real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(inout) :: h_nodal
@@ -12078,12 +11318,8 @@ subroutine recompute_h_shelf_from_nodal(CS, ISS, G)
   enddo ; enddo
 end subroutine recompute_h_shelf_from_nodal
 
-!> Cold-start initialise h_nodal from the cell-mean h_shelf field. Each
-!! corner is the area-weighted average of the up-to-four surrounding cells'
-!! h_shelf values, using G%areaT as the metric weight. On uniform grids this
-!! collapses bit-identically to the simple arithmetic mean. One-sided
-!! fallback at hmask boundaries. Produces a continuous (no-jump) Q1 field at
-!! init; the limiter introduces admissible jumps later if the field warrants.
+!> Seed h_nodal from h_shelf: each corner is the areaT-weighted mean of the ice-covered cells
+!! sharing it, giving a continuous field.
 subroutine initialize_h_nodal_from_cellmean(h_shelf, h_nodal, hmask, G)
   type(ocean_grid_type), intent(inout) :: G
   real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: h_shelf
@@ -12095,9 +11331,7 @@ subroutine initialize_h_nodal_from_cellmean(h_shelf, h_nodal, hmask, G)
   real :: sum_area   ! Sum of areas of contributing cells [L2 ~> m2]
   real :: area_ic    ! Area of one contributing cell [L2 ~> m2]
 
-  ! Corner (a,b) of cell (i,j) is shared with up to four T-cells whose
-  ! offsets are (dx*di_off, dy*dj_off) for dx,dy in {0,1} and
-  ! di_off = 2*(a-1)-1, dj_off = 2*(b-1)-1 (i.e. -1 for a=1, +1 for a=2).
+  ! Corner (a,b) is shared with the cells offset by (dx*di_off, dy*dj_off), dx,dy in {0,1}.
   do j = G%jsc, G%jec ; do i = G%isc, G%iec
     if (hmask(i,j) /= 1.0 .and. hmask(i,j) /= 3.0) cycle
     do b = 1, 2 ; do a = 1, 2
@@ -12125,9 +11359,8 @@ subroutine initialize_h_nodal_from_cellmean(h_shelf, h_nodal, hmask, G)
 end subroutine initialize_h_nodal_from_cellmean
 
 
-!> Liu-style positivity-preserving limiter: scale each cell's corner
-!! deviations from the mean by a single factor in [0,1] so the minimum
-!! corner is at least CS%min_h_shelf. Preserves cell mean exactly.
+!> Positivity limiter: scale each cell's corner deviations from its mean so that the smallest
+!! corner is at least CS%min_h_shelf. The cell mean is unchanged.
 subroutine nodal_positivity_limit(CS, G, ISS)
   type(ice_shelf_dyn_CS), intent(inout) :: CS
   type(ocean_grid_type),  intent(inout) :: G
@@ -12156,10 +11389,8 @@ subroutine nodal_positivity_limit(CS, G, ISS)
   call pass_corner_field(CS%h_nodal, G)
 end subroutine nodal_positivity_limit
 
-!> Subgrid (Phisub) cell-mean of surface elevation s(x,y) = h - bed (grounded) or
-!! (1 - rho_i/rho_w)*h (floating), with per-sub-QP flotation determination. Used
-!! at grounding-line cells so the cell-mean of s respects partial grounding the
-!! same way the strong-form driving stress integration does.
+!> Cell mean of the surface elevation over the Phisub sub-quadrature points, with a flotation
+!! test at each point.
 pure real function subgrid_cell_mean_s(Phisub, h_nodal_cell, bed_corners, &
                                        rhoi_rhow, min_h_shelf) result(Sbar)
   real, dimension(:,:,:,:,:,:), intent(in) :: Phisub  !< Sub-grid quadrature weights [nondim]
@@ -12180,8 +11411,6 @@ pure real function subgrid_cell_mean_s(Phisub, h_nodal_cell, bed_corners, &
   nsub    = size(Phisub, 3)
   subarea = 1.0 / real(nsub)**2
 
-  ! sum over all (ii,jj,qx,qy) of (0.25 * subarea * s_gp) gives the area-weighted
-  ! cell-mean of s on the reference cell [0,1]^2 (sum of weights = 1).
   accum = 0.0
   do jj = 1, nsub ; do ii = 1, nsub ; do qy = 1, 2 ; do qx = 1, 2
     h_gp = ((Phisub(qx,qy,ii,jj,1,1) * h_nodal_cell(1,1)) + &
@@ -12204,66 +11433,35 @@ pure real function subgrid_cell_mean_s(Phisub, h_nodal_cell, bed_corners, &
   Sbar = accum
 end function subgrid_cell_mean_s
 
-!> Sum four products, each rounded to working precision before any of them is added.
-!!
-!! Grouping a four-term sum into opposite pairs is enough to make it independent of
-!! the order the terms are written in, and that is all a quarter turn of the grid
-!! changes when the terms are plain values.  It is NOT enough when the terms are
-!! PRODUCTS and the compiler is allowed to contract, because a fused multiply-add
-!! carries one factor pair at full width into the sum while its partner is rounded
-!! first.  Which term gets that treatment is fixed by where it sits in the
-!! expression, and a quarter turn permutes the corners cyclically through those
-!! slots, so no arrangement of the source can make the two orientations agree: a
-!! four-cycle has no invariant pair of slots to assign the exact term to.
-!!
-!! Parentheses do not help.  They stop the compiler from reassociating, not from
-!! contracting, and gfortran fuses a parenthesised product into a neighbouring add
-!! whenever it vectorises the expression, which it does for this corner loop however
-!! it is written: as a loop, unrolled by hand, or through a scalar temporary.
-!! Precomputing the metric factor of each product does not help either, since the
-!! product with the right-hand side is still a product.
-!!
-!! Passing the products through volatile storage does, because the sum then has to
-!! read values that have been through memory at working precision.  The cost is four
-!! stores and four loads per corner, outside the velocity solve.
-!!
-!! With -ffp-contract=off (gfortran) or -fp-model source without -fma (Intel), this
-!! is a no-op and the result is bit-for-bit what the plain expression gives.
+!> (p1 + p2) + (p3 + p4) with each product rounded before the sum. A fused multiply-add keeps
+!! one product unrounded, and a quarter turn cycles the corners through the slots, so no
+!! ordering is rotation-invariant. Parentheses do not stop gfortran fusing once it vectorizes;
+!! the volatile store does. Without FMA this equals the plain expression.
 function dg_sum4_rounded(p1, p2, p3, p4) result(s)
   real, intent(in) :: p1 !< First product, paired with p2 [arbitrary]
   real, intent(in) :: p2 !< Second product, paired with p1 [arbitrary]
   real, intent(in) :: p3 !< Third product, paired with p4 [arbitrary]
   real, intent(in) :: p4 !< Fourth product, paired with p3 [arbitrary]
   real :: s              !< (p1 + p2) + (p3 + p4), each term rounded first [arbitrary]
-  real, volatile, dimension(4) :: t ! Forces each product to working precision [arbitrary]
+  real, volatile, dimension(4) :: t ! The products, rounded by storage [arbitrary]
   t(1) = p1 ; t(2) = p2 ; t(3) = p3 ; t(4) = p4
   s = (t(1) + t(2)) + (t(3) + t(4))
 end function dg_sum4_rounded
 
-!> Apply the per-cell tensor-product Q1 mass-matrix inverse:
-!! out(a,b) = sum_{p,q} Minv_nodal(a,b,p,q) * rhs(p,q).
+!> Apply a cell's inverse mass matrix, out(a,b) = sum_pq Minv_cell(a,b,p,q)*rhs(p,q).
 subroutine apply_nodal_DG_mass_inverse(Minv_cell, rhs, out)
   real, dimension(2,2,2,2), intent(in)  :: Minv_cell !< Inverse mass matrix of this cell [L-2 ~> m-2]
   real, dimension(2,2),     intent(in)  :: rhs       !< Per-cell RHS at the 4 corners [Z L2 T-1 ~> m3 s-1]
   real, dimension(2,2),     intent(out) :: out       !< M^-1 * rhs [Z T-1 ~> m s-1]
   integer :: a, b
-  ! The four source corners are reduced as opposite pairs rather than accumulated
-  ! in loop order.  A quarter turn of the grid permutes the corners cyclically,
-  ! which would reorder a running sum; it maps each opposite pair onto the other,
-  ! which leaves this reduction unchanged.  The terms are products, so they go
-  ! through dg_sum4_rounded rather than straight into the sum -- see there for why
-  ! nothing short of that survives contraction.  Not pure, because that helper
-  ! cannot be: a pure procedure may not declare a volatile local.
+  ! Opposite corners paired for rotation invariance.
   do b = 1, 2 ; do a = 1, 2
     out(a,b) = dg_sum4_rounded(Minv_cell(a,b,1,1) * rhs(1,1), Minv_cell(a,b,2,2) * rhs(2,2), &
                                Minv_cell(a,b,2,1) * rhs(2,1), Minv_cell(a,b,1,2) * rhs(1,2))
   enddo ; enddo
 end subroutine apply_nodal_DG_mass_inverse
 
-!> Per-side-flotation surface-elevation jump s_B - s_A at a face quadrature point.
-!! Each side evaluates its own flotation branch on its own thickness and the shared
-!! single-valued face bed. A hydrostatically-continuous grounding line (s_B = s_A)
-!! returns zero even when h_B /= h_A.
+!> Surface jump s_B - s_A at a face point, each side taking its own flotation branch.
 pure function dg1_wb_surface_jump(h_A, h_B, bed_qp, rhoi_rhow) result(ds)
   real, intent(in) :: h_A       !< Side-A face-QP thickness [Z ~> m]
   real, intent(in) :: h_B       !< Side-B face-QP thickness [Z ~> m]
@@ -12273,11 +11471,6 @@ pure function dg1_wb_surface_jump(h_A, h_B, bed_qp, rhoi_rhow) result(ds)
   real :: s_A, s_B              ! Per-side surface elevation [Z ~> m]
   real :: one_m_r               ! 1 - rhoi_rhow [nondim]
   one_m_r = 1.0 - rhoi_rhow
-  ! The floating branch is parenthesised so that the product is rounded before the
-  ! subtraction below. At a mixed-flotation face ds is (h_B - bed) - one_m_r*h_A, and
-  ! a compiler that fuses the multiply into that subtract keeps one side exact and
-  ! rounds the other. Which side is which changes when a quarter turn of the grid
-  ! exchanges A and B, so ds would stop being exactly antisymmetric.
   if (rhoi_rhow*h_A - bed_qp > 0.0) then ; s_A = (h_A - bed_qp)
   else ; s_A = (one_m_r*h_A) ; endif
   if (rhoi_rhow*h_B - bed_qp > 0.0) then ; s_B = (h_B - bed_qp)
@@ -12285,15 +11478,8 @@ pure function dg1_wb_surface_jump(h_A, h_B, bed_qp, rhoi_rhow) result(ds)
   ds = s_B - s_A
 end function dg1_wb_surface_jump
 
-
-
-!> Mean inverse flotation slope dh/ds across a face (1 grounded, 1/(1-r) floating per
-!! side), harmonic or arithmetic. Multiplying a surface jump by this mean gives the
-!! equivalent thickness jump. The same-branch shortcut keeps uniform-flotation faces
-!! bitwise independent of the mean choice (both means coincide there). The harmonic
-!! mean makes the jump-mode stability rate amplification exactly 2 at every face; the
-!! arithmetic mean (legacy) amplifies mixed grounded/floating faces by up to ~2.8x
-!! relative to that (rate factor 0.5*(1+1/(1-r))*(1+(1-r)) ~ 5.7 vs 2, for r ~= 0.89).
+!> Harmonic mean across a face of dh/ds (1 grounded, 1/(1-r) floating), which converts a surface
+!! jump to a thickness jump and makes DG1_WB_JUMP_RATE_AMP exactly 2.
 pure function dg1_wb_slope_mean(h_A, h_B, bed_qp, rhoi_rhow) result(m)
   real, intent(in) :: h_A       !< Side-A face-QP thickness [Z ~> m]
   real, intent(in) :: h_B       !< Side-B face-QP thickness [Z ~> m]
@@ -12306,19 +11492,14 @@ pure function dg1_wb_slope_mean(h_A, h_B, bed_qp, rhoi_rhow) result(m)
   if (rhoi_rhow*h_A - bed_qp > 0.0) then ; g_A = 1.0 ; else ; g_A = one_m_r ; endif
   if (rhoi_rhow*h_B - bed_qp > 0.0) then ; g_B = 1.0 ; else ; g_B = one_m_r ; endif
   if (g_A == g_B) then
-    m = 1.0/g_A   ! Same flotation branch: this form keeps uniform-flotation faces
-                  ! bitwise identical to the pre-harmonic-mean code.
+    m = 1.0/g_A
   else
     m = 2.0/(g_A + g_B)
   endif
 end function dg1_wb_slope_mean
 
-!> Well-balanced equivalent thickness jump for the DG(1) artificial viscosity: the
-!! per-side surface-elevation jump [s] mapped back to a thickness flux by the mean
-!! inverse flotation slope. On a uniform-flotation face the single-valued bed makes
-!! [s] proportional to [h], so the result equals (h_B - h_A) exactly; the harmonic
-!! and arithmetic means diverge only at mixed-flotation (grounding-line) faces, where
-!! a hydrostatically-continuous surface (s_B = s_A) returns zero even when h_B /= h_A.
+!> Thickness jump equivalent to the surface jump, (h_B - h_A) on a uniform-flotation face and
+!! zero where the surface is continuous.
 pure function dg1_wb_equiv_jump(h_A, h_B, bed_qp, rhoi_rhow) result(dh_eq)
   real, intent(in) :: h_A       !< Side-A face-QP thickness [Z ~> m]
   real, intent(in) :: h_B       !< Side-B face-QP thickness [Z ~> m]
@@ -12330,31 +11511,24 @@ pure function dg1_wb_equiv_jump(h_A, h_B, bed_qp, rhoi_rhow) result(dh_eq)
 end function dg1_wb_equiv_jump
 
 
-!> 2D effective strain rate (second invariant) used by the DG(1) artificial-viscosity
-!! strain-scaled floor. eps_e = sqrt(eps_xx^2 + eps_yy^2 + eps_xx*eps_yy + eps_xy^2) with
-!! eps_xy = 0.5*(du/dy + dv/dx). max(0,.) guards FP roundoff in the radicand.
+!> SSA effective strain rate sqrt(eps_xx^2 + eps_yy^2 + eps_xx*eps_yy + eps_xy^2).
+!! For DG(1) artificial-viscosity strain-scaled floor.
 pure function dg1_face_eps_eff(dudx, dudy, dvdx, dvdy) result(eps_e)
-  real, intent(in) :: dudx     !< du/dx at face midpoint [T-1]
-  real, intent(in) :: dudy     !< du/dy at face midpoint [T-1]
-  real, intent(in) :: dvdx     !< dv/dx at face midpoint [T-1]
-  real, intent(in) :: dvdy     !< dv/dy at face midpoint [T-1]
-  real :: eps_e                !< Effective strain rate [T-1]
-  real :: eps_xy               ! Off-diagonal symmetric strain rate [T-1]
+  real, intent(in) :: dudx     !< du/dx at face midpoint [T-1 ~> s-1]
+  real, intent(in) :: dudy     !< du/dy at face midpoint [T-1 ~> s-1]
+  real, intent(in) :: dvdx     !< dv/dx at face midpoint [T-1 ~> s-1]
+  real, intent(in) :: dvdy     !< dv/dy at face midpoint [T-1 ~> s-1]
+  real :: eps_e                !< Effective strain rate [T-1 ~> s-1]
+  real :: eps_xy               ! Shear strain rate [T-1 ~> s-1]
   eps_xy = 0.5*(dudy + dvdx)
-  ! Each product is parenthesised and the pair that a quarter turn exchanges
-  ! (dudx <-> dvdy) is grouped, so the sum is unchanged by the exchange. Without
-  ! the inner parentheses the compiler may fuse one multiply into the add, which
-  ! makes that product exact and its partner rounded and breaks the symmetry.
+  ! dudx and dvdy, which a quarter turn exchanges, are grouped.
   eps_e = sqrt(max(0.0, (((dudx*dudx) + (dvdy*dvdy)) + &
                          ((dudx*dvdy) + (eps_xy*eps_xy)))))
 end function dg1_face_eps_eff
 
-!> Compute the nodal Q1 DG(1) spatial operator (RHS of the per-cell mass-matrix
-!! system for d h_nodal / dt). Implements the IBP weak form
-!!   M dh/dt = + int grad(N) . (u h) dV  -  contour N (u.n) h_upwind ds
-!! at 2x2 Gauss-Legendre QPs in the volume and 2-point Gauss on each face.
-!! Specified-flux faces (u/v_face_mask == 4) distribute the prescribed face
-!! flux to the two on-face corners with equal weight (plan R24).
+!> DG(1) right-hand side M dh/dt = int grad(N).(u h) dA - int N (u.n) h_upwind ds + art visc,
+!! with 2x2 Gauss points in the cell and 2 per face. Specified-flux faces split their flux
+!! equally between the two corners.
 subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_ice, dt)
   type(ice_shelf_dyn_CS), intent(in) :: CS
   type(ocean_grid_type),  intent(in) :: G
@@ -12363,15 +11537,9 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out)   :: rhs
   real, dimension(SZDIB_(G),SZDJ_(G)),    intent(inout) :: uh_ice
   real, dimension(SZDI_(G),SZDJB_(G)),    intent(inout) :: vh_ice
-  real,                                   intent(in)    :: dt !< RK-stage time step [T ~> s]
-                                                              !! used to derive the per-face
-                                                              !! CFL cap on the gated
-                                                              !! artificial-viscosity coef.
+  real,                                   intent(in)    :: dt !< Time step for the art-visc cap [T ~> s]
 
-  ! 2-point Gauss-Legendre on [0,1]
-  ! Symmetric about the cell midpoint to the last bit: 1-gp1 == gp2 and 1-gp2 == gp1.
-  ! The obvious 0.5 -+ 0.5/sqrt(3) form satisfies only the first of those, and that
-  ! one-ulp asymmetry alone breaks rotational reproducibility of this operator.
+  ! 2-point Gauss-Legendre on [0,1], with 1-gp1 == gp2 and 1-gp2 == gp1 exactly.
   real, parameter :: gp1 = 0.5 * (1.0 - sqrt(1.0/3.0))
   real, parameter :: gp2 = 1.0 - gp1
   real, parameter :: gw  = 0.5
@@ -12387,48 +11555,36 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: u_at_qp, v_at_qp, h_upwind, flux_qp, face_flux_total
   real :: h_A_qp, h_B_qp     ! Face-QP corner thickness on the two sides of a DG face [Z ~> m]
   real :: u_mag_qp           ! Velocity magnitude sqrt(u^2+v^2) at a face QP [L T-1 ~> m s-1]
-  real :: visc_flux_qp       ! Artificial-viscosity face flux per QP, antisymmetric [Z L2 T-1]
+  real :: visc_flux_qp       ! Artificial-viscosity face flux per QP [Z L2 T-1 ~> m3 s-1]
   real :: Hbar_A, Hbar_B     ! Cell-mean thickness on the two sides of a DG face [Z ~> m]
-  real :: H_ref              ! Reference thickness for the smoothness ratio [Z ~> m]
-  real :: r_face             ! Smoothness ratio |Delta h_eq|/H_ref [nondim]
-  real :: sigma_face         ! Piecewise-linear smoothness ramp sigma(r_face) in [0,1] [nondim]
+  real :: H_ref              ! Reference thickness for the gate ratio [Z ~> m]
+  real :: r_face             ! Gate ratio max|[s]|/H_ref [nondim]
+  real :: sigma_face         ! Gate min(r_face/r_hi, 1) [nondim]
   real :: dx_perp            ! Across-face length scale at the current face [L ~> m]
-  real :: coef_face          ! Per-face viscosity coefficient post smoothness gate [nondim]
+  real :: coef_face          ! Face viscosity coefficient [nondim]
   real :: u_eff_face_max     ! Max u_eff over the 2 face QPs, for the stability budget [L T-1 ~> m s-1]
-  real :: amp_qp             ! Per-QP jump-mode rate amplification [nondim]
+  real :: amp_qp             ! Jump-mode rate amplification [nondim]
   real :: amp_face_max       ! Max amp_qp over the 2 face QPs [nondim]
-  real :: ds_use             ! Surface jump driving the flux: full or excess [Z ~> m]
+  real :: ds_use             ! Surface jump at a face QP [Z ~> m]
   real :: ds_face_max        ! Max |ds_use| over the 2 face QPs [Z ~> m]
-  real :: rate_face          ! Per-face semi-discrete diffusion rate c*u_eff_avg*ell/dx_perp [T-1]
-  real :: scale_AB           ! Min of the two adjacent cells' per-cell CFL scale [nondim]
-  real :: dh_eq              ! Well-balanced equivalent thickness jump (surface-jump-derived) [Z ~> m]
-                             ! driving the viscosity flux.
+  real :: rate_face          ! Face jump-mode decay rate [T-1 ~> s-1]
+  real :: scale_AB           ! Smaller cap factor of the two cells [nondim]
+  real :: dh_eq              ! Equivalent thickness jump driving the viscosity flux [Z ~> m]
   real :: bed_qp             ! Bed elevation at a face QP [Z ~> m]
   real :: rhoi_rhow_wb       ! Ice/ocean density ratio for the well-balanced jump [nondim]
-  real :: u_floor_qp         ! Strain-rate-scaled velocity-independent floor at a face QP [L T-1 ~> m s-1]
-  real :: u_adv_qp           ! Advective contribution to u_eff at a face QP [L T-1 ~> m s-1]
-  real :: u_eff_qp           ! |u_face| + u_floor for the viscosity flux and CFL cap [L T-1 ~> m s-1]
-  real :: advect_inv_L       ! Reciprocal of DG1_ART_VISC_ADVECT_L_REF, or 0 to select the
-                             ! legacy (grid-dependent) advective scaling [L-1 ~> m-1]
-  real :: inv_tau_floor      ! Reciprocal of DG1_ART_VISC_TAU_FLOOR, or 0 when the absolute
-                             ! damping floor is disabled [T-1 ~> s-1]
-  logical :: advect_grid_inv ! If true, scale the advective term by dx_perp/L_ref so its
-                             ! jump-mode decay rate is resolution-independent.
-  real :: eps_e_face         ! Effective strain rate at the face midpoint [T-1]
-  real :: dudx_f, dudy_f, dvdx_f, dvdy_f ! Face-midpoint velocity gradients [T-1]
-  real :: u_mn, u_pl, v_mn, v_pl ! 4-corner-averaged cell velocities on the [L T-1 ~> m s-1]
-                                  ! minus/plus side of the face
+  real :: u_floor_qp         ! Strain-rate term of u_eff at a face QP [L T-1 ~> m s-1]
+  real :: u_adv_qp           ! Advective term of u_eff at a face QP [L T-1 ~> m s-1]
+  real :: u_eff_qp           ! u_eff at a face QP [L T-1 ~> m s-1]
+  real :: advect_inv_L       ! 1/DG1_ART_VISC_ADVECT_L_REF, or 0 [L-1 ~> m-1]
+  real :: inv_tau_floor      ! 1/DG1_ART_VISC_TAU_FLOOR, or 0 [T-1 ~> s-1]
+  logical :: advect_grid_inv ! If true, scale the advective term by dx_perp/L_ref.
+  real :: eps_e_face         ! Effective strain rate at the face midpoint [T-1 ~> s-1]
+  real :: dudx_f, dudy_f, dvdx_f, dvdy_f ! Face-midpoint velocity gradients [T-1 ~> s-1]
+  real :: u_mn, u_pl, v_mn, v_pl ! Cell-mean velocities on the minus/plus sides [L T-1 ~> m s-1]
   real :: dh_eq_face_max     ! Max |Delta h_eq| over the 2 face QPs [Z ~> m]
   real :: u_mag_face_max     ! Max |u_mag_qp| over the 2 face QPs [L T-1 ~> m s-1]
-  logical :: valid_A_visc, valid_B_visc ! Side A/B participates in DG art-visc face
-                                         ! flux (hmask==1 interior, or hmask==3
-                                         ! Dirichlet thickness BC used one-sided).
-  ! The smoothness-gate saturation threshold (CS%dg_art_visc_r_hi) and the
-  ! per-cell jump-mode stability budget
-  ! (CS%dg_art_visc_kcell) are runtime parameters; see their get_param descriptions.
-  ! Pass-1 workspace for the two-pass per-cell CFL restructure of the viscosity branch:
-  ! per-face desired coefficient, per-QP u_eff and Delta h_eq, and per-cell sum of face
-  ! rates. Sized over the same index ranges as the surrounding face loops.
+  logical :: valid_A_visc, valid_B_visc ! Side A/B is hmask 1 or 3.
+  ! Art-visc pass-1 results: face coefficient and rate, and per-QP u_eff and Delta h_eq.
   real, dimension(SZDIB_(G),SZDJ_(G))   :: cK_E, rate_E
   real, dimension(SZDI_(G),SZDJB_(G))   :: cK_N, rate_N
   real, dimension(SZDIB_(G),SZDJ_(G),2) :: ueff_E, dheq_E
@@ -12436,16 +11592,12 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   logical, dimension(SZDIB_(G),SZDJ_(G)) :: active_E
   logical, dimension(SZDI_(G),SZDJB_(G)) :: active_N
   real, dimension(SZDI_(G),SZDJ_(G))    :: cell_scale
-  real :: S_K                ! Per-cell sum of face rates for the CFL bound [T-1]
+  real :: S_K                ! Sum of a cell's face rates [T-1 ~> s-1]
   real, dimension(2,2,2,2) :: qv_vol ! Per-QP volume contribution to the 4 cell corners,
                                      ! indexed (qx,qy,a,b) [Z L2 T-1 ~> m3 s-1]
-  integer :: i_lo, i_hi, j_lo, j_hi  ! One-sided clipping bounds for boundary strain
+  integer :: i_lo, i_hi, j_lo, j_hi  ! Neighbour indices clipped to the data domain
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_vol
-  ! Face contributions are held in four accumulators, one per direction and per
-  ! term, rather than summed into a single array in loop order. A quarter turn of
-  ! the grid exchanges the x and y families, so a single running sum would add the
-  ! same four numbers in a different order. The pairwise reduction at the end of
-  ! this routine is order-independent; a running sum is not.
+  ! Face terms kept per direction and summed pairwise at the end, for rotation invariance.
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_advx, rhs_advy, rhs_viscx, rhs_viscy
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
@@ -12461,14 +11613,9 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   if (associated(CS%dg_art_visc_nu_v)) CS%dg_art_visc_nu_v(:,:) = 0.0
   if (associated(CS%dg_slow_idle_face_u)) CS%dg_slow_idle_face_u(:,:) = 0.0
   if (associated(CS%dg_slow_idle_face_v)) CS%dg_slow_idle_face_v(:,:) = 0.0
-  ! Reset to 1 (= unthrottled), not 0: a 0 would read as "fully throttled" in cells
-  ! the cap loop never visits (non-ice cells, or the whole domain when the
-  ! viscosity is disabled).
+  ! 1 means uncapped.
   if (associated(CS%dg_art_visc_cell_scale)) CS%dg_art_visc_cell_scale(:,:) = 1.0
 
-  ! Optional rate-denominated forms of the two velocity-independent u_eff terms. Both are
-  ! off by default (sentinel <= 0), in which case advect_grid_inv is false and inv_tau_floor
-  ! is 0, and u_eff reduces exactly to the legacy advect_coef*|u| + strain_coef*eps*dx_perp.
   advect_grid_inv = (CS%dg_art_visc_advect_L_ref > 0.0)
   advect_inv_L = 0.0
   if (advect_grid_inv) advect_inv_L = 1.0 / CS%dg_art_visc_advect_L_ref
@@ -12501,13 +11648,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       v_qp = (((N11*CS%v_shelf(i-1,j-1)) + (N22*CS%v_shelf(i,j))) + &
               ((N21*CS%v_shelf(i,j-1))   + (N12*CS%v_shelf(i-1,j))))
 
-      ! Volume contribution at this QP for each test function N(a,b):
-      ! + weight * h * ( u * dN/dxi * d + v * dN/deta * a )
-      ! Held per-QP rather than accumulated in place. A quarter turn of the grid
-      ! permutes the four quadrature points cyclically, so a running sum over
-      ! qx,qy is not reproducible under rotation. The diagonal-pair reduction
-      ! below is, because that permutation maps each opposite-corner pair of
-      ! quadrature points onto the other.
+      ! Volume contribution at this qp for each test function N(a,b):
+      ! weight * h * (u * dN/dxi * d + v * dN/deta * a), summed below in diagonal QP pairs.
       qv_vol(qx,qy,1,1) = gw*gw * h_qp * (((u_qp * dN_dxi_11) * d_qp) + ((v_qp * dN_deta_11) * a_qp))
       qv_vol(qx,qy,2,1) = gw*gw * h_qp * (((u_qp * dN_dxi_21) * d_qp) + ((v_qp * dN_deta_21) * a_qp))
       qv_vol(qx,qy,1,2) = gw*gw * h_qp * (((u_qp * dN_dxi_12) * d_qp) + ((v_qp * dN_deta_12) * a_qp))
@@ -12571,29 +11713,10 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     endif
   enddo ; enddo
 
-  ! DG(1) artificial viscosity, face formulation.
-  ! Per face, the antisymmetric flux is +gw * c_face * u_eff * Delta h_eq * ell_face
-  ! at each QP, distributed conservatively to the two adjacent cells (-A, +B).
-  ! Driver is the well-balanced equivalent thickness jump Delta h_eq derived from
-  ! the surface jump, so a hydrostatically-continuous grounding line is not damped.
-  ! With DG1_ART_VISC_EXCESS_JUMP, only the part of the surface jump in excess of
-  ! the jump supported by the two cell-mean surfaces drives the flux, so standing
-  ! mean-supported contrasts (e.g. shear margins) are not damped.
-  ! c_face = c_min + (c_max - c_min) * sigma(r_face) ramps from c_min in smooth
-  ! regions to c_max at shocks, where the gate ratio r_face is |Delta h_eq|/H_ref
-  ! (legacy) or |[s]|/H_ref (DG1_ART_VISC_GATE_SURFACE): O(dx^2) smooth, O(1) at
-  ! jumps. u_eff = advect_coef*|u_face| + strain_coef*eps_e*dx_perp covers both
-  ! advective and deformation-driven excitation of the broken-Q1 mode. A per-cell
-  ! SSP-RK2 stability budget (DG1_ART_VISC_KCELL/dt) on the summed jump-mode decay
-  ! rates lambda_F = 4*amp*c*u_eff_max/dx_perp scales all faces of any cell that
-  ! would exceed it; the factor 4*amp (>= 8) accounts for node localization (x2),
-  ! the consistent-mass inverse at the face node (x2), and the flotation-branch
-  ! flux Jacobian (amp = 2 uniform/harmonic, up to ~5.7 mixed-arithmetic) relative
-  ! to the cell-mean rate. The excess map is 1-Lipschitz in the face traces, so
-  ! this rate remains a valid bound with DG1_ART_VISC_EXCESS_JUMP. Weak one-sided
-  ! imposition at Dirichlet thickness BCs (hmask==3): the existing hmask==1 write
-  ! guards on rhs_advx discard the BC-side update; the BC side uses h_bdry_val for
-  ! h and Hbar.
+  ! DG(1) artificial viscosity. Each face QP carries the flux gw*c_face*u_eff*Delta h_eq*ell,
+  ! where Delta h_eq is the thickness jump equivalent to the surface jump, so a continuous
+  ! surface is not damped. c_face = min(max|[s]|/(H_ref*r_hi), 1). Each cell caps dt times its
+  ! summed face rates 4*amp*c*u_eff/dx_perp at DG1_ART_VISC_KCELL. hmask=3 sides use h_bdry_val.
   active_E(:,:) = .false.
   cK_E(:,:)     = 0.0
   rate_E(:,:)   = 0.0
@@ -12606,8 +11729,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   dheq_N(:,:,:) = 0.0
   cell_scale(:,:) = 1.0
 
-  ! Pass 1, east faces: compute per-QP (u_eff, Delta h_eq), face-level c_face and
-  ! semi-discrete diffusion rate, store for the scaled application in pass 2.
+  ! Pass 1, east faces: u_eff and Delta h_eq per QP, c_face and rate per face.
   do j = jsc, jec ; do i = isc-1, iec
     if (CS%u_face_mask(i,j) == 4.0) cycle  ! specified-flux face: viscosity undefined.
     valid_A_visc = (hmask(i,  j) == 1.0 .or. hmask(i,  j) == 3.0)
@@ -12629,9 +11751,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     H_ref = max(CS%min_h_shelf, 0.5*(Hbar_A + Hbar_B))
     dx_perp = G%dxCu(i,j)
 
-    ! Boundary-aware one-sided cell-centred velocities for the across-face strain.
-    ! When the i-1 or i+1 column is outside the data halo, collapse to the central
-    ! column (first-order one-sided difference instead of zeroing the floor).
+    ! Cell-mean velocities either side, one-sided where a neighbour is outside the data domain.
     i_lo = max(i-1, G%isd) ; i_hi = min(i+1, G%ied)
     if (CS%dg_art_visc_strain_coef > 0.0) then
       if (i_lo < i) then
@@ -12692,8 +11812,6 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       else
         u_adv_qp = CS%dg_art_visc_advect_coef * u_mag_qp
       endif
-      ! The +0 from a disabled tau floor is exact, so the defaults are bitwise identical
-      ! to the legacy single-expression form.
       u_eff_qp = (u_adv_qp + u_floor_qp) + (dx_perp * inv_tau_floor)
 
       ueff_E(i,j,gp) = u_eff_qp
@@ -12707,8 +11825,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     enddo
 
 
-    ! Surface-cliff gate: R_LO/R_HI are the cliff heights, as fractions of the
-    ! local mean thickness, at which damping starts and saturates.
+    ! Gate on the surface jump relative to the mean thickness.
     r_face = ds_face_max / H_ref
     if (r_face <= 0.0) then
       sigma_face = 0.0
@@ -12719,18 +11836,11 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     endif
     coef_face = sigma_face
     cK_E(i,j) = coef_face
-    ! Per-face semi-discrete decay rate of the face-node jump mode,
-    ! lambda_F = 4 * amp * c * u_eff / dx_perp. The factor 4*amp (>= 8) accounts
-    ! for node localization (x2), the consistent-mass inverse at the face node
-    ! (x2), and the flotation-branch flux Jacobian (amp = 2 uniform/harmonic, up
-    ! to ~5.7 mixed-arithmetic), relative to the cell-mean rate c*u_eff/dx_perp.
-    ! Max-over-QP u_eff bounds the worst QP. No ell factor (it cancels between
-    ! the face-integrated flux and the cell area).
+    ! Jump-mode decay rate: node localization (x2) and consistent mass (x2) times amp.
     rate_face = 4.0 * amp_face_max * coef_face * u_eff_face_max / dx_perp
     rate_E(i,j) = rate_face
 
-    ! Stagnant-jump diagnostic: |u| and eps_e both tiny while the equivalent jump
-    ! is non-negligible. Mark with 1.0 (otherwise stays at 0 from the reset).
+    ! Stagnant-jump diagnostic.
     if (associated(CS%dg_slow_idle_face_u)) then
       if (u_mag_face_max < CS%dg_slow_idle_u_tiny .and. &
           eps_e_face     < CS%dg_slow_idle_eps_tiny .and. &
@@ -12791,7 +11901,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     endif
   enddo ; enddo
 
-  ! Pass 1, north faces (analogous to east-face block above).
+  ! Pass 1, north faces.
   do j = jsc-1, jec ; do i = isc, iec
     if (CS%v_face_mask(i,j) == 4.0) cycle
     valid_A_visc = (hmask(i,j  ) == 1.0 .or. hmask(i,j  ) == 3.0)
@@ -12873,8 +11983,6 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       else
         u_adv_qp = CS%dg_art_visc_advect_coef * u_mag_qp
       endif
-      ! The +0 from a disabled tau floor is exact, so the defaults are bitwise identical
-      ! to the legacy single-expression form.
       u_eff_qp = (u_adv_qp + u_floor_qp) + (dx_perp * inv_tau_floor)
 
       ueff_N(i,j,gp) = u_eff_qp
@@ -12910,10 +12018,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     endif
   enddo ; enddo
 
-  ! Aggregate per-cell rate sum and form scale = min(1, kcell/(S_K*dt)). Each PE
-  ! computes scales for its owned cells (all four face rates of an owned cell are
-  ! available locally); non-ice and BC cells keep scale 1 so the min(scale_A,
-  ! scale_B) below picks up the interior cell's budget at one-sided faces.
+  ! Per-cell cap factor min(1, kcell/(S_K*dt)); non-ice and hmask=3 cells keep 1.
   do j = jsc, jec ; do i = isc, iec
     if (hmask(i,j) /= 1.0) cycle
     S_K = 0.0
@@ -12929,16 +12034,10 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     if (associated(CS%dg_art_visc_cell_scale)) &
       CS%dg_art_visc_cell_scale(i,j) = cell_scale(i,j)
   enddo ; enddo
-  ! Halo-update the scales so that a face on a PE boundary (or a reentrant seam)
-  ! sees both adjacent cells' budgets: without this, each side would apply only
-  ! its own cell's throttle, breaking the antisymmetric flux pair (local
-  ! non-conservation) and making an engaged cap layout-dependent.
+  ! Both sides of a PE-boundary face need both factors to keep the flux antisymmetric.
   call pass_var(cell_scale, G%domain)
 
-  ! Pass 2, east faces: scaled application. Per-face scale_AB is the min of the
-  ! two adjacent cells' scales; after the halo update both sides are valid on
-  ! every active face (non-ice and BC cells carry scale 1), so the same value is
-  ! formed on whichever PE computes the face and the antisymmetric pair is exact.
+  ! Pass 2, east faces: apply the flux with the smaller of the two cells' cap factors.
   do j = jsc, jec ; do i = isc-1, iec
     if (.not. active_E(i,j)) cycle
     scale_AB = min(cell_scale(i,j), cell_scale(i+1,j))
@@ -12995,12 +12094,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   enddo ; enddo
 end subroutine DG1_nodal_spatial_operator
 
-!> Advect h_nodal one time step with SSP-RK2 + Barth-Jespersen + Liu positivity.
-!! Operates directly on CS%h_nodal (mutates the authoritative nodal storage).
-!> Biased second difference along one axis: centred (b=1), forward (b=2) or
-!! backward (b=3).  All three read 2*f(0) on the alternating mode and zero on a
-!! uniform field, so the delivered relaxation time does not depend on which is
-!! used.
+!> Biased second difference along one axis: centred (b=1), forward (b=2) or backward (b=3).
+!! All give 2*f(0) on the alternating mode and zero on a uniform field.
 pure function dg_d2_biased(f, b) result(A)
   real, dimension(-4:4), intent(in) :: f !< Samples along the axis [Z ~> m]
   integer,               intent(in) :: b !< 1 centred, 2 forward, 3 backward
@@ -13016,9 +12111,7 @@ end function dg_d2_biased
 pure function dg_d1_weights(b) result(w)
   integer, intent(in) :: b    !< Bias along the axis: 1 centred, 2 forward, 3 backward
   real, dimension(-2:2) :: w  !< First-difference stencil weights [nondim]
-  ! Second-order and centred on the cell in every case: a first-order one-sided
-  ! difference would estimate the tilt half a cell away, and the reference has
-  ! to sit where the detector does or the cancellation degrades.
+  ! Second order and centred on the cell, so the reference sits where the detector does.
   w(:) = 0.0
   select case (b)
     case (1) ; w(-1) = -0.5 ; w(1) = 0.5
@@ -13027,10 +12120,8 @@ pure function dg_d1_weights(b) result(w)
   end select
 end function dg_d1_weights
 
-!> Mean-supported twist at offset (p,q): the cross difference of the cell means,
-!! each first difference taking the bias of its own axis.  This is the twist the
-!! conservative data already justify, and subtracting it is what cancels the
-!! smooth-solution residual, exactly as A_ref does for the tilt.
+!> Mean-supported twist at offset (p,q): the cross difference of the cell means, each axis
+!! with its own bias. It plays the role of A_ref for the twist.
 pure function dg_wref_at(hw, p, q, bx, by) result(wr)
   real, dimension(-4:4,-4:4), intent(in) :: hw !< Cell means on the gather [Z ~> m]
   integer, intent(in) :: p  !< Offset along xi
@@ -13041,19 +12132,11 @@ pure function dg_wref_at(hw, p, q, bx, by) result(wr)
   real, dimension(-2:2) :: wxi, weta   ! Per-axis first-difference weights [nondim]
   real, dimension(-2:2,-2:2) :: tm     ! Per-offset contribution to the twist [Z ~> m]
   integer :: m, n, r
-  ! One representative per orbit of the quarter turn (m,n) -> (n,-m) acting on the
-  ! 5x5 stencil. The centre is its own orbit; the other 24 offsets form these six
-  ! orbits of four.
+  ! One offset from each of the six four-member orbits of (m,n) -> (n,-m) on the 5x5 stencil.
   integer, dimension(6), parameter :: rep_m = (/ 1, 1, 2, 2, 1, 2 /)
   integer, dimension(6), parameter :: rep_n = (/ 0, 1, 0, 1, 2, 2 /)
 
-  ! Summed as a single weighted stencil, not as a difference along xi of a
-  ! difference along eta. The nested form fixes an order on the two axes, and a
-  ! quarter turn of the grid exchanges them, so the same terms would be added in a
-  ! different order and the twist would not be reproducible under rotation.
-  ! Reducing each orbit of the turn as its two pairs of opposite offsets, and the
-  ! orbits in a fixed sequence, does not depend on that order: the turn maps each
-  ! orbit onto itself and exchanges its two pairs.
+  ! One weighted stencil summed orbit by orbit in opposite pairs, for rotation invariance.
   wxi = dg_d1_weights(bx) ; weta = dg_d1_weights(by)
   tm(:,:) = 0.0
   do n = -2, 2
@@ -13070,35 +12153,11 @@ pure function dg_wref_at(hw, p, q, bx, by) result(wr)
   enddo
 end function dg_wref_at
 
-!> One-dimensional tilt detector, biased away from unavailable cells.
-!!
-!! The detector is a second difference of the per-cell tilt, and a second
-!! difference need not be centred.  Where a centred stencil would reach outside
-!! the ice or outside the domain, a forward- or backward-biased one is used
-!! instead, so a cell next to a boundary is still evaluated rather than skipped.
-!! Skipping it is not neutral: it treats neighbouring cells differently for a
-!! reason unrelated to the solution, which is itself a source of the grid-scale
-!! structure this term exists to remove.  At 10 km in a channel eight cells
-!! wide, skipping two cells at each wall would silence half the domain in the
-!! very direction the mode occupies.
-!!
-!! Both biased forms read 2*t on the alternating mode, exactly as the centred
-!! form does, so the delivered relaxation time is unchanged.  The same operator
-!! is applied to the tilt, to the bed and to the mean-supported reference, which
-!! is what preserves the cancellation between A and A_ref on a smooth solution:
-!! that follows from A(t) ~ A(t_ref) for any consistent second difference, not
-!! from the centred form in particular.
-!!
-!! The reference must be SECOND-order and evaluated at the cell centre, and the
-!! SAME form at every offset of the stencil.  A first-order one-sided difference
-!! hbar(k+1) - hbar(k) estimates the tilt half a cell away, and mixing a
-!! one-sided value at the edge offset with centred values elsewhere makes the
-!! reference non-smooth in k, which its own second difference then picks up.
-!! Either mistake leaves a leak that no longer vanishes relative to the detector
-!! under refinement -- measured convergence of the smooth-solution excess falls
-!! from O(dx^5) to O(dx^3.8) against a detector that is O(dx^3) -- and the leak
-!! is signed, so it damps a smooth solution steadily for as long as the model
-!! runs.  That is a fifth cell's worth of stencil, hence the +-4 gather.
+!> One-dimensional tilt detector A (a second difference of the cell tilt), with the same operator
+!! on the bed (A_bed) and on the tilt implied by the cell means (A_ref). The stencil is centred
+!! where possible and biased forward or backward next to unusable cells; all forms give 2*t on
+!! the alternating mode. The reference is second order at the cell centre at every offset, so
+!! A - A_ref vanishes faster than A on a smooth solution. This needs a +-4 gather.
 pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, fit_tol, A, A_bed, A_ref, href, &
                                     valid, mode, kink_c)
   real,    dimension(-4:4), intent(in)  :: tv !< Per-cell tilt along the stencil [Z ~> m]
@@ -13115,20 +12174,14 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, fit_tol, A, A_bed,
   real,    intent(out) :: href  !< Mean thickness over the stencil used [Z ~> m]
   logical, intent(out) :: valid !< False if no admissible stencil exists
   integer, intent(out) :: mode  !< Stencil chosen: 1 centred, 2 forward, 3 backward, 0 none
-  real,    intent(out) :: kink_c  !< How far the reference carries the break, 0 to 1: the
-                                  !! caller interpolates the grounding-line exemption on it
-                                  !! rather than switching, so that a cell does not jump
-                                  !! between damped and exempt as the geometry shifts
+  real,    intent(out) :: kink_c  !< Confidence in the kink in the reference, 0 to 1 [nondim]
 
   real :: rm, r0, rp  ! Mean-supported tilt at the three stencil cells [Z ~> m]
   real :: s_g, s_f    ! Branch slopes across a flotation transition [Z ~> m]
   real :: sigma       ! How much of a transition the reference's window spans [nondim]
   real :: cf          ! Confidence in the branch slopes that were found [nondim]
   integer :: km, k0, kp ! Offsets of the three cells whose tilt the reference supplies
-  integer :: rlo, rhi   ! Offsets of the cell MEANS the reference reads, which reach two
-                        ! further than the tilts it supplies and are what the span must
-                        ! cover: a cell whose reference reads a straddling neighbour is
-                        ! contaminated by it even though its own three offsets are not.
+  integer :: rlo, rhi   ! Offsets of the cell means the reference reads
   logical :: kv       ! True if the branch slopes could be built
 
   A = 0.0 ; A_bed = 0.0 ; A_ref = 0.0 ; href = 0.0 ; valid = .true. ; mode = 1
@@ -13139,11 +12192,6 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, fit_tol, A, A_bed,
     A_bed = bv(0) - (0.5*(bv(-1) + bv(1)))
     rm = 0.5*(hv(0) - hv(-2)) ; r0 = 0.5*(hv(1) - hv(-1)) ; rp = 0.5*(hv(2) - hv(0))
     km = -1 ; k0 = 0 ; kp = 1 ; rlo = -2 ; rhi = 2
-    ! Grouped so the pair straddling the centre is summed first. A quarter turn
-    ! of the grid reverses this stencil, and ((hv(-1)+hv(0))+hv(1)) would then be
-    ! summed as ((hv(1)+hv(0))+hv(-1)), which is a different number. The biased
-    ! branches below need no such care: reflection maps one onto the other with
-    ! the operand order already matching.
     href  = (hv(0) + (hv(-1) + hv(1))) / 3.0
   elseif (all(ok(0:4))) then                    ! forward
     A     = 0.5*(tv(0) - (2.0*tv(1))+ tv(2))
@@ -13166,10 +12214,7 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, fit_tol, A, A_bed,
   endif
   if (.not.valid) return
 
-  ! Tell the reference where the flotation break is, if it is asked for and the
-  ! branches can be built.  The blend is by how much of a transition the window
-  ! spans, so sigma = 0 in a smooth region returns the centred form bit for bit
-  ! and nothing outside a grounding line changes.
+  ! Blend in the flotation kink by the span of the grounded fraction; zero span changes nothing.
   if (kink) then
     call dg_kink_branches(hv, fv, ok, rlo, rhi, fit_tol, s_g, s_f, sigma, cf, kv)
     if (kv) then
@@ -13181,9 +12226,6 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, fit_tol, A, A_bed,
     endif
   endif
 
-  ! One assembly for all three branches: the centred form weights the outer two
-  ! by a half, the biased ones by a half of a one-sided second difference, which
-  ! is the same expression once the offsets are those the branch actually used.
   if (mode == 1) then
     A_ref = r0 - (0.5*(rm + rp))
   else
@@ -13191,48 +12233,24 @@ pure subroutine dg_tilt_detector_1d(tv, bv, hv, ok, fv, kink, fit_tol, A, A_bed,
   endif
 end subroutine dg_tilt_detector_1d
 
-!> The two branch slopes across a flotation transition, and how much of one the
-!! stencil spans.
-!!
-!! The mean-supported reference fails at a grounding line for one reason: a
-!! centred difference of cell means averages across a slope break.  But the break
-!! is not unknown.  The grounded fraction locates it to a fraction of a cell, and
-!! a profile that is piecewise linear with a break at fraction f of a cell has a
-!! rise across that cell of exactly f*s_g + (1-f)*s_f -- the cell being f of one
-!! slope and 1-f of the other.  Given the two branch slopes, the reference can
-!! therefore be built with the kink in it, and the term no longer has to be
-!! switched off to avoid eating one.
-!!
-!! Each slope is taken from cells lying WHOLLY on its own side, nearest the
-!! transition, so neither is contaminated by the break.  Three such cells give a
-!! centred difference, which is exactly zero on an alternating mean and so cannot
-!! import that mode into the reference; two give a one-sided difference, which
-!! can, and costs about 30% in a test with an alternating mean present.  Fewer
-!! than two and there is nothing to build from: the caller falls back to the
-!! grounding-line exemption, on the much smaller set of cells where that is now
-!! the only option.
+!> Grounded and floating branch slopes across a flotation transition, from the cells nearest it
+!! lying wholly on each side, and the span of the grounded fraction. A piecewise-linear profile
+!! breaking at fraction f of a cell rises f*s_g + (1-f)*s_f across it. valid is false if either
+!! side has fewer than two such cells.
 pure subroutine dg_kink_branches(hv, fv, ok, lo, hi, fit_tol, s_g, s_f, sigma, conf, valid)
   real,    dimension(-4:4), intent(in)  :: hv !< Cell means on the gather [Z ~> m]
   real,    dimension(-4:4), intent(in)  :: fv !< Grounded fraction on the gather [nondim]
   logical, dimension(-4:4), intent(in)  :: ok !< True where the cell is usable
   integer, intent(in)  :: lo    !< First offset the reference reads
   integer, intent(in)  :: hi    !< Last offset the reference reads
-  real,    intent(in)  :: fit_tol !< Relative slope misfit at which the two-branch model is
-                                !! disbelieved outright, or non-positive to skip the test
-                                !! and keep the count-only confidence [nondim]
-                                !! The span is measured over [lo,hi]; the branch slopes are
-                                !! sought over the whole usable gather, since cells wholly
-                                !! on one side generally lie OUTSIDE the three offsets the
-                                !! reference supplies -- looking only within them finds one
-                                !! grounded cell and gives up.
+  real,    intent(in)  :: fit_tol !< Relative slope misfit giving zero confidence, or
+                                !! non-positive to skip the fit test [nondim]
   real,    intent(out) :: s_g   !< Rise per cell on the grounded branch [Z ~> m]
   real,    intent(out) :: s_f   !< Rise per cell on the floating branch [Z ~> m]
   real,    intent(out) :: sigma !< Span max(f) - min(f) over the window [nondim]
   real,    intent(out) :: conf  !< How far the branch slopes are to be trusted, 0 to 1 [nondim]
   logical, intent(out) :: valid !< False if either branch has fewer than two cells
-  real, parameter :: eps = 1.0e-9 ! Wholly grounded or afloat is exact, every
-                        ! sub-point of the partition falling the same way, so this
-                        ! guards against round-trip rounding and nothing else.
+  real, parameter :: eps = 1.0e-9 ! Rounding tolerance on wholly grounded or afloat [nondim]
   integer :: k, ng, nf, ge, fs, slo, shi
   logical :: gnd_low    ! True when the grounded end of the window is the low one
   real :: den           ! Largest slope in play, the scale a misfit is judged against [Z ~> m]
@@ -13243,8 +12261,7 @@ pure subroutine dg_kink_branches(hv, fv, ok, lo, hi, fit_tol, s_g, s_f, sigma, c
   sigma = maxval(fv(lo:hi)) - minval(fv(lo:hi))
   if (.not.all(ok(lo:hi))) return
 
-  ! Search the largest run of usable cells containing the host, which is wider
-  ! than the reference's own offsets and is where cells wholly on one side live.
+  ! Branch cells are sought over the whole usable run containing the host.
   slo = 0 ; do k = 0, -4, -1 ; if (ok(k)) then ; slo = k ; else ; exit ; endif ; enddo
   shi = 0 ; do k = 0, 4       ; if (ok(k)) then ; shi = k ; else ; exit ; endif ; enddo
   gnd_low = (fv(slo) >= fv(shi))
@@ -13260,19 +12277,11 @@ pure subroutine dg_kink_branches(hv, fv, ok, lo, hi, fit_tol, s_g, s_f, sigma, c
     ge = shi - ng + 1 ; fs = slo + nf - 1
   endif
   if ((ng < 2) .or. (nf < 2)) return
-  ! How far to trust what was found.  Three cells give a centred difference,
-  ! which is exactly zero on an alternating mean and so cannot import that mode
-  ! into the reference; two give a one-sided difference, which can, and was
-  ! measured 30% wrong with an alternating mean present.  The weaker branch sets
-  ! the confidence, and it is interpolated rather than switched so that a cell
-  ! does not flip between damped and exempt as a valley's clean-cell count
-  ! changes under a migrating grounding line.
+  ! A two-cell branch uses a one-sided difference, which can pick up an alternating mean.
   conf = 1.0
   if (min(ng, nf) < 3) conf = 0.7
 
-  ! Nearest the transition in both cases, and in the +index sense in both, so the
-  ! slopes are directly comparable with the tilts whatever way round the
-  ! grounding line lies.
+  ! Slopes in the +index sense, nearest the transition.
   if (gnd_low) then
     if (ng >= 3) then ; s_g = 0.5*(hv(ge) - hv(ge-2)) ; else ; s_g = hv(ge) - hv(ge-1) ; endif
     if (nf >= 3) then ; s_f = 0.5*(hv(fs+2) - hv(fs)) ; else ; s_f = hv(fs+1) - hv(fs) ; endif
@@ -13281,32 +12290,8 @@ pure subroutine dg_kink_branches(hv, fv, ok, lo, hi, fit_tol, s_g, s_f, sigma, c
     if (nf >= 3) then ; s_f = 0.5*(hv(fs) - hv(fs-2)) ; else ; s_f = hv(fs) - hv(fs-1) ; endif
   endif
 
-  ! Does the two-branch model actually DESCRIBE these cells?  The count above is
-  ! a sufficiency test -- were there enough clean cells to build a slope from --
-  ! and it says nothing about fit.  A flotation transition that refinement has
-  ! resolved offers plenty of clean cells on both sides and is still the wrong
-  ! shape for a single sharp break, so the count grows more confident exactly
-  ! where the model grows less appropriate.  Measured on MISMIP+: below about
-  ! 4 km the residual the reference leaves near the grounding line stops
-  ! alternating and turns coherent, the lag-1 correlation of the detector going
-  ! -0.61, -0.50, -0.40, -0.17, +0.13 from 10 km to 2 km, while away from the
-  ! line it stays near -0.6.  The term was spending most of its effort there for
-  ! a 1.8% reduction in the thing it was aimed at.
-  !
-  ! So check the model against the means.  Under it cell k rises by
-  ! f(k)*s_g + (1-f(k))*s_f, and a centre-to-centre difference spans half of each
-  ! of two cells.  Judge the misfit against the largest slope in play, a misfit
-  ! mattering only relative to the correction being made.  This mirrors the test
-  ! dg_kink_plane_2d already applies to the twist, which has had one from the
-  ! start; only the 1D branch was missing it.
-  !
-  ! min(), never max(): confidence can only FALL here.  That matters for more
-  ! than tidiness.  A falling confidence blends the reference back toward the
-  ! plain centred form AND closes the gate toward the grounding-line exemption,
-  ! together, so a cell whose geometry the model misreads ends up damped LESS
-  ! rather than damped against a reference it should not have trusted.  Less
-  ! damping at a grounding line is the configuration whose P75R reversibility was
-  ! established before the kink reference existed, so this cannot cost it.
+  ! Fit test: compare the model's centre-to-centre rises with the cell means, relative to the
+  ! largest slope. Confidence can only fall.
   if (fit_tol > 0.0) then
     den = max(abs(s_g - s_f), max(abs(s_g), abs(s_f)))
     if (den > 0.0) then
@@ -13322,11 +12307,7 @@ pure subroutine dg_kink_branches(hv, fv, ok, lo, hi, fit_tol, s_g, s_f, sigma, c
   valid = .true.
 end subroutine dg_kink_branches
 
-!> Area of the unit cell where a LINEAR function is positive, from its corners.
-!!
-!! Linear, so the bilinear interpolant of the corners is the function itself and
-!! the region is a polygon: clip the square against the zero contour and take the
-!! area.  Exact, and the count of vertices is at most five.
+!> Exact area fraction of the unit cell where a linear function, given at the corners, is positive.
 pure function dg_lin_area(d) result(a)
   real, dimension(4), intent(in) :: d !< Corner values, SW SE NW NE [Z ~> m]
   real :: a                           !< Area fraction where the value is positive [nondim]
@@ -13357,12 +12338,7 @@ pure function dg_lin_area(d) result(a)
   a = min(max(0.5*abs(a), 0.0), 1.0)
 end function dg_lin_area
 
-!> Shift a linear function so the area where it is positive matches a target.
-!!
-!! Bisection rather than the closed form: the area is piecewise quadratic in the
-!! shift with breakpoints at the four corner values, so the closed form has cases
-!! and the iteration has none.  Fifty steps is deterministic and takes it to the
-!! last bit, and it runs only on cells a grounding line passes near.
+!> Constant to add to a linear function so its positive area fraction is f, by 50 bisection steps.
 pure function dg_shift_to_frac(d, f) result(c)
   real, dimension(4), intent(in) :: d !< Corner values before the shift [Z ~> m]
   real, intent(in) :: f               !< Target positive-area fraction [nondim]
@@ -13421,9 +12397,7 @@ pure subroutine dg_kink_plane_2d(hw, fw, okw, lo, hi, tol, dqx, dqy, dq0, sigma,
   dqx = 0.0 ; dqy = 0.0 ; dq0 = 0.0 ; conf = 0.0 ; valid = .false.
   sigma = maxval(fw(lo:hi,lo:hi)) - minval(fw(lo:hi,lo:hi))
 
-  ! Branch gradients, averaged over every adjacent pair lying wholly on the side
-  ! in question.  Averaging over positions is what suppresses an alternating mean,
-  ! which a single difference would import into the reference.
+  ! Branch gradients averaged over all wholly grounded or floating adjacent pairs.
   gx = 0.0 ; gy = 0.0 ; nx = 0 ; ny = 0
   do b = 1, 2
     do q = -4, 4 ; do p = -4, 3
@@ -13450,8 +12424,7 @@ pure subroutine dg_kink_plane_2d(hw, fw, okw, lo, hi, tol, dqx, dqy, dq0, sigma,
   dqy = (gy(1)/real(ny(1))) - (gy(2)/real(ny(2)))
   if ((abs(dqx) + abs(dqy)) <= 0.0) return
 
-  ! Anchor on the most straddled cell available: it is the best conditioned place
-  ! to fix the offset, and an unstraddled one carries no information about it.
+  ! Anchor the constant on the most straddled cell.
   best = -1.0 ; pa = 0 ; qa = 0
   do q = lo, hi ; do p = lo, hi
     if (.not.okw(p,q)) cycle
@@ -13470,7 +12443,6 @@ pure subroutine dg_kink_plane_2d(hw, fw, okw, lo, hi, tol, dqx, dqy, dq0, sigma,
   ! Does one line actually describe this neighbourhood?  Having placed it,
   ! predict every straddling cell's grounded fraction from it and compare with
   ! what the partition reported.  A single line that fits reproduces them all.
-  !
   ! This is not a formality.  Against a grounding line curving with a radius of
   ! four to eight cells the single-line reference is WORSE than the
   ! mean-supported one it replaces -- errors above the amplitude of the mode it
@@ -13498,8 +12470,7 @@ pure subroutine dg_kink_plane_2d(hw, fw, okw, lo, hi, tol, dqx, dqy, dq0, sigma,
   valid = .true.
 end subroutine dg_kink_plane_2d
 
-!> The twist of the clipped linear kink over cell (p,q).
-!!
+!> Twist of max(0, D) over cell (p,q); the linear part has none.
 !! The smooth part of the field is a plane and contributes no twist at all, so the
 !! whole of it comes from the clipped part and follows from four corner values.
 pure function dg_kink_twist_at(dqx, dqy, dq0, p, q) result(w)
@@ -13514,31 +12485,8 @@ pure function dg_kink_twist_at(dqx, dqy, dq0, p, q) result(w)
   w = (m(4) - m(3)) - (m(2) - m(1))
 end function dg_kink_twist_at
 
-!> The part of a detector reading that no reference accounts for.
-!!
-!! Both references are the SAME operator applied to a different field -- the
-!! tilt the neighbouring cell means already justify, and the tilt the bed
-!! forces -- so A, A_ref and A_bed are directly comparable and their difference
-!! is meaningful.  The reading is shrunk toward the interval those references
-!! span, widened to include zero:
-!!
-!!   - inside the interval, some reference explains the reading and nothing is
-!!     removed;
-!!   - outside it, only the signed distance to the nearest end is removed, so
-!!     the term never damps A past what a reference supports and never past
-!!     zero.  The result always has the sign of A, so the correction always
-!!     reduces |A| and cannot overshoot.
-!!
-!! Zero is in the interval so that a reference of the opposite sign cannot
-!! license MORE damping than A itself, and so that a floating cell -- whose bed
-!! reference is scaled to zero by the grounded fraction -- keeps a valid
-!! interval rather than an empty one.
-!!
-!! On the mode the term exists to remove this changes nothing at all: a tilt
-!! reconstructed from cell means is identically zero on an alternating tilt,
-!! and also on an alternating MEAN, since hbar(k+1) - hbar(k-1) vanishes there.
-!! A smooth bed likewise gives A_bed = 0.  The interval collapses to {0} and
-!! the whole reading is returned, so the delivered relaxation time is untouched.
+!> The part of detector A outside the interval spanned by 0 and the references r1 and r2.
+!! It has the sign of A and never exceeds it, and equals A when both references are zero.
 pure function dg_unexplained(A, r1, r2) result(Ad)
   real, intent(in) :: A   !< The detector reading [Z ~> m]
   real, intent(in) :: r1  !< The same operator on the mean-supported tilt [Z ~> m]
@@ -13549,37 +12497,18 @@ pure function dg_unexplained(A, r1, r2) result(Ad)
   Ad = A - min(max(A, lo), hi)
 end function dg_unexplained
 
-!> Grounding-line protection weight over the reach a chosen stencil covers.
-!!
-!! The bisected cell is not the only cell whose floor a grounding line breaks.
-!! A_ref is built from CELL MEANS, and a slope break is precisely what a
-!! mean-supported reconstruction cannot represent: the means smooth the kink,
-!! the tilts resolve it, and |A| - |A_ref| is left large and systematically
-!! POSITIVE over the whole neighbourhood of the break rather than at the one
-!! cell the contour passes through.  Measured in MISMIP3d Stnd at 10 km, the
-!! four cells around the grounding line carry essentially all of the term's
-!! work, at |A| near 48 m against a floor of 34 m and gates from 0.16 to 0.71,
-!! while the biased-stencil cells carry 0.0% and the domain-mean gate is 0.02.
-!! Protecting only the bisected cell therefore leaves the term acting at close
-!! to full strength on the sub-grid grounding line itself.
-!!
-!! The reach is not a tunable band but the reach of an operator.  Level 1 is
-!! the cells whose TILT enters A, level 2 those whose MEAN enters A_ref, both
-!! following whichever bias the detector selected; level 0 is the cell alone.
+!> Grounding-line protection weight: 0 if the cell (reach 0), the detector stencil (reach 1) or
+!! the reference stencil (reach 2) contains both grounded and floating ice, otherwise 1.
 pure function dg_gl_reach_wt(fv, mode, reach) result(wt)
   real, dimension(-4:4), intent(in) :: fv !< Grounded fraction on the gather [nondim]
   integer, intent(in) :: mode  !< Stencil chosen: 1 centred, 2 forward, 3 backward
   integer, intent(in) :: reach !< 0 the cell alone, 1 the reach of A, 2 the reach of A_ref
   real :: wt                   !< Weight to apply to the rate [nondim]
-  ! Offsets each operator reads, by stencil: A is a second difference and
-  ! A_ref its own second difference of a first difference, two cells wider.
-  ! Every cell in either window is ice-covered by construction, since that is
-  ! what the detector's admissibility test guarantees before a bias is chosen.
+  ! Offsets read by A and A_ref for each stencil bias.
   integer, dimension(3), parameter :: Alo = (/ -1, 0, -2 /), Ahi = (/ 1, 2, 0 /)
   integer, dimension(3), parameter :: Rlo = (/ -2, 0, -4 /), Rhi = (/ 2, 4, 0 /)
   integer :: lo, hi
   if (reach <= 0) then
-    ! The cell alone, which can only ask whether the fraction is fractional.
     wt = merge(0.0, 1.0, (fv(0) > 0.0) .and. (fv(0) < 1.0))
     return
   elseif (reach == 1) then
@@ -13587,116 +12516,18 @@ pure function dg_gl_reach_wt(fv, mode, reach) result(wt)
   else
     lo = Rlo(mode) ; hi = Rhi(mode)
   endif
-  ! A window that contains both grounded and floating content has a grounding
-  ! line in it, whether or not any single cell reports a fractional value.
   wt = merge(0.0, 1.0, (minval(fv(lo:hi)) < 1.0) .and. (maxval(fv(lo:hi)) > 0.0))
 end function dg_gl_reach_wt
 
-!> Damp the grid-scale component of the in-cell tilt and twist degrees of freedom.
-!!
-!! Every dissipative mechanism in this scheme -- the upwind flux and the
-!! artificial viscosity alike -- is proportional to a face jump.  On a chain of
-!! cells the jump is
-!!   [[h]]_{j+1/2} = (hbar_{j+1} - hbar_j) - (t_j + t_{j+1})/2,
-!! so a tilt mode t_j = T*exp(i*j*theta) enters it through the factor
-!! (1 + exp(i*theta))/2, which is identically zero at theta = pi.  A tilt that
-!! alternates in sign between adjacent cells therefore contributes nothing to
-!! any jump and is invisible to all of them, while still supplying a spurious
-!! surface gradient to the momentum balance.
-!!
-!! The detector is a discrete Laplacian of the tilt field,
-!!   A_j = t_j - (t_{j-1} + t_{j+1})/2,
-!! whose Fourier response T*(1 - cos(theta)) vanishes on a uniform tilt -- the
-!! mode the artificial viscosity already handles, so the two do not overlap --
-!! is maximal at theta = pi, and is O(dx^3) on a smooth solution.
-!!
-!! Not all grid-scale tilt is spurious, and the test is what the momentum
-!! balance sees: the surface, not the thickness.  On grounded ice s = h - bed,
-!! so a flat surface requires A_h = A_bed exactly -- the floor is the bed's own
-!! tilt Laplacian with a coefficient of one, not a fitted multiple of it.  A
-!! floating cell owes the bed nothing (s = (1 - rho_i/rho_w) h), so its floor is
-!! zero.  The test stays one-sided: only ice carrying MORE structure than the
-!! bed explains is damped.  That matters where a sub-grid bed feature leaves the
-!! ice carrying LESS structure than it should (a sidewall narrower than a cell),
-!! since there |A_h - A_bed| is large but damping would drive A_h further from
-!! A_bed and make the surface structure grow.
-!!
-!! The harm is then weighted into surface terms by ds/dh, which is 1 on grounded
-!! ice and 1 - rho_i/rho_w on floating ice: the same thickness zigzag on a shelf
-!! produces about a ninth of the spurious surface gradient, so it is gated about
-!! a ninth as readily.
-!!
-!! The bed is not the only legitimate source of grid-scale tilt: a shear margin
-!! carries a real one that no bed explains.  So the floor also includes what the
-!! neighbouring cell MEANS already justify.  The means are the trusted data --
-!! they are what the flux divergence updates conservatively, and unlike the
-!! tilts they carry no jump-invisible mode, since a mean checkerboard does
-!! produce face jumps.  Their implied tilt is the central difference
-!!   t_ref_j = (hbar_j+1 - hbar_j-1)/2,
-!! and A_ref is the same Laplacian applied to it.  On a smooth solution both A
-!! and A_ref are -h'''dx^3/2 to leading order, so the difference vanishes to
-!! higher order than either -- the smooth-solution residual cancels instead of
-!! merely being thresholded.  On the alternating mode the means stay smooth
-!! while the tilts do not, so the difference survives.
-!!
-!! The two floors are combined with max() rather than added: over a rough bed
-!! the means already show the bed's own structure, so summing them would
-!! double-count and under-damp.
-!!
-!! The twist w (the xy-hourglass mode, NE - NW - SE + SW) has the same blind
-!! spot: it enters the along-face VARIATION of the jump through the sum
-!! (w_R + w_L), so a twist alternating between diagonal neighbours contributes
-!! nothing to any jump either.  It differs in that w*xi*eta integrates to zero
-!! over the cell, so it supplies no net driving stress and reaches the momentum
-!! balance only at second order -- invisible AND first-order forcing is the
-!! dangerous combination, and the twist has only the first half.  Its size is
-!! bed-dependent: a separable bed forces no twist at all (d2b/dxdy = 0), which
-!! is why MISMIP+ shows 1.4% of the tilt and a continental bed shows 35%.  It is
-!! damped on the same terms behind DG1_TWIST_DAMP, with the 4-neighbour detector
-!! w - (sum of neighbours)/4 whose response 1 - (cos(tx)+cos(ty))/2 vanishes on a
-!! uniform twist, and the sign pattern +,-,-,+ which is orthogonal to the cell
-!! mean and to both tilts.
-!!
-!! Every field the detector reads is undefined over ice-free ground, where the
-!! nodal thickness is zero.  A zero there is not "no structure" but a fictitious
-!! cliff, and it corrupts the detector and both floors at once; an ice-free cell
-!! also reads as fully floating, so it neither carries grounding-line protection
-!! nor keeps its bed floor.  Each direction is therefore gated on ITS OWN stencil, not on a block:
-!! the xi detector never leaves row j, so it asks only for ice on (i-2:i+2, j),
-!! the reach of the mean-supported reference.  A block test would switch off
-!! xi damping in the outer rows of a domain, which in a problem uniform in y
-!! manufactures exactly the grid-scale y structure this term exists to remove.
-!! Under-damping at an ice edge is the safe direction; over-damping there drives
-!! nodes onto the positivity floor.
-!!
-!! Where the flotation contour crosses a cell the in-cell tilt IS the sub-cell
-!! grounding-line position -- it is what makes h - h_flot change sign inside the
-!! element rather than the whole cell switching regime -- and no indicator built
-!! on a third difference can separate that from the spurious mode, a grounding
-!! line being a genuine slope break in whichever field is gated on.  At fixed
-!! cell mean the tilt and the position of the crossing are in one-to-one
-!! correspondence, so in one dimension no scheme can damp such a cell without
-!! moving its grounding line.
-!!
-!! Such a cell is therefore not damped, f being the sub-element grounded
-!! fraction CS%ground_frac -- measured on the DG nodal state by the SEP2/SEP3
-!! partition, not reconstructed here.  Only the cell itself: its NEIGHBOURS are
-!! damped normally, even though their stencils read it.  Two alternatives were
-!! tried and are worse.  Silencing the whole stencil reach as well changes
-!! MISMIP+ by 0.6 km, six percent of a cell, so it buys nothing -- the floors
-!! already absorb the contamination, the excess at a cell one away from the
-!! grounding line falling from 5.9 m to 0.24 m once the mean-supported floor is
-!! applied -- while it blankets an ice stream that grounds and ungrounds inside
-!! a valley a few cells across.  And grading the protection by |2f-1| instead of
-!! switching it leaves the grounding line oscillating and displaces it 6 km
-!! beyond BOTH extremes, which is what intermediate gain does in a feedback
-!! loop: the loop rings at partial damping and settles at either end.
-!!
-!! The same f sets ds/dh and the share of the bed floor a cell is owed.
-!!
-!! The correction is applied as equal and opposite rates on the two nodes that
-!! define the tilt, so the cell mean is unchanged to machine precision: this
-!! term redistributes within a cell and moves no mass between cells.
+!> Nodal rates damping the grid-scale in-cell tilt and twist. A tilt alternating between cells
+!! adds nothing to any face jump, so the upwind flux and the artificial viscosity cannot see it,
+!! but it gives a spurious surface slope. The detector is the tilt Laplacian
+!! A = t_j - (t_j-1 + t_j+1)/2, zero on a uniform tilt and O(dx^3) when smooth. Only the part
+!! not explained by the bed (grounded share only) or by the tilt of the cell means is removed,
+!! gated by ds/dh relative to the thickness. Grounding-line cells are protected per
+!! DG1_TILT_DAMP_GL_REACH unless the kink reference explains them. The twist
+!! (SW - SE - NW + NE) is treated the same way with a 2D detector. The corrections are
+!! equal and opposite between nodes, so the cell mean is unchanged.
 subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   type(ice_shelf_dyn_CS), intent(in)  :: CS   !< Ice shelf dynamics control structure
   type(ocean_grid_type),  intent(in)  :: G    !< Ocean grid structure
@@ -13709,7 +12540,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real, dimension(SZDI_(G),SZDJ_(G)) :: t_eta  ! Per-cell eta-tilt of thickness [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: b_xi   ! Per-cell xi-tilt of the bed [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: b_eta  ! Per-cell eta-tilt of the bed [Z ~> m]
-  real, dimension(SZDI_(G),SZDJ_(G)) :: hbar_c ! Cell-mean thickness [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: hbar_c ! Mean of the four corner thicknesses [Z ~> m]
   logical, dimension(SZDI_(G),SZDJ_(G)) :: ice_ok !< True on a fully ice-covered cell
   real, dimension(SZDI_(G),SZDJ_(G)) :: w_c    ! Per-cell xy-twist of thickness [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: b_w    ! Per-cell xy-twist of the bed [Z ~> m]
@@ -13735,13 +12566,10 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   logical :: kw_ok  ! True if that break could be reconstructed at all
   real :: knat_xi, knat_eta ! Removal rate the transport already delivers on each axis [T-1 ~> s-1]
   real :: kwant     ! Rate the gate asks for, before the transport's share [T-1 ~> s-1]
-  real :: itau_xi, itau_eta, itau_w ! 1/(2*tau) per direction, from DG1_TILT_DAMP_U_CUT
-                    !! from DG1_TILT_DAMP_U_CUT [T-1 ~> s-1]
-  real :: d_l2      ! Sum of squares of the per-mode corrections, for the activity
-                    !! diagnostic [Z2 T-2 ~> m2 s-2]
-  real :: d_gate    ! Largest gate opened in this cell, over the three modes [nondim]
-  real :: d_want, d_got ! Rates summed over the modes, before and after the transport's
-                    !! share, for the withheld-fraction diagnostic [T-1 ~> s-1]
+  real :: itau_xi, itau_eta, itau_w ! Full rate per mode, from DG1_TILT_DAMP_U_CUT [T-1 ~> s-1]
+  real :: d_l2      ! Sum of squared corrections, for diagnostics [Z2 T-2 ~> m2 s-2]
+  real :: d_gate    ! Largest gate over the three modes [nondim]
+  real :: d_want, d_got ! Rates summed over modes, before and after the transport credit [T-1 ~> s-1]
   logical :: diag_on ! True if any of the three activity diagnostics is registered
   integer :: k, kk, kj, jj ! Stencil offsets, and the clamped array indices
   ! Twist gathers, over the 7x7 block the biased cross difference can reach.
@@ -13763,21 +12591,18 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   ! Trial order: centred in both axes first, then centred in one, then neither.
   integer, dimension(9), parameter :: bx_try = (/ 1,1,1, 2,3, 2,2,3,3 /)
   integer, dimension(9), parameter :: by_try = (/ 1,2,3, 1,1, 2,3,2,3 /)
-  ! The trial list above is ordered by how much biasing it uses: entry 1 is
-  ! centred on both axes, entries 2-5 bias exactly one axis, entries 6-9 bias both.
+  ! Tiers of that list: centred in both, biased in one, biased in both.
   integer, dimension(3), parameter :: tw_lo = (/ 1, 2, 6 /), tw_hi = (/ 1, 5, 9 /)
   real :: floor_A  ! Larger of the bed- and mean-supported floors [Z ~> m]
   real :: excess   ! One-sided excess over that floor [Z ~> m]
   real :: href     ! Cell-mean thickness used to normalize the gate [Z ~> m]
-  real :: dsdh     ! d(surface)/d(thickness) for this cell: 1 grounded,
-                   ! 1 - rho_i/rho_w floating [nondim]
+  real :: dsdh     ! ds/dh, 1 grounded and 1 - rho_i/rho_w floating [nondim]
   real :: gam      ! Gate fraction, 0 to 1 [nondim]
   real :: kap      ! Delivered rate for this cell and direction [T-1 ~> s-1]
   real :: rate_cap ! Largest rate the explicit step may carry [T-1 ~> s-1]
   real :: rhoi_rhow ! Ice/ocean density ratio for the flotation test [nondim]
   real :: one_m_r  ! 1 - rho_i/rho_w, the floating-ice ds/dh [nondim]
-  real, dimension(SZDI_(G),SZDJ_(G)) :: f_gnd !< Sub-element grounded fraction,
-                   !! taken from CS%ground_frac rather than reconstructed here
+  real, dimension(SZDI_(G),SZDJ_(G)) :: f_gnd ! CS%ground_frac clipped to [0,1] [nondim]
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed
 
   T_node(:,:,:,:) = 0.0
@@ -13791,9 +12616,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
-  ! Reach is two cells: A_ref at i reads tref at i-1:i+1, and tref at i-1 reads
-  ! the cell mean at i-2.  With a halo of one those edge values are the
-  ! zero-initialized array bounds, which would be read as real data.
+  ! A_ref reads cell means two cells away.
   if ((G%isc - G%isd < 2) .or. (G%jsc - G%jsd < 2)) call MOM_error(FATAL, &
     "dg_nodal_mode_damp_rate: DG1_TILT_DAMP needs a halo of at least 2 cells; "//&
     "increase NIHALO/NJHALO.")
@@ -13809,11 +12632,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   ! left to advection and the artificial viscosity.
   rate_cap = 0.5 / max(dt, tiny(dt))
 
-  ! Cell means on the full halo: the mean-supported tilt below reads one cell
-  ! either way, and its own Laplacian reads one further.
-  ! Everything that needs only cell-local data is built on the FULL halo, so
-  ! that a stencil reaching the outermost ring reads real values.  Only the bed
-  ! tilts are restricted below, because they index bed_node one further out.
+  ! Cell-local fields on the full data domain.
   hbar_c(:,:) = 0.0 ; ice_ok(:,:) = .false.
   t_xi(:,:) = 0.0 ; t_eta(:,:) = 0.0 ; w_c(:,:) = 0.0
   f_gnd(:,:) = 0.0
@@ -13828,17 +12647,12 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     if (CS%dg_twist_damp) &
       w_c(i,j) = (h_nodal_in(i,j,2,2) - h_nodal_in(i,j,1,2)) - &
                  (h_nodal_in(i,j,2,1) - h_nodal_in(i,j,1,1))
-    ! The sub-element grounded fraction, measured on this same nodal state by
-    ! the SEP2/SEP3 partition in compute_ground_frac.  Not reconstructed here:
-    ! any second opinion would disagree with the friction and the driving stress
-    ! about where the grounding line is.
+    ! The sub-element grounded fraction
+    ! TODO: use f_ground_cell instead for CISM-style grounding with DG for advection?
     f_gnd(i,j) = min(max(CS%ground_frac(i,j), 0.0), 1.0)
   enddo ; enddo
 
-  ! Bed tilts index bed_node one cell beyond the host cell, so they stop one
-  ! ring short of the halo edge.  The outermost ring is never read by a selected
-  ! stencil: the biased branches that would reach it are exactly the ones the
-  ! range test rejects there.
+  ! Bed tilts read bed_node, so they stop one ring short; no chosen stencil reads that ring.
   b_xi(:,:) = 0.0 ; b_eta(:,:) = 0.0 ; b_w(:,:) = 0.0
   do j = jsd+1, jed-1 ; do i = isd+1, ied-1
     b_xi(i,j)  = 0.5*((CS%bed_node(I,J-1) - CS%bed_node(I-1,J-1)) + &
@@ -13856,32 +12670,11 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     if (href <= 0.0) cycle
     d_l2 = 0.0 ; d_gate = 0.0 ; d_want = 0.0 ; d_got = 0.0
 
-    ! The gate is normalized by the MEAN cell thickness over whichever stencil
-    ! the detector ended up using, returned by dg_tilt_detector_1d, rather than
-    ! by the local value.  The spurious driving stress the mode produces is
-    ! rho*g*h*(mu*E/dx), which scales WITH thickness, so the local value makes
-    ! the term most eager on the thinnest ice, where the harm is least: on a
-    ! continental bed the gate saturates in 20% of the thinnest decile against
-    ! 8% elsewhere.  The stencil mean is exactly the local value wherever
-    ! thickness varies linearly, so it changes nothing in the interior, and
-    ! rises only where a cell sits in a dip relative to its neighbours -- which
-    ! is the case it is meant to catch.  The stencil MAXIMUM was tried first and
-    ! is too blunt: it rises wherever thickness varies at all, weakening the
-    ! term across the whole domain rather than at margins.
-
-    ! ds/dh and the share of the bed floor the cell is owed, both interpolated
-    ! by the grounded fraction: a flat surface on grounded ice needs
-    ! A_h = A_bed exactly, while a floating cell owes the bed nothing.
+    ! The gate is normalized by the mean thickness over the chosen stencil.
     dsdh = one_m_r + f_gnd(i,j)*(1.0 - one_m_r)
 
-    ! The rate the transport itself delivers on each axis.  Cell-centred speed
-    ! from the four B-grid corners, so it carries no staggering of its own; per
-    ! axis, because the xi mode is swept out by u and the eta mode by v, and
-    ! across a confined stream only the second of those vanishes.
-    ! 1/(2*tau) per direction.  With U_CUT set, tau = dx/(2*c*U_CUT) in each
-    ! direction separately, so the wanted rate is c*U_CUT/dx: a speed divided by
-    ! the cell size in the direction the mode alternates along.  The twist
-    ! alternates along both, so it takes the cell's geometric mean size.
+    ! Full rate c*U_CUT/dx along each axis; the twist uses sqrt(dx*dy). knat is the rate the
+    ! transport itself delivers, from the cell-centred |u| or |v|.
     itau_xi  = CS%dg_damp_advective_c * CS%dg_damp_u_cut * G%IdxT(i,j)
     itau_eta = CS%dg_damp_advective_c * CS%dg_damp_u_cut * G%IdyT(i,j)
     itau_w   = CS%dg_damp_advective_c * CS%dg_damp_u_cut * &
@@ -13897,11 +12690,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
                  (abs(CS%v_shelf(I,J-1))   + abs(CS%v_shelf(I-1,J))))
     endif
 
-    ! --- xi direction ---
-    ! Nothing in this direction leaves row j, so a neighbouring ROW being
-    ! ice-free is no reason to stop.  The grounding-line protection is taken as
-    ! the minimum over the reach DG1_TILT_DAMP_GL_REACH asks for, evaluated on
-    ! the stencil the detector actually chose, so it follows the bias.
+    ! --- xi direction, gated only on row j ---
     if (CS%dg_tilt_damp) then
       do k = -4, 4
         kk = min(max(i+k, isd), ied)
@@ -13912,10 +12701,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       call dg_tilt_detector_1d(tv, bv, hv, okv, gv, CS%dg_damp_kink_ref, &
                                CS%dg_damp_kink_fit_tol, &
                                A_h, A_bed, A_ref, href_d, det_ok, dmode, kink_c)
-      ! The exemption is a workaround for a reference that cannot represent the
-      ! break.  Where the reference now represents it, there is nothing to work
-      ! around, and the cell is damped like any other -- which is the point, those
-      ! being the thin, heavily buttressing cells along a channel's walls.
+      ! Grounding-line protection, relaxed where the reference carries the kink.
       gwt = kink_c + (1.0 - kink_c) * &
             dg_gl_reach_wt(gv, max(dmode,1), CS%dg_damp_gl_reach)
       ! One-sided, so ice carrying LESS structure than the bed forces is left
@@ -13957,10 +12743,6 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       call dg_tilt_detector_1d(tv, bv, hv, okv, gv, CS%dg_damp_kink_ref, &
                                CS%dg_damp_kink_fit_tol, &
                                A_h, A_bed, A_ref, href_d, det_ok, dmode, kink_c)
-      ! The exemption is a workaround for a reference that cannot represent the
-      ! break.  Where the reference now represents it, there is nothing to work
-      ! around, and the cell is damped like any other -- which is the point, those
-      ! being the thin, heavily buttressing cells along a channel's walls.
       gwt = kink_c + (1.0 - kink_c) * &
             dg_gl_reach_wt(gv, max(dmode,1), CS%dg_damp_gl_reach)
       A_bed = f_gnd(i,j)*A_bed
@@ -14000,18 +12782,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         if (k == 0) gwy(kj) = f_gnd(kk,jj)
       enddo ; enddo
 
-      ! The 2D detector separates, A_w = (A_xi(w) + A_eta(w))/2, so each axis
-      ! takes its own bias; only the mean-supported reference is genuinely
-      ! two-dimensional, and it is a product of two first differences which
-      ! bias the same way.  Take the first admissible pair in preference order.
-      ! Collect EVERY admissible pair in the least-biased tier that has one, rather
-      ! than the first entry that fits. Taking the first makes the result depend on
-      ! the order within a tier, and a quarter turn of the grid permutes that order,
-      ! so two orientations of the same problem can choose different stencils. The
-      ! turn carries the admissible set of a tier onto itself, so averaging over it
-      ! does not depend on the order. At most two pairs can fit at once: once an
-      ! axis loses its centred stencil, the cell that blocked it also blocks one of
-      ! that axis's two one-sided stencils, leaving one choice per axis.
+      ! A_w = (A_xi(w) + A_eta(w))/2, each axis with its own bias. All admissible bias pairs in
+      ! the least-biased tier are averaged, so the choice does not depend on trial order.
       ntw = 0
       do tier = 1, 3
         do m = tw_lo(tier), tw_hi(tier)
@@ -14027,10 +12799,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
 
       excess = -1.0
       if (tw_ok) then
-        ! Place the flotation break once for the whole neighbourhood, and blend
-        ! the reference toward the twist it implies by how much of a transition
-        ! the window spans.  A span of zero returns the mean-supported form bit
-        ! for bit, so nothing away from a grounding line moves.
+        ! Blend the reference toward the kink's twist by the grounded-fraction span.
         kw_ok = .false. ; ksig = 0.0 ; kconf = 0.0
         if (CS%dg_damp_kink_ref) &
           call dg_kink_plane_2d(hw, fw, okw, -2, 2, CS%dg_damp_kink_tol, &
@@ -14075,6 +12844,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         endif
       endif
       if (excess > 0.0) then
+        ! Protection interpolated on the kink-fit confidence.
         ! The twist's second difference separates by axis, so the protection
         ! does too: each axis contributes the minimum over its own bias's reach.
         ! Where the reference carries the break there is nothing for the
@@ -14087,11 +12857,13 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         ! whole exercise exists to avoid.
         gwt = kconf + ((1.0 - kconf) * reach_w)
         gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_w))
+        ! Credit the slower of the two sweeps.
         ! The checkerboard twist alternates along BOTH axes, so it survives as
         ! long as either sweep is slow: credit the transport with the smaller of
         ! the two rates, not their sum.
         kwant = gam * itau_w
         kap = min(max(kwant - min(knat_xi, knat_eta), 0.0), rate_cap)
+        ! Changes w by -kap*A_dmp, orthogonal to the mean and the tilts.
         ! +,-,-,+ : changes w by 4*(-0.25*kap*A_dmp) = -kap*A_dmp, and is exactly
         ! orthogonal to the cell mean and to both tilts.
         T_node(i,j,1,1) = T_node(i,j,1,1) - (0.25*kap*A_dmp)
@@ -14116,6 +12888,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
 end subroutine dg_nodal_mode_damp_rate
 
 
+!> Advance CS%h_nodal one step with SSP-RK2, including the sources and mode damping, and return
+!! the stage-averaged face fluxes.
 subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_ice)
   type(ice_shelf_dyn_CS), intent(inout) :: CS
   type(ice_shelf_state),  intent(in)    :: ISS
@@ -14126,29 +12900,11 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   real, dimension(SZDI_(G),SZDJB_(G)),      intent(inout) :: vh_ice
 
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: h0, h_curr, rhs
-  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: S_node ! Q1 nodal source per cell [Z T-1].
-                                                   ! Continuous across cell faces by
-                                                   ! construction; integrating it against
-                                                   ! the local mass matrix recovers the
-                                                   ! source contribution to dh_nodal/dt.
-  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: T_node ! Q1 nodal tilt-damping rate per cell
-                                                   ! [Z T-1]. Pure tilt: equal and opposite
-                                                   ! on the two nodes of each direction, so
-                                                   ! the cell mean is untouched and no mass
-                                                   ! moves between cells.
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: S_node ! Nodal source rate [Z T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: T_node ! Nodal mode-damping rate [Z T-1 ~> m s-1]
   real, dimension(2,2) :: dh
-  real :: tau_chk ! Shortest relaxation time the mode damper will deliver anywhere in the
-                  ! computational domain, for the time-step warning [T ~> s]
-  character(len=24) :: n1, n2 ! Formatted numbers for the warnings below.  Only the
-                  ! NUMBERS go through an internal write; the prose is concatenated
-                  ! afterwards.  Two hazards are avoided that way, both of which bit:
-                  ! an internal write that overruns its scalar buffer does not
-                  ! truncate but fails at run time with "too many records", the
-                  ! format having tried to start a second record where a scalar has
-                  ! only one; and the "//& idiom that MOM6 uses to continue a long
-                  ! message means something different inside a FORMAT literal, where
-                  ! it splices two quoted strings and leaves a stray quote in the
-                  ! format itself.
+  real :: tau_chk ! Shortest mode-damper relaxation time in the domain [T ~> s]
+  character(len=24) :: n1, n2 ! Numbers for the warnings; the text is concatenated separately
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed, a, b
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
@@ -14163,11 +12919,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   h0(:,:,:,:) = CS%h_nodal(:,:,:,:)
   call pass_corner_field(h0, G)
 
-  ! Project the cell-mean source rate accumulated since the last advect
-  ! (basal melt + surface SMB, units Z T-1) onto a continuous Q1 nodal field.
-  ! For a Q1-projected source, the consistent Galerkin treatment M*dh/dt = -L
-  ! + M*S_node collapses after M^-1 to dh/dt += S_node element-wise, so the
-  ! source enters each SSP-RK2 stage as a simple additive term on dh.
+  ! A nodal source S enters as M*S, so after M^-1 it is added to dh/dt directly.
   call project_h_source_rate_to_nodes(CS, ISS, G, S_node)
 
   if (CS%debug) then
@@ -14175,10 +12927,11 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
     if (CS%dg_basal_source_sem2) call check_xi_basal_consistency(CS, ISS, G)
   endif
 
-  ! Stage 1: positivity floor -> hierarchical limiter -> spatial op -> M^-1 -> Euler step.
+  ! Stage 1: positivity limit, spatial operator, M^-1, Euler step.
   call nodal_positivity_limit(CS, G, ISS)
   call pass_corner_field(CS%h_nodal, G)
   call DG1_nodal_spatial_operator(CS, G, hmask, CS%h_nodal, rhs, uh_ice, vh_ice, time_step)
+
   ! Two independent floors on the delivered relaxation time, warned once each.
   ! Neither is a stability bound: the 0.5/dt rate cap covers stability outright.
   !
@@ -14205,23 +12958,18 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   ! against the advection step, as this did, is permissive by exactly the ratio of
   ! the two, which is why the old threshold had to be set at 50 advection steps to
   ! catch anything at all.
+
+  ! Warn once if the shortest relaxation time is below the advection step, where the rate cap
+  ! binds, or within 10 velocity steps, where the lagged velocity feedback can ring.
   if ((CS%dg_tilt_damp .or. CS%dg_twist_damp) .and. .not.CS%dg_tilt_damp_dt_warned) then
-    ! With U_CUT set the relaxation time varies by cell and by direction, so the
-    ! binding one is the smallest: tau = dx/(2*c*U_CUT), minimised over the
-    ! shortest cell dimension in the computational domain.
+    ! tau = dx/(2*c*U_CUT) over the shortest cell dimension.
     tau_chk = huge(1.0)
     do j = jsc, jec ; do i = isc, iec
       tau_chk = min(tau_chk, 0.5 / max(CS%dg_damp_advective_c * CS%dg_damp_u_cut * &
                                        max(G%IdxT(i,j), G%IdyT(i,j)), tiny(1.0)))
     enddo ; enddo
-    ! One collective, once per run, so that a PE holding the smallest cell is not
-    ! the only one that knows.  Every PE reaches this: the flag below is set
-    ! unconditionally and the enclosing test is on parameters, so there is no
-    ! path where some ranks enter the reduction and others do not.
+    ! Every PE reaches this collective.
     call min_across_PEs(tau_chk)
-    ! Root only.  A warning from every rank at once is what overwhelms the error
-    ! handler on a large decomposition, and the message is identical on all of
-    ! them now that the minimum is global.
     if (is_root_pe()) then
       if (tau_chk < time_step) then
         write(n1,'(ES10.3)') tau_chk ; write(n2,'(ES10.3)') time_step
@@ -14256,7 +13004,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   enddo ; enddo
   call pass_corner_field(CS%h_nodal, G)
 
-  ! Stage 2: positivity floor -> hierarchical limiter -> spatial op -> M^-1 -> SSP-RK2 combine.
+  ! Stage 2: positivity limit, spatial operator, M^-1, SSP-RK2 combination.
   call nodal_positivity_limit(CS, G, ISS)
   h_curr(:,:,:,:) = CS%h_nodal(:,:,:,:)
   call DG1_nodal_spatial_operator(CS, G, hmask, h_curr, rhs, uh_ice, vh_ice, time_step)
@@ -14273,13 +13021,12 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   enddo ; enddo
   call pass_corner_field(CS%h_nodal, G)
 
-  ! Snapshot the rate just consumed for the h_source_rate diagnostic, then
-  ! reset the buffer so subsequent melt/SMB callers start from a clean slate.
+  ! Keep the consumed source for diagnostics and reset the buffers.
   CS%h_source_rate_last(:,:) = CS%h_source_rate(:,:)
   CS%h_source_rate(:,:) = 0.0
   CS%h_source_rate_bmb(:,:) = 0.0
 
-  ! Final positivity floor + optional hierarchical limit on the SSP-RK2 result.
+  ! Final positivity limit.
   call nodal_positivity_limit(CS, G, ISS)
   call pass_corner_field(CS%h_nodal, G)
 

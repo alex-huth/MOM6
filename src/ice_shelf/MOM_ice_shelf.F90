@@ -55,7 +55,7 @@ use MOM_get_input, only : directories, Get_MOM_input
 use MOM_EOS, only : calculate_density, calculate_density_derivs, calculate_TFreeze, EOS_domain
 use MOM_EOS, only : EOS_type, EOS_init
 use MOM_ice_shelf_dynamics, only : ice_shelf_dyn_CS, update_ice_shelf, write_ice_shelf_energy
-use MOM_ice_shelf_dynamics, only : reset_DG_to_cellmean_at_cell, reset_DG_to_cellmean_bulk
+use MOM_ice_shelf_dynamics, only : reset_DG_to_cellmean_at_cell, zero_DG_h_nodal
 use MOM_ice_shelf_dynamics, only : accumulate_DG_source_rate
 use MOM_ice_shelf_dynamics, only : calc_prescribed_basal_melt
 use MOM_ice_shelf_dynamics, only : register_ice_shelf_dyn_restarts, initialize_ice_shelf_dyn
@@ -1252,22 +1252,10 @@ subroutine change_thickness_using_melt(CS, ISS, G, US, time_step, fluxes)
       if (associated(fluxes%salt_flux)) fluxes%salt_flux(i,j) = 0.0
 
       if (ISS%water_flux(i,j) * time_step * I_rho_ice < ISS%h_shelf(i,j)) then
-        ! On the DG path, this direct h_shelf update is a transient: the same
-        ! mass change will be applied through h_nodal inside the next DG advect
-        ! step (see accumulate_DG_source_rate below), and recompute_h_shelf_from_nodal
-        ! will then overwrite h_shelf with the post-advect nodal mean for hmask=1
-        ! and hmask=3 cells. The update is kept for two reasons: (1) the dh_bdott
-        ! diagnostic snapshot captures the change here; (2) the non-DG path uses
-        ! h_shelf as the authoritative state. Intermediate consumers between this
-        ! point and the DG advect (mass_shelf recompute, mass_ba snapshot, debug
-        ! hchksum) all read the intermediate value as intended.
+        ! Under DG this update is provisional: the source is applied to h_nodal by the next
+        ! DG advection, which then resets h_shelf to the nodal mean.
         ISS%h_shelf(i,j) = ISS%h_shelf(i,j) - ISS%water_flux(i,j) * time_step * I_rho_ice
-        ! DG path: accumulate the cell-mean ablation rate (negative for melt) into
-        ! the source buffer so the next DG advect picks it up as a Q1 nodal RHS
-        ! source inside the SSP-RK2 stages. Restricted to hmask=1 cells, matching
-        ! the cells the DG advect actually updates; hmask=2 cells stay on the
-        ! direct h_shelf path above and are not touched by the DG source pipeline.
-        ! No-op when DG is inactive.
+        ! DG source, for the hmask=1 cells the DG advection updates.
         if (ISS%hmask(i,j) == 1) then
           call accumulate_DG_source_rate(CS%dCS, i, j, &
                   -ISS%water_flux(i,j) * I_rho_ice, basal=.true.)
@@ -2169,7 +2157,7 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
   ISS%mass_shelf(:,:)=0.0
   ISS%mass_hole=0.0
   ISS%tot_flux_inout = 0.0
-  call reset_DG_to_cellmean_bulk(CS%dCS)
+  call zero_DG_h_nodal(CS%dCS)
 
   if (CS%override_shelf_movement .and. CS%mass_from_file) then
 
@@ -2261,10 +2249,8 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
   endif
 
   if (new_sim .and. (.not. (CS%override_shelf_movement .and. CS%mass_from_file))) then
-    ! This model is initialized internally or from a file. The nodal thickness array is
-    ! handed over so that INIT_ICE_THICKNESS_NODAL can fill it here, where the cell mean it
-    ! implies is still needed to set mass_shelf below. It is allocated by
-    ! register_ice_shelf_dyn_restarts, which has already run.
+    ! This model is initialized internally or from a file. h_nodal is passed so that
+    ! INIT_ICE_THICKNESS_NODAL can fill it.
     h_nodal_ptr => DG_nodal_thickness_ptr(CS%dCS)
     call initialize_ice_thickness(ISS%h_shelf, ISS%area_shelf_h, ISS%hmask, ISS%melt_mask, CS%Grid, CS%Grid_in, &
                                   US, param_file, CS%rotate_index, CS%turns, h_nodal=h_nodal_ptr)
@@ -2779,19 +2765,9 @@ subroutine change_thickness_using_precip(CS, ISS, G, US, fluxes, time_step, Time
     if ((ISS%hmask(i,j) == 1) .or. (ISS%hmask(i,j) == 2 .and. ISS%h_shelf(i,j) > 0)) then
 
       if (-fluxes%shelf_sfc_mass_flux(i,j) * time_step * I_rho_ice  < ISS%h_shelf(i,j)) then
-        ! On the DG path, this direct h_shelf update is a transient: the same
-        ! mass change will be applied through h_nodal inside the next DG advect
-        ! step (see accumulate_DG_source_rate below), and recompute_h_shelf_from_nodal
-        ! will then overwrite h_shelf with the post-advect nodal mean for hmask=1
-        ! and hmask=3 cells. The update is kept for the dh_adott diagnostic
-        ! snapshot and for the non-DG path where h_shelf is authoritative.
+        ! Under DG this update is provisional; see change_thickness_using_melt.
         ISS%h_shelf(i,j) = ISS%h_shelf(i,j) + fluxes%shelf_sfc_mass_flux(i,j) * time_step * I_rho_ice
-        ! DG path: accumulate the cell-mean surface mass-balance rate into the
-        ! source buffer (positive = accumulation, negative = ablation). The
-        ! source is later consumed by the SSP-RK2 stages of the DG advect step
-        ! via a continuous Q1 nodal projection. Restricted to hmask=1 cells to
-        ! match the cells the DG advect updates; hmask=2 cells stay on the
-        ! direct h_shelf path. No-op when DG is inactive.
+        ! DG source, for the hmask=1 cells the DG advection updates.
         if (ISS%hmask(i,j) == 1) then
           call accumulate_DG_source_rate(CS%dCS, i, j, &
                   fluxes%shelf_sfc_mass_flux(i,j) * I_rho_ice, basal=.false.)
@@ -3081,14 +3057,8 @@ subroutine solo_step_ice_shelf(CS, time_interval, nsteps, Time, min_time_step_in
       call MOM_mesg("solo_step_ice_shelf: "//mesg, 5)
     endif
 
-    ! Prescribed basal melt. calc_prescribed_basal_melt only fills ISS%water_flux (and is a
-    ! no-op unless ICE_ONLY_BASAL_MELT is set); change_thickness_using_melt then applies it
-    ! exactly as it does for ocean-supplied melt in a coupled run, so the melt-away handling,
-    ! the mass_hole accounting and the DG source accumulation are shared between the two paths.
-    ! The melt is applied before the surface mass balance, as it is in a coupled run, so that
-    ! calc_prescribed_basal_melt reads the ice thickness that the grounded fractions it also
-    ! reads were computed from.  Were the precipitation applied first, the melt rate would be
-    ! set from the updated thickness but scaled by a grounded fraction that predates it.
+    ! Prescribed basal melt sets ISS%water_flux, applied as in a coupled run. It comes before the
+    ! surface mass balance so the thickness matches the grounded fractions it reads.
     if (CS%bmb_diag) dh_bdott(is:ie,js:je) = ISS%h_shelf(is:ie,js:je)
     call calc_prescribed_basal_melt(CS%dCS, ISS, G, US)
     call change_thickness_using_melt(CS, ISS, G, US, time_step, fluxes_in)

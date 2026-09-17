@@ -53,9 +53,8 @@ subroutine initialize_ice_thickness(h_shelf, area_shelf_h, hmask, melt_mask, G, 
   type(param_file_type), intent(in)    :: PF !< A structure to parse for run-time parameters
   logical, intent(in), optional        :: rotate_index !< If true, this is a rotation test
   integer, intent(in), optional        :: turns !< Number of turns for rotation test
-  real, dimension(:,:,:,:), optional, pointer :: h_nodal !< Q1 nodal thickness at the 4 cell
-                                             !! corners, filled only when
-                                             !! INIT_ICE_THICKNESS_NODAL is true [Z ~> m].
+  real, dimension(:,:,:,:), optional, pointer :: h_nodal !< DG(1) corner thickness, filled only
+                                             !! under INIT_ICE_THICKNESS_NODAL [Z ~> m].
 
   character(len=40)  :: mdl = "initialize_ice_thickness" ! This subroutine's name.
   character(len=200) :: config
@@ -121,9 +120,8 @@ subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, melt
                          intent(inout) :: melt_mask !< A mask indicating where to allow ice-shelf melting [nondim]
   type(unit_scale_type), intent(in)    :: US !< A structure containing unit conversion factors
   type(param_file_type), intent(in)    :: PF !< A structure to parse for run-time parameters
-  real, dimension(:,:,:,:), optional, pointer :: h_nodal !< Q1 nodal thickness at the 4 cell
-                                             !! corners, filled only when
-                                             !! INIT_ICE_THICKNESS_NODAL is true [Z ~> m].
+  real, dimension(:,:,:,:), optional, pointer :: h_nodal !< DG(1) corner thickness, filled only
+                                             !! under INIT_ICE_THICKNESS_NODAL [Z ~> m].
 
   !  This subroutine reads ice thickness and area from a file and puts it into
   !  h_shelf [Z ~> m] and area_shelf_h [L2 ~> m2] (and dimensionless) and updates hmask
@@ -156,12 +154,9 @@ subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, melt
                  "a cell-averaged one.", &
                  default="h_shelf")
   call get_param(PF, mdl, "INIT_ICE_THICKNESS_NODAL", nodal_thickness, &
-                 "If true, ICE_THICKNESS_VARNAME is read as a nodal (B-grid corner) "//&
-                 "field rather than a cell average, and the cell-averaged thickness is "//&
-                 "derived from it as the area-weighted mean of the bilinear interpolant "//&
-                 "of the four corners. The corner values are also the Q1 nodal thickness "//&
-                 "used by USE_DG_THICKNESS; without DG they are discarded after "//&
-                 "initialization. Requires the shelf mask to be present in the file.", &
+                 "If true, read ICE_THICKNESS_VARNAME at B-grid nodes and set the cell thickness "//&
+                 "to the area-weighted mean of their bilinear interpolant. The nodes also "//&
+                 "initialize USE_DG_THICKNESS. Requires the shelf mask in the file.", &
                  default=.false.)
   call get_param(PF, mdl, "ICE_AREA_VARNAME", area_varname, &
                  "The name of the area variable in ICE_THICKNESS_FILE.", &
@@ -202,9 +197,7 @@ subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, melt
     enddo ; enddo
   endif
 
-  ! Read the nodal thickness and derive the cell mean from it. This happens after hmask is
-  ! known, because ice-free cells take no thickness from the nodal field, and before the
-  ! area/hmask loop below, which reads h_shelf through the side-stress taper.
+  ! Nodal thickness and its cell means, once hmask is known.
   if (nodal_thickness) then
     if (.not. present(h_nodal)) call MOM_error(FATAL, "initialize_ice_thickness_from_file: "//&
               "INIT_ICE_THICKNESS_NODAL needs the nodal thickness array, which only the "//&
@@ -504,9 +497,8 @@ subroutine initialize_ice_flow_from_file(bed_elev,u_shelf, v_shelf,float_cond,&
                                                 !! shelf is floating: 0 if floating, 1 if not. [nondim]
   type(unit_scale_type), intent(in)    :: US !< A structure containing unit conversion factors
   type(param_file_type), intent(in)    :: PF !< A structure to parse for run-time parameters
-  logical, optional,     intent(in)    :: skip_bed !< If true, skip the BED_TOPO_FILE read.
-                                                !! Used when bed_elev will be derived from a
-                                                !! separately-read nodal bed field.
+  logical, optional,     intent(in)    :: skip_bed !< If true, do not read the cell bed,
+                                                !! because it comes from the nodal bed.
 
   logical :: skip_bed_local
 
@@ -562,14 +554,9 @@ subroutine initialize_ice_flow_from_file(bed_elev,u_shelf, v_shelf,float_cond,&
 
 end subroutine initialize_ice_flow_from_file
 
-!> Per-corner integration weights of the Q1 basis against the separable-Jacobian
-!! element, w(a,b) = int_0^1 int_0^1 N(a,b) * a(eta) * d(xi) dxi deta, with
-!! d(xi) = dyW*(1-xi) + dyE*xi and a(eta) = dxS*(1-eta) + dxN*eta. Both the basis
-!! and the Jacobian separate, so each weight is a product of two 1D integrals:
-!!   int N_1(xi)*d(xi) dxi = dyW/3 + dyE/6,  int N_2(xi)*d(xi) dxi = dyW/6 + dyE/3
-!! and likewise in eta. The 2:1 bias towards a corner's own side is what carries
-!! the cell metric; on a uniform cell every weight is areaT/4.
-!! The weights sum to the cell area, so dividing by their sum gives a cell mean.
+!> Corner weights w(a,b) = int N(a,b) a(eta) d(xi) dxi deta, with d(xi) = dyW*(1-xi) + dyE*xi
+!! and a(eta) = dxS*(1-eta) + dxN*eta. Each is a product of 1D integrals such as dyW/3 + dyE/6.
+!! They sum to the cell area.
 pure subroutine corner_cell_weights(dxS, dxN, dyW, dyE, w_cell)
   real, intent(in) :: dxS  !< South face length [L ~> m]
   real, intent(in) :: dxN  !< North face length [L ~> m]
@@ -583,11 +570,8 @@ pure subroutine corner_cell_weights(dxS, dxN, dyW, dyE, w_cell)
   w_cell(2,2) = (dyW/6.0 + dyE/3.0) * (dxS/6.0 + dxN/3.0)
 end subroutine corner_cell_weights
 
-!> Area-weighted cell mean of a field given at the four corners of a cell, using
-!! the integration weights from corner_cell_weights. The diagonal-pair grouping
-!! of both sums is deliberate: a 90 degree rotation permutes the corners
-!! cyclically, so pairing opposite corners keeps the result bit-for-bit
-!! rotation-invariant.
+!> Area-weighted cell mean of a bilinear field from its corner values and corner_cell_weights.
+!! Opposite corners are paired for rotation invariance.
 pure real function nodal_cell_mean(h_cell, w_cell) result(Hbar)
   real, dimension(2,2), intent(in) :: h_cell !< Corner values [A ~> a]
   real, dimension(2,2), intent(in) :: w_cell !< Per-corner integration weights [L2 ~> m2]
@@ -596,10 +580,6 @@ pure real function nodal_cell_mean(h_cell, w_cell) result(Hbar)
 
   area = ((w_cell(1,1) + w_cell(2,2)) + (w_cell(1,2) + w_cell(2,1)))
   if (area > 0.0) then
-    ! Each product is parenthesised, not just the pairs. Under a quarter turn of
-    ! the grid the two pairs exchange, and without the inner parentheses the
-    ! compiler may fuse one multiply into the add, making that product exact and
-    ! its partner rounded, which the exchange then does not preserve.
     Hbar = ( ((w_cell(1,1)*h_cell(1,1)) + (w_cell(2,2)*h_cell(2,2))) + &
              ((w_cell(1,2)*h_cell(1,2)) + (w_cell(2,1)*h_cell(2,1))) ) / area
   else
@@ -607,10 +587,8 @@ pure real function nodal_cell_mean(h_cell, w_cell) result(Hbar)
   endif
 end function nodal_cell_mean
 
-!> Area-weighted cell mean of the bilinear interpolant of a field given at the
-!! four B-grid corners of cell (i,j). Picks the cell's face lengths, with the
-!! same one-sided fallback at non-reentrant domain edges that init_nodal_DG_metric
-!! uses, and then applies the shared weights and reduction.
+!> Area-weighted cell mean of the bilinear interpolant of the B-grid corner values of cell (i,j),
+!! with the face lengths chosen as in init_nodal_DG_metric.
 function corner_cell_mean(G, i, j, reentrant_x, reentrant_y, c11, c21, c12, c22) result(cmean)
   type(ocean_grid_type), intent(in) :: G   !< The grid structure used by the ice shelf.
   integer,               intent(in) :: i   !< The i-index of the cell.
@@ -644,10 +622,7 @@ function corner_cell_mean(G, i, j, reentrant_x, reentrant_y, c11, c21, c12, c22)
 
 end function corner_cell_mean
 
-!> Read node-based bed elevation from BED_TOPO_FILE into CS%bed_node, then
-!! derive the cell-centered CS%bed_elev as the area-weighted cell mean of the
-!! bilinear interpolant of the four surrounding nodes. Used when
-!! INIT_ICE_BED_NODAL is true.
+!> Read the nodal bed from BED_TOPO_FILE and set bed_elev to its cell means (INIT_ICE_BED_NODAL).
 subroutine initialize_bed_node_from_file(bed_node, bed_elev, G, US, PF)
   type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
   real, dimension(SZDIB_(G),SZDJB_(G)), &
@@ -688,9 +663,6 @@ subroutine initialize_bed_node_from_file(bed_node, bed_elev, G, US, PF)
                      position=CORNER, scale=US%m_to_Z)
   call pass_var(bed_node, G%domain, position=CORNER)
 
-  ! Derive cell-centered bed_elev as the area-weighted cell mean of the
-  ! bilinear corner-node interpolant on the separable-Jacobian element.
-  ! Uniform cells collapse to bed_elev = 0.25*sum(corners) bit-exactly.
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
     bed_elev(i,j) = corner_cell_mean(G, i, j, reentrant_x, reentrant_y, &
                                      bed_node(I-1,J-1), bed_node(I,J-1), &
