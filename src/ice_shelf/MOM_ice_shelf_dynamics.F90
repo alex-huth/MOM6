@@ -51,6 +51,11 @@ integer, parameter :: INNER_CG = 1       !< Conjugate gradient (default)
 integer, parameter :: INNER_MINRES = 2   !< MINRES
 integer, parameter :: INNER_CR = 3       !< Conjugate residual
 
+! DG(1) mode-damper gate forms, selected by DG1_TILT_DAMP_GATE
+integer, parameter :: DAMP_GATE_THICKNESS = 0 !< Gate the zigzag against the ice thickness
+integer, parameter :: DAMP_GATE_SLOPE = 1     !< Gate it against the real surface slope
+integer, parameter :: DAMP_GATE_AGREEMENT = 2 !< Gate it on how well the readings agree
+
 
 ! Sentinel returned by the Coulomb fB routines when the effective pressure is zero. The sliding law
 ! tau_b = C |u|^m / (1 + fB |u|^q)^m gives exactly zero drag as N -> 0, but it encodes that limit as
@@ -431,6 +436,19 @@ type, public :: ice_shelf_dyn_CS ; private
   real :: dg_tilt_damp_r_hi       !< Mode damper: normalized detector excess at which the gate is
                                   !! fully open [nondim].
   logical :: dg_twist_damp        !< If true, the mode damper damps the grid-scale in-cell twist mode.
+  integer :: dg_damp_gate_form    !< Mode damper: which gate scales the damping, one of
+                                  !! DAMP_GATE_THICKNESS, DAMP_GATE_SLOPE or DAMP_GATE_AGREEMENT.
+  real :: dg_damp_rho_g           !< Mode damper: disagreement between the detector readings,
+                                  !! relative to the part they agree on, at which the agreement
+                                  !! gate is half open [nondim].
+  real :: dg_damp_rho_s           !< Mode damper: zigzag surface slope, relative to the real surface
+                                  !! slope, at which the slope gate is fully open [nondim].
+  real :: dg_damp_slope_floor     !< Mode damper: smallest real surface slope the slope gate accepts
+                                  !! as a reference [nondim].
+  real, pointer, dimension(:,:) :: dg_damp_ahat => NULL() !< Mode damper: L2 cell norm of the
+                                  !! detector output over the three modes [Z ~> m].
+  real, pointer, dimension(:,:) :: dg_damp_spread => NULL() !< Mode damper: largest spread of the
+                                  !! detector readings over the three modes [Z ~> m].
   real, pointer, dimension(:,:) :: dg_damp_tend => NULL() !< Mode damper: L2 cell norm of the
                                   !! correction rate [Z T-1 ~> m s-1].
   real, pointer, dimension(:,:) :: dg_damp_gate => NULL() !< Mode damper: largest gate over the
@@ -550,6 +568,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_taudx_shelf = -1, id_taudy_shelf = -1, id_taud_shelf = -1, id_bed_elev = -1, &
              id_dg_damp_tend = -1, id_dg_damp_gate = -1, &
              id_dg_damp_want = -1, id_dg_damp_got = -1, &
+             id_dg_damp_ahat = -1, id_dg_damp_spread = -1, &
              id_ground_frac = -1, id_col_thick = -1, id_OD_av = -1, &
              id_f_ground_cell = -1, id_f_ground_node = -1, &
              id_u_mask = -1, id_v_mask = -1, id_ufb_mask =-1, id_vfb_mask = -1, id_t_mask = -1, &
@@ -752,6 +771,8 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%OD_av(isd:ied,jsd:jed), source=0.0)
     allocate(CS%ground_frac(isd:ied,jsd:jed), source=0.0)
     ! Unconditional: the damper flags are not read yet.
+    allocate(CS%dg_damp_ahat(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_damp_spread(isd:ied,jsd:jed), source=0.0)
     allocate(CS%dg_damp_tend(isd:ied,jsd:jed), source=0.0)
     allocate(CS%dg_damp_gate(isd:ied,jsd:jed), source=0.0)
     allocate(CS%dg_damp_want(isd:ied,jsd:jed), source=0.0)
@@ -1619,6 +1640,13 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       CS%id_dg_damp_got = register_diag_field('ice_shelf_model','dg_mode_damp_rate_got', &
          CS%diag%axesT1, Time, 'DG(1) tilt-mode-damper rate delivered, summed over modes', &
          's-1', conversion=US%s_to_T)
+      CS%id_dg_damp_ahat = register_diag_field('ice_shelf_model','dg_mode_damp_ahat', &
+         CS%diag%axesT1, Time, 'L2 cell norm of the DG(1) mode-damper detector over its three '//&
+         'modes', 'm', conversion=US%Z_to_m)
+      CS%id_dg_damp_spread = register_diag_field('ice_shelf_model','dg_mode_damp_spread', &
+         CS%diag%axesT1, Time, 'largest spread of the DG(1) mode-damper detector readings over '//&
+         'its three modes; zero unless the agreement detector is selected', 'm', &
+         conversion=US%Z_to_m)
     endif
 
     CS%id_ground_frac = register_diag_field('ice_shelf_model','ice_ground_frac',CS%diag%axesT1, Time, &
@@ -2101,6 +2129,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       enddo ; enddo
       call post_data(CS%id_surf_slope_mag_shelf, surf_slope, CS%diag)
     endif
+    if (CS%id_dg_damp_ahat > 0) call post_data(CS%id_dg_damp_ahat, CS%dg_damp_ahat, CS%diag)
+    if (CS%id_dg_damp_spread > 0) call post_data(CS%id_dg_damp_spread, CS%dg_damp_spread, CS%diag)
     if (CS%id_dg_damp_tend > 0) call post_data(CS%id_dg_damp_tend, CS%dg_damp_tend, CS%diag)
     if (CS%id_dg_damp_gate > 0) call post_data(CS%id_dg_damp_gate, CS%dg_damp_gate, CS%diag)
     if (CS%id_dg_damp_want > 0) call post_data(CS%id_dg_damp_want, CS%dg_damp_want, CS%diag)
@@ -9259,6 +9289,8 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_slow_idle_face_u)) deallocate(CS%dg_slow_idle_face_u)
   if (associated(CS%dg_slow_idle_face_v)) deallocate(CS%dg_slow_idle_face_v)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
+  if (associated(CS%dg_damp_ahat)) deallocate(CS%dg_damp_ahat)
+  if (associated(CS%dg_damp_spread)) deallocate(CS%dg_damp_spread)
   if (associated(CS%dg_damp_tend)) deallocate(CS%dg_damp_tend)
   if (associated(CS%dg_damp_gate)) deallocate(CS%dg_damp_gate)
   if (associated(CS%dg_damp_want)) deallocate(CS%dg_damp_want)
@@ -10901,13 +10933,51 @@ subroutine read_DG_params(param_file, mdl, CS, US)
     call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG1_TILT_DAMP_U_CUT must be positive; "//&
                    "it sets the damping rate, which would otherwise be zero.")
 
+  call get_param(param_file, mdl, "DG1_TILT_DAMP_GATE", CS%dg_damp_gate_form, &
+                 "Which gate scales the mode damping.  0 compares the detected zigzag with the "//&
+                 "ice thickness, through DG1_TILT_DAMP_R_HI; that gate closes on thick ice, and "//&
+                 "the slope error it accepts doubles each time the grid is refined by two.  1 "//&
+                 "compares it with the real surface slope, through DG1_TILT_DAMP_RHO_S; that "//&
+                 "gate closes on steep grounded ice.  2 compares the part the detector readings "//&
+                 "agree on with the part they do not, through DG1_TILT_DAMP_RHO_G; it carries "//&
+                 "no thickness, no slope and no grid spacing, and it needs the agreement "//&
+                 "detector to be meaningful.", &
+                 default=DAMP_GATE_THICKNESS, &
+                 do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
+  if ((CS%dg_damp_gate_form < DAMP_GATE_THICKNESS) .or. &
+      (CS%dg_damp_gate_form > DAMP_GATE_AGREEMENT)) call MOM_error(FATAL, &
+    "DG1_TILT_DAMP_GATE must be 0, 1 or 2.")
+
+  call get_param(param_file, mdl, "DG1_TILT_DAMP_RHO_S", CS%dg_damp_rho_s, &
+                 "Zigzag surface slope, as a multiple of the real surface slope, at which "//&
+                 "DG1_TILT_DAMP_GATE = 1 is fully open.  The detector reads twice the amplitude "//&
+                 "of the zigzag, so 2 opens the gate where the zigzag is as steep as the ice.", &
+                 units="nondim", default=2.0, &
+                 do_not_log=(CS%dg_damp_gate_form /= DAMP_GATE_SLOPE))
+
+  call get_param(param_file, mdl, "DG1_TILT_DAMP_SLOPE_FLOOR", CS%dg_damp_slope_floor, &
+                 "Smallest real surface slope that DG1_TILT_DAMP_GATE = 1 accepts as a "//&
+                 "reference.  It is a slope rather than a rise, so the gate carries no grid "//&
+                 "spacing on ice flat enough for the floor to decide.", &
+                 units="nondim", default=1.0e-5, &
+                 do_not_log=(CS%dg_damp_gate_form /= DAMP_GATE_SLOPE))
+
+  call get_param(param_file, mdl, "DG1_TILT_DAMP_RHO_G", CS%dg_damp_rho_g, &
+                 "Disagreement between the detector readings, as a multiple of the part they "//&
+                 "agree on, at which DG1_TILT_DAMP_GATE = 2 is half open.  Raising it protects "//&
+                 "real features and costs almost no zigzag removal; lowering it does not "//&
+                 "remove more zigzag, because what stays comes from the detector.", &
+                 units="nondim", default=4.0, &
+                 do_not_log=(CS%dg_damp_gate_form /= DAMP_GATE_AGREEMENT))
+
   call get_param(param_file, mdl, "DG1_TILT_DAMP_R_HI", CS%dg_tilt_damp_r_hi, &
                  "Gate value at which the mode damping is at full strength. The gate is "//&
                  "(ds/dh)*(|A| - max(|A_bed|,|A_ref|))/h, where A is the discrete Laplacian of "//&
                  "the cell tilt, A_bed and A_ref the same for the bed and for the tilt implied "//&
-                 "by the cell means, and ds/dh is 1 grounded and 1 - rho_i/rho_w floating.", &
+                 "by the cell means, and ds/dh is 1 grounded and 1 - rho_i/rho_w floating.  "//&
+                 "Used only by DG1_TILT_DAMP_GATE = 0.", &
                  units="nondim", default=0.02, &
-                 do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
+                 do_not_log=(CS%dg_damp_gate_form /= DAMP_GATE_THICKNESS))
 
   call get_param(param_file, mdl, "DG1_ART_VISC_R_HI", CS%dg_art_visc_r_hi, &
                  "Face surface jump, relative to the mean thickness, at which the DG(1) "//&
@@ -12148,6 +12218,49 @@ pure function dg_gl_reach_wt(fv, mode, reach) result(wt)
   wt = merge(0.0, 1.0, (minval(fv(lo:hi)) < 1.0) .and. (maxval(fv(lo:hi)) > 0.0))
 end function dg_gl_reach_wt
 
+!> Fraction of full strength that the mode damper runs at, from one of three gates. The
+!! thickness gate asks how large the zigzag is against the ice thickness; it closes on thick
+!! ice, and because the detector output scales with the cell size while the thickness does not,
+!! the slope error it accepts doubles each time the grid is refined by two. The slope gate asks
+!! how steep the zigzag is against the real surface slope; both scale with the cell size, so it
+!! carries no grid spacing, but it closes on steep grounded ice. The agreement gate asks how
+!! much the detector readings agree, which carries no thickness, no slope and no grid spacing.
+pure function dg_damp_gate_frac(form, dsdh, excess, spread, href, dsurf, r_hi, rho_s, &
+                                floor_rise, rho_g) result(gam)
+  integer, intent(in) :: form   !< Gate form, one of DAMP_GATE_THICKNESS, DAMP_GATE_SLOPE
+                                !! or DAMP_GATE_AGREEMENT
+  real,    intent(in) :: dsdh   !< Surface elevation change per thickness change [nondim]
+  real,    intent(in) :: excess !< Detector output the damper would act on [Z ~> m]
+  real,    intent(in) :: spread !< Largest minus smallest detector reading [Z ~> m]
+  real,    intent(in) :: href   !< Reference thickness for the thickness gate [Z ~> m]
+  real,    intent(in) :: dsurf  !< Real rise of the surface across the cell [Z ~> m]
+  real,    intent(in) :: r_hi   !< Zigzag over thickness at which the thickness gate opens [nondim]
+  real,    intent(in) :: rho_s  !< Zigzag slope over real slope at which the slope gate opens [nondim]
+  real,    intent(in) :: floor_rise !< Smallest surface rise the slope gate uses [Z ~> m]
+  real,    intent(in) :: rho_g  !< Disagreement over agreement at which the agreement gate is
+                                !! half open [nondim]
+  real :: gam                   !< Gate fraction, 0 to 1 [nondim]
+
+  real :: denom  ! Reference the detector output is compared with [Z ~> m]
+
+  gam = 0.0
+  if (excess <= 0.0) return
+
+  if (form == DAMP_GATE_AGREEMENT) then
+    ! Scale-free in amplitude: a pure zigzag gives equal readings, hence no spread and a gate
+    ! of 1, whatever the thickness, the slope or the size of the zigzag.
+    gam = excess / (excess + (rho_g * max(spread, 0.0)))
+  else
+    if (form == DAMP_GATE_SLOPE) then
+      denom = rho_s * max(abs(dsurf), floor_rise)
+    else
+      denom = r_hi * href
+    endif
+    if (denom <= 0.0) return
+    gam = min(1.0, (dsdh*excess) / denom)
+  endif
+end function dg_damp_gate_frac
+
 !> Nodal rates damping the grid-scale in-cell tilt and twist. A tilt alternating between cells
 !! adds nothing to any face jump, so the upwind flux and the artificial viscosity cannot see it,
 !! but it gives a spurious surface slope. The detector is the tilt Laplacian
@@ -12170,6 +12283,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real, dimension(SZDI_(G),SZDJ_(G)) :: b_xi   ! Per-cell xi-tilt of the bed [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: b_eta  ! Per-cell eta-tilt of the bed [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: hbar_c ! Mean of the four corner thicknesses [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: sbar_c ! Surface elevation from the cell mean thickness,
+                                  ! the reference of the surface-slope gate [Z ~> m]
   logical, dimension(SZDI_(G),SZDJ_(G)) :: ice_ok !< True on a fully ice-covered cell
   real, dimension(SZDI_(G),SZDJ_(G)) :: w_c    ! Per-cell xy-twist of thickness [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: b_w    ! Per-cell xy-twist of the bed [Z ~> m]
@@ -12197,6 +12312,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real :: kwant     ! Rate the gate asks for, before the transport's share [T-1 ~> s-1]
   real :: itau_xi, itau_eta, itau_w ! Full rate per mode, from DG1_TILT_DAMP_U_CUT [T-1 ~> s-1]
   real :: d_l2      ! Sum of squared corrections, for diagnostics [Z2 T-2 ~> m2 s-2]
+  real :: d_ahat    ! Sum of squared detector outputs, for diagnostics [Z2 ~> m2]
+  real :: d_spread  ! Largest reading spread over the three modes, for diagnostics [Z ~> m]
   real :: d_gate    ! Largest gate over the three modes [nondim]
   real :: d_want, d_got ! Rates summed over modes, before and after the transport credit [T-1 ~> s-1]
   logical :: diag_on ! True if any of the three activity diagnostics is registered
@@ -12226,6 +12343,11 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real :: excess   ! One-sided excess over that floor [Z ~> m]
   real :: href     ! Cell-mean thickness used to normalize the gate [Z ~> m]
   real :: dsdh     ! ds/dh, 1 grounded and 1 - rho_i/rho_w floating [nondim]
+  real :: dsurf    ! Real rise of the surface across the cell, the surface-slope gate's
+                   ! reference [Z ~> m]
+  real :: A_spread ! Largest minus smallest detector reading; zero unless the detector
+                   ! reports it [Z ~> m]
+  real :: dx_cell, dy_cell ! Cell width and height [L ~> m]
   real :: gam      ! Gate fraction, 0 to 1 [nondim]
   real :: kap      ! Delivered rate for this cell and direction [T-1 ~> s-1]
   real :: rate_cap ! Largest rate the explicit step may carry [T-1 ~> s-1]
@@ -12264,7 +12386,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   rate_cap = 0.5 / max(dt, tiny(dt))
 
   ! Cell-local fields on the full data domain.
-  hbar_c(:,:) = 0.0 ; ice_ok(:,:) = .false.
+  hbar_c(:,:) = 0.0 ; ice_ok(:,:) = .false. ; sbar_c(:,:) = 0.0
   t_xi(:,:) = 0.0 ; t_eta(:,:) = 0.0 ; w_c(:,:) = 0.0
   f_gnd(:,:) = 0.0
   do j = jsd, jed ; do i = isd, ied
@@ -12281,6 +12403,9 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     ! The sub-element grounded fraction
     ! TODO: use f_ground_cell instead for CISM-style grounding with DG for advection?
     f_gnd(i,j) = min(max(CS%ground_frac(i,j), 0.0), 1.0)
+    ! Surface elevation the cell mean implies: freeboard afloat, thickness above the bed where
+    ! the flotation deficit rho_i/rho_w*h - depth is positive. Continuous across the contour.
+    sbar_c(i,j) = (one_m_r*hbar_c(i,j)) + max((rhoi_rhow*hbar_c(i,j)) - CS%bed_elev(i,j), 0.0)
   enddo ; enddo
 
   ! Bed tilts read bed_node, so they stop one ring short; no chosen stencil reads that ring.
@@ -12300,6 +12425,11 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     href = hbar_c(i,j)
     if (href <= 0.0) cycle
     d_l2 = 0.0 ; d_gate = 0.0 ; d_want = 0.0 ; d_got = 0.0
+    d_ahat = 0.0 ; d_spread = 0.0
+    dx_cell = 1.0 / G%IdxT(i,j) ; dy_cell = 1.0 / G%IdyT(i,j)
+    ! Only a detector that reports the spread of its readings can open the agreement gate on
+    ! anything but a perfect zigzag; today's detector leaves it zero.
+    A_spread = 0.0
 
     ! The gate is normalized by the mean thickness over the chosen stencil.
     dsdh = one_m_r + f_gnd(i,j)*(1.0 - one_m_r)
@@ -12348,7 +12478,10 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         A_dmp = A_h
       endif
       if (det_ok .and. (excess > 0.0)) then
-        gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
+        dsurf = 0.5*(sbar_c(i+1,j) - sbar_c(i-1,j))
+        gam = gwt * dg_damp_gate_frac(CS%dg_damp_gate_form, dsdh, excess, A_spread, href_d, &
+                                      dsurf, CS%dg_tilt_damp_r_hi, CS%dg_damp_rho_s, &
+                                      CS%dg_damp_slope_floor*dx_cell, CS%dg_damp_rho_g)
         kwant = gam * itau_xi
         kap = min(max(kwant - knat_xi, 0.0), rate_cap)
         T_node(i,j,1,1) = T_node(i,j,1,1) + (0.5*kap*A_dmp)
@@ -12357,6 +12490,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         T_node(i,j,2,2) = T_node(i,j,2,2) - (0.5*kap*A_dmp)
         if (diag_on) then
           d_l2 = d_l2 + ((kap*A_dmp)**2) / 12.0
+          d_ahat = d_ahat + (A_dmp**2) ; d_spread = max(d_spread, A_spread)
           d_gate = max(d_gate, gam) ; d_want = d_want + kwant
           d_got = d_got + kap
         endif
@@ -12386,7 +12520,10 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         A_dmp = A_h
       endif
       if (det_ok .and. (excess > 0.0)) then
-        gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_d))
+        dsurf = 0.5*(sbar_c(i,j+1) - sbar_c(i,j-1))
+        gam = gwt * dg_damp_gate_frac(CS%dg_damp_gate_form, dsdh, excess, A_spread, href_d, &
+                                      dsurf, CS%dg_tilt_damp_r_hi, CS%dg_damp_rho_s, &
+                                      CS%dg_damp_slope_floor*dy_cell, CS%dg_damp_rho_g)
         kwant = gam * itau_eta
         kap = min(max(kwant - knat_eta, 0.0), rate_cap)
         T_node(i,j,1,1) = T_node(i,j,1,1) + (0.5*kap*A_dmp)
@@ -12395,6 +12532,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         T_node(i,j,2,2) = T_node(i,j,2,2) - (0.5*kap*A_dmp)
         if (diag_on) then
           d_l2 = d_l2 + ((kap*A_dmp)**2) / 12.0
+          d_ahat = d_ahat + (A_dmp**2) ; d_spread = max(d_spread, A_spread)
           d_gate = max(d_gate, gam) ; d_want = d_want + kwant
           d_got = d_got + kap
         endif
@@ -12487,7 +12625,12 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         ! full strength against the worst floor, which is the combination this
         ! whole exercise exists to avoid.
         gwt = kconf + ((1.0 - kconf) * reach_w)
-        gam = gwt * min(1.0, (dsdh*excess) / (CS%dg_tilt_damp_r_hi * href_w))
+        dsurf = 0.25*((sbar_c(i+1,j+1) + sbar_c(i-1,j-1)) - &
+                      (sbar_c(i-1,j+1) + sbar_c(i+1,j-1)))
+        gam = gwt * dg_damp_gate_frac(CS%dg_damp_gate_form, dsdh, excess, A_spread, href_w, &
+                                      dsurf, CS%dg_tilt_damp_r_hi, CS%dg_damp_rho_s, &
+                                      CS%dg_damp_slope_floor*sqrt(dx_cell*dy_cell), &
+                                      CS%dg_damp_rho_g)
         ! Credit the slower of the two sweeps.
         ! The checkerboard twist alternates along BOTH axes, so it survives as
         ! long as either sweep is slow: credit the transport with the smaller of
@@ -12505,6 +12648,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         T_node(i,j,1,2) = T_node(i,j,1,2) + (0.25*kap*A_dmp)
         if (diag_on) then
           d_l2 = d_l2 + ((kap*A_dmp)**2) / 144.0
+          d_ahat = d_ahat + (A_dmp**2) ; d_spread = max(d_spread, A_spread)
           d_gate = max(d_gate, gam) ; d_want = d_want + kwant
           d_got = d_got + kap
         endif
@@ -12526,6 +12670,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
 
     if (diag_on) then
       CS%dg_damp_tend(i,j) = sqrt(d_l2)
+      CS%dg_damp_ahat(i,j) = sqrt(d_ahat)
+      CS%dg_damp_spread(i,j) = d_spread
       CS%dg_damp_gate(i,j) = d_gate
       CS%dg_damp_want(i,j) = d_want ; CS%dg_damp_got(i,j) = d_got
     endif
