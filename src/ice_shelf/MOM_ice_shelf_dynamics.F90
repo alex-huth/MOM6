@@ -12319,17 +12319,23 @@ end function dg_damp_gate_frac
 !! so the damper never removes more than the least any reading supports. Both outputs come from
 !! minval and maxval over the whole set, which do not depend on its order, so a rotation or a
 !! reflection of the grid cannot change them.
-pure subroutine dg_minmod_spread(rd, nrd, A, S)
-  real, dimension(:), intent(in)  :: rd  !< The readings [Z ~> m]
-  integer,            intent(in)  :: nrd !< How many of them are set
-  real,               intent(out) :: A   !< The part they all agree on [Z ~> m]
-  real,               intent(out) :: S   !< Largest minus smallest reading [Z ~> m]
+pure subroutine dg_minmod_spread(nrd, rd, A, S)
+  integer,              intent(in)  :: nrd !< How many readings are set
+  real, dimension(nrd), intent(in)  :: rd  !< The readings [Z ~> m]
+  real,                 intent(out) :: A   !< The part they all agree on [Z ~> m]
+  real,                 intent(out) :: S   !< Largest minus smallest reading [Z ~> m]
 
   real :: rmin, rmax ! Extremes of the set [Z ~> m]
+  integer :: n
 
   A = 0.0 ; S = 0.0
   if (nrd < 1) return
-  rmin = minval(rd(1:nrd)) ; rmax = maxval(rd(1:nrd))
+  ! One pass rather than two.  The extremes of a set do not depend on the order in which a
+  ! quarter turn presents it, so this reduction needs no pairing.
+  rmin = rd(1) ; rmax = rd(1)
+  do n = 2, nrd
+    rmin = min(rmin, rd(n)) ; rmax = max(rmax, rd(n))
+  enddo
   S = rmax - rmin
   if (rmin > 0.0) then
     A = rmin
@@ -12433,7 +12439,7 @@ pure subroutine dg_agree_1d(tv, bv, fv, ilv, len0, ok, single_rule, A, S, valid)
   enddo
   call dg_agree_readings(gv, ok, len0, rd, nrd)
 
-  call dg_minmod_spread(rd, nrd, A, S)
+  call dg_minmod_spread(nrd, rd, A, S)
 end subroutine dg_agree_1d
 
 !> Stencil agreement for the twist. The checkerboard alternates along both axes, so it is read
@@ -12486,7 +12492,7 @@ pure subroutine dg_agree_2d(wv, bwv, fv, ilx, ily, dx0, dy0, okw, A, S, valid)
   call dg_agree_readings(gv, okl, dy0, rd, nrd)
 
   valid = (nrd > 0)
-  call dg_minmod_spread(rd, nrd, A, S)
+  call dg_minmod_spread(nrd, rd, A, S)
 end subroutine dg_agree_2d
 
 !> Nodal rates damping the grid-scale in-cell tilt and twist. A tilt alternating between cells
@@ -12589,6 +12595,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   real :: gam      ! Gate fraction, 0 to 1 [nondim]
   real :: kap      ! Delivered rate for this cell and direction [T-1 ~> s-1]
   real :: rate_cap ! Largest rate the explicit step may carry [T-1 ~> s-1]
+  real :: c_ucut   ! Rate the transport cut-off speed asks for, per unit of reciprocal
+                   ! cell length [L T-1 ~> m s-1]
   real :: rhoi_rhow ! Ice/ocean density ratio for the flotation test [nondim]
   real :: one_m_r  ! 1 - rho_i/rho_w, the floating-ice ds/dh [nondim]
   real :: Tbar     ! Cell mean of the nodal increment, removed so the damper moves no mass
@@ -12625,6 +12633,9 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   ! left to advection and the artificial viscosity.
   rate_cap = 0.5 / max(dt, tiny(dt))
 
+  ! The full rate per unit of reciprocal cell length, which no cell changes.
+  c_ucut = CS%dg_damp_advective_c * CS%dg_damp_u_cut
+
   agree_det  = (CS%dg_damp_detector == DAMP_DET_AGREE)
   slope_gate = (CS%dg_damp_gate_form == DAMP_GATE_SLOPE)
 
@@ -12636,10 +12647,12 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     hbar_c(i,j) = 0.25*((h_nodal_in(i,j,1,1) + h_nodal_in(i,j,2,2)) + &
                         (h_nodal_in(i,j,2,1) + h_nodal_in(i,j,1,2)))
     ice_ok(i,j) = (hmask(i,j) == 1.0)
-    t_xi(i,j)  = 0.5*((h_nodal_in(i,j,2,1) - h_nodal_in(i,j,1,1)) + &
-                      (h_nodal_in(i,j,2,2) - h_nodal_in(i,j,1,2)))
-    t_eta(i,j) = 0.5*((h_nodal_in(i,j,1,2) - h_nodal_in(i,j,1,1)) + &
-                      (h_nodal_in(i,j,2,2) - h_nodal_in(i,j,2,1)))
+    if (CS%dg_tilt_damp) then
+      t_xi(i,j)  = 0.5*((h_nodal_in(i,j,2,1) - h_nodal_in(i,j,1,1)) + &
+                        (h_nodal_in(i,j,2,2) - h_nodal_in(i,j,1,2)))
+      t_eta(i,j) = 0.5*((h_nodal_in(i,j,1,2) - h_nodal_in(i,j,1,1)) + &
+                        (h_nodal_in(i,j,2,2) - h_nodal_in(i,j,2,1)))
+    endif
     if (CS%dg_twist_damp) &
       w_c(i,j) = (h_nodal_in(i,j,2,2) - h_nodal_in(i,j,1,2)) - &
                  (h_nodal_in(i,j,2,1) - h_nodal_in(i,j,1,1))
@@ -12655,16 +12668,20 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
 
   ! Bed tilts read bed_node, so they stop one ring short; no chosen stencil reads that ring,
   ! but the gathers clamp into it, so clear the ring alone rather than the whole array.
-  b_xi(isd,:) = 0.0 ; b_xi(ied,:) = 0.0 ; b_xi(:,jsd) = 0.0 ; b_xi(:,jed) = 0.0
-  b_eta(isd,:) = 0.0 ; b_eta(ied,:) = 0.0 ; b_eta(:,jsd) = 0.0 ; b_eta(:,jed) = 0.0
+  if (CS%dg_tilt_damp) then
+    b_xi(isd,:) = 0.0 ; b_xi(ied,:) = 0.0 ; b_xi(:,jsd) = 0.0 ; b_xi(:,jed) = 0.0
+    b_eta(isd,:) = 0.0 ; b_eta(ied,:) = 0.0 ; b_eta(:,jsd) = 0.0 ; b_eta(:,jed) = 0.0
+  endif
   if (CS%dg_twist_damp) then
     b_w(isd,:) = 0.0 ; b_w(ied,:) = 0.0 ; b_w(:,jsd) = 0.0 ; b_w(:,jed) = 0.0
   endif
   do j = jsd+1, jed-1 ; do i = isd+1, ied-1
-    b_xi(i,j)  = 0.5*((CS%bed_node(I,J-1) - CS%bed_node(I-1,J-1)) + &
-                      (CS%bed_node(I,J)   - CS%bed_node(I-1,J)))
-    b_eta(i,j) = 0.5*((CS%bed_node(I-1,J) - CS%bed_node(I-1,J-1)) + &
-                      (CS%bed_node(I,J)   - CS%bed_node(I,J-1)))
+    if (CS%dg_tilt_damp) then
+      b_xi(i,j)  = 0.5*((CS%bed_node(I,J-1) - CS%bed_node(I-1,J-1)) + &
+                        (CS%bed_node(I,J)   - CS%bed_node(I-1,J)))
+      b_eta(i,j) = 0.5*((CS%bed_node(I-1,J) - CS%bed_node(I-1,J-1)) + &
+                        (CS%bed_node(I,J)   - CS%bed_node(I,J-1)))
+    endif
     if (CS%dg_twist_damp) &
       b_w(i,j) = (CS%bed_node(I,J) - CS%bed_node(I-1,J)) - &
                  (CS%bed_node(I,J-1) - CS%bed_node(I-1,J-1))
@@ -12691,23 +12708,29 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     if (hmask(i,j) /= 1.0) cycle
     href = hbar_c(i,j)
     if (href <= 0.0) cycle
-    d_gate = 0.0 ; d_want = 0.0 ; d_got = 0.0
-    d_ahat = 0.0 ; d_spread = 0.0
+    if (diag_on) then
+      d_gate = 0.0 ; d_want = 0.0 ; d_got = 0.0
+      d_ahat = 0.0 ; d_spread = 0.0
+    endif
     ! The grid carries both the length and its reciprocal, so neither costs a division.
     dx_cell = G%dxT(i,j) ; dy_cell = G%dyT(i,j)
     ! Only a detector that reports the spread of its readings can open the agreement gate on
     ! anything but a perfect zigzag; today's detector leaves it zero.
     A_spread = 0.0
 
-    ! The gate is normalized by the mean thickness over the chosen stencil.
-    dsdh = one_m_r + f_gnd(i,j)*(1.0 - one_m_r)
+    ! The zigzag in the thickness raises the surface by less than itself where the ice
+    ! floats.  Both the thickness gate and the slope gate compare surface rises; the
+    ! agreement gate compares readings with each other and never reads this.
+    dsdh = 0.0
+    if (CS%dg_damp_gate_form /= DAMP_GATE_AGREEMENT) &
+      dsdh = one_m_r + f_gnd(i,j)*(1.0 - one_m_r)
 
     ! Full rate c*U_CUT/dx along each axis; the twist uses sqrt(dx*dy). knat is the rate the
     ! transport itself delivers, from the cell-centred |u| or |v|.
-    itau_xi  = CS%dg_damp_advective_c * CS%dg_damp_u_cut * G%IdxT(i,j)
-    itau_eta = CS%dg_damp_advective_c * CS%dg_damp_u_cut * G%IdyT(i,j)
-    itau_w   = CS%dg_damp_advective_c * CS%dg_damp_u_cut * &
-               sqrt(G%IdxT(i,j) * G%IdyT(i,j))
+    itau_xi  = c_ucut * G%IdxT(i,j)
+    itau_eta = c_ucut * G%IdyT(i,j)
+    itau_w   = 0.0
+    if (CS%dg_twist_damp) itau_w = c_ucut * sqrt(G%IdxT(i,j) * G%IdyT(i,j))
 
     knat_xi = 0.0 ; knat_eta = 0.0
     if (CS%dg_damp_advective) then
