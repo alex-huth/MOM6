@@ -12584,6 +12584,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   integer :: isc_w, iec_w, jsc_w, jec_w ! Loop bounds, one cell wider with the high pass
   logical :: skip_xi, skip_eta, skip_w ! True where the transport already delivers the full rate
   integer :: kglo, kghi ! Gather range: the agreement detector reads two cells, not four
+  logical :: agree_det  ! True when the stencil-agreement detector is selected
   real :: gam      ! Gate fraction, 0 to 1 [nondim]
   real :: kap      ! Delivered rate for this cell and direction [T-1 ~> s-1]
   real :: rate_cap ! Largest rate the explicit step may carry [T-1 ~> s-1]
@@ -12674,8 +12675,9 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   r_xi(isc_w:iec_w,jsc_w:jec_w) = 0.0
   r_eta(isc_w:iec_w,jsc_w:jec_w) = 0.0
   r_w(isc_w:iec_w,jsc_w:jec_w) = 0.0
+  agree_det = (CS%dg_damp_detector == DAMP_DET_AGREE)
   kglo = -4 ; kghi = 4
-  if (CS%dg_damp_detector == DAMP_DET_AGREE) then ; kglo = -2 ; kghi = 2 ; endif
+  if (agree_det) then ; kglo = -2 ; kghi = 2 ; endif
 
   do j = jsc_w, jec_w ; do i = isc_w, iec_w
     if (hmask(i,j) /= 1.0) cycle
@@ -12719,12 +12721,15 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
 
     ! --- xi direction, gated only on row j ---
     if (CS%dg_tilt_damp .and. (.not.skip_xi)) then
-      okv(:) = .false.
+      okv(-4:kglo-1) = .false. ; okv(kghi+1:4) = .false.
       do k = kglo, kghi
         kk = min(max(i+k, isd), ied)
         okv(k) = ice_ok(kk,j) .and. (i+k >= isd) .and. (i+k <= ied)
-        tv(k) = t_xi(kk,j) ; bv(k) = b_xi(kk,j) ; hv(k) = hbar_c(kk,j)
+        tv(k) = t_xi(kk,j) ; bv(k) = b_xi(kk,j)
         gv(k) = f_gnd(kk,j) ; ilv(k) = G%IdxT(kk,j)
+        ! Agreement needs no stencil thickness; it normalizes the gate on the cell mean.
+        if (agree_det) cycle
+        hv(k) = hbar_c(kk,j)
       enddo
       if (CS%dg_damp_detector == DAMP_DET_AGREE) then
         ! Agreement needs no floor and no kink reference, and nothing here protects the
@@ -12771,12 +12776,14 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
 
     ! --- eta direction ---
     if (CS%dg_tilt_damp .and. (.not.skip_eta)) then
-      okv(:) = .false.
+      okv(-4:kglo-1) = .false. ; okv(kghi+1:4) = .false.
       do k = kglo, kghi
         kk = min(max(j+k, jsd), jed)
         okv(k) = ice_ok(i,kk) .and. (j+k >= jsd) .and. (j+k <= jed)
-        tv(k) = t_eta(i,kk) ; bv(k) = b_eta(i,kk) ; hv(k) = hbar_c(i,kk)
+        tv(k) = t_eta(i,kk) ; bv(k) = b_eta(i,kk)
         gv(k) = f_gnd(i,kk) ; ilv(k) = G%IdyT(i,kk)
+        if (agree_det) cycle
+        hv(k) = hbar_c(i,kk)
       enddo
       if (CS%dg_damp_detector == DAMP_DET_AGREE) then
         call dg_agree_1d(tv, bv, gv, ilv, dy_cell, okv, CS%dg_damp_single_rule, &
@@ -12820,12 +12827,13 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       ! need not be gathered.  Today's twist reference uses the full square.
       okw(:,:) = .false.
       do kj = kglo, kghi ; do k = kglo, kghi
-        if ((CS%dg_damp_detector == DAMP_DET_AGREE) .and. (k /= 0) .and. (kj /= 0)) cycle
+        if (agree_det .and. (k /= 0) .and. (kj /= 0)) cycle
         kk = min(max(i+k, isd), ied) ; jj = min(max(j+kj, jsd), jed)
         okw(k,kj) = ice_ok(kk,jj) .and. ((i+k >= isd) .and. (i+k <= ied)) &
                                   .and. ((j+kj >= jsd) .and. (j+kj <= jed))
-        ww(k,kj) = w_c(kk,jj) ; bw(k,kj) = b_w(kk,jj) ; hw(k,kj) = hbar_c(kk,jj)
+        ww(k,kj) = w_c(kk,jj) ; bw(k,kj) = b_w(kk,jj)
         fw(k,kj) = f_gnd(kk,jj)
+        if (.not.agree_det) hw(k,kj) = hbar_c(kk,jj)
         if (kj == 0) then
           gwx(k) = f_gnd(kk,jj) ; iwx(k) = G%IdxT(kk,j)
         endif
