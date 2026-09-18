@@ -11289,21 +11289,24 @@ pure function dg1_eps_face_u(CS, G, I, j) result(eps_e)
   real :: dudx, dudy, dvdx, dvdy ! Face-midpoint velocity gradients [T-1 ~> s-1]
   integer :: i_lo, i_hi          ! Neighbour indices clipped to the data domain
 
+  ! The four-corner means are summed in opposite pairs, as every other corner reduction in the
+  ! DG path is, because a quarter turn maps each diagonal pair onto the other.  Grouping them by
+  ! row, which is the order they are written in, does not survive the turn.
   i_lo = max(I-1, G%isd) ; i_hi = min(I+1, G%ied)
   if (i_lo < I) then
-    u_mn = 0.25*((CS%u_shelf(i_lo,j-1) + CS%u_shelf(I,j-1)) + &
-                 (CS%u_shelf(i_lo,j  ) + CS%u_shelf(I,j  )))
-    v_mn = 0.25*((CS%v_shelf(i_lo,j-1) + CS%v_shelf(I,j-1)) + &
-                 (CS%v_shelf(i_lo,j  ) + CS%v_shelf(I,j  )))
+    u_mn = 0.25*((CS%u_shelf(i_lo,j-1) + CS%u_shelf(I,j  )) + &
+                 (CS%u_shelf(I   ,j-1) + CS%u_shelf(i_lo,j)))
+    v_mn = 0.25*((CS%v_shelf(i_lo,j-1) + CS%v_shelf(I,j  )) + &
+                 (CS%v_shelf(I   ,j-1) + CS%v_shelf(i_lo,j)))
   else
     u_mn = 0.5*(CS%u_shelf(I,j-1) + CS%u_shelf(I,j))
     v_mn = 0.5*(CS%v_shelf(I,j-1) + CS%v_shelf(I,j))
   endif
   if (i_hi > I) then
-    u_pl = 0.25*((CS%u_shelf(I   ,j-1) + CS%u_shelf(i_hi,j-1)) + &
-                 (CS%u_shelf(I   ,j  ) + CS%u_shelf(i_hi,j  )))
-    v_pl = 0.25*((CS%v_shelf(I   ,j-1) + CS%v_shelf(i_hi,j-1)) + &
-                 (CS%v_shelf(I   ,j  ) + CS%v_shelf(i_hi,j  )))
+    u_pl = 0.25*((CS%u_shelf(I   ,j-1) + CS%u_shelf(i_hi,j  )) + &
+                 (CS%u_shelf(i_hi,j-1) + CS%u_shelf(I   ,j  )))
+    v_pl = 0.25*((CS%v_shelf(I   ,j-1) + CS%v_shelf(i_hi,j  )) + &
+                 (CS%v_shelf(i_hi,j-1) + CS%v_shelf(I   ,j  )))
   else
     u_pl = 0.5*(CS%u_shelf(I,j-1) + CS%u_shelf(I,j))
     v_pl = 0.5*(CS%v_shelf(I,j-1) + CS%v_shelf(I,j))
@@ -11326,21 +11329,22 @@ pure function dg1_eps_face_v(CS, G, i, J) result(eps_e)
   real :: dudx, dudy, dvdx, dvdy ! Face-midpoint velocity gradients [T-1 ~> s-1]
   integer :: j_lo, j_hi          ! Neighbour indices clipped to the data domain
 
+  ! Opposite pairs again, matching dg1_eps_face_u so the turn carries one onto the other.
   j_lo = max(J-1, G%jsd) ; j_hi = min(J+1, G%jed)
   if (j_lo < J) then
-    u_mn = 0.25*((CS%u_shelf(i-1,j_lo) + CS%u_shelf(i,j_lo)) + &
-                 (CS%u_shelf(i-1,J   ) + CS%u_shelf(i,J   )))
-    v_mn = 0.25*((CS%v_shelf(i-1,j_lo) + CS%v_shelf(i,j_lo)) + &
-                 (CS%v_shelf(i-1,J   ) + CS%v_shelf(i,J   )))
+    u_mn = 0.25*((CS%u_shelf(i-1,j_lo) + CS%u_shelf(i,J   )) + &
+                 (CS%u_shelf(i  ,j_lo) + CS%u_shelf(i-1,J  )))
+    v_mn = 0.25*((CS%v_shelf(i-1,j_lo) + CS%v_shelf(i,J   )) + &
+                 (CS%v_shelf(i  ,j_lo) + CS%v_shelf(i-1,J  )))
   else
     u_mn = 0.5*(CS%u_shelf(i-1,J) + CS%u_shelf(i,J))
     v_mn = 0.5*(CS%v_shelf(i-1,J) + CS%v_shelf(i,J))
   endif
   if (j_hi > J) then
-    u_pl = 0.25*((CS%u_shelf(i-1,J   ) + CS%u_shelf(i,J   )) + &
-                 (CS%u_shelf(i-1,j_hi) + CS%u_shelf(i,j_hi)))
-    v_pl = 0.25*((CS%v_shelf(i-1,J   ) + CS%v_shelf(i,J   )) + &
-                 (CS%v_shelf(i-1,j_hi) + CS%v_shelf(i,j_hi)))
+    u_pl = 0.25*((CS%u_shelf(i-1,J   ) + CS%u_shelf(i,j_hi)) + &
+                 (CS%u_shelf(i  ,J   ) + CS%u_shelf(i-1,j_hi)))
+    v_pl = 0.25*((CS%v_shelf(i-1,J   ) + CS%v_shelf(i,j_hi)) + &
+                 (CS%v_shelf(i  ,J   ) + CS%v_shelf(i-1,j_hi)))
   else
     u_pl = 0.5*(CS%u_shelf(i-1,J) + CS%u_shelf(i,J))
     v_pl = 0.5*(CS%v_shelf(i-1,J) + CS%v_shelf(i,J))
@@ -11506,6 +11510,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   logical, dimension(SZDI_(G),SZDJB_(G)) :: active_N
   real, dimension(SZDI_(G),SZDJ_(G))    :: cell_scale
   real :: S_K                ! Sum of a cell's face rates [T-1 ~> s-1]
+  real :: sK_W, sK_E, sK_S, sK_N ! Its four face rates, zero where the face is inactive
+                             ! [T-1 ~> s-1]
   real, dimension(2,2,2,2) :: qv_vol ! Per-QP volume contribution to the 4 cell corners,
                                      ! indexed (qx,qy,a,b) [Z L2 T-1 ~> m3 s-1]
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_vol
@@ -11763,11 +11769,15 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   ! Per-cell cap factor min(1, kcell/(S_K*dt)); non-ice and hmask=3 cells keep 1.
   do j = jsc, jec ; do i = isc, iec
     if (hmask(i,j) /= 1.0) cycle
-    S_K = 0.0
-    if (active_E(i-1,j)) S_K = S_K + rate_E(i-1,j)
-    if (active_E(i  ,j)) S_K = S_K + rate_E(i  ,j)
-    if (active_N(i,j-1)) S_K = S_K + rate_N(i,j-1)
-    if (active_N(i,j  )) S_K = S_K + rate_N(i,j  )
+    ! Opposite faces are summed as a pair, and the two pairs are then added.  A quarter turn
+    ! carries the west-east pair onto the south-north pair and back, so it only exchanges the
+    ! two pair sums, which addition does not notice.  Summing the four in a fixed E, E, N, N
+    ! order does not survive the turn.
+    sK_W = 0.0 ; if (active_E(i-1,j)) sK_W = rate_E(i-1,j)
+    sK_E = 0.0 ; if (active_E(i  ,j)) sK_E = rate_E(i  ,j)
+    sK_S = 0.0 ; if (active_N(i,j-1)) sK_S = rate_N(i,j-1)
+    sK_N = 0.0 ; if (active_N(i,j  )) sK_N = rate_N(i,j  )
+    S_K = (sK_W + sK_E) + (sK_S + sK_N)
     if (S_K*dt > CS%dg_art_visc_kcell) then
       cell_scale(i,j) = CS%dg_art_visc_kcell / (S_K*dt)
     else
