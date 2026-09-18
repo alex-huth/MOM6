@@ -12585,6 +12585,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   logical :: skip_xi, skip_eta, skip_w ! True where the transport already delivers the full rate
   integer :: kglo, kghi ! Gather range: the agreement detector reads two cells, not four
   logical :: agree_det  ! True when the stencil-agreement detector is selected
+  logical :: slope_gate ! True when the gate reads the real surface slope
   real :: gam      ! Gate fraction, 0 to 1 [nondim]
   real :: kap      ! Delivered rate for this cell and direction [T-1 ~> s-1]
   real :: rate_cap ! Largest rate the explicit step may carry [T-1 ~> s-1]
@@ -12624,10 +12625,13 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   ! left to advection and the artificial viscosity.
   rate_cap = 0.5 / max(dt, tiny(dt))
 
-  ! Cell-local fields on the full data domain.
-  hbar_c(:,:) = 0.0 ; ice_ok(:,:) = .false. ; sbar_c(:,:) = 0.0
-  t_xi(:,:) = 0.0 ; t_eta(:,:) = 0.0 ; w_c(:,:) = 0.0
-  f_gnd(:,:) = 0.0
+  agree_det  = (CS%dg_damp_detector == DAMP_DET_AGREE)
+  slope_gate = (CS%dg_damp_gate_form == DAMP_GATE_SLOPE)
+
+  ! Cell-local fields on the full data domain.  The loop below writes every element of
+  ! hbar_c, ice_ok, t_xi, t_eta and f_gnd, so clearing them first would only be a dead
+  ! store; w_c and sbar_c are written only where their feature asks for them, and nothing
+  ! reads them otherwise.
   do j = jsd, jed ; do i = isd, ied
     hbar_c(i,j) = 0.25*((h_nodal_in(i,j,1,1) + h_nodal_in(i,j,2,2)) + &
                         (h_nodal_in(i,j,2,1) + h_nodal_in(i,j,1,2)))
@@ -12645,12 +12649,17 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     ! Surface elevation the cell mean implies: freeboard afloat, thickness above the bed where
     ! the flotation deficit rho_i/rho_w*h - depth is positive. Continuous across the contour.
     ! Only the surface-slope gate reads it.
-    if (CS%dg_damp_gate_form == DAMP_GATE_SLOPE) &
+    if (slope_gate) &
       sbar_c(i,j) = (one_m_r*hbar_c(i,j)) + max((rhoi_rhow*hbar_c(i,j)) - CS%bed_elev(i,j), 0.0)
   enddo ; enddo
 
-  ! Bed tilts read bed_node, so they stop one ring short; no chosen stencil reads that ring.
-  b_xi(:,:) = 0.0 ; b_eta(:,:) = 0.0 ; b_w(:,:) = 0.0
+  ! Bed tilts read bed_node, so they stop one ring short; no chosen stencil reads that ring,
+  ! but the gathers clamp into it, so clear the ring alone rather than the whole array.
+  b_xi(isd,:) = 0.0 ; b_xi(ied,:) = 0.0 ; b_xi(:,jsd) = 0.0 ; b_xi(:,jed) = 0.0
+  b_eta(isd,:) = 0.0 ; b_eta(ied,:) = 0.0 ; b_eta(:,jsd) = 0.0 ; b_eta(:,jed) = 0.0
+  if (CS%dg_twist_damp) then
+    b_w(isd,:) = 0.0 ; b_w(ied,:) = 0.0 ; b_w(:,jsd) = 0.0 ; b_w(:,jed) = 0.0
+  endif
   do j = jsd+1, jed-1 ; do i = isd+1, ied-1
     b_xi(i,j)  = 0.5*((CS%bed_node(I,J-1) - CS%bed_node(I-1,J-1)) + &
                       (CS%bed_node(I,J)   - CS%bed_node(I-1,J)))
@@ -12675,7 +12684,6 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   r_xi(isc_w:iec_w,jsc_w:jec_w) = 0.0
   r_eta(isc_w:iec_w,jsc_w:jec_w) = 0.0
   r_w(isc_w:iec_w,jsc_w:jec_w) = 0.0
-  agree_det = (CS%dg_damp_detector == DAMP_DET_AGREE)
   kglo = -4 ; kghi = 4
   if (agree_det) then ; kglo = -2 ; kghi = 2 ; endif
 
@@ -12759,7 +12767,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         endif
       endif
       if (det_ok .and. (excess > 0.0)) then
-        dsurf = 0.5*(sbar_c(i+1,j) - sbar_c(i-1,j))
+        dsurf = 0.0
+        if (slope_gate) dsurf = 0.5*(sbar_c(i+1,j) - sbar_c(i-1,j))
         gam = gwt * dg_damp_gate_frac(CS%dg_damp_gate_form, dsdh, excess, A_spread, href_d, &
                                       dsurf, CS%dg_tilt_damp_r_hi, CS%dg_damp_rho_s, &
                                       CS%dg_damp_slope_floor*dx_cell, CS%dg_damp_rho_g)
@@ -12806,7 +12815,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         endif
       endif
       if (det_ok .and. (excess > 0.0)) then
-        dsurf = 0.5*(sbar_c(i,j+1) - sbar_c(i,j-1))
+        dsurf = 0.0
+        if (slope_gate) dsurf = 0.5*(sbar_c(i,j+1) - sbar_c(i,j-1))
         gam = gwt * dg_damp_gate_frac(CS%dg_damp_gate_form, dsdh, excess, A_spread, href_d, &
                                       dsurf, CS%dg_tilt_damp_r_hi, CS%dg_damp_rho_s, &
                                       CS%dg_damp_slope_floor*dy_cell, CS%dg_damp_rho_g)
@@ -12825,22 +12835,34 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     if (CS%dg_twist_damp .and. (.not.skip_w)) then
       ! Agreement reads the cross only, five cells along each axis, so the other 72 of the 81
       ! need not be gathered.  Today's twist reference uses the full square.
-      okw(:,:) = .false.
-      do kj = kglo, kghi ; do k = kglo, kghi
-        if (agree_det .and. (k /= 0) .and. (kj /= 0)) cycle
-        kk = min(max(i+k, isd), ied) ; jj = min(max(j+kj, jsd), jed)
-        okw(k,kj) = ice_ok(kk,jj) .and. ((i+k >= isd) .and. (i+k <= ied)) &
-                                  .and. ((j+kj >= jsd) .and. (j+kj <= jed))
-        ww(k,kj) = w_c(kk,jj) ; bw(k,kj) = b_w(kk,jj)
-        fw(k,kj) = f_gnd(kk,jj)
-        if (.not.agree_det) hw(k,kj) = hbar_c(kk,jj)
-        if (kj == 0) then
-          gwx(k) = f_gnd(kk,jj) ; iwx(k) = G%IdxT(kk,j)
-        endif
-        if (k == 0) then
-          gwy(kj) = f_gnd(kk,jj) ; iwy(kj) = G%IdyT(i,jj)
-        endif
-      enddo ; enddo
+      ! Neither branch needs the stencils cleared first: today's writes all 81 entries, and
+      ! agreement reads the cross alone, which the sweep below writes.  The two halves of that
+      ! sweep are the image of each other under a quarter turn.
+      if (agree_det) then
+        do k = kglo, kghi
+          kk = min(max(i+k, isd), ied) ; jj = min(max(j+k, jsd), jed)
+          okw(k,0) = ice_ok(kk,j) .and. ((i+k >= isd) .and. (i+k <= ied))
+          ww(k,0) = w_c(kk,j) ; bw(k,0) = b_w(kk,j) ; fw(k,0) = f_gnd(kk,j)
+          gwx(k) = f_gnd(kk,j) ; iwx(k) = G%IdxT(kk,j)
+          okw(0,k) = ice_ok(i,jj) .and. ((j+k >= jsd) .and. (j+k <= jed))
+          ww(0,k) = w_c(i,jj) ; bw(0,k) = b_w(i,jj) ; fw(0,k) = f_gnd(i,jj)
+          gwy(k) = f_gnd(i,jj) ; iwy(k) = G%IdyT(i,jj)
+        enddo
+      else
+        do kj = kglo, kghi ; do k = kglo, kghi
+          kk = min(max(i+k, isd), ied) ; jj = min(max(j+kj, jsd), jed)
+          okw(k,kj) = ice_ok(kk,jj) .and. ((i+k >= isd) .and. (i+k <= ied)) &
+                                    .and. ((j+kj >= jsd) .and. (j+kj <= jed))
+          ww(k,kj) = w_c(kk,jj) ; bw(k,kj) = b_w(kk,jj)
+          fw(k,kj) = f_gnd(kk,jj) ; hw(k,kj) = hbar_c(kk,jj)
+          if (kj == 0) then
+            gwx(k) = f_gnd(kk,jj) ; iwx(k) = G%IdxT(kk,j)
+          endif
+          if (k == 0) then
+            gwy(kj) = f_gnd(kk,jj) ; iwy(kj) = G%IdyT(i,jj)
+          endif
+        enddo ; enddo
+      endif
 
       if (CS%dg_damp_detector == DAMP_DET_AGREE) then
         ! Both axes, never a diagonal: the checkerboard alternates along x and along y, but is
@@ -12929,8 +12951,10 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
           ! whole exercise exists to avoid.
           gwt = kconf + ((1.0 - kconf) * reach_w)
         endif
-        dsurf = 0.25*((sbar_c(i+1,j+1) + sbar_c(i-1,j-1)) - &
-                      (sbar_c(i-1,j+1) + sbar_c(i+1,j-1)))
+        dsurf = 0.0
+        if (slope_gate) &
+          dsurf = 0.25*((sbar_c(i+1,j+1) + sbar_c(i-1,j-1)) - &
+                        (sbar_c(i-1,j+1) + sbar_c(i+1,j-1)))
         gam = gwt * dg_damp_gate_frac(CS%dg_damp_gate_form, dsdh, excess, A_spread, href_w, &
                                       dsurf, CS%dg_tilt_damp_r_hi, CS%dg_damp_rho_s, &
                                       CS%dg_damp_slope_floor*sqrt(dx_cell*dy_cell), &
