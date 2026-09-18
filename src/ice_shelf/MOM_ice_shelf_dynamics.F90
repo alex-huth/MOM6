@@ -444,6 +444,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! DAMP_GATE_THICKNESS, DAMP_GATE_SLOPE or DAMP_GATE_AGREEMENT.
   integer :: dg_damp_detector     !< Mode damper: which detector finds the zigzag, one of
                                   !! DAMP_DET_TODAY or DAMP_DET_AGREE.
+  logical :: dg_damp_centred_amp !< Mode damper: if true, the minmod of the readings decides
+                                 !! whether to damp and the centred reading sets how much.
   logical :: dg_damp_single_rule  !< Mode damper: if true, the agreement detector leaves a slope
                                   !! alone in a cell that has one stencil when that stencil
                                   !! crosses the grounding line.
@@ -10957,6 +10959,16 @@ subroutine read_DG_params(param_file, mdl, CS, US)
       (CS%dg_damp_detector > DAMP_DET_AGREE)) call MOM_error(FATAL, &
     "DG1_TILT_DAMP_DETECTOR must be 0 or 1.")
 
+  call get_param(param_file, mdl, "DG1_TILT_DAMP_CENTRED_AMP", CS%dg_damp_centred_amp, &
+                 "If true, the minmod of the stencil-agreement readings only decides whether "//&
+                 "to damp, and the centred reading sets how much is removed. The minmod keeps "//&
+                 "the veto, so a structure 4 cells wide and wider still gives exactly zero, "//&
+                 "and the response to the grid-scale mode itself does not change. Only the "//&
+                 "band between 2 and 4 cells gains. If false, the minmod sets the amount as "//&
+                 "well, which makes the removal smaller than the mode whenever the stencils "//&
+                 "read different mixtures of the mode and of real structure.", &
+                 default=.false., do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)) &
+                                  .or. (CS%dg_damp_detector /= DAMP_DET_AGREE))
   call get_param(param_file, mdl, "DG1_TILT_DAMP_SINGLE_RULE", CS%dg_damp_single_rule, &
                  "If true, the agreement detector leaves a tilt alone in a cell that has one "//&
                  "stencil, when that stencil is neither wholly floating nor wholly grounded.  "//&
@@ -12349,7 +12361,7 @@ end subroutine dg_minmod_spread
 !! the centre cell, which is what gives zero for a constant slope on cells of unequal width. The
 !! left and right forms are the same expression with mirrored indices, and the centred form pairs
 !! the two neighbours, so a rotation or a reflection maps one reading onto another exactly.
-pure subroutine dg_agree_readings(gv, ok, scl, rd, nrd)
+pure subroutine dg_agree_readings(gv, ok, scl, rd, nrd, cv, ncv)
   real,    dimension(-4:4), intent(in)    :: gv    !< The field per unit length [Z L-1 ~> nondim]
   logical, dimension(-4:4), intent(in)    :: ok    !< True where the cell is usable
   real,                     intent(in)    :: scl   !< Length of the centre cell along the line,
@@ -12357,6 +12369,8 @@ pure subroutine dg_agree_readings(gv, ok, scl, rd, nrd)
                                                    !! the coefficient [L ~> m]
   real, dimension(:),       intent(inout) :: rd    !< The set of readings [Z ~> m]
   integer,                  intent(inout) :: nrd   !< How many of them are set
+  real, dimension(:),       intent(inout) :: cv    !< The centred readings alone [Z ~> m]
+  integer,                  intent(inout) :: ncv   !< How many of those are set
 
   real :: half_scl ! Half of that length [L ~> m]
 
@@ -12364,6 +12378,9 @@ pure subroutine dg_agree_readings(gv, ok, scl, rd, nrd)
   if (ok(-1) .and. ok(1)) then
     nrd = nrd + 1
     rd(nrd) = scl * (gv(0) - (0.5*(gv(-1) + gv(1))))
+    ! The centred reading is kept apart because it, alone, measures the mode at this cell.
+    ncv = ncv + 1
+    cv(ncv) = rd(nrd)
   endif
   if (ok(-2) .and. ok(-1)) then
     nrd = nrd + 1
@@ -12381,7 +12398,7 @@ end subroutine dg_agree_readings
 !! every group and gives equal readings; a real feature does not, and the readings differ. On
 !! smooth ice the centred reading takes the sign opposite to the two one-sided ones, so the
 !! result is exactly zero however steep the ice is.
-pure subroutine dg_agree_1d(tv, bv, fv, ilv, len0, ok, single_rule, A, S, valid)
+pure subroutine dg_agree_1d(tv, bv, fv, ilv, len0, ok, single_rule, A, S, C, nc, valid)
   real,    dimension(-4:4), intent(in)  :: tv  !< Cell tilt of the thickness [Z ~> m]
   real,    dimension(-4:4), intent(in)  :: bv  !< Cell tilt of the bed depth [Z ~> m]
   real,    dimension(-4:4), intent(in)  :: fv  !< Grounded fraction [nondim]
@@ -12395,14 +12412,19 @@ pure subroutine dg_agree_1d(tv, bv, fv, ilv, len0, ok, single_rule, A, S, valid)
                                              !! grounding line
   real,                     intent(out) :: A     !< The agreed detector value [Z ~> m]
   real,                     intent(out) :: S     !< Spread of the readings [Z ~> m]
+  real,                     intent(out) :: C     !< The agreed centred reading, which measures
+                                                 !! the mode at this cell [Z ~> m]
+  integer,                  intent(out) :: nc    !< How many centred readings were found
   logical,                  intent(out) :: valid !< True if any stencil exists
 
   real, dimension(6) :: rd  ! Up to three stencils on two fields [Z ~> m]
+  real, dimension(2) :: cv  ! The centred reading of each field [Z ~> m]
   real, dimension(-4:4) :: gv ! One field per unit length [Z L-1 ~> nondim]
+  real :: Sc                ! Spread of the centred readings, not used [Z ~> m]
   integer :: k, nrd, nst
   logical :: st_c, st_l, st_r ! Whether the centred, left and right stencils exist
 
-  A = 0.0 ; S = 0.0 ; valid = .false.
+  A = 0.0 ; S = 0.0 ; C = 0.0 ; nc = 0 ; valid = .false.
   st_c = ok(-1) .and. ok(1)
   st_l = ok(-2) .and. ok(-1)
   st_r = ok(1) .and. ok(2)
@@ -12427,26 +12449,29 @@ pure subroutine dg_agree_1d(tv, bv, fv, ilv, len0, ok, single_rule, A, S, valid)
     endif
   endif
 
-  nrd = 0
+  nrd = 0 ; nc = 0
   ! The thickness, then the surface form: the thickness tilt less the part the bed explains,
   ! which is the change of surface elevation across a grounded cell and the tilt itself afloat.
   do k = -2, 2
     gv(k) = tv(k) * ilv(k)
   enddo
-  call dg_agree_readings(gv, ok, len0, rd, nrd)
+  call dg_agree_readings(gv, ok, len0, rd, nrd, cv, nc)
   do k = -2, 2
     gv(k) = (tv(k) - (fv(k)*bv(k))) * ilv(k)
   enddo
-  call dg_agree_readings(gv, ok, len0, rd, nrd)
+  call dg_agree_readings(gv, ok, len0, rd, nrd, cv, nc)
 
   call dg_minmod_spread(nrd, rd, A, S)
+  ! The two fields must still agree on the centred reading, so that a thickness which follows
+  ! a rough bed is protected exactly as it is in the full set.
+  if (nc > 0) call dg_minmod_spread(nc, cv, C, Sc)
 end subroutine dg_agree_1d
 
 !> Stencil agreement for the twist. The checkerboard alternates along both axes, so it is read
 !! along both, and it is constant along either diagonal, so a diagonal stencil would read zero
 !! and silence the damper. The field per unit length is the twist per unit area; along a line of
 !! constant j only the widths vary, so each line reduces to the same one-dimensional form.
-pure subroutine dg_agree_2d(wv, bwv, fv, ilx, ily, dx0, dy0, okw, A, S, valid)
+pure subroutine dg_agree_2d(wv, bwv, fv, ilx, ily, dx0, dy0, okw, A, S, C, nc, valid)
   real,    dimension(-4:4,-4:4), intent(in) :: wv  !< Cell twist of the thickness [Z ~> m]
   real,    dimension(-4:4,-4:4), intent(in) :: bwv !< Cell twist of the bed depth [Z ~> m]
   real,    dimension(-4:4,-4:4), intent(in) :: fv  !< Grounded fraction [nondim]
@@ -12458,14 +12483,19 @@ pure subroutine dg_agree_2d(wv, bwv, fv, ilx, ily, dx0, dy0, okw, A, S, valid)
   logical, dimension(-4:4,-4:4), intent(in) :: okw !< True where the cell is usable
   real,                     intent(out) :: A     !< The agreed detector value [Z ~> m]
   real,                     intent(out) :: S     !< Spread of the readings [Z ~> m]
+  real,                     intent(out) :: C     !< The agreed centred reading, which measures
+                                                 !! the mode at this cell [Z ~> m]
+  integer,                  intent(out) :: nc    !< How many centred readings were found
   logical,                  intent(out) :: valid !< True if any stencil exists
 
   real, dimension(12) :: rd ! Up to six stencils on two fields [Z ~> m]
+  real, dimension(4) :: cv  ! The centred reading of each field on each axis [Z ~> m]
   real, dimension(-4:4) :: gv ! One field per unit length along the line [Z L-1 ~> nondim]
   logical, dimension(-4:4) :: okl ! Usability along the line
+  real :: Sc                ! Spread of the centred readings, not used [Z ~> m]
   integer :: k, nrd
 
-  A = 0.0 ; S = 0.0 ; valid = .false.
+  A = 0.0 ; S = 0.0 ; C = 0.0 ; nc = 0 ; valid = .false.
   nrd = 0
 
   ! Along x, at the row of this cell.  The twist per unit area is w/(dx*dy), and dy does not
@@ -12474,25 +12504,28 @@ pure subroutine dg_agree_2d(wv, bwv, fv, ilx, ily, dx0, dy0, okw, A, S, valid)
     okl(k) = okw(k,0)
     gv(k) = wv(k,0) * ilx(k)
   enddo
-  call dg_agree_readings(gv, okl, dx0, rd, nrd)
+  call dg_agree_readings(gv, okl, dx0, rd, nrd, cv, nc)
   do k = -2, 2
     gv(k) = (wv(k,0) - (fv(k,0)*bwv(k,0))) * ilx(k)
   enddo
-  call dg_agree_readings(gv, okl, dx0, rd, nrd)
+  call dg_agree_readings(gv, okl, dx0, rd, nrd, cv, nc)
 
   ! Along y, at the column of this cell.
   do k = -2, 2
     okl(k) = okw(0,k)
     gv(k) = wv(0,k) * ily(k)
   enddo
-  call dg_agree_readings(gv, okl, dy0, rd, nrd)
+  call dg_agree_readings(gv, okl, dy0, rd, nrd, cv, nc)
   do k = -2, 2
     gv(k) = (wv(0,k) - (fv(0,k)*bwv(0,k))) * ily(k)
   enddo
-  call dg_agree_readings(gv, okl, dy0, rd, nrd)
+  call dg_agree_readings(gv, okl, dy0, rd, nrd, cv, nc)
 
   valid = (nrd > 0)
   call dg_minmod_spread(nrd, rd, A, S)
+  ! Both axes and both fields must agree on the centred reading, exactly as they must on the
+  ! full set.  A minmod over a set does not depend on the order a quarter turn presents it in.
+  if (nc > 0) call dg_minmod_spread(nc, cv, C, Sc)
 end subroutine dg_agree_2d
 
 !> Nodal rates damping the grid-scale in-cell tilt and twist. A tilt alternating between cells
@@ -12580,6 +12613,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
                    ! reference [Z ~> m]
   real :: A_spread ! Largest minus smallest detector reading; zero unless the detector
                    ! reports it [Z ~> m]
+  real :: A_cen    ! The agreed centred reading, which measures the mode at the cell [Z ~> m]
+  integer :: n_cen ! How many centred readings the detector found
   real :: dx_cell, dy_cell ! Cell width and height [L ~> m]
   real, dimension(-4:4) :: ilv ! Reciprocal cell length along the direction examined [L-1 ~> m-1]
   real, dimension(-4:4) :: iwx ! Reciprocal cell width along the twist's row [L-1 ~> m-1]
@@ -12767,7 +12802,10 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         ! grounding line: the readings disagree there on their own.  No single stencil is
         ! chosen, so the thickness gate normalizes on the cell mean.
         call dg_agree_1d(tv, bv, gv, ilv, dx_cell, okv, CS%dg_damp_single_rule, &
-                         A_dmp, A_spread, det_ok)
+                         A_dmp, A_spread, A_cen, n_cen, det_ok)
+        ! The minmod keeps the veto; the centred reading sets the amount.  Where no centred
+        ! reading exists the cell has no second opinion at all, so leave it as it was.
+        if (CS%dg_damp_centred_amp .and. (A_dmp /= 0.0) .and. (n_cen > 0)) A_dmp = A_cen
         excess = abs(A_dmp) ; gwt = 1.0 ; href_d = href
       else
         call dg_tilt_detector_1d(tv, bv, hv, okv, gv, CS%dg_damp_kink_ref, &
@@ -12819,7 +12857,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       enddo
       if (CS%dg_damp_detector == DAMP_DET_AGREE) then
         call dg_agree_1d(tv, bv, gv, ilv, dy_cell, okv, CS%dg_damp_single_rule, &
-                         A_dmp, A_spread, det_ok)
+                         A_dmp, A_spread, A_cen, n_cen, det_ok)
+        if (CS%dg_damp_centred_amp .and. (A_dmp /= 0.0) .and. (n_cen > 0)) A_dmp = A_cen
         excess = abs(A_dmp) ; gwt = 1.0 ; href_d = href
       else
         call dg_tilt_detector_1d(tv, bv, hv, okv, gv, CS%dg_damp_kink_ref, &
@@ -12892,7 +12931,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         ! constant along either diagonal, so a diagonal stencil would read zero.  The second
         ! axis is also why the twist needs no single-stencil rule.
         call dg_agree_2d(ww, bw, fw, iwx, iwy, dx_cell, dy_cell, okw, &
-                         A_dmp, A_spread, tw_ok)
+                         A_dmp, A_spread, A_cen, n_cen, tw_ok)
+        if (CS%dg_damp_centred_amp .and. (A_dmp /= 0.0) .and. (n_cen > 0)) A_dmp = A_cen
         excess = abs(A_dmp) ; gwt = 1.0 ; href_w = href
       else
 
