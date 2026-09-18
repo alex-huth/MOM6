@@ -57,6 +57,10 @@ integer, parameter :: DAMP_GATE_SLOPE = 1     !< Gate it against the real surfac
 integer, parameter :: DAMP_GATE_AGREEMENT = 2 !< Gate it on how well the readings agree
 
 ! DG(1) mode-damper detectors, selected by DG1_TILT_DAMP_DETECTOR
+integer, parameter :: DAMP_EDGE_OFF = 0 !< Leave a cell that has lost a neighbour to the
+                                        !! stencil readings, which cannot cancel there
+integer, parameter :: DAMP_EDGE_REF = 1 !< Take the estimates from the cell means instead, and
+                                        !! stand down where the run crosses a flotation break
 integer, parameter :: DAMP_DET_TODAY = 0 !< Tilt Laplacian against bed and mean-supported floors
 integer, parameter :: DAMP_DET_AGREE = 1 !< Stencil agreement over three stencils and two fields
 
@@ -444,6 +448,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! DAMP_GATE_THICKNESS, DAMP_GATE_SLOPE or DAMP_GATE_AGREEMENT.
   integer :: dg_damp_detector     !< Mode damper: which detector finds the zigzag, one of
                                   !! DAMP_DET_TODAY or DAMP_DET_AGREE.
+  integer :: dg_damp_edge_rule   !< Mode damper: what to do at a cell that has lost a
+                                 !! neighbour; see the DG1_TILT_DAMP_EDGE parameter.
   logical :: dg_damp_centred_amp !< Mode damper: if true, the minmod of the readings decides
                                  !! whether to damp and the centred reading sets how much.
   logical :: dg_damp_single_rule  !< Mode damper: if true, the agreement detector leaves a slope
@@ -10959,6 +10965,21 @@ subroutine read_DG_params(param_file, mdl, CS, US)
       (CS%dg_damp_detector > DAMP_DET_AGREE)) call MOM_error(FATAL, &
     "DG1_TILT_DAMP_DETECTOR must be 0 or 1.")
 
+  call get_param(param_file, mdl, "DG1_TILT_DAMP_EDGE", CS%dg_damp_edge_rule, &
+                 "What the stencil-agreement detector does at a cell that has lost a "//&
+                 "neighbour, next to an ice front, a wall or a nunatak. The cancellation on "//&
+                 "smooth ice works through the opposite signs of the centred reading and the "//&
+                 "one-sided ones, so it needs a neighbour on both sides; a cell without one "//&
+                 "also has no spread, so its gate cannot close. 0 leaves those cells to the "//&
+                 "readings they have, which damps smooth ice at the full rate. 1 takes the "//&
+                 "estimates from the cell means instead, over every run of 2 to 5 usable "//&
+                 "cells that holds the cell, and stands down where that run crosses a "//&
+                 "flotation break or holds fewer than 3 cells. The reference is exact for "//&
+                 "cells of equal width and first order otherwise.", &
+                 default=DAMP_EDGE_OFF, do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)) &
+                                  .or. (CS%dg_damp_detector /= DAMP_DET_AGREE))
+  if ((CS%dg_damp_edge_rule < 0) .or. (CS%dg_damp_edge_rule > 1)) call MOM_error(FATAL, &
+    "read_DG_params: DG1_TILT_DAMP_EDGE must be 0 or 1.")
   call get_param(param_file, mdl, "DG1_TILT_DAMP_CENTRED_AMP", CS%dg_damp_centred_amp, &
                  "If true, the minmod of the stencil-agreement readings only decides whether "//&
                  "to damp, and the centred reading sets how much is removed. The minmod keeps "//&
@@ -12361,6 +12382,96 @@ end subroutine dg_minmod_spread
 !! the centre cell, which is what gives zero for a constant slope on cells of unequal width. The
 !! left and right forms are the same expression with mirrored indices, and the centred form pairs
 !! the two neighbours, so a rotation or a reflection maps one reading onto another exactly.
+!> Weights that turn the cell means of a short run into the tilt those means imply at one cell
+!! of it.  The run holds n cells of equal width, numbered 1 to n, and the host is cell p+1.
+!! The polynomial of degree n-1 whose cell means match is taken, and its tilt at the host is
+!! returned as w . hbar.  The values are exact rationals, so the compiler folds them.
+pure function dg_ref_w(n, p) result(w)
+  integer, intent(in) :: n   !< Cells in the run, 2 to 5
+  integer, intent(in) :: p   !< Position of the host in the run, 0 to n-1
+  real, dimension(5) :: w    !< The weights, the last 5-n of them zero [nondim]
+
+  w(:) = 0.0
+  select case (10*n + p)
+    case (20, 21)
+      w(1:2) = (/ -1.0, 1.0 /)
+    case (30)
+      w(1:3) = (/ -1.5, 2.0, -0.5 /)
+    case (31)
+      w(1:3) = (/ -0.5, 0.0, 0.5 /)
+    case (32)
+      w(1:3) = (/ 0.5, -2.0, 1.5 /)
+    case (40)
+      w(1:4) = (/ -109.0/60.0, 59.0/20.0, -29.0/20.0, 19.0/60.0 /)
+    case (41)
+      w(1:4) = (/ -19.0/60.0, -11.0/20.0, 21.0/20.0, -11.0/60.0 /)
+    case (42)
+      w(1:4) = (/ 11.0/60.0, -21.0/20.0, 11.0/20.0, 19.0/60.0 /)
+    case (43)
+      w(1:4) = (/ -19.0/60.0, 29.0/20.0, -59.0/20.0, 109.0/60.0 /)
+    case (50)
+      w(1:5) = (/ -49.0/24.0, 77.0/20.0, -14.0/5.0, 73.0/60.0, -9.0/40.0 /)
+    case (51)
+      w(1:5) = (/ -9.0/40.0, -11.0/12.0, 8.0/5.0, -11.0/20.0, 11.0/120.0 /)
+    case (52)
+      w(1:5) = (/ 11.0/120.0, -41.0/60.0, 0.0, 41.0/60.0, -11.0/120.0 /)
+    case (53)
+      w(1:5) = (/ -11.0/120.0, 11.0/20.0, -8.0/5.0, 11.0/12.0, 9.0/40.0 /)
+    case (54)
+      w(1:5) = (/ 9.0/40.0, -73.0/60.0, 14.0/5.0, -77.0/20.0, 49.0/24.0 /)
+  end select
+end function dg_ref_w
+
+!> Estimates of the mode at a cell that has lost a neighbour, from the cell means.
+!!
+!! The mode never changes a cell mean, so the means are an honest reference, and they do not
+!! depend on the bed or on the state of flotation.  Every contiguous run of 2 to 5 usable cells
+!! that holds the host gives one estimate: the actual tilt less the tilt those means imply.  A
+!! run of 3 cells or fewer gains one more, the tilt itself, which is the reference that assumes
+!! no slope at all.  The caller reduces the set with the same minmod and the same spread that
+!! the stencil readings use.
+pure subroutine dg_ref_readings(tv, hv, ok, rd, nrd, lo, hi)
+  real,    dimension(-4:4), intent(in)    :: tv  !< Cell tilt of the field [Z ~> m]
+  real,    dimension(-4:4), intent(in)    :: hv  !< Cell mean of the field [Z ~> m]
+  logical, dimension(-4:4), intent(in)    :: ok  !< True where the cell is usable
+  real,    dimension(:),    intent(inout) :: rd  !< The set of estimates [Z ~> m]
+  integer,                  intent(inout) :: nrd !< How many of them are set
+  integer,                  intent(out)   :: lo  !< First offset of the usable run
+  integer,                  intent(out)   :: hi  !< Last offset of the usable run
+
+  real, dimension(5) :: w  ! The weights of one run [nondim]
+  real :: r                ! The tilt one run's means imply [Z ~> m]
+  integer :: a, b, n, k
+
+  ! The usable run that holds the host cell.
+  lo = 0 ; do k = 0, -4, -1 ; if (ok(k)) then ; lo = k ; else ; exit ; endif ; enddo
+  hi = 0 ; do k = 0, 4      ; if (ok(k)) then ; hi = k ; else ; exit ; endif ; enddo
+  if (hi - lo < 2) return    ! 2 cells cannot separate the mode from curvature
+
+  do a = lo, 0 ; do b = 0, hi
+    n = (b - a) + 1
+    if ((n < 2) .or. (n > 5)) cycle
+    w = dg_ref_w(n, -a)
+    ! Summed in pairs about the middle of the run.  A quarter turn reverses the run, and a
+    ! reversed running sum would not reproduce the same rounding; a symmetric pairing does.
+    r = 0.0
+    do k = 1, n/2
+      r = r + ((w(k)*hv(a+k-1)) + (w(n+1-k)*hv(b-k+1)))
+    enddo
+    if (mod(n, 2) == 1) r = r + (w((n+1)/2)*hv(a + ((n-1)/2)))
+    nrd = nrd + 1
+    rd(nrd) = tv(0) - r
+  enddo ; enddo
+
+  ! A short run cannot see the third degree, so add the weakest reference of all as a partner
+  ! for the minmod.  Without it a 3-cell run damps a smooth wave at 0.084 of its amplitude;
+  ! with it, at 0.0025.
+  if (hi - lo <= 2) then
+    nrd = nrd + 1
+    rd(nrd) = tv(0)
+  endif
+end subroutine dg_ref_readings
+
 pure subroutine dg_agree_readings(gv, ok, scl, rd, nrd, cv, ncv)
   real,    dimension(-4:4), intent(in)    :: gv    !< The field per unit length [Z L-1 ~> nondim]
   logical, dimension(-4:4), intent(in)    :: ok    !< True where the cell is usable
@@ -12398,10 +12509,13 @@ end subroutine dg_agree_readings
 !! every group and gives equal readings; a real feature does not, and the readings differ. On
 !! smooth ice the centred reading takes the sign opposite to the two one-sided ones, so the
 !! result is exactly zero however steep the ice is.
-pure subroutine dg_agree_1d(tv, bv, fv, ilv, len0, ok, single_rule, A, S, C, nc, valid)
+pure subroutine dg_agree_1d(tv, bv, fv, hv, ilv, len0, ok, single_rule, edge_rule, &
+                            A, S, C, nc, valid)
   real,    dimension(-4:4), intent(in)  :: tv  !< Cell tilt of the thickness [Z ~> m]
   real,    dimension(-4:4), intent(in)  :: bv  !< Cell tilt of the bed depth [Z ~> m]
   real,    dimension(-4:4), intent(in)  :: fv  !< Grounded fraction [nondim]
+  real,    dimension(-4:4), intent(in)  :: hv  !< Cell mean thickness, read by the edge rule
+                                               !! only [Z ~> m]
   real,    dimension(-4:4), intent(in)  :: ilv !< Reciprocal cell length along the direction,
                                                !! which the grid already carries, so the slope
                                                !! per unit length costs no division [L-1 ~> m-1]
@@ -12410,6 +12524,8 @@ pure subroutine dg_agree_1d(tv, bv, fv, ilv, len0, ok, single_rule, A, S, C, nc,
   logical,                  intent(in)  :: single_rule !< If true, leave a cell that has one
                                              !! stencil alone when that stencil crosses the
                                              !! grounding line
+  integer,                  intent(in)  :: edge_rule !< What to do where the stencils cannot
+                                             !! cancel on smooth ice; see DG1_TILT_DAMP_EDGE
   real,                     intent(out) :: A     !< The agreed detector value [Z ~> m]
   real,                     intent(out) :: S     !< Spread of the readings [Z ~> m]
   real,                     intent(out) :: C     !< The agreed centred reading, which measures
@@ -12417,11 +12533,12 @@ pure subroutine dg_agree_1d(tv, bv, fv, ilv, len0, ok, single_rule, A, S, C, nc,
   integer,                  intent(out) :: nc    !< How many centred readings were found
   logical,                  intent(out) :: valid !< True if any stencil exists
 
-  real, dimension(6) :: rd  ! Up to three stencils on two fields [Z ~> m]
+  real, dimension(16) :: rd ! Up to three stencils on two fields, or the runs of the edge rule
+                            ! [Z ~> m]
   real, dimension(2) :: cv  ! The centred reading of each field [Z ~> m]
   real, dimension(-4:4) :: gv ! One field per unit length [Z L-1 ~> nondim]
   real :: Sc                ! Spread of the centred readings, not used [Z ~> m]
-  integer :: k, nrd, nst
+  integer :: k, nrd, nst, lo, hi
   logical :: st_c, st_l, st_r ! Whether the centred, left and right stencils exist
 
   A = 0.0 ; S = 0.0 ; C = 0.0 ; nc = 0 ; valid = .false.
@@ -12432,6 +12549,25 @@ pure subroutine dg_agree_1d(tv, bv, fv, ilv, len0, ok, single_rule, A, S, C, nc,
   if (st_c) nst = nst + 1
   if (st_l) nst = nst + 1
   if (st_r) nst = nst + 1
+
+  ! The cancellation on smooth ice works through the opposite signs of the centred reading and
+  ! the one-sided ones, so it needs the centred stencil AND at least one of the others.  Where
+  ! it is not available the cell means take over.
+  if ((edge_rule > 0) .and. .not.(st_c .and. (st_l .or. st_r))) then
+    nrd = 0
+    call dg_ref_readings(tv, hv, ok, rd, nrd, lo, hi)
+    if (nrd == 0) return
+    ! The means themselves bend where the run crosses a flotation break, so the reference is
+    ! not to be trusted there.  The grounded fraction is set to exactly 0 and exactly 1, so
+    ! the test needs no tolerance.
+    if (edge_rule == DAMP_EDGE_REF) then
+      if (maxval(fv(lo:hi)) > minval(fv(lo:hi))) return
+    endif
+    valid = .true.
+    call dg_minmod_spread(nrd, rd, A, S)
+    return
+  endif
+
   if (nst == 0) return
   valid = .true.
 
@@ -12471,7 +12607,8 @@ end subroutine dg_agree_1d
 !! along both, and it is constant along either diagonal, so a diagonal stencil would read zero
 !! and silence the damper. The field per unit length is the twist per unit area; along a line of
 !! constant j only the widths vary, so each line reduces to the same one-dimensional form.
-pure subroutine dg_agree_2d(wv, bwv, fv, ilx, ily, dx0, dy0, okw, A, S, C, nc, valid)
+pure subroutine dg_agree_2d(wv, bwv, fv, ilx, ily, dx0, dy0, okw, edge_rule, &
+                            A, S, C, nc, valid)
   real,    dimension(-4:4,-4:4), intent(in) :: wv  !< Cell twist of the thickness [Z ~> m]
   real,    dimension(-4:4,-4:4), intent(in) :: bwv !< Cell twist of the bed depth [Z ~> m]
   real,    dimension(-4:4,-4:4), intent(in) :: fv  !< Grounded fraction [nondim]
@@ -12481,6 +12618,8 @@ pure subroutine dg_agree_2d(wv, bwv, fv, ilx, ily, dx0, dy0, okw, A, S, C, nc, v
   real,                     intent(in) :: dx0 !< Width of the centre cell [L ~> m]
   real,                     intent(in) :: dy0 !< Height of the centre cell [L ~> m]
   logical, dimension(-4:4,-4:4), intent(in) :: okw !< True where the cell is usable
+  integer,                  intent(in)  :: edge_rule !< What to do where neither axis can
+                                             !! cancel on smooth ice; see DG1_TILT_DAMP_EDGE
   real,                     intent(out) :: A     !< The agreed detector value [Z ~> m]
   real,                     intent(out) :: S     !< Spread of the readings [Z ~> m]
   real,                     intent(out) :: C     !< The agreed centred reading, which measures
@@ -12494,9 +12633,19 @@ pure subroutine dg_agree_2d(wv, bwv, fv, ilx, ily, dx0, dy0, okw, A, S, C, nc, v
   logical, dimension(-4:4) :: okl ! Usability along the line
   real :: Sc                ! Spread of the centred readings, not used [Z ~> m]
   integer :: k, nrd
+  logical :: st_x, st_y     ! Whether each axis can cancel on smooth ice
 
   A = 0.0 ; S = 0.0 ; C = 0.0 ; nc = 0 ; valid = .false.
   nrd = 0
+
+  ! The twist puts both axes into one set, so one axis that can cancel protects the whole set.
+  ! Only a corner loses both.  There the cell means would have to supply a twist, which needs a
+  ! two-dimensional fit that has not been tested, so stand down instead.
+  st_x = (okw(-1,0) .and. okw(1,0)) .and. &
+         ((okw(-2,0) .and. okw(-1,0)) .or. (okw(1,0) .and. okw(2,0)))
+  st_y = (okw(0,-1) .and. okw(0,1)) .and. &
+         ((okw(0,-2) .and. okw(0,-1)) .or. (okw(0,1) .and. okw(0,2)))
+  if ((edge_rule > 0) .and. .not.(st_x .or. st_y)) return
 
   ! Along x, at the row of this cell.  The twist per unit area is w/(dx*dy), and dy does not
   ! change along a row, so the height divides out of the second difference and the scale alike.
@@ -12626,6 +12775,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   logical :: skip_xi, skip_eta, skip_w ! True where the transport already delivers the full rate
   integer :: kglo, kghi ! Gather range: the agreement detector reads two cells, not four
   logical :: agree_det  ! True when the stencil-agreement detector is selected
+  logical :: edge_on    ! True when the edge rule reads the cell means
   logical :: slope_gate ! True when the gate reads the real surface slope
   real :: gam      ! Gate fraction, 0 to 1 [nondim]
   real :: kap      ! Delivered rate for this cell and direction [T-1 ~> s-1]
@@ -12672,6 +12822,9 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   c_ucut = CS%dg_damp_advective_c * CS%dg_damp_u_cut
 
   agree_det  = (CS%dg_damp_detector == DAMP_DET_AGREE)
+  ! The edge rule fits the cell means over runs of up to five cells, so it reaches as far as
+  ! today's detector does and it needs the means that the agreement path otherwise skips.
+  edge_on    = agree_det .and. (CS%dg_damp_edge_rule > 0)
   slope_gate = (CS%dg_damp_gate_form == DAMP_GATE_SLOPE)
 
   ! Cell-local fields on the full data domain.  The loop below writes every element of
@@ -12737,7 +12890,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   r_eta(isc_w:iec_w,jsc_w:jec_w) = 0.0
   r_w(isc_w:iec_w,jsc_w:jec_w) = 0.0
   kglo = -4 ; kghi = 4
-  if (agree_det) then ; kglo = -2 ; kghi = 2 ; endif
+  if (agree_det .and. (.not.edge_on)) then ; kglo = -2 ; kghi = 2 ; endif
 
   do j = jsc_w, jec_w ; do i = isc_w, iec_w
     if (hmask(i,j) /= 1.0) cycle
@@ -12793,16 +12946,16 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         okv(k) = ice_ok(kk,j) .and. (i+k >= isd) .and. (i+k <= ied)
         tv(k) = t_xi(kk,j) ; bv(k) = b_xi(kk,j)
         gv(k) = f_gnd(kk,j) ; ilv(k) = G%IdxT(kk,j)
-        ! Agreement needs no stencil thickness; it normalizes the gate on the cell mean.
-        if (agree_det) cycle
+        ! Agreement needs no stencil thickness unless the edge rule reads the means.
+        if (agree_det .and. (.not.edge_on)) cycle
         hv(k) = hbar_c(kk,j)
       enddo
       if (CS%dg_damp_detector == DAMP_DET_AGREE) then
         ! Agreement needs no floor and no kink reference, and nothing here protects the
         ! grounding line: the readings disagree there on their own.  No single stencil is
         ! chosen, so the thickness gate normalizes on the cell mean.
-        call dg_agree_1d(tv, bv, gv, ilv, dx_cell, okv, CS%dg_damp_single_rule, &
-                         A_dmp, A_spread, A_cen, n_cen, det_ok)
+        call dg_agree_1d(tv, bv, gv, hv, ilv, dx_cell, okv, CS%dg_damp_single_rule, &
+                         CS%dg_damp_edge_rule, A_dmp, A_spread, A_cen, n_cen, det_ok)
         ! The minmod keeps the veto; the centred reading sets the amount.  Where no centred
         ! reading exists the cell has no second opinion at all, so leave it as it was.
         if (CS%dg_damp_centred_amp .and. (A_dmp /= 0.0) .and. (n_cen > 0)) A_dmp = A_cen
@@ -12852,12 +13005,12 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         okv(k) = ice_ok(i,kk) .and. (j+k >= jsd) .and. (j+k <= jed)
         tv(k) = t_eta(i,kk) ; bv(k) = b_eta(i,kk)
         gv(k) = f_gnd(i,kk) ; ilv(k) = G%IdyT(i,kk)
-        if (agree_det) cycle
+        if (agree_det .and. (.not.edge_on)) cycle
         hv(k) = hbar_c(i,kk)
       enddo
       if (CS%dg_damp_detector == DAMP_DET_AGREE) then
-        call dg_agree_1d(tv, bv, gv, ilv, dy_cell, okv, CS%dg_damp_single_rule, &
-                         A_dmp, A_spread, A_cen, n_cen, det_ok)
+        call dg_agree_1d(tv, bv, gv, hv, ilv, dy_cell, okv, CS%dg_damp_single_rule, &
+                         CS%dg_damp_edge_rule, A_dmp, A_spread, A_cen, n_cen, det_ok)
         if (CS%dg_damp_centred_amp .and. (A_dmp /= 0.0) .and. (n_cen > 0)) A_dmp = A_cen
         excess = abs(A_dmp) ; gwt = 1.0 ; href_d = href
       else
@@ -12930,7 +13083,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         ! Both axes, never a diagonal: the checkerboard alternates along x and along y, but is
         ! constant along either diagonal, so a diagonal stencil would read zero.  The second
         ! axis is also why the twist needs no single-stencil rule.
-        call dg_agree_2d(ww, bw, fw, iwx, iwy, dx_cell, dy_cell, okw, &
+        call dg_agree_2d(ww, bw, fw, iwx, iwy, dx_cell, dy_cell, okw, CS%dg_damp_edge_rule, &
                          A_dmp, A_spread, A_cen, n_cen, tw_ok)
         if (CS%dg_damp_centred_amp .and. (A_dmp /= 0.0) .and. (n_cen > 0)) A_dmp = A_cen
         excess = abs(A_dmp) ; gwt = 1.0 ; href_w = href
