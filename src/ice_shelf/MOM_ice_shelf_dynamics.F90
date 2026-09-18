@@ -12576,6 +12576,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
                                   ! optional high pass [Z T-1 ~> m s-1]
   real :: rf_xi, rf_eta, rf_w ! The same after it [Z T-1 ~> m s-1]
   integer :: isc_w, iec_w, jsc_w, jec_w ! Loop bounds, one cell wider with the high pass
+  logical :: skip_xi, skip_eta, skip_w ! True where the transport already delivers the full rate
+  integer :: kglo, kghi ! Gather range: the agreement detector reads two cells, not four
   real :: gam      ! Gate fraction, 0 to 1 [nondim]
   real :: kap      ! Delivered rate for this cell and direction [T-1 ~> s-1]
   real :: rate_cap ! Largest rate the explicit step may carry [T-1 ~> s-1]
@@ -12658,7 +12660,12 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       "increase NIHALO/NJHALO or switch the filter off.")
     isc_w = isc-1 ; iec_w = iec+1 ; jsc_w = jsc-1 ; jec_w = jec+1
   endif
-  r_xi(:,:) = 0.0 ; r_eta(:,:) = 0.0 ; r_w(:,:) = 0.0
+  ! Only the window the second pass reads has to be valid.
+  r_xi(isc_w:iec_w,jsc_w:jec_w) = 0.0
+  r_eta(isc_w:iec_w,jsc_w:jec_w) = 0.0
+  r_w(isc_w:iec_w,jsc_w:jec_w) = 0.0
+  kglo = -4 ; kghi = 4
+  if (CS%dg_damp_detector == DAMP_DET_AGREE) then ; kglo = -2 ; kghi = 2 ; endif
 
   do j = jsc_w, jec_w ; do i = isc_w, iec_w
     if (hmask(i,j) /= 1.0) cycle
@@ -12691,9 +12698,18 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
                  (abs(CS%v_shelf(I,J-1))   + abs(CS%v_shelf(I-1,J))))
     endif
 
+    ! The delivered rate is min(max(gam*itau - knat, 0), cap) with gam <= 1, so where the
+    ! transport already removes the mode faster than the damper's full rate there is nothing to
+    ! add and the detector need not run at all.  Guarded on the diagnostics, which report the
+    ! rate the gate asked for and would otherwise lose those cells.
+    skip_xi  = (.not.diag_on) .and. (itau_xi  <= knat_xi)
+    skip_eta = (.not.diag_on) .and. (itau_eta <= knat_eta)
+    skip_w   = (.not.diag_on) .and. (itau_w   <= min(knat_xi, knat_eta))
+
     ! --- xi direction, gated only on row j ---
-    if (CS%dg_tilt_damp) then
-      do k = -4, 4
+    if (CS%dg_tilt_damp .and. (.not.skip_xi)) then
+      okv(:) = .false.
+      do k = kglo, kghi
         kk = min(max(i+k, isd), ied)
         okv(k) = ice_ok(kk,j) .and. (i+k >= isd) .and. (i+k <= ied)
         tv(k) = t_xi(kk,j) ; bv(k) = b_xi(kk,j) ; hv(k) = hbar_c(kk,j)
@@ -12743,8 +12759,9 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     endif
 
     ! --- eta direction ---
-    if (CS%dg_tilt_damp) then
-      do k = -4, 4
+    if (CS%dg_tilt_damp .and. (.not.skip_eta)) then
+      okv(:) = .false.
+      do k = kglo, kghi
         kk = min(max(j+k, jsd), jed)
         okv(k) = ice_ok(i,kk) .and. (j+k >= jsd) .and. (j+k <= jed)
         tv(k) = t_eta(i,kk) ; bv(k) = b_eta(i,kk) ; hv(k) = hbar_c(i,kk)
@@ -12787,8 +12804,12 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
     endif
 
     ! --- xy-twist ---
-    if (CS%dg_twist_damp) then
-      do kj = -4, 4 ; do k = -4, 4
+    if (CS%dg_twist_damp .and. (.not.skip_w)) then
+      ! Agreement reads the cross only, five cells along each axis, so the other 72 of the 81
+      ! need not be gathered.  Today's twist reference uses the full square.
+      okw(:,:) = .false.
+      do kj = kglo, kghi ; do k = kglo, kghi
+        if ((CS%dg_damp_detector == DAMP_DET_AGREE) .and. (k /= 0) .and. (kj /= 0)) cycle
         kk = min(max(i+k, isd), ied) ; jj = min(max(j+kj, jsd), jed)
         okw(k,kj) = ice_ok(kk,jj) .and. ((i+k >= isd) .and. (i+k <= ied)) &
                                   .and. ((j+kj >= jsd) .and. (j+kj <= jed))
