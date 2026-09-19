@@ -68,6 +68,9 @@ integer, parameter :: DAMP_EDGE_REF = 1 !< Take the estimates from the cell mean
                                         !! stand down where the run crosses a flotation break
 integer, parameter :: DAMP_DET_TODAY = 0 !< Tilt Laplacian against bed and mean-supported floors
 integer, parameter :: DAMP_DET_AGREE = 1 !< Stencil agreement over three stencils and two fields
+integer, parameter :: DAMP_DET_HYBRID = 2 !< Each cell chooses: the tilt Laplacian where the
+                                          !! stencil stays on one side of the flotation
+                                          !! contour, stencil agreement where it does not
 
 
 ! Sentinel returned by the Coulomb fB routines when the effective pressure is zero. The sliding law
@@ -10965,12 +10968,18 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "reference.  1 is stencil agreement: read the second difference of the slope "//&
                  "on each group of three adjacent cells, on the thickness and on the surface "//&
                  "form, and keep only the part every reading agrees on.  1 has no parameters "//&
-                 "and gives exactly zero for any structure four cells wide or wider.", &
+                 "and gives exactly zero for any structure four cells wide or wider.  2 lets "//&
+                 "each cell choose: 0 where the cells the stencil reads are all grounded or "//&
+                 "all afloat, and 1 where they are not.  0 finds more of the mode, but it "//&
+                 "needs a reference that averages across a flotation break, which is what "//&
+                 "the kink reference exists to repair; 1 needs no reference at all.  2 "//&
+                 "therefore uses 0 where it is strong and 1 where it is safe, and the kink "//&
+                 "reference can be left off.", &
                  default=DAMP_DET_TODAY, &
                  do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)))
   if ((CS%dg_damp_detector < DAMP_DET_TODAY) .or. &
-      (CS%dg_damp_detector > DAMP_DET_AGREE)) call MOM_error(FATAL, &
-    "DG1_TILT_DAMP_DETECTOR must be 0 or 1.")
+      (CS%dg_damp_detector > DAMP_DET_HYBRID)) call MOM_error(FATAL, &
+    "DG1_TILT_DAMP_DETECTOR must be 0, 1 or 2.")
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_EDGE", CS%dg_damp_edge_rule, &
                  "What the stencil-agreement detector does at a cell that has lost a "//&
@@ -10984,7 +10993,8 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "flotation break or holds fewer than 3 cells. The reference is exact for "//&
                  "cells of equal width and first order otherwise.", &
                  default=DAMP_EDGE_OFF, do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)) &
-                                  .or. (CS%dg_damp_detector /= DAMP_DET_AGREE))
+                                  .or. ((CS%dg_damp_detector /= DAMP_DET_AGREE) .and. &
+                                       (CS%dg_damp_detector /= DAMP_DET_HYBRID)))
   if ((CS%dg_damp_edge_rule < 0) .or. (CS%dg_damp_edge_rule > 1)) call MOM_error(FATAL, &
     "read_DG_params: DG1_TILT_DAMP_EDGE must be 0 or 1.")
   call get_param(param_file, mdl, "DG1_TILT_DAMP_CENTRED_AMP", CS%dg_damp_centred_amp, &
@@ -10996,7 +11006,8 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "well, which makes the removal smaller than the mode whenever the stencils "//&
                  "read different mixtures of the mode and of real structure.", &
                  default=.false., do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)) &
-                                  .or. (CS%dg_damp_detector /= DAMP_DET_AGREE))
+                                  .or. ((CS%dg_damp_detector /= DAMP_DET_AGREE) .and. &
+                                       (CS%dg_damp_detector /= DAMP_DET_HYBRID)))
   call get_param(param_file, mdl, "DG1_TILT_DAMP_REDUCE", CS%dg_damp_reduce, &
                  "How the stencil-agreement detector reduces its readings to one value. 0 "//&
                  "compares every reading with every other one, so a single reading of the "//&
@@ -11012,7 +11023,8 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "grounding line in place.", &
                  default=DAMP_RED_MINMOD, &
                  do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)) &
-                            .or. (CS%dg_damp_detector /= DAMP_DET_AGREE))
+                            .or. ((CS%dg_damp_detector /= DAMP_DET_AGREE) .and. &
+                                       (CS%dg_damp_detector /= DAMP_DET_HYBRID)))
   if ((CS%dg_damp_reduce < DAMP_RED_MINMOD) .or. (CS%dg_damp_reduce > DAMP_RED_PAIRED)) &
     call MOM_error(FATAL, "read_DG_params: DG1_TILT_DAMP_REDUCE must be 0 or 1.")
   call get_param(param_file, mdl, "DG1_TILT_DAMP_SINGLE_RULE", CS%dg_damp_single_rule, &
@@ -11022,7 +11034,8 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "compare with, so a stencil that crosses the grounding line reads the change "//&
                  "of slope there.  The twist does not need this: it reads both axes.", &
                  default=.true., &
-                 do_not_log=(CS%dg_damp_detector /= DAMP_DET_AGREE))
+                 do_not_log=((CS%dg_damp_detector /= DAMP_DET_AGREE) .and. &
+                             (CS%dg_damp_detector /= DAMP_DET_HYBRID)))
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_FILTER", CS%dg_damp_filter, &
                  "If true, apply a 1-2-1 high pass to the damper's removal before it is "//&
@@ -11048,6 +11061,15 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   if ((CS%dg_damp_gate_form < DAMP_GATE_THICKNESS) .or. &
       (CS%dg_damp_gate_form > DAMP_GATE_AGREEMENT)) call MOM_error(FATAL, &
     "DG1_TILT_DAMP_GATE must be 0, 1 or 2.")
+  ! Under the hybrid this names the gate of the tilt-Laplacian branch alone; the agreement
+  ! branch always uses the agreement gate, which is the only one that reads its spread.  The
+  ! agreement gate on the tilt Laplacian would stand fully open, because that detector reports
+  ! no spread.
+  if ((CS%dg_damp_detector == DAMP_DET_HYBRID) .and. &
+      (CS%dg_damp_gate_form == DAMP_GATE_AGREEMENT)) call MOM_error(FATAL, &
+    "read_DG_params: DG1_TILT_DAMP_GATE = 2 cannot gate the tilt-Laplacian branch of "//&
+    "DG1_TILT_DAMP_DETECTOR = 2, which reports no spread.  Use 0 or 1; the agreement "//&
+    "branch gates itself.")
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_RHO_S", CS%dg_damp_rho_s, &
                  "Zigzag surface slope, as a multiple of the real surface slope, at which "//&
@@ -12912,6 +12934,11 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   logical :: skip_xi, skip_eta, skip_w ! True where the transport already delivers the full rate
   integer :: kglo, kghi ! Gather range: the agreement detector reads two cells, not four
   logical :: agree_det  ! True when the stencil-agreement detector is selected
+  logical :: hybrid     ! True when every cell chooses its own detector
+  logical :: agr_xi, agr_eta, agr_w ! True where this component uses stencil agreement
+  integer :: gate_now   ! The gate that belongs to the detector this component used
+  integer :: ngr, nfl   ! Cells of the twist window that are not afloat, and not grounded
+  integer :: ki, kj_g   ! Offsets across the twist window
   logical :: edge_on    ! True when the edge rule reads the cell means
   logical :: slope_gate ! True when the gate reads the real surface slope
   real :: gam      ! Gate fraction, 0 to 1 [nondim]
@@ -12959,9 +12986,12 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
   c_ucut = CS%dg_damp_advective_c * CS%dg_damp_u_cut
 
   agree_det  = (CS%dg_damp_detector == DAMP_DET_AGREE)
+  ! The hybrid gathers as the tilt Laplacian does, because either detector may run at any
+  ! cell, and it decides between them cell by cell inside the loop.
+  hybrid     = (CS%dg_damp_detector == DAMP_DET_HYBRID)
   ! The edge rule fits the cell means over runs of up to five cells, so it reaches as far as
   ! today's detector does and it needs the means that the agreement path otherwise skips.
-  edge_on    = agree_det .and. (CS%dg_damp_edge_rule > 0)
+  edge_on    = (agree_det .or. hybrid) .and. (CS%dg_damp_edge_rule > 0)
   slope_gate = (CS%dg_damp_gate_form == DAMP_GATE_SLOPE)
 
   ! Cell-local fields on the full data domain.  The loop below writes every element of
@@ -13087,7 +13117,14 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         if (agree_det .and. (.not.edge_on)) cycle
         hv(k) = hbar_c(kk,j)
       enddo
-      if (CS%dg_damp_detector == DAMP_DET_AGREE) then
+      ! The tilt Laplacian is the stronger detector, but its reference averages the cell
+      ! means across whatever the stencil covers, so a flotation break inside the stencil
+      ! bends it.  Hand those cells to stencil agreement, which holds the readings against
+      ! each other and needs no reference.  The grounded fraction is set to exactly 0 and
+      ! exactly 1 away from the contour, so the test needs no tolerance.
+      agr_xi = agree_det
+      if (hybrid) agr_xi = .not.dg_same_ground(gv(-2:2), okv(-2:2))
+      if (agr_xi) then
         ! Agreement needs no floor and no kink reference, and nothing here protects the
         ! grounding line: the readings disagree there on their own.  No single stencil is
         ! chosen, so the thickness gate normalizes on the cell mean.
@@ -13121,7 +13158,11 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       if (det_ok .and. (excess > 0.0)) then
         dsurf = 0.0
         if (slope_gate) dsurf = 0.5*(sbar_c(i+1,j) - sbar_c(i-1,j))
-        gam = gwt * dg_damp_gate_frac(CS%dg_damp_gate_form, dsdh, excess, A_spread, href_d, &
+        ! Each branch is gated by the gate that can read it: only the agreement detector
+        ! reports a spread, and only the tilt Laplacian is normalized by a thickness.
+        gate_now = CS%dg_damp_gate_form
+        if (hybrid .and. agr_xi) gate_now = DAMP_GATE_AGREEMENT
+        gam = gwt * dg_damp_gate_frac(gate_now, dsdh, excess, A_spread, href_d, &
                                       dsurf, CS%dg_tilt_damp_r_hi, CS%dg_damp_rho_s, &
                                       CS%dg_damp_slope_floor*dx_cell, CS%dg_damp_rho_g)
         kwant = gam * itau_xi
@@ -13146,7 +13187,14 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         if (agree_det .and. (.not.edge_on)) cycle
         hv(k) = hbar_c(i,kk)
       enddo
-      if (CS%dg_damp_detector == DAMP_DET_AGREE) then
+      ! The tilt Laplacian is the stronger detector, but its reference averages the cell
+      ! means across whatever the stencil covers, so a flotation break inside the stencil
+      ! bends it.  Hand those cells to stencil agreement, which holds the readings against
+      ! each other and needs no reference.  The grounded fraction is set to exactly 0 and
+      ! exactly 1 away from the contour, so the test needs no tolerance.
+      agr_eta = agree_det
+      if (hybrid) agr_eta = .not.dg_same_ground(gv(-2:2), okv(-2:2))
+      if (agr_eta) then
         call dg_agree_1d(tv, bv, gv, hv, ilv, dy_cell, okv, CS%dg_damp_single_rule, &
                          CS%dg_damp_edge_rule, CS%dg_damp_reduce, &
                          A_dmp, A_spread, A_cen, n_cen, det_ok)
@@ -13171,7 +13219,9 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       if (det_ok .and. (excess > 0.0)) then
         dsurf = 0.0
         if (slope_gate) dsurf = 0.5*(sbar_c(i,j+1) - sbar_c(i,j-1))
-        gam = gwt * dg_damp_gate_frac(CS%dg_damp_gate_form, dsdh, excess, A_spread, href_d, &
+        gate_now = CS%dg_damp_gate_form
+        if (hybrid .and. agr_eta) gate_now = DAMP_GATE_AGREEMENT
+        gam = gwt * dg_damp_gate_frac(gate_now, dsdh, excess, A_spread, href_d, &
                                       dsurf, CS%dg_tilt_damp_r_hi, CS%dg_damp_rho_s, &
                                       CS%dg_damp_slope_floor*dy_cell, CS%dg_damp_rho_g)
         kwant = gam * itau_eta
@@ -13218,7 +13268,20 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         enddo ; enddo
       endif
 
-      if (CS%dg_damp_detector == DAMP_DET_AGREE) then
+      ! The twist's reference reads a two-dimensional window, so the whole window has to
+      ! stay on one side of the flotation contour before the tilt Laplacian may have it.
+      agr_w = agree_det
+      if (hybrid) then
+        ngr = 0 ; nfl = 0
+        do kj_g = -2, 2 ; do ki = -2, 2
+          if (okw(ki,kj_g)) then
+            if (fw(ki,kj_g) > 0.0) ngr = ngr + 1
+            if (fw(ki,kj_g) < 1.0) nfl = nfl + 1
+          endif
+        enddo ; enddo
+        agr_w = .not.((ngr == 0) .or. (nfl == 0))
+      endif
+      if (agr_w) then
         ! Both axes, never a diagonal: the checkerboard alternates along x and along y, but is
         ! constant along either diagonal, so a diagonal stencil would read zero.  The second
         ! axis is also why the twist needs no single-stencil rule.
@@ -13292,7 +13355,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       endif
 
       if (excess > 0.0) then
-        if (CS%dg_damp_detector /= DAMP_DET_AGREE) then
+        if (.not.agr_w) then
           ! Protection interpolated on the kink-fit confidence.
           ! The twist's second difference separates by axis, so the protection
           ! does too: each axis contributes the minimum over its own bias's reach.
@@ -13310,7 +13373,9 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         if (slope_gate) &
           dsurf = 0.25*((sbar_c(i+1,j+1) + sbar_c(i-1,j-1)) - &
                         (sbar_c(i-1,j+1) + sbar_c(i+1,j-1)))
-        gam = gwt * dg_damp_gate_frac(CS%dg_damp_gate_form, dsdh, excess, A_spread, href_w, &
+        gate_now = CS%dg_damp_gate_form
+        if (hybrid .and. agr_w) gate_now = DAMP_GATE_AGREEMENT
+        gam = gwt * dg_damp_gate_frac(gate_now, dsdh, excess, A_spread, href_w, &
                                       dsurf, CS%dg_tilt_damp_r_hi, CS%dg_damp_rho_s, &
                                       CS%dg_damp_slope_floor*sqrt(dx_cell*dy_cell), &
                                       CS%dg_damp_rho_g)
