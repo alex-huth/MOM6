@@ -13123,7 +13123,20 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       ! each other and needs no reference.  The grounded fraction is set to exactly 0 and
       ! exactly 1 away from the contour, so the test needs no tolerance.
       agr_xi = agree_det
-      if (hybrid) agr_xi = .not.dg_same_ground(gv(-2:2), okv(-2:2))
+      if (hybrid) then
+        agr_xi = .not.dg_same_ground(gv(-2:2), okv(-2:2))
+        ! The tilt Laplacian reads three cells, but the reference it is held against reads
+        ! five: the mean-supported tilt at each of those three cells takes a cell mean on
+        ! either side of itself.  Where no run of five exists the detector reports nothing.
+        ! Hand the cell to the agreement detector, whose edge rule fits the means over
+        ! whatever run it does find.
+        if (.not.agr_xi) then
+          call dg_tilt_detector_1d(tv, bv, hv, okv, gv, CS%dg_damp_kink_ref, &
+                                   CS%dg_damp_kink_fit_tol, &
+                                   A_h, A_bed, A_ref, href_d, det_ok, dmode, kink_c)
+          agr_xi = .not.det_ok
+        endif
+      endif
       if (agr_xi) then
         ! Agreement needs no floor and no kink reference, and nothing here protects the
         ! grounding line: the readings disagree there on their own.  No single stencil is
@@ -13136,9 +13149,11 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         if (CS%dg_damp_centred_amp .and. (A_dmp /= 0.0) .and. (n_cen > 0)) A_dmp = A_cen
         excess = abs(A_dmp) ; gwt = 1.0 ; href_d = href
       else
-        call dg_tilt_detector_1d(tv, bv, hv, okv, gv, CS%dg_damp_kink_ref, &
-                                 CS%dg_damp_kink_fit_tol, &
-                                 A_h, A_bed, A_ref, href_d, det_ok, dmode, kink_c)
+        ! Under the hybrid this ran above, and its answer is what chose this branch.
+        if (.not.hybrid) &
+          call dg_tilt_detector_1d(tv, bv, hv, okv, gv, CS%dg_damp_kink_ref, &
+                                   CS%dg_damp_kink_fit_tol, &
+                                   A_h, A_bed, A_ref, href_d, det_ok, dmode, kink_c)
         ! Grounding-line protection, relaxed where the reference carries the kink.
         gwt = kink_c + (1.0 - kink_c) * &
               dg_gl_reach_wt(gv, max(dmode,1), CS%dg_damp_gl_reach)
@@ -13193,7 +13208,20 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       ! each other and needs no reference.  The grounded fraction is set to exactly 0 and
       ! exactly 1 away from the contour, so the test needs no tolerance.
       agr_eta = agree_det
-      if (hybrid) agr_eta = .not.dg_same_ground(gv(-2:2), okv(-2:2))
+      if (hybrid) then
+        agr_eta = .not.dg_same_ground(gv(-2:2), okv(-2:2))
+        ! The tilt Laplacian reads three cells, but the reference it is held against reads
+        ! five: the mean-supported tilt at each of those three cells takes a cell mean on
+        ! either side of itself.  Where no run of five exists the detector reports nothing.
+        ! Hand the cell to the agreement detector, whose edge rule fits the means over
+        ! whatever run it does find.
+        if (.not.agr_eta) then
+          call dg_tilt_detector_1d(tv, bv, hv, okv, gv, CS%dg_damp_kink_ref, &
+                                   CS%dg_damp_kink_fit_tol, &
+                                   A_h, A_bed, A_ref, href_d, det_ok, dmode, kink_c)
+          agr_eta = .not.det_ok
+        endif
+      endif
       if (agr_eta) then
         call dg_agree_1d(tv, bv, gv, hv, ilv, dy_cell, okv, CS%dg_damp_single_rule, &
                          CS%dg_damp_edge_rule, CS%dg_damp_reduce, &
@@ -13201,9 +13229,11 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         if (CS%dg_damp_centred_amp .and. (A_dmp /= 0.0) .and. (n_cen > 0)) A_dmp = A_cen
         excess = abs(A_dmp) ; gwt = 1.0 ; href_d = href
       else
-        call dg_tilt_detector_1d(tv, bv, hv, okv, gv, CS%dg_damp_kink_ref, &
-                                 CS%dg_damp_kink_fit_tol, &
-                                 A_h, A_bed, A_ref, href_d, det_ok, dmode, kink_c)
+        ! Under the hybrid this ran above, and its answer is what chose this branch.
+        if (.not.hybrid) &
+          call dg_tilt_detector_1d(tv, bv, hv, okv, gv, CS%dg_damp_kink_ref, &
+                                   CS%dg_damp_kink_fit_tol, &
+                                   A_h, A_bed, A_ref, href_d, det_ok, dmode, kink_c)
         gwt = kink_c + (1.0 - kink_c) * &
               dg_gl_reach_wt(gv, max(dmode,1), CS%dg_damp_gl_reach)
         A_bed = f_gnd(i,j)*A_bed
@@ -13281,15 +13311,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         enddo ; enddo
         agr_w = .not.((ngr == 0) .or. (nfl == 0))
       endif
-      if (agr_w) then
-        ! Both axes, never a diagonal: the checkerboard alternates along x and along y, but is
-        ! constant along either diagonal, so a diagonal stencil would read zero.  The second
-        ! axis is also why the twist needs no single-stencil rule.
-        call dg_agree_2d(ww, bw, fw, iwx, iwy, dx_cell, dy_cell, okw, CS%dg_damp_edge_rule, &
-                         CS%dg_damp_reduce, A_dmp, A_spread, A_cen, n_cen, tw_ok)
-        if (CS%dg_damp_centred_amp .and. (A_dmp /= 0.0) .and. (n_cen > 0)) A_dmp = A_cen
-        excess = abs(A_dmp) ; gwt = 1.0 ; href_w = href
-      else
+      if (.not.agr_w) then
 
       ! A_w = (A_xi(w) + A_eta(w))/2, each axis with its own bias. All admissible bias pairs in
       ! the least-biased tier are averaged, so the choice does not depend on trial order.
@@ -13352,6 +13374,19 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
           A_dmp = A_w
         endif
       endif
+        ! The twist's reference needs a pair of stencils on both axes at once.  Where no pair
+        ! exists the cell means cannot supply a twist, and the agreement detector takes the
+        ! cell, exactly as it does for the slopes.
+        if (hybrid .and. (.not.tw_ok)) agr_w = .true.
+      endif
+      if (agr_w) then
+        ! Both axes, never a diagonal: the checkerboard alternates along x and along y, but is
+        ! constant along either diagonal, so a diagonal stencil would read zero.  The second
+        ! axis is also why the twist needs no single-stencil rule.
+        call dg_agree_2d(ww, bw, fw, iwx, iwy, dx_cell, dy_cell, okw, CS%dg_damp_edge_rule, &
+                         CS%dg_damp_reduce, A_dmp, A_spread, A_cen, n_cen, tw_ok)
+        if (CS%dg_damp_centred_amp .and. (A_dmp /= 0.0) .and. (n_cen > 0)) A_dmp = A_cen
+        excess = abs(A_dmp) ; gwt = 1.0 ; href_w = href
       endif
 
       if (excess > 0.0) then
