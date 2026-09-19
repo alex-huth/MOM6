@@ -56,6 +56,11 @@ integer, parameter :: DAMP_GATE_THICKNESS = 0 !< Gate the zigzag against the ice
 integer, parameter :: DAMP_GATE_SLOPE = 1     !< Gate it against the real surface slope
 integer, parameter :: DAMP_GATE_AGREEMENT = 2 !< Gate it on how well the readings agree
 
+! DG(1) mode-damper reductions, selected by DG1_TILT_DAMP_REDUCE
+integer, parameter :: DAMP_RED_MINMOD = 0 !< Compare every reading with every other one
+integer, parameter :: DAMP_RED_PAIRED = 1 !< Add the two one-sided readings before comparing
+                                          !! them with the centred one
+
 ! DG(1) mode-damper detectors, selected by DG1_TILT_DAMP_DETECTOR
 integer, parameter :: DAMP_EDGE_OFF = 0 !< Leave a cell that has lost a neighbour to the
                                         !! stencil readings, which cannot cancel there
@@ -452,6 +457,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                  !! neighbour; see the DG1_TILT_DAMP_EDGE parameter.
   logical :: dg_damp_centred_amp !< Mode damper: if true, the minmod of the readings decides
                                  !! whether to damp and the centred reading sets how much.
+  integer :: dg_damp_reduce      !< Mode damper: how the agreement detector reduces its
+                                 !! readings to one value; see DG1_TILT_DAMP_REDUCE.
   logical :: dg_damp_single_rule  !< Mode damper: if true, the agreement detector leaves a slope
                                   !! alone in a cell that has one stencil when that stencil
                                   !! crosses the grounding line.
@@ -10990,6 +10997,24 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "read different mixtures of the mode and of real structure.", &
                  default=.false., do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)) &
                                   .or. (CS%dg_damp_detector /= DAMP_DET_AGREE))
+  call get_param(param_file, mdl, "DG1_TILT_DAMP_REDUCE", CS%dg_damp_reduce, &
+                 "How the stencil-agreement detector reduces its readings to one value. 0 "//&
+                 "compares every reading with every other one, so a single reading of the "//&
+                 "opposite sign stops the damper. The damper then drives the ice until one "//&
+                 "reading sits on zero and stops itself. 1 adds the two one-sided readings "//&
+                 "before it compares them with the centred one, which ends that, because the "//&
+                 "sum of the two does not reach zero where one of them does. On smooth ice "//&
+                 "the sum still takes the sign opposite to the centred reading, so a "//&
+                 "structure 4 cells wide and wider still gives exactly zero. The pair is "//&
+                 "used only where the cells the stencil reads share a grounding status: one "//&
+                 "cell of grounded ice beside floating ice puts a real kink in the surface "//&
+                 "that reads exactly like the mode, and there setting 0 is what leaves the "//&
+                 "grounding line in place.", &
+                 default=DAMP_RED_MINMOD, &
+                 do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)) &
+                            .or. (CS%dg_damp_detector /= DAMP_DET_AGREE))
+  if ((CS%dg_damp_reduce < DAMP_RED_MINMOD) .or. (CS%dg_damp_reduce > DAMP_RED_PAIRED)) &
+    call MOM_error(FATAL, "read_DG_params: DG1_TILT_DAMP_REDUCE must be 0 or 1.")
   call get_param(param_file, mdl, "DG1_TILT_DAMP_SINGLE_RULE", CS%dg_damp_single_rule, &
                  "If true, the agreement detector leaves a tilt alone in a cell that has one "//&
                  "stencil, when that stencil is neither wholly floating nor wholly grounded.  "//&
@@ -12503,6 +12528,71 @@ pure subroutine dg_agree_readings(gv, ok, scl, rd, nrd, cv, ncv)
   endif
 end subroutine dg_agree_readings
 
+!> The paired reading of one field. The two one-sided readings are added before they are
+!! compared with the centred one. A single reading that has settled on zero then no longer
+!! stops the damper, while the cancellation on smooth ice survives: for a smooth slope the
+!! centred reading is -c and the one-sided ones are c-3e and c+3e, so their sum keeps the
+!! sign opposite to the centred reading whatever the cubic term does.
+pure subroutine dg_pair_reading(gv, ok, scl, pr, npr)
+  real,    dimension(-4:4), intent(in)    :: gv  !< The field per unit length [Z L-1 ~> nondim]
+  logical, dimension(-4:4), intent(in)    :: ok  !< True where the cell is usable
+  real,                     intent(in)    :: scl !< Length of the centre cell, which returns the
+                                                 !! reading to the units of the coefficient
+                                                 !! [L ~> m]
+  real, dimension(:),       intent(inout) :: pr  !< The paired reading of each field [Z ~> m]
+  integer,                  intent(inout) :: npr !< How many of them are set
+
+  real, dimension(2) :: v  ! The centred reading, then the pair [Z ~> m]
+  real :: half_scl         ! Half the length of the centre cell [L ~> m]
+  real :: a                ! The smaller of the two in magnitude, or zero [Z ~> m]
+  real :: sp               ! Their spread, which the full set already reports [Z ~> m]
+  logical :: hl, hr        ! Whether the left and the right stencil exist
+
+  ! The pair says nothing on its own: without the centred reading there is nothing to compare
+  ! it with, and without a one-sided reading there is no pair.
+  if (.not.(ok(-1) .and. ok(1))) return
+  hl = ok(-2) .and. ok(-1)
+  hr = ok(1) .and. ok(2)
+  if (.not.(hl .or. hr)) return
+
+  half_scl = 0.5*scl
+  v(1) = scl * (gv(0) - (0.5*(gv(-1) + gv(1))))
+  if (hl .and. hr) then
+    ! Added as one pair, so that a quarter turn, which exchanges the two, maps the sum onto
+    ! itself to the last digit.
+    v(2) = 0.5 * ((half_scl * ((gv(0) - (2.0*gv(-1))) + gv(-2))) + &
+                  (half_scl * ((gv(0) - (2.0*gv(1))) + gv(2))))
+  elseif (hl) then
+    v(2) = half_scl * ((gv(0) - (2.0*gv(-1))) + gv(-2))
+  else
+    v(2) = half_scl * ((gv(0) - (2.0*gv(1))) + gv(2))
+  endif
+
+  call dg_minmod_spread(2, v, a, sp)
+  npr = npr + 1
+  pr(npr) = a
+end subroutine dg_pair_reading
+
+!> True where every usable cell of this stencil has the same grounding status. The grounded
+!! fraction is set to exactly 0 and exactly 1 away from the contour, so the test needs no
+!! tolerance; a cell that is part grounded counts as neither.
+pure function dg_same_ground(fv, ok) result(same)
+  real,    dimension(-2:2), intent(in) :: fv !< Grounded fraction [nondim]
+  logical, dimension(-2:2), intent(in) :: ok !< True where the cell is usable
+  logical :: same
+
+  integer :: k, ngr, nfl
+
+  ngr = 0 ; nfl = 0
+  do k = -2, 2
+    if (ok(k)) then
+      if (fv(k) > 0.0) ngr = ngr + 1
+      if (fv(k) < 1.0) nfl = nfl + 1
+    endif
+  enddo
+  same = (ngr == 0) .or. (nfl == 0)
+end function dg_same_ground
+
 !> Stencil agreement for one slope direction. Read the second difference of the slope on each
 !! group of three adjacent cells that contains this cell, on the thickness and again on the
 !! surface form, then keep only the part every reading agrees on. A zigzag looks the same from
@@ -12510,7 +12600,7 @@ end subroutine dg_agree_readings
 !! smooth ice the centred reading takes the sign opposite to the two one-sided ones, so the
 !! result is exactly zero however steep the ice is.
 pure subroutine dg_agree_1d(tv, bv, fv, hv, ilv, len0, ok, single_rule, edge_rule, &
-                            A, S, C, nc, valid)
+                            reduce_rule, A, S, C, nc, valid)
   real,    dimension(-4:4), intent(in)  :: tv  !< Cell tilt of the thickness [Z ~> m]
   real,    dimension(-4:4), intent(in)  :: bv  !< Cell tilt of the bed depth [Z ~> m]
   real,    dimension(-4:4), intent(in)  :: fv  !< Grounded fraction [nondim]
@@ -12526,6 +12616,8 @@ pure subroutine dg_agree_1d(tv, bv, fv, hv, ilv, len0, ok, single_rule, edge_rul
                                              !! grounding line
   integer,                  intent(in)  :: edge_rule !< What to do where the stencils cannot
                                              !! cancel on smooth ice; see DG1_TILT_DAMP_EDGE
+  integer,                  intent(in)  :: reduce_rule !< How to reduce the readings to one
+                                             !! value; see DG1_TILT_DAMP_REDUCE
   real,                     intent(out) :: A     !< The agreed detector value [Z ~> m]
   real,                     intent(out) :: S     !< Spread of the readings [Z ~> m]
   real,                     intent(out) :: C     !< The agreed centred reading, which measures
@@ -12536,10 +12628,13 @@ pure subroutine dg_agree_1d(tv, bv, fv, hv, ilv, len0, ok, single_rule, edge_rul
   real, dimension(16) :: rd ! Up to three stencils on two fields, or the runs of the edge rule
                             ! [Z ~> m]
   real, dimension(2) :: cv  ! The centred reading of each field [Z ~> m]
+  real, dimension(2) :: pr  ! The paired reading of each field [Z ~> m]
   real, dimension(-4:4) :: gv ! One field per unit length [Z L-1 ~> nondim]
   real :: Sc                ! Spread of the centred readings, not used [Z ~> m]
-  integer :: k, nrd, nst, lo, hi
+  real :: Sp                ! Spread of the paired readings, not used [Z ~> m]
+  integer :: k, nrd, nst, lo, hi, npr
   logical :: st_c, st_l, st_r ! Whether the centred, left and right stencils exist
+  logical :: paired         ! Whether to add the one-sided readings before comparing them
 
   A = 0.0 ; S = 0.0 ; C = 0.0 ; nc = 0 ; valid = .false.
   st_c = ok(-1) .and. ok(1)
@@ -12585,19 +12680,33 @@ pure subroutine dg_agree_1d(tv, bv, fv, hv, ilv, len0, ok, single_rule, edge_rul
     endif
   endif
 
-  nrd = 0 ; nc = 0
+  ! Add the one-sided readings only where the cells this stencil reads share a grounding
+  ! status.  Where they do not, the surface has a real kink, and one kinked cell reads exactly
+  ! like the mode; there the comparison of every reading with every other one is what leaves
+  ! the grounding line in place.
+  paired = .false.
+  if (reduce_rule == DAMP_RED_PAIRED) paired = dg_same_ground(fv(-2:2), ok(-2:2))
+
+  nrd = 0 ; nc = 0 ; npr = 0
   ! The thickness, then the surface form: the thickness tilt less the part the bed explains,
   ! which is the change of surface elevation across a grounded cell and the tilt itself afloat.
   do k = -2, 2
     gv(k) = tv(k) * ilv(k)
   enddo
   call dg_agree_readings(gv, ok, len0, rd, nrd, cv, nc)
+  if (paired) call dg_pair_reading(gv, ok, len0, pr, npr)
   do k = -2, 2
     gv(k) = (tv(k) - (fv(k)*bv(k))) * ilv(k)
   enddo
   call dg_agree_readings(gv, ok, len0, rd, nrd, cv, nc)
+  if (paired) call dg_pair_reading(gv, ok, len0, pr, npr)
 
+  ! The spread always comes from the full set, because it reports how far the readings stand
+  ! apart, which the pair hides by construction.
   call dg_minmod_spread(nrd, rd, A, S)
+  ! The two fields must still agree: a thickness that follows a rough bed is protected here
+  ! exactly as it is in the full set.
+  if (paired .and. (npr > 0)) call dg_minmod_spread(npr, pr, A, Sp)
   ! The two fields must still agree on the centred reading, so that a thickness which follows
   ! a rough bed is protected exactly as it is in the full set.
   if (nc > 0) call dg_minmod_spread(nc, cv, C, Sc)
@@ -12607,7 +12716,7 @@ end subroutine dg_agree_1d
 !! along both, and it is constant along either diagonal, so a diagonal stencil would read zero
 !! and silence the damper. The field per unit length is the twist per unit area; along a line of
 !! constant j only the widths vary, so each line reduces to the same one-dimensional form.
-pure subroutine dg_agree_2d(wv, bwv, fv, ilx, ily, dx0, dy0, okw, edge_rule, &
+pure subroutine dg_agree_2d(wv, bwv, fv, ilx, ily, dx0, dy0, okw, edge_rule, reduce_rule, &
                             A, S, C, nc, valid)
   real,    dimension(-4:4,-4:4), intent(in) :: wv  !< Cell twist of the thickness [Z ~> m]
   real,    dimension(-4:4,-4:4), intent(in) :: bwv !< Cell twist of the bed depth [Z ~> m]
@@ -12620,6 +12729,8 @@ pure subroutine dg_agree_2d(wv, bwv, fv, ilx, ily, dx0, dy0, okw, edge_rule, &
   logical, dimension(-4:4,-4:4), intent(in) :: okw !< True where the cell is usable
   integer,                  intent(in)  :: edge_rule !< What to do where neither axis can
                                              !! cancel on smooth ice; see DG1_TILT_DAMP_EDGE
+  integer,                  intent(in)  :: reduce_rule !< How to reduce the readings to one
+                                             !! value; see DG1_TILT_DAMP_REDUCE
   real,                     intent(out) :: A     !< The agreed detector value [Z ~> m]
   real,                     intent(out) :: S     !< Spread of the readings [Z ~> m]
   real,                     intent(out) :: C     !< The agreed centred reading, which measures
@@ -12629,14 +12740,18 @@ pure subroutine dg_agree_2d(wv, bwv, fv, ilx, ily, dx0, dy0, okw, edge_rule, &
 
   real, dimension(12) :: rd ! Up to six stencils on two fields [Z ~> m]
   real, dimension(4) :: cv  ! The centred reading of each field on each axis [Z ~> m]
+  real, dimension(4) :: pr  ! The paired reading of each field on each axis [Z ~> m]
   real, dimension(-4:4) :: gv ! One field per unit length along the line [Z L-1 ~> nondim]
+  real, dimension(-2:2) :: fl ! Grounded fraction along the line [nondim]
   logical, dimension(-4:4) :: okl ! Usability along the line
   real :: Sc                ! Spread of the centred readings, not used [Z ~> m]
-  integer :: k, nrd
+  real :: Sp                ! Spread of the paired readings, not used [Z ~> m]
+  integer :: k, nrd, npr
   logical :: st_x, st_y     ! Whether each axis can cancel on smooth ice
+  logical :: pr_x, pr_y     ! Whether each axis may add its one-sided readings
 
   A = 0.0 ; S = 0.0 ; C = 0.0 ; nc = 0 ; valid = .false.
-  nrd = 0
+  nrd = 0 ; npr = 0
 
   ! The twist puts both axes into one set, so one axis that can cancel protects the whole set.
   ! Only a corner loses both.  There the cell means would have to supply a twist, which needs a
@@ -12653,25 +12768,47 @@ pure subroutine dg_agree_2d(wv, bwv, fv, ilx, ily, dx0, dy0, okw, edge_rule, &
     okl(k) = okw(k,0)
     gv(k) = wv(k,0) * ilx(k)
   enddo
+  ! Each axis decides for itself: a row that crosses the grounding line must not add its
+  ! one-sided readings even where the column may.
+  pr_x = .false.
+  if (reduce_rule == DAMP_RED_PAIRED) then
+    do k = -2, 2
+      fl(k) = fv(k,0)
+    enddo
+    pr_x = dg_same_ground(fl, okl(-2:2))
+  endif
   call dg_agree_readings(gv, okl, dx0, rd, nrd, cv, nc)
+  if (pr_x) call dg_pair_reading(gv, okl, dx0, pr, npr)
   do k = -2, 2
     gv(k) = (wv(k,0) - (fv(k,0)*bwv(k,0))) * ilx(k)
   enddo
   call dg_agree_readings(gv, okl, dx0, rd, nrd, cv, nc)
+  if (pr_x) call dg_pair_reading(gv, okl, dx0, pr, npr)
 
   ! Along y, at the column of this cell.
   do k = -2, 2
     okl(k) = okw(0,k)
     gv(k) = wv(0,k) * ily(k)
   enddo
+  pr_y = .false.
+  if (reduce_rule == DAMP_RED_PAIRED) then
+    do k = -2, 2
+      fl(k) = fv(0,k)
+    enddo
+    pr_y = dg_same_ground(fl, okl(-2:2))
+  endif
   call dg_agree_readings(gv, okl, dy0, rd, nrd, cv, nc)
+  if (pr_y) call dg_pair_reading(gv, okl, dy0, pr, npr)
   do k = -2, 2
     gv(k) = (wv(0,k) - (fv(0,k)*bwv(0,k))) * ily(k)
   enddo
   call dg_agree_readings(gv, okl, dy0, rd, nrd, cv, nc)
+  if (pr_y) call dg_pair_reading(gv, okl, dy0, pr, npr)
 
   valid = (nrd > 0)
+  ! The spread always comes from the full set; the pair hides it by construction.
   call dg_minmod_spread(nrd, rd, A, S)
+  if ((npr > 0) .and. (reduce_rule == DAMP_RED_PAIRED)) call dg_minmod_spread(npr, pr, A, Sp)
   ! Both axes and both fields must agree on the centred reading, exactly as they must on the
   ! full set.  A minmod over a set does not depend on the order a quarter turn presents it in.
   if (nc > 0) call dg_minmod_spread(nc, cv, C, Sc)
@@ -12955,7 +13092,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         ! grounding line: the readings disagree there on their own.  No single stencil is
         ! chosen, so the thickness gate normalizes on the cell mean.
         call dg_agree_1d(tv, bv, gv, hv, ilv, dx_cell, okv, CS%dg_damp_single_rule, &
-                         CS%dg_damp_edge_rule, A_dmp, A_spread, A_cen, n_cen, det_ok)
+                         CS%dg_damp_edge_rule, CS%dg_damp_reduce, &
+                         A_dmp, A_spread, A_cen, n_cen, det_ok)
         ! The minmod keeps the veto; the centred reading sets the amount.  Where no centred
         ! reading exists the cell has no second opinion at all, so leave it as it was.
         if (CS%dg_damp_centred_amp .and. (A_dmp /= 0.0) .and. (n_cen > 0)) A_dmp = A_cen
@@ -13010,7 +13148,8 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
       enddo
       if (CS%dg_damp_detector == DAMP_DET_AGREE) then
         call dg_agree_1d(tv, bv, gv, hv, ilv, dy_cell, okv, CS%dg_damp_single_rule, &
-                         CS%dg_damp_edge_rule, A_dmp, A_spread, A_cen, n_cen, det_ok)
+                         CS%dg_damp_edge_rule, CS%dg_damp_reduce, &
+                         A_dmp, A_spread, A_cen, n_cen, det_ok)
         if (CS%dg_damp_centred_amp .and. (A_dmp /= 0.0) .and. (n_cen > 0)) A_dmp = A_cen
         excess = abs(A_dmp) ; gwt = 1.0 ; href_d = href
       else
@@ -13084,7 +13223,7 @@ subroutine dg_nodal_mode_damp_rate(CS, G, hmask, h_nodal_in, dt, T_node)
         ! constant along either diagonal, so a diagonal stencil would read zero.  The second
         ! axis is also why the twist needs no single-stencil rule.
         call dg_agree_2d(ww, bw, fw, iwx, iwy, dx_cell, dy_cell, okw, CS%dg_damp_edge_rule, &
-                         A_dmp, A_spread, A_cen, n_cen, tw_ok)
+                         CS%dg_damp_reduce, A_dmp, A_spread, A_cen, n_cen, tw_ok)
         if (CS%dg_damp_centred_amp .and. (A_dmp /= 0.0) .and. (n_cen > 0)) A_dmp = A_cen
         excess = abs(A_dmp) ; gwt = 1.0 ; href_w = href
       else
