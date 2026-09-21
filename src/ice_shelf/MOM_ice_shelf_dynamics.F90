@@ -73,6 +73,9 @@ integer, parameter :: DAMP_EDGE_REF_GL = 2 !< The same, but read the means acros
 integer, parameter :: DAMP_FLD_BOTH = 0 !< The thickness and the surface form must agree
 integer, parameter :: DAMP_FLD_SURF = 1 !< The surface form alone
 integer, parameter :: DAMP_FLD_THCK = 2 !< The thickness alone
+integer, parameter :: DAMP_FLD_GL_TH = 3 !< Both, except at a cell the flotation contour
+                                         !! crosses, where the surface form is a fraction of
+                                         !! the bed removed and means nothing
 integer, parameter :: DAMP_DET_TODAY = 0 !< Tilt Laplacian against bed and mean-supported floors
 integer, parameter :: DAMP_DET_AGREE = 1 !< Stencil agreement over three stencils and two fields
 integer, parameter :: DAMP_DET_HYBRID = 2 !< Each cell chooses: the tilt Laplacian where the
@@ -11012,15 +11015,17 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "follows a rough bed is then protected, because the surface does not see "//&
                  "the bed. 1 reads the surface form alone. 2 reads the thickness alone. "//&
                  "Where the ice floats the two are the same field, so this changes grounded "//&
-                 "ice only. Setting 0 is the careful one, but at a grounding line the "//&
-                 "thickness follows the bed while the surface does not, so the two disagree "//&
-                 "and the detector declines; 1 acts there instead.", &
+                 "ice only. Setting 0 is the careful one, and it is what stops the damper "//&
+                 "eating a thickness that follows a rough bed. 3 keeps that everywhere "//&
+                 "except at a cell the flotation contour crosses: there the surface form is "//&
+                 "a FRACTION of the bed removed, which is no surface at all, so it is "//&
+                 "dropped and the thickness decides alone.", &
                  default=DAMP_FLD_BOTH, &
                  do_not_log=(.not.(CS%dg_tilt_damp .or. CS%dg_twist_damp)) &
                             .or. ((CS%dg_damp_detector /= DAMP_DET_AGREE) .and. &
                                   (CS%dg_damp_detector /= DAMP_DET_HYBRID)))
-  if ((CS%dg_damp_fields < DAMP_FLD_BOTH) .or. (CS%dg_damp_fields > DAMP_FLD_THCK)) &
-    call MOM_error(FATAL, "read_DG_params: DG1_TILT_DAMP_FIELDS must be 0, 1 or 2.")
+  if ((CS%dg_damp_fields < DAMP_FLD_BOTH) .or. (CS%dg_damp_fields > DAMP_FLD_GL_TH)) &
+    call MOM_error(FATAL, "read_DG_params: DG1_TILT_DAMP_FIELDS must be 0, 1, 2 or 3.")
   call get_param(param_file, mdl, "DG1_TILT_DAMP_CENTRED_AMP", CS%dg_damp_centred_amp, &
                  "If true, the minmod of the stencil-agreement readings only decides whether "//&
                  "to damp, and the centred reading sets how much is removed. The minmod keeps "//&
@@ -12683,6 +12688,7 @@ pure subroutine dg_agree_1d(tv, bv, fv, hv, ilv, len0, ok, single_rule, edge_rul
   integer :: k, nrd, nst, lo, hi, npr
   logical :: st_c, st_l, st_r ! Whether the centred, left and right stencils exist
   logical :: paired         ! Whether to add the one-sided readings before comparing them
+  logical :: use_t, use_s   ! Which of the two fields this cell reads
 
   A = 0.0 ; S = 0.0 ; C = 0.0 ; nc = 0 ; valid = .false.
   st_c = ok(-1) .and. ok(1)
@@ -12743,14 +12749,23 @@ pure subroutine dg_agree_1d(tv, bv, fv, hv, ilv, len0, ok, single_rule, edge_rul
   ! which is the change of surface elevation across a grounded cell and the tilt itself afloat.
   ! Where the ice floats the bed term is zero, so the two fields are one field and the
   ! selection changes nothing.  It bites on grounded ice only.
-  if (field_rule /= DAMP_FLD_SURF) then
+  use_t = (field_rule /= DAMP_FLD_SURF)
+  use_s = (field_rule /= DAMP_FLD_THCK)
+  if (field_rule == DAMP_FLD_GL_TH) then
+    ! A cell the contour crosses has a grounded fraction strictly between 0 and 1, so its
+    ! surface form removes a FRACTION of the bed.  That is no surface, and holding the
+    ! thickness against it only silences the cell.  Drop it and let the thickness decide.
+    use_t = .true.
+    use_s = .not.((fv(0) > 0.0) .and. (fv(0) < 1.0))
+  endif
+  if (use_t) then
     do k = -2, 2
       gv(k) = tv(k) * ilv(k)
     enddo
     call dg_agree_readings(gv, ok, len0, rd, nrd, cv, nc)
     if (paired) call dg_pair_reading(gv, ok, len0, pr, npr)
   endif
-  if (field_rule /= DAMP_FLD_THCK) then
+  if (use_s) then
     do k = -2, 2
       gv(k) = (tv(k) - (fv(k)*bv(k))) * ilv(k)
     enddo
@@ -12808,9 +12823,16 @@ pure subroutine dg_agree_2d(wv, bwv, fv, ilx, ily, dx0, dy0, okw, edge_rule, red
   integer :: k, nrd, npr
   logical :: st_x, st_y     ! Whether each axis can cancel on smooth ice
   logical :: pr_x, pr_y     ! Whether each axis may add its one-sided readings
+  logical :: use_t, use_s   ! Which of the two fields this cell reads
 
   A = 0.0 ; S = 0.0 ; C = 0.0 ; nc = 0 ; valid = .false.
   nrd = 0 ; npr = 0
+  use_t = (field_rule /= DAMP_FLD_SURF)
+  use_s = (field_rule /= DAMP_FLD_THCK)
+  if (field_rule == DAMP_FLD_GL_TH) then
+    use_t = .true.
+    use_s = .not.((fv(0,0) > 0.0) .and. (fv(0,0) < 1.0))
+  endif
 
   ! The twist puts both axes into one set, so one axis that can cancel protects the whole set.
   ! Only a corner loses both.  There the cell means would have to supply a twist, which needs a
@@ -12836,11 +12858,11 @@ pure subroutine dg_agree_2d(wv, bwv, fv, ilx, ily, dx0, dy0, okw, edge_rule, red
     enddo
     pr_x = dg_same_ground(fl, okl(-2:2))
   endif
-  if (field_rule /= DAMP_FLD_SURF) then
+  if (use_t) then
     call dg_agree_readings(gv, okl, dx0, rd, nrd, cv, nc)
     if (pr_x) call dg_pair_reading(gv, okl, dx0, pr, npr)
   endif
-  if (field_rule /= DAMP_FLD_THCK) then
+  if (use_s) then
     do k = -2, 2
       gv(k) = (wv(k,0) - (fv(k,0)*bwv(k,0))) * ilx(k)
     enddo
@@ -12860,11 +12882,11 @@ pure subroutine dg_agree_2d(wv, bwv, fv, ilx, ily, dx0, dy0, okw, edge_rule, red
     enddo
     pr_y = dg_same_ground(fl, okl(-2:2))
   endif
-  if (field_rule /= DAMP_FLD_SURF) then
+  if (use_t) then
     call dg_agree_readings(gv, okl, dy0, rd, nrd, cv, nc)
     if (pr_y) call dg_pair_reading(gv, okl, dy0, pr, npr)
   endif
-  if (field_rule /= DAMP_FLD_THCK) then
+  if (use_s) then
     do k = -2, 2
       gv(k) = (wv(0,k) - (fv(0,k)*bwv(0,k))) * ily(k)
     enddo
