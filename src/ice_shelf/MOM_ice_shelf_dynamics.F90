@@ -526,6 +526,10 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! the neighbours' means imply wherever the artificial viscosity acts.
   real :: dg_tilt_relax_frac      !< Tilt relaxation: its rate as a fraction of the artificial viscosity's
                                   !! jump decay rate on the cell's faces [nondim].
+  real :: dg_tilt_relax_u_cut     !< Tilt relaxation: if positive, its rate is the speed law
+                                  !! max(u_cut - u_credit*|u_n|, 0)/dx on each axis [L T-1 ~> m s-1].
+  real :: dg_tilt_relax_u_credit  !< Tilt relaxation: the fraction of the transport's own removal
+                                  !! speed that the speed law credits [nondim].
   logical :: dg_tilt_relax_spread !< Tilt relaxation: if true, a cell also takes half the gate of its
                                   !! neighbours along each axis.
   logical :: dg_tilt_relax_twist  !< Tilt relaxation: if true, relax the twist as well as the tilts.
@@ -10978,8 +10982,28 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  default=.false., do_not_log=.not.CS%use_DG_thickness)
   call get_param(param_file, mdl, "DG1_TILT_RELAX_FRAC", CS%dg_tilt_relax_frac, &
                  "The tilt-relaxation rate as a fraction of the artificial viscosity's jump "//&
-                 "decay rate on the cell's faces along the same axis.", &
+                 "decay rate on the cell's faces along the same axis. Ignored unless "//&
+                 "DG1_TILT_RELAX_U_CUT is zero.", &
                  units="nondim", default=1.0, do_not_log=.not.CS%dg_tilt_relax)
+  call get_param(param_file, mdl, "DG1_TILT_RELAX_U_CUT", CS%dg_tilt_relax_u_cut, &
+                 "If positive, the tilt-relaxation rate is the speed law max(U_CUT - "//&
+                 "DG1_TILT_RELAX_U_CREDIT*|u_n|, 0)/dx along each axis, where u_n is the "//&
+                 "cell-centred velocity component on that axis, and DG1_TILT_RELAX_FRAC is "//&
+                 "ignored. A speed is the grid-invariant form, because both the rate the "//&
+                 "transport supplies and the harm the mode does scale as 1/dx. The rate then "//&
+                 "carries no dependence on the artificial viscosity, whose gate reads the face "//&
+                 "jump and so is blind to this mode by construction, and is smallest where the "//&
+                 "mode is purest. Ice moving faster than U_CUT/U_CREDIT along an axis is not "//&
+                 "relaxed on that axis, because transport already removes the mode there.", &
+                 units="m s-1", default=1.5854896E-06, scale=US%m_s_to_L_T, &
+                 do_not_log=.not.CS%dg_tilt_relax)
+  call get_param(param_file, mdl, "DG1_TILT_RELAX_U_CREDIT", CS%dg_tilt_relax_u_credit, &
+                 "The fraction of the transport's own removal speed that DG1_TILT_RELAX_U_CUT "//&
+                 "credits. Upwind transport removes the grid-scale tilt mode at |u_n|/dx, but "//&
+                 "the artificial viscosity slows that to f(alpha)*|u_n|/dx, so a full credit "//&
+                 "withdraws more than the flow returns. Under-crediting leaves the relaxation "//&
+                 "on until |u_n| reaches U_CUT/U_CREDIT.", &
+                 units="nondim", default=0.5, do_not_log=.not.CS%dg_tilt_relax)
   call get_param(param_file, mdl, "DG1_TILT_RELAX_SPREAD", CS%dg_tilt_relax_spread, &
                  "If true, a cell also takes half the tilt-relaxation gate of its neighbours "//&
                  "along each axis, so the cells beside a flagged face are relaxed as well.", &
@@ -13716,6 +13740,8 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
                                                ! mean-supported values [Z ~> m]
   logical, dimension(SZDI_(G),SZDJ_(G)) :: ok_xi, ok_eta, ok_w ! Those residuals exist
   real :: gxs, gys   ! Rates after the spread [T-1 ~> s-1]
+  real :: frac_use   ! Multiplier on the axis rate: 1 under the speed law [nondim]
+  real :: unat_x, unat_y ! Credited part of the cell-centred speed on each axis [L T-1 ~> m s-1]
   real :: t_xi, t_eta, t_w ! The cell's tilts and twist [Z ~> m]
   real :: b_xi, b_eta, b_w ! The bed-depth tilts and twist of the cell [Z ~> m]
   real :: a_xi, a_eta, a_w ! Alternating part of each residual [Z ~> m]
@@ -13905,17 +13931,35 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
     enddo ; enddo
   endif
 
-  ! Rate along each axis: the larger viscosity jump decay rate of the cell's two faces on that axis,
-  ! 4*amp*nu/dx_perp^2, from the face viscosities the spatial operator wrote on this same stage.
+  ! Rate along each axis.  With DG1_TILT_RELAX_U_CUT set this is the speed law
+  ! max(u_cut - u_credit*|u_n|, 0)/dx, which is grid-invariant and carries no dependence on the
+  ! artificial viscosity: that gate reads the face jump, which this mode does not produce, so it is
+  ! smallest exactly where the error is purest.  Otherwise it is the legacy fraction of the larger
+  ! viscosity jump decay rate of the cell's two faces on that axis, 4*amp*nu/dx_perp^2, from the
+  ! face viscosities the spatial operator wrote on this same stage.  The cell-centred speed sums its
+  ! four corners in diagonal pairs, so a quarter turn of the grid permutes the same additions.
   gx(:,:) = 0.0 ; gy(:,:) = 0.0
+  frac_use = CS%dg_tilt_relax_frac
+  if (CS%dg_tilt_relax_u_cut > 0.0) frac_use = 1.0
   do j = jsc, jec ; do i = isc, iec
     if (hmask(i,j) /= 1.0) cycle
-    gx(i,j) = (4.0*DG1_WB_JUMP_RATE_AMP) * &
-              max(CS%dg_art_visc_nu_u(I-1,j) / (G%dxCu(I-1,j)*G%dxCu(I-1,j)), &
-                  CS%dg_art_visc_nu_u(I,j) / (G%dxCu(I,j)*G%dxCu(I,j)))
-    gy(i,j) = (4.0*DG1_WB_JUMP_RATE_AMP) * &
-              max(CS%dg_art_visc_nu_v(i,J-1) / (G%dyCv(i,J-1)*G%dyCv(i,J-1)), &
-                  CS%dg_art_visc_nu_v(i,J) / (G%dyCv(i,J)*G%dyCv(i,J)))
+    if (CS%dg_tilt_relax_u_cut > 0.0) then
+      unat_x = CS%dg_tilt_relax_u_credit * 0.25 * &
+               ((abs(CS%u_shelf(I-1,J-1)) + abs(CS%u_shelf(I,J))) + &
+                (abs(CS%u_shelf(I,J-1))   + abs(CS%u_shelf(I-1,J))))
+      unat_y = CS%dg_tilt_relax_u_credit * 0.25 * &
+               ((abs(CS%v_shelf(I-1,J-1)) + abs(CS%v_shelf(I,J))) + &
+                (abs(CS%v_shelf(I,J-1))   + abs(CS%v_shelf(I-1,J))))
+      gx(i,j) = max(CS%dg_tilt_relax_u_cut - unat_x, 0.0) * G%IdxT(i,j)
+      gy(i,j) = max(CS%dg_tilt_relax_u_cut - unat_y, 0.0) * G%IdyT(i,j)
+    else
+      gx(i,j) = (4.0*DG1_WB_JUMP_RATE_AMP) * &
+                max(CS%dg_art_visc_nu_u(I-1,j) / (G%dxCu(I-1,j)*G%dxCu(I-1,j)), &
+                    CS%dg_art_visc_nu_u(I,j) / (G%dxCu(I,j)*G%dxCu(I,j)))
+      gy(i,j) = (4.0*DG1_WB_JUMP_RATE_AMP) * &
+                max(CS%dg_art_visc_nu_v(i,J-1) / (G%dyCv(i,J-1)*G%dyCv(i,J-1)), &
+                    CS%dg_art_visc_nu_v(i,J) / (G%dyCv(i,J)*G%dyCv(i,J)))
+    endif
   enddo ; enddo
   if (CS%dg_tilt_relax_spread) then
     call pass_var(gx, G%domain)
@@ -13958,7 +14002,7 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
         endif
         if (nnb > 0) then
           a_xi = es_xi(i,j) - (esum / real(nnb))
-          k_xi = min(CS%dg_tilt_relax_frac*gxs, rate_cap)
+          k_xi = min(frac_use*gxs, rate_cap)
           r_xi = k_xi * a_xi
         endif
       endif
@@ -13973,7 +14017,7 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
         endif
         if (nnb > 0) then
           a_eta = es_eta(i,j) - (esum / real(nnb))
-          k_eta = min(CS%dg_tilt_relax_frac*gys, rate_cap)
+          k_eta = min(frac_use*gys, rate_cap)
           r_eta = k_eta * a_eta
         endif
       endif
@@ -14018,7 +14062,7 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
       endif
       if (nnb > 0) then
         a_xi = e_xi(i,j) - (esum / real(nnb))
-        k_xi = min(CS%dg_tilt_relax_frac*gxs, rate_cap)
+        k_xi = min(frac_use*gxs, rate_cap)
         r_xi = k_xi * a_xi
       endif
     endif
@@ -14034,7 +14078,7 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
       endif
       if (nnb > 0) then
         a_eta = e_eta(i,j) - (esum / real(nnb))
-        k_eta = min(CS%dg_tilt_relax_frac*gys, rate_cap)
+        k_eta = min(frac_use*gys, rate_cap)
         r_eta = k_eta * a_eta
       endif
     endif
@@ -14059,7 +14103,7 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
       endif
       if (n_x + n_y > 0) then
         a_w = e_w(i,j) - ((esum_x + esum_y) / real(n_x + n_y))
-        k_w = min(CS%dg_tilt_relax_frac*max(gxs, gys), rate_cap)
+        k_w = min(frac_use*max(gxs, gys), rate_cap)
         r_w = k_w * a_w
       endif
     endif
@@ -14104,6 +14148,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: R_node ! Nodal tilt-relaxation rate [Z T-1 ~> m s-1]
   real, dimension(2,2) :: dh
   real :: tau_chk ! Shortest mode-damper relaxation time in the domain [T ~> s]
+  real :: u_chk   ! Fastest removal speed either tilt term asks for in a cell [L T-1 ~> m s-1]
   character(len=24) :: n1, n2 ! Numbers for the warnings; the text is concatenated separately
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed, a, b
 
@@ -14160,19 +14205,24 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
 
   ! Warn once if the shortest relaxation time is below the advection step, where the rate cap
   ! binds, or within 10 velocity steps, where the lagged velocity feedback can ring.
-  if ((CS%dg_tilt_damp .or. CS%dg_twist_damp) .and. .not.CS%dg_tilt_damp_dt_warned) then
+  ! The tilt relaxation's speed law shares the clock, and at rest delivers U_CUT/dx.
+  if ((CS%dg_tilt_damp .or. CS%dg_twist_damp .or. &
+       (CS%dg_tilt_relax .and. (CS%dg_tilt_relax_u_cut > 0.0))) .and. &
+      .not.CS%dg_tilt_damp_dt_warned) then
     ! tau = dx/(2*c*U_CUT) over the shortest cell dimension.
     tau_chk = huge(1.0)
     do j = jsc, jec ; do i = isc, iec
-      tau_chk = min(tau_chk, 0.5 / max(CS%dg_damp_advective_c * CS%dg_damp_u_cut * &
-                                       max(G%IdxT(i,j), G%IdyT(i,j)), tiny(1.0)))
+      u_chk = 0.0
+      if (CS%dg_tilt_damp .or. CS%dg_twist_damp) u_chk = CS%dg_damp_advective_c * CS%dg_damp_u_cut
+      if (CS%dg_tilt_relax) u_chk = max(u_chk, CS%dg_tilt_relax_u_cut)
+      tau_chk = min(tau_chk, 0.5 / max(u_chk * max(G%IdxT(i,j), G%IdyT(i,j)), tiny(1.0)))
     enddo ; enddo
     ! Every PE reaches this collective.
     call min_across_PEs(tau_chk)
     if (is_root_pe()) then
       if (tau_chk < time_step) then
         write(n1,'(ES10.3)') tau_chk ; write(n2,'(ES10.3)') time_step
-        call MOM_error(WARNING, "DG(1) mode damper: shortest relaxation time "//&
+        call MOM_error(WARNING, "DG(1) tilt terms: shortest relaxation time "//&
              trim(adjustl(n1))//" s is below the advection step "//trim(adjustl(n2))//&
              " s. The rate cap binds, so the delivered relaxation time IS the advection "//&
              "step and not the one requested; lowering it further will change nothing.")
@@ -14180,7 +14230,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
       if (tau_chk < 10.0*CS%velocity_update_time_step) then
         write(n1,'(ES10.3)') tau_chk
         write(n2,'(F8.2)') tau_chk / CS%velocity_update_time_step
-        call MOM_error(WARNING, "DG(1) mode damper: shortest relaxation time "//&
+        call MOM_error(WARNING, "DG(1) tilt terms: shortest relaxation time "//&
              trim(adjustl(n1))//" s is only "//trim(adjustl(n2))//" ICE_VELOCITY_TIMESTEPs. "//&
              "The velocity is frozen between updates while the damper keeps acting, and "//&
              "that lag rings once the relaxation is within a few times it; expect a "//&
