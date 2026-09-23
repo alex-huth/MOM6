@@ -14201,36 +14201,32 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   call nodal_positivity_limit(CS, G, ISS)
   call DG1_nodal_spatial_operator(CS, G, hmask, CS%h_nodal, rhs, uh_ice, vh_ice, time_step)
 
-  ! Two independent floors on the delivered relaxation time, warned once each.
-  ! Neither is a stability bound: the 0.5/dt rate cap covers stability outright.
+  ! One floor on the delivered relaxation time, warned once. It is not a stability
+  ! bound: the 0.5/dt rate cap covers stability outright. Once tau falls below the
+  ! advection step that cap binds, and the DELIVERED relaxation time is the advection
+  ! step rather than the tau that was asked for. Lowering tau further then changes
+  ! nothing, so a tau ladder goes flat for a reason that has nothing to do with the
+  ! solution. Sharp, and with no free constant in it.
   !
-  ! (a) The cap itself. Once tau falls below the advection step the cap binds and
-  !     the DELIVERED relaxation time is the advection step, not the tau that was
-  !     asked for. Lowering tau further then changes nothing, so a tau ladder goes
-  !     flat for a reason that has nothing to do with the solution. Sharp, and
-  !     with no free constant in it.
-  !
-  ! (b) Ringing against the velocity solve. The damper acts continuously while the
-  !     velocity, and so the transport's feedback on the tilt, is frozen for one
-  !     ICE_VELOCITY_TIMESTEP. Linearising that as
-  !     dt/ds = -t/tau + lam*t(s-T) and putting z = i*w in its characteristic
-  !     equation gives w = sqrt(lam^2 - 1/tau^2) and w*T = 2*pi - arccos(1/(lam*tau)),
-  !     from which two things follow. Oscillation requires lam > 1/tau: a damper
-  !     faster than the feedback cannot ring, and the frozen interval on its own is
-  !     a pure decay. Once that is met the critical lag is a FEW tau, not tens --
-  !     3.0 tau at lam*tau = 2, 1.3 at 4, 0.6 at 8. The gain lam is the
-  !     tilt -> surface -> velocity -> flux-divergence loop and is configuration
-  !     dependent, so the margin below is empirical; a factor of ten covers gains
-  !     up to about 8/tau.
-  !
-  ! The velocity step is the right clock for (b), not the advection step. Testing
-  ! against the advection step, as this did, is permissive by exactly the ratio of
-  ! the two, which is why the old threshold had to be set at 50 advection steps to
-  ! catch anything at all.
+  ! A second floor, against the lagged velocity feedback, was tried here and removed.
+  ! A steady state can carry a small grounding-line oscillation, because the velocity
+  ! is frozen for one ICE_VELOCITY_TIMESTEP while the thickness keeps advancing.
+  ! Measured on MISMIP+ at 10 km it is about 0.007 cells rms, some 70 m, with a
+  ! 40-50 yr period, and it falls to 0.0003 cells when the velocity step is quartered.
+  ! The tilt terms raise the loop gain and so bring it into view sooner, but they do
+  ! not cause it: the same period appears with every tilt term off, and it is
+  ! unaffected by the number of nonlinear substeps per velocity solve. No honest test
+  ! could be written for it at this point. The clock that governs it is the velocity
+  ! step over the cell traversal time dx/u, which had to stay under about 0.1 in that
+  ! configuration -- but that number is a loop gain, so it moves with geometry,
+  ! friction and buttressing; and this code runs once, on the first step, before the
+  ! velocity field that sets the clock has developed. Any fixed threshold tested here
+  ! would be arbitrary AND evaluated at the wrong time. If a fluctuating steady state
+  ! does appear, shorten ICE_VELOCITY_TIMESTEP; lengthening the relaxation does not
+  ! help, and was measured to make it worse.
 
   ! Warn once if the shortest relaxation time is below the advection step, where the rate cap
-  ! binds, or within 10 velocity steps, where the lagged velocity feedback can ring.
-  ! The tilt relaxation's speed law shares the clock, and at rest delivers U_CUT/dx.
+  ! binds. The tilt relaxation's speed law shares the clock, and at rest delivers U_CUT/dx.
   if ((CS%dg_tilt_damp .or. CS%dg_twist_damp .or. &
        (CS%dg_tilt_relax .and. (CS%dg_tilt_relax_u_cut > 0.0))) .and. &
       .not.CS%dg_tilt_damp_dt_warned) then
@@ -14251,16 +14247,6 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
              trim(adjustl(n1))//" s is below the advection step "//trim(adjustl(n2))//&
              " s. The rate cap binds, so the delivered relaxation time IS the advection "//&
              "step and not the one requested; lowering it further will change nothing.")
-      endif
-      if (tau_chk < 10.0*CS%velocity_update_time_step) then
-        write(n1,'(ES10.3)') tau_chk
-        write(n2,'(F8.2)') tau_chk / CS%velocity_update_time_step
-        call MOM_error(WARNING, "DG(1) tilt terms: shortest relaxation time "//&
-             trim(adjustl(n1))//" s is only "//trim(adjustl(n2))//" ICE_VELOCITY_TIMESTEPs. "//&
-             "The velocity is frozen between updates while the damper keeps acting, and "//&
-             "that lag rings once the relaxation is within a few times it; expect a "//&
-             "fluctuating steady state. Lengthen the relaxation or shorten "//&
-             "ICE_VELOCITY_TIMESTEP -- these are different fixes.")
       endif
     endif
     CS%dg_tilt_damp_dt_warned = .true.
