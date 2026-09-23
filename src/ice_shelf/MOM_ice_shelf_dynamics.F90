@@ -6686,6 +6686,31 @@ end subroutine CG_diagonal_subgrid_basal
 !! Q1 corner-basis weights (beta) and reference-space measures (wref); no physical metric
 !! enters here. All formulas are keyed to vertex roles and grouped in symmetry orbits so
 !! outputs are bitwise-covariant under grid rotations and reflections.
+!!
+!! KNOWN LIMITATION: assembled basis-weighted quantities are discontinuous in the sub-cell
+!! grounding-line position, although the partition geometry is not. The two rules below are
+!! each exact for the parent Jacobian, so the weight sums -- hence areas and ground_frac --
+!! vary continuously through every topology change. They are not exact for beta_i*beta_j*J,
+!! which is total degree 4 (degree 5 per variable on a quad piece after the bilinear sub-map),
+!! while the 3-pt triangle rule is exact to degree 2 and the 2x2 tensor rule to degree 3 per
+!! variable. So the same region integrated by different rules returns different values, and the
+!! assembled basal friction and driving stress step whenever a branch change re-assigns the
+!! rules. The largest case is the centre deficit f_C changing sign, which switches all four
+!! parent triangles at once: two go uncut <-> centre-cut, and two swap the minority vertex
+!! between the corner-cut branches, which exchanges the triangle and quad rules over the same
+!! two pieces. Measured on MISMIP+ at 10 km (dg_thin/runs/glsweep.sh, z18_glsmooth.py): a 2.5%
+!! step in the local velocity at one grounding-line position, against a 0.02% background, not
+!! resolved by refining the sweep 5x, and absent under GROUNDING_LINE_SUBGRID_SCHEME="SEP3".
+!!
+!! Raising the quadrature to 3x3 on quad pieces (exact to degree 5 per variable) and a
+!! degree-4-exact rule on triangle pieces would remove it: rules that are exact for the
+!! integrand agree whatever the parameterization, so a branch change cannot move the answer.
+!! Using one rule family everywhere is NOT sufficient on its own -- which corner of a collapsed
+!! quad is doubled up follows the branch's (X,Y,Z) role assignment, not the piece's geometry,
+!! so the same piece is parameterized differently in the two branches that produce it.
+!! Not done because it is not the cause of the steady grounding-line wobble (SEP3 removes these
+!! steps and makes the wobble 3-8x worse), P75R reversibility already passes as this stands, and
+!! the measured sensitivity to the quadrature choice away from a transition is about 0.2%.
 subroutine sep2_cell_qps(f, nqp, beta, wref, qp_grounded)
   real, dimension(4),     intent(in)  :: f    !< Flotation deficit r*h - bed at the cell corners,
                                               !! ordered SW, SE, NW, NE [Z ~> m]
