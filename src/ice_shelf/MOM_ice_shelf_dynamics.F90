@@ -537,14 +537,9 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: dg_tilt_relax_free_edge !< Tilt relaxation: if true, also relax an axis on which the
                                   !! cell has no artificial-viscosity face on one side, so that its
                                   !! outer node has no pin and would otherwise drift.
-  logical :: dg_tilt_relax_surface_all !< Tilt relaxation: if true, every cell reads its residual in
-                                  !! surface form and the removal is converted back with one factor
-                                  !! per cell.  Algebraically the same as the thickness form while
-                                  !! the neighbours are of one flotation state.
   logical :: dg_tilt_relax_wide_nb !< Tilt relaxation: if true, a neighbour is usable when it holds
                                   !! ice, whatever its flotation state, and a cell the grounding
-                                  !! line crosses is relaxed like any other.  Needs
-                                  !! DG1_TILT_RELAX_SURFACE_ALL.
+                                  !! line crosses is relaxed like any other.
   real, pointer, dimension(:,:) :: dg_tilt_relax_rate => NULL() !< Tilt relaxation: largest delivered
                                   !! rate over the three modes [T-1 ~> s-1].
   real, pointer, dimension(:,:) :: dg_tilt_relax_tend => NULL() !< Tilt relaxation: L2 cell norm of
@@ -11057,30 +11052,16 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "is relaxed whatever its flotation state, using whichever reference the other "//&
                  "side gives: one of its own state if there is one, otherwise any ice cell. "//&
                  "Reading across a grounding line is allowed here, and only here, because the "//&
-                 "alternative is no constraint. Needs DG1_TILT_RELAX_SURFACE_ALL, since a "//&
-                 "thickness reference cannot be read across a grounding line.", &
-                 default=.false., do_not_log=.not.CS%dg_tilt_relax)
-  call get_param(param_file, mdl, "DG1_TILT_RELAX_SURFACE_ALL", CS%dg_tilt_relax_surface_all, &
-                 "If true, every cell reads its tilt residual in surface elevation, and the "//&
-                 "removal is converted back to thickness with one factor for the cell, the "//&
-                 "harmonic mean of dh/ds over it. Surface elevation is the only variable that "//&
-                 "means the same thing on both sides of a grounding line, so it is what a "//&
-                 "reference must use if it is ever to read across one. While a cell's neighbours "//&
-                 "are all of its own flotation state this is algebraically the same as the "//&
-                 "thickness form it replaces, and differs only by rounding.", &
+                 "alternative is no constraint at all.", &
                  default=.false., do_not_log=.not.CS%dg_tilt_relax)
   call get_param(param_file, mdl, "DG1_TILT_RELAX_WIDE_NEIGHBOURS", CS%dg_tilt_relax_wide_nb, &
                  "If true, a neighbour is usable for the tilt reference whenever it holds ice, "//&
                  "whatever its flotation state, and a cell the grounding line crosses is relaxed "//&
                  "like any other. Without this the relaxation does nothing along a continuous "//&
                  "curve the length of every grounding line, because a crossed cell is neither "//&
-                 "relaxed nor usable as a neighbour. Requires DG1_TILT_RELAX_SURFACE_ALL, since "//&
+                 "relaxed nor usable as a neighbour. "//&
                  "a thickness reference cannot be read across a grounding line.", &
-                 default=.false., do_not_log=.not.CS%dg_tilt_relax_surface_all)
-  if (CS%dg_tilt_relax_wide_nb .and. .not.CS%dg_tilt_relax_surface_all) call MOM_error(FATAL, &
-    "ice_shelf_dyn_init: DG1_TILT_RELAX_WIDE_NEIGHBOURS requires DG1_TILT_RELAX_SURFACE_ALL.")
-  if (CS%dg_tilt_relax_free_edge .and. .not.CS%dg_tilt_relax_surface_all) call MOM_error(FATAL, &
-    "ice_shelf_dyn_init: DG1_TILT_RELAX_FREE_EDGE requires DG1_TILT_RELAX_SURFACE_ALL.")
+                 default=.false., do_not_log=.not.CS%dg_tilt_relax)
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP", CS%dg_tilt_damp, &
                  "If true, damp the grid-scale DG(1) in-cell tilt. A tilt alternating between "//&
@@ -13811,7 +13792,8 @@ end subroutine dg_nodal_mode_damp_rate
 !! reaches across a grounding line.  A cell the grounding line crosses is neither relaxed nor used as
 !! a neighbour: the real change of slope is there.  The exception is DG1_TILT_RELAX_FREE_EDGE, for
 !! an axis with no artificial-viscosity face on one side: that node has no pin at all, so a bounded
-!! contamination from reading across the grounding line is better than leaving it to drift.  The rate along each axis is a fraction of the
+!! contamination from reading across the grounding line is better than leaving it to drift.
+!! The rate along each axis is a fraction of the
 !! viscosity's own jump decay rate on the cell's two faces on that axis, so the removal acts where
 !! and as fast as the penalty that feeds the alternating field.  It is optionally spread by half to
 !! the neighbours so the cells beside a flagged face are pinned too.
@@ -13823,8 +13805,6 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
   real,                   intent(in)  :: dt   !< Time step [T ~> s]
   real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out) :: R_node !< Nodal relaxation rate [Z T-1 ~> m s-1]
 
-  real, dimension(SZDI_(G),SZDJ_(G)) :: q      ! Cell-mean surface form: thickness less the mean
-                                               ! bed depth where grounded, thickness afloat [Z ~> m]
   integer, dimension(SZDI_(G),SZDJ_(G)) :: state ! 1 grounded, -1 floating, 0 crossed or not ice
   real, dimension(SZDI_(G),SZDJ_(G)) :: gx, gy ! Viscosity jump decay rate along each axis, the
                                                ! larger of the cell's two faces [T-1 ~> s-1]
@@ -13834,12 +13814,9 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
   real :: gxs, gys   ! Rates after the spread [T-1 ~> s-1]
   real :: frac_use   ! Multiplier on the axis rate: 1 under the speed law [nondim]
   real :: unat_x, unat_y ! Credited part of the cell-centred speed on each axis [L T-1 ~> m s-1]
-  real :: t_xi, t_eta, t_w ! The cell's tilts and twist [Z ~> m]
-  real :: b_xi, b_eta, b_w ! The bed-depth tilts and twist of the cell [Z ~> m]
   real :: a_xi, a_eta, a_w ! Alternating part of each residual [Z ~> m]
   real :: r_xi, r_eta, r_w ! Removal rates per mode [Z T-1 ~> m s-1]
   real :: k_xi, k_eta, k_w ! Delivered rates per mode [T-1 ~> s-1]
-  real :: ref       ! Mean-supported tilt or twist [Z ~> m]
   real :: num, den  ! Numerator [Z L ~> m2] and denominator [L2 ~> m2] of the least-squares slope
   real :: dm, dp    ! Distances to the neighbours behind and ahead along the axis [L ~> m]
   real :: esum      ! Sum of the usable neighbour residuals [Z ~> m]
@@ -13860,7 +13837,6 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
                                                ! one side of this axis, so that node has no pin
   logical :: wx, wy ! Any ice neighbour is usable on this axis, for this cell
   logical :: wide   ! A neighbour is usable whenever it holds ice, whatever its flotation state
-  logical :: surf   ! Every cell reads its residual in surface form
   real :: ts_w      ! The cell's surface twist [Z ~> m]
   real :: m_cell    ! Thickness change per unit surface change for the cell [nondim]
   real :: s_c(2,2)  ! Surface elevation at the cell's corners [Z ~> m]
@@ -13895,94 +13871,21 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
 
   rate_cap = 0.5 / max(dt, tiny(dt))
 
-  ! Surface form and flotation state on the data domain, bed from the four corners so that it
-  ! matches the bed tilts below.
+  ! Flotation state on the data domain.  The comparison variable itself is the corner surface,
+  ! built where the residuals are; only the state is needed here, to decide which neighbours a
+  ! cell may use.
   do j = jsd, jed ; do i = isd, ied
-    state(i,j) = 0 ; q(i,j) = 0.0
+    state(i,j) = 0
     if (hmask(i,j) /= 1.0) cycle
     if ((i == isd) .or. (i == ied) .or. (j == jsd) .or. (j == jed)) cycle
     f = min(max(CS%ground_frac(i,j), 0.0), 1.0)
-    q(i,j) = 0.25*((h_nodal_in(i,j,1,1) + h_nodal_in(i,j,2,2)) + &
-                   (h_nodal_in(i,j,2,1) + h_nodal_in(i,j,1,2)))
     if (f >= 1.0 - f_eps) then
       state(i,j) = 1
-      q(i,j) = q(i,j) - (0.25*((CS%bed_node(I-1,J-1) + CS%bed_node(I,J)) + &
-                               (CS%bed_node(I,J-1) + CS%bed_node(I-1,J))))
     elseif (f <= f_eps) then
       state(i,j) = -1
     endif
   enddo ; enddo
 
-  ! Residuals against the mean-supported tilts, one cell beyond the compute domain.
-  e_xi(:,:) = 0.0 ; e_eta(:,:) = 0.0 ; e_w(:,:) = 0.0
-  ok_xi(:,:) = .false. ; ok_eta(:,:) = .false. ; ok_w(:,:) = .false.
-  do j = jsc-1, jec+1 ; do i = isc-1, iec+1
-    if (state(i,j) == 0) cycle
-    t_xi  = 0.5*((h_nodal_in(i,j,2,1) - h_nodal_in(i,j,1,1)) + &
-                 (h_nodal_in(i,j,2,2) - h_nodal_in(i,j,1,2)))
-    t_eta = 0.5*((h_nodal_in(i,j,1,2) - h_nodal_in(i,j,1,1)) + &
-                 (h_nodal_in(i,j,2,2) - h_nodal_in(i,j,2,1)))
-    t_w   = (h_nodal_in(i,j,2,2) - h_nodal_in(i,j,1,2)) - &
-            (h_nodal_in(i,j,2,1) - h_nodal_in(i,j,1,1))
-    b_xi = 0.0 ; b_eta = 0.0 ; b_w = 0.0
-    if (state(i,j) == 1) then
-      b_xi  = 0.5*((CS%bed_node(I,J-1) - CS%bed_node(I-1,J-1)) + &
-                   (CS%bed_node(I,J)   - CS%bed_node(I-1,J)))
-      b_eta = 0.5*((CS%bed_node(I-1,J) - CS%bed_node(I-1,J-1)) + &
-                   (CS%bed_node(I,J)   - CS%bed_node(I,J-1)))
-      b_w   = (CS%bed_node(I,J) - CS%bed_node(I-1,J)) - &
-              (CS%bed_node(I,J-1) - CS%bed_node(I-1,J-1))
-    endif
-
-    ! Along xi: the least-squares slope through the cell's own mean, times the cell width.  Each
-    ! neighbour term is written as distance times rise toward it, so a quarter turn only swaps or
-    ! negates whole terms.
-    use_m = (state(i-1,j) == state(i,j)) ; use_p = (state(i+1,j) == state(i,j))
-    if (use_m .or. use_p) then
-      dm = G%dxCu(I-1,j) ; dp = G%dxCu(I,j)
-      if (use_m .and. use_p) then
-        num = (dp*(q(i+1,j) - q(i,j))) + (dm*(q(i,j) - q(i-1,j)))
-        den = (dp*dp) + (dm*dm)
-      elseif (use_p) then
-        num = dp*(q(i+1,j) - q(i,j)) ; den = dp*dp
-      else
-        num = dm*(q(i,j) - q(i-1,j)) ; den = dm*dm
-      endif
-      ref = ((num / den) * G%dxT(i,j)) + b_xi
-      e_xi(i,j) = t_xi - ref ; ok_xi(i,j) = .true.
-    endif
-
-    ! Along eta, the same.
-    use_m = (state(i,j-1) == state(i,j)) ; use_p = (state(i,j+1) == state(i,j))
-    if (use_m .or. use_p) then
-      dm = G%dyCv(i,J-1) ; dp = G%dyCv(i,J)
-      if (use_m .and. use_p) then
-        num = (dp*(q(i,j+1) - q(i,j))) + (dm*(q(i,j) - q(i,j-1)))
-        den = (dp*dp) + (dm*dm)
-      elseif (use_p) then
-        num = dp*(q(i,j+1) - q(i,j)) ; den = dp*dp
-      else
-        num = dm*(q(i,j) - q(i,j-1)) ; den = dm*dm
-      endif
-      ref = ((num / den) * G%dyT(i,j)) + b_eta
-      e_eta(i,j) = t_eta - ref ; ok_eta(i,j) = .true.
-    endif
-
-    ! The twist, from the cross difference of the four diagonal neighbours, which needs all four.
-    ! It reads means rather than neighbour tilts, so a tilt mode cannot leak into its reference.
-    if (CS%dg_tilt_relax_twist) then
-      if ((state(i-1,j-1) == state(i,j)) .and. (state(i+1,j+1) == state(i,j)) .and. &
-          (state(i-1,j+1) == state(i,j)) .and. (state(i+1,j-1) == state(i,j))) then
-        ref = (0.25*((q(i+1,j+1) + q(i-1,j-1)) - (q(i-1,j+1) + q(i+1,j-1)))) + b_w
-        e_w(i,j) = t_w - ref ; ok_w(i,j) = .true.
-      endif
-    endif
-  enddo ; enddo
-
-  ! Surface-form residuals for the unpinned cells the grounding line crosses.  The surface is
-  ! continuous across the grounding line where the thickness form is not, so the reference reads
-  ! the mean corner surface of neighbours in any flotation state.  The residuals are formed for
-  ! every ice cell, as the alternating part of a crossed cell's residual needs its neighbours'.
   ! An axis has a free edge where one side carries no artificial-viscosity face: dg1_art_visc_face
   ! is only built where both cells are hmask 1 or 3, so beyond a domain edge or a calving front
   ! there is none and the outer node has no pin at all.  A thickness boundary does NOT count: the
@@ -13996,99 +13899,93 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
   fe_x(isd,:) = .false. ; fe_x(ied,:) = .false. ; fe_x(:,jsd) = .false. ; fe_x(:,jed) = .false.
   fe_y(isd,:) = .false. ; fe_y(ied,:) = .false. ; fe_y(:,jsd) = .false. ; fe_y(:,jed) = .false.
 
-  surf = CS%dg_tilt_relax_surface_all
   ! A neighbour is usable whatever its flotation state under the unpinned rule, which reaches a
   ! crossed cell on purpose, and under the wide rule.  Otherwise it must share this cell's state,
   ! which is what makes the surface form reproduce the thickness form it replaces.
   wide = CS%dg_tilt_relax_wide_nb
-  if (surf) then
-    rr = CS%density_ice / CS%density_ocean_avg
-    sbar(:,:) = 0.0 ; ice(:,:) = .false.
-    do j = jsd+1, jed-1 ; do i = isd+1, ied-1
-      if (hmask(i,j) /= 1.0) cycle
-      ice(i,j) = .true.
-      do n = 1, 2 ; do m = 1, 2
-        s_c(m,n) = max(h_nodal_in(i,j,m,n) - CS%bed_node(i-2+m,j-2+n), (1.0-rr)*h_nodal_in(i,j,m,n))
-      enddo ; enddo
-      sbar(i,j) = 0.25*((s_c(1,1) + s_c(2,2)) + (s_c(2,1) + s_c(1,2)))
+  rr = CS%density_ice / CS%density_ocean_avg
+  sbar(:,:) = 0.0 ; ice(:,:) = .false.
+  do j = jsd+1, jed-1 ; do i = isd+1, ied-1
+    if (hmask(i,j) /= 1.0) cycle
+    ice(i,j) = .true.
+    do n = 1, 2 ; do m = 1, 2
+      s_c(m,n) = max(h_nodal_in(i,j,m,n) - CS%bed_node(i-2+m,j-2+n), (1.0-rr)*h_nodal_in(i,j,m,n))
     enddo ; enddo
-    es_xi(:,:) = 0.0 ; es_eta(:,:) = 0.0 ; es_w(:,:) = 0.0
-    oks_xi(:,:) = .false. ; oks_eta(:,:) = .false. ; oks_w(:,:) = .false.
-    do j = jsc-1, jec+1 ; do i = isc-1, iec+1
-      if (.not.ice(i,j)) cycle
-      ! An axis is widened to any ice neighbour under the wide rule, or where it has a free edge
-      ! and the free-edge rule is on: there the only alternative is no reference at all.
-      wx = wide .or. (CS%dg_tilt_relax_free_edge .and. fe_x(i,j))
-      wy = wide .or. (CS%dg_tilt_relax_free_edge .and. fe_y(i,j))
-      ! Without either, a crossed cell is left out entirely, exactly as the thickness form leaves
-      ! it out, so that it is neither relaxed nor offered to a neighbour as a reference.
-      if ((state(i,j) == 0) .and. (.not.(wx .or. wy))) cycle
-      do n = 1, 2 ; do m = 1, 2
-        s_c(m,n) = max(h_nodal_in(i,j,m,n) - CS%bed_node(i-2+m,j-2+n), (1.0-rr)*h_nodal_in(i,j,m,n))
-      enddo ; enddo
-      ts_xi  = 0.5*((s_c(2,1) - s_c(1,1)) + (s_c(2,2) - s_c(1,2)))
-      ts_eta = 0.5*((s_c(1,2) - s_c(1,1)) + (s_c(2,2) - s_c(2,1)))
-      use_m = ice(i-1,j) ; use_p = ice(i+1,j)
-      if (.not.wx) then
-        use_m = use_m .and. (state(i-1,j) == state(i,j))
-        use_p = use_p .and. (state(i+1,j) == state(i,j))
-      endif
-      if (use_m .or. use_p) then
-        dm = G%dxCu(I-1,j) ; dp = G%dxCu(I,j)
-        if (use_m .and. use_p) then
-          num = (dp*(sbar(i+1,j) - sbar(i,j))) + (dm*(sbar(i,j) - sbar(i-1,j)))
-          den = (dp*dp) + (dm*dm)
-        elseif (use_p) then
-          num = dp*(sbar(i+1,j) - sbar(i,j)) ; den = dp*dp
-        else
-          num = dm*(sbar(i,j) - sbar(i-1,j)) ; den = dm*dm
-        endif
-        es_xi(i,j) = ts_xi - ((num / den) * G%dxT(i,j)) ; oks_xi(i,j) = .true.
-      endif
-      use_m = ice(i,j-1) ; use_p = ice(i,j+1)
-      if (.not.wy) then
-        use_m = use_m .and. (state(i,j-1) == state(i,j))
-        use_p = use_p .and. (state(i,j+1) == state(i,j))
-      endif
-      if (use_m .or. use_p) then
-        dm = G%dyCv(i,J-1) ; dp = G%dyCv(i,J)
-        if (use_m .and. use_p) then
-          num = (dp*(sbar(i,j+1) - sbar(i,j))) + (dm*(sbar(i,j) - sbar(i,j-1)))
-          den = (dp*dp) + (dm*dm)
-        elseif (use_p) then
-          num = dp*(sbar(i,j+1) - sbar(i,j)) ; den = dp*dp
-        else
-          num = dm*(sbar(i,j) - sbar(i,j-1)) ; den = dm*dm
-        endif
-        es_eta(i,j) = ts_eta - ((num / den) * G%dyT(i,j)) ; oks_eta(i,j) = .true.
-      endif
-
-      ! The twist, from the cross difference of the four diagonal neighbours' mean surfaces.  It
-      ! reads means rather than neighbour tilts, so a tilt mode cannot leak into its reference.
-      if (CS%dg_tilt_relax_twist) then
-        use_m = (ice(i-1,j-1) .and. ice(i+1,j+1)) .and. (ice(i-1,j+1) .and. ice(i+1,j-1))
-        use_m = use_m .and. (state(i,j) /= 0)
-        if (.not.wide) use_m = use_m .and. &
-          (((state(i-1,j-1) == state(i,j)) .and. (state(i+1,j+1) == state(i,j))) .and. &
-           ((state(i-1,j+1) == state(i,j)) .and. (state(i+1,j-1) == state(i,j))))
-        if (use_m) then
-          ts_w = (s_c(2,2) - s_c(1,2)) - (s_c(2,1) - s_c(1,1))
-          es_w(i,j) = ts_w - (0.25*((sbar(i+1,j+1) + sbar(i-1,j-1)) - &
-                                    (sbar(i-1,j+1) + sbar(i+1,j-1))))
-          oks_w(i,j) = .true.
-        endif
-      endif
+    sbar(i,j) = 0.25*((s_c(1,1) + s_c(2,2)) + (s_c(2,1) + s_c(1,2)))
+  enddo ; enddo
+  es_xi(:,:) = 0.0 ; es_eta(:,:) = 0.0 ; es_w(:,:) = 0.0
+  oks_xi(:,:) = .false. ; oks_eta(:,:) = .false. ; oks_w(:,:) = .false.
+  do j = jsc-1, jec+1 ; do i = isc-1, iec+1
+    if (.not.ice(i,j)) cycle
+    ! An axis is widened to any ice neighbour under the wide rule, or where it has a free edge
+    ! and the free-edge rule is on: there the only alternative is no reference at all.
+    wx = wide .or. (CS%dg_tilt_relax_free_edge .and. fe_x(i,j))
+    wy = wide .or. (CS%dg_tilt_relax_free_edge .and. fe_y(i,j))
+    ! Without either, a crossed cell is left out entirely, exactly as the thickness form leaves
+    ! it out, so that it is neither relaxed nor offered to a neighbour as a reference.
+    if ((state(i,j) == 0) .and. (.not.(wx .or. wy))) cycle
+    do n = 1, 2 ; do m = 1, 2
+      s_c(m,n) = max(h_nodal_in(i,j,m,n) - CS%bed_node(i-2+m,j-2+n), (1.0-rr)*h_nodal_in(i,j,m,n))
     enddo ; enddo
-
-    ! With DG1_TILT_RELAX_SURFACE_ALL the surface residuals replace the thickness ones outright,
-    ! so that one loop below serves every cell.  The bed tilts are already inside them, because
-    ! s_c subtracts the bed at each grounded corner.
-    if (surf) then
-      e_xi(:,:) = es_xi(:,:) ; ok_xi(:,:) = oks_xi(:,:)
-      e_eta(:,:) = es_eta(:,:) ; ok_eta(:,:) = oks_eta(:,:)
-      e_w(:,:) = es_w(:,:) ; ok_w(:,:) = oks_w(:,:)
+    ts_xi  = 0.5*((s_c(2,1) - s_c(1,1)) + (s_c(2,2) - s_c(1,2)))
+    ts_eta = 0.5*((s_c(1,2) - s_c(1,1)) + (s_c(2,2) - s_c(2,1)))
+    use_m = ice(i-1,j) ; use_p = ice(i+1,j)
+    if (.not.wx) then
+      use_m = use_m .and. (state(i-1,j) == state(i,j))
+      use_p = use_p .and. (state(i+1,j) == state(i,j))
     endif
-  endif
+    if (use_m .or. use_p) then
+      dm = G%dxCu(I-1,j) ; dp = G%dxCu(I,j)
+      if (use_m .and. use_p) then
+        num = (dp*(sbar(i+1,j) - sbar(i,j))) + (dm*(sbar(i,j) - sbar(i-1,j)))
+        den = (dp*dp) + (dm*dm)
+      elseif (use_p) then
+        num = dp*(sbar(i+1,j) - sbar(i,j)) ; den = dp*dp
+      else
+        num = dm*(sbar(i,j) - sbar(i-1,j)) ; den = dm*dm
+      endif
+      es_xi(i,j) = ts_xi - ((num / den) * G%dxT(i,j)) ; oks_xi(i,j) = .true.
+    endif
+    use_m = ice(i,j-1) ; use_p = ice(i,j+1)
+    if (.not.wy) then
+      use_m = use_m .and. (state(i,j-1) == state(i,j))
+      use_p = use_p .and. (state(i,j+1) == state(i,j))
+    endif
+    if (use_m .or. use_p) then
+      dm = G%dyCv(i,J-1) ; dp = G%dyCv(i,J)
+      if (use_m .and. use_p) then
+        num = (dp*(sbar(i,j+1) - sbar(i,j))) + (dm*(sbar(i,j) - sbar(i,j-1)))
+        den = (dp*dp) + (dm*dm)
+      elseif (use_p) then
+        num = dp*(sbar(i,j+1) - sbar(i,j)) ; den = dp*dp
+      else
+        num = dm*(sbar(i,j) - sbar(i,j-1)) ; den = dm*dm
+      endif
+      es_eta(i,j) = ts_eta - ((num / den) * G%dyT(i,j)) ; oks_eta(i,j) = .true.
+    endif
+
+    ! The twist, from the cross difference of the four diagonal neighbours' mean surfaces.  It
+    ! reads means rather than neighbour tilts, so a tilt mode cannot leak into its reference.
+    if (CS%dg_tilt_relax_twist) then
+      use_m = (ice(i-1,j-1) .and. ice(i+1,j+1)) .and. (ice(i-1,j+1) .and. ice(i+1,j-1))
+      use_m = use_m .and. (state(i,j) /= 0)
+      if (.not.wide) use_m = use_m .and. &
+        (((state(i-1,j-1) == state(i,j)) .and. (state(i+1,j+1) == state(i,j))) .and. &
+         ((state(i-1,j+1) == state(i,j)) .and. (state(i+1,j-1) == state(i,j))))
+      if (use_m) then
+        ts_w = (s_c(2,2) - s_c(1,2)) - (s_c(2,1) - s_c(1,1))
+        es_w(i,j) = ts_w - (0.25*((sbar(i+1,j+1) + sbar(i-1,j-1)) - &
+                                  (sbar(i-1,j+1) + sbar(i+1,j-1))))
+        oks_w(i,j) = .true.
+      endif
+    endif
+  enddo ; enddo
+
+  ! The surface residuals are the residuals.  The bed tilts are already inside them, because
+  ! s_c subtracts the bed at each grounded corner, so no separate bed stencil is needed.
+  e_xi(:,:) = es_xi(:,:) ; ok_xi(:,:) = oks_xi(:,:)
+  e_eta(:,:) = es_eta(:,:) ; ok_eta(:,:) = oks_eta(:,:)
+  e_w(:,:) = es_w(:,:) ; ok_w(:,:) = oks_w(:,:)
 
   ! Rate along each axis.  With DG1_TILT_RELAX_U_CUT set this is the speed law
   ! max(u_cut - u_credit*|u_n|, 0)/dx, which is grid-invariant and carries no dependence on the
@@ -14211,12 +14108,10 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
     ! tilt of the THICKNESS nodes.  The same conversion dg1_wb_slope_mean makes across a face.
     ! The grounded AREA fraction keeps the factor continuous as the grounding line sweeps past a
     ! corner; "SEP2" gives a true area fraction, "SEP3" a counted one that moves in steps.
-    if (surf) then
-      fg_cell = min(max(CS%ground_frac(i,j), 0.0), 1.0)
-      m_cell = 1.0 / (fg_cell + ((1.0 - fg_cell) * (1.0 - rr)))
-      r_xi = r_xi * m_cell ; r_eta = r_eta * m_cell ; r_w = r_w * m_cell
-      a_xi = a_xi * m_cell ; a_eta = a_eta * m_cell ; a_w = a_w * m_cell
-    endif
+    fg_cell = min(max(CS%ground_frac(i,j), 0.0), 1.0)
+    m_cell = 1.0 / (fg_cell + ((1.0 - fg_cell) * (1.0 - rr)))
+    r_xi = r_xi * m_cell ; r_eta = r_eta * m_cell ; r_w = r_w * m_cell
+    a_xi = a_xi * m_cell ; a_eta = a_eta * m_cell ; a_w = a_w * m_cell
 
     ! The corner pattern of the removal, as in dg_nodal_mode_damp_rate, with the cell mean taken out
     ! so that no mass moves on a grid whose opposite faces differ in length.
