@@ -52,6 +52,7 @@ public :: MOM_thread_affinity_set, set_MOM_thread_affinity
 public :: To_East, To_West, To_North, To_South, To_All, Omit_Corners
 public :: AGRID, BGRID_NE, CGRID_NE, SCALAR_PAIR
 public :: CORNER, CENTER, NORTH_FACE, EAST_FACE
+public :: FOLD_NORTH_EDGE
 public :: set_domain, nullify_domain
 ! These are no longer used by MOM6 because the reproducing sum works so well, but they are
 ! still referenced by some of the non-GFDL couplers.

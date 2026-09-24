@@ -21,6 +21,7 @@ use MOM_domain_infra,     only : rescale_comp_data, global_field, redistribute_a
 use MOM_domain_infra,     only : MOM_thread_affinity_set, set_MOM_thread_affinity
 use MOM_domain_infra,     only : AGRID, BGRID_NE, CGRID_NE, SCALAR_PAIR
 use MOM_domain_infra,     only : CORNER, CENTER, NORTH_FACE, EAST_FACE
+use MOM_domain_infra,     only : FOLD_NORTH_EDGE
 use MOM_domain_infra,     only : To_East, To_West, To_North, To_South, To_All, Omit_Corners
 use MOM_domain_infra,     only : compute_extent
 use MOM_error_handler,    only : MOM_error, MOM_mesg, NOTE, WARNING, FATAL, is_root_pe
@@ -58,6 +59,7 @@ public :: rescale_comp_data
 public :: AGRID, BGRID_NE, CGRID_NE, SCALAR_PAIR
 !> These encoding constants are used to indicate the discretization position of a variable
 public :: CORNER, CENTER, NORTH_FACE, EAST_FACE
+public :: FOLD_NORTH_EDGE
 !> These encoding constants indicate communication patterns.  In practice they can be added.
 public :: To_East, To_West, To_North, To_South, To_All, Omit_Corners
 
