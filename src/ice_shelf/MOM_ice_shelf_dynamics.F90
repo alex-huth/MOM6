@@ -13828,7 +13828,8 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
   logical, dimension(SZDI_(G),SZDJ_(G)) :: oks_xi, oks_eta, oks_w ! Those surface residuals exist
   logical, dimension(SZDI_(G),SZDJ_(G)) :: fe_x, fe_y ! The cell has no artificial-viscosity face on
                                                ! one side of this axis, so that node has no pin
-  logical :: wx, wy ! Any ice neighbour is usable on this axis, for this cell
+  logical :: ax, ay ! This axis admits a neighbour of any flotation state
+  logical :: wx, wy ! This axis may act at all for this cell
   logical :: wide   ! A neighbour is usable whenever it holds ice, whatever its flotation state
   real :: ts_w      ! The cell's surface twist [Z ~> m]
   real :: m_cell    ! Thickness change per unit surface change for the cell [nondim]
@@ -13910,20 +13911,21 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
   oks_xi(:,:) = .false. ; oks_eta(:,:) = .false. ; oks_w(:,:) = .false.
   do j = jsc-1, jec+1 ; do i = isc-1, iec+1
     if (.not.ice(i,j)) cycle
-    ! An axis is widened to any ice neighbour under the wide rule, or where it has a free edge
-    ! and the free-edge rule is on: there the only alternative is no reference at all.
-    wx = wide .or. (CS%dg_tilt_relax_free_edge .and. fe_x(i,j))
-    wy = wide .or. (CS%dg_tilt_relax_free_edge .and. fe_y(i,j))
-    ! Without either, a crossed cell is left out entirely, exactly as the thickness form leaves
-    ! it out, so that it is neither relaxed nor offered to a neighbour as a reference.
-    if ((state(i,j) == 0) .and. (.not.(wx .or. wy))) cycle
+    ! An axis admits any ice neighbour under the wide rule, or where it has a free edge and the
+    ! free-edge rule is on: there the only alternative is no reference at all.
+    ax = wide .or. (CS%dg_tilt_relax_free_edge .and. fe_x(i,j))
+    ay = wide .or. (CS%dg_tilt_relax_free_edge .and. fe_y(i,j))
+    ! Every ice cell gets a residual, including one the grounding line crosses, because the
+    ! alternating part of a free-edge cell's residual needs its neighbours' -- and beside a wall
+    ! the only neighbour it has may itself be crossed.  Whether a cell is RELAXED, and whether a
+    ! neighbour's residual may be USED, are decided below; they are not decided here.
     do n = 1, 2 ; do m = 1, 2
       s_c(m,n) = max(h_nodal_in(i,j,m,n) - CS%bed_node(i-2+m,j-2+n), (1.0-rr)*h_nodal_in(i,j,m,n))
     enddo ; enddo
     ts_xi  = 0.5*((s_c(2,1) - s_c(1,1)) + (s_c(2,2) - s_c(1,2)))
     ts_eta = 0.5*((s_c(1,2) - s_c(1,1)) + (s_c(2,2) - s_c(2,1)))
     use_m = ice(i-1,j) ; use_p = ice(i+1,j)
-    if (.not.wx) then
+    if (.not.ax) then
       use_m = use_m .and. (state(i-1,j) == state(i,j))
       use_p = use_p .and. (state(i+1,j) == state(i,j))
     endif
@@ -13940,7 +13942,7 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
       es_xi(i,j) = ts_xi - ((num / den) * G%dxT(i,j)) ; oks_xi(i,j) = .true.
     endif
     use_m = ice(i,j-1) ; use_p = ice(i,j+1)
-    if (.not.wy) then
+    if (.not.ay) then
       use_m = use_m .and. (state(i,j-1) == state(i,j))
       use_p = use_p .and. (state(i,j+1) == state(i,j))
     endif
@@ -14020,8 +14022,12 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
     ! Which axes may act.  A pure cell acts on both.  A cell the grounding line crosses acts only
     ! where the wide rule is on, or where the axis has a free edge and nothing else holds its outer
     ! node.  Everything below is then common to every cell.
-    wx = (state(i,j) /= 0) .or. wide .or. (CS%dg_tilt_relax_free_edge .and. fe_x(i,j))
-    wy = (state(i,j) /= 0) .or. wide .or. (CS%dg_tilt_relax_free_edge .and. fe_y(i,j))
+    ! ax, ay: this axis admits a neighbour of any flotation state.  wx, wy: this axis may act at
+    ! all.  A pure cell always may; a crossed cell only where an axis is widened.
+    ax = wide .or. (CS%dg_tilt_relax_free_edge .and. fe_x(i,j))
+    ay = wide .or. (CS%dg_tilt_relax_free_edge .and. fe_y(i,j))
+    wx = (state(i,j) /= 0) .or. ax
+    wy = (state(i,j) /= 0) .or. ay
     if (.not.(wx .or. wy)) cycle
 
     r_xi = 0.0 ; r_eta = 0.0 ; r_w = 0.0 ; k_xi = 0.0 ; k_eta = 0.0 ; k_w = 0.0
@@ -14030,12 +14036,17 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
     ! The alternating part of each residual: the residual less the mean of its usable neighbours
     ! along the same axis.  A cell with no usable neighbour cannot tell a zigzag from structure.
     if (((gxs > 0.0) .and. ok_xi(i,j)) .and. wx) then
+      ! A neighbour's residual is usable on the same terms its mean was: of this cell's own
+      ! flotation state, or any ice cell where the axis is widened.  Without this a pure cell
+      ! would pick up a crossed neighbour's residual, which the reference itself refuses.
       esum = 0.0 ; nnb = 0
-      if (ok_xi(i-1,j) .and. ok_xi(i+1,j)) then
+      use_m = ok_xi(i-1,j) .and. (ax .or. (state(i-1,j) == state(i,j)))
+      use_p = ok_xi(i+1,j) .and. (ax .or. (state(i+1,j) == state(i,j)))
+      if (use_m .and. use_p) then
         esum = e_xi(i-1,j) + e_xi(i+1,j) ; nnb = 2
-      elseif (ok_xi(i-1,j)) then
+      elseif (use_m) then
         esum = e_xi(i-1,j) ; nnb = 1
-      elseif (ok_xi(i+1,j)) then
+      elseif (use_p) then
         esum = e_xi(i+1,j) ; nnb = 1
       endif
       if (nnb > 0) then
@@ -14047,11 +14058,13 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
 
     if (((gys > 0.0) .and. ok_eta(i,j)) .and. wy) then
       esum = 0.0 ; nnb = 0
-      if (ok_eta(i,j-1) .and. ok_eta(i,j+1)) then
+      use_m = ok_eta(i,j-1) .and. (ay .or. (state(i,j-1) == state(i,j)))
+      use_p = ok_eta(i,j+1) .and. (ay .or. (state(i,j+1) == state(i,j)))
+      if (use_m .and. use_p) then
         esum = e_eta(i,j-1) + e_eta(i,j+1) ; nnb = 2
-      elseif (ok_eta(i,j-1)) then
+      elseif (use_m) then
         esum = e_eta(i,j-1) ; nnb = 1
-      elseif (ok_eta(i,j+1)) then
+      elseif (use_p) then
         esum = e_eta(i,j+1) ; nnb = 1
       endif
       if (nnb > 0) then
@@ -14065,18 +14078,20 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
     ! axis sums are formed first and then added, which a quarter turn only exchanges.
     if (ok_w(i,j)) then
       esum_x = 0.0 ; n_x = 0 ; esum_y = 0.0 ; n_y = 0
-      if (ok_w(i-1,j) .and. ok_w(i+1,j)) then
+      if ((ok_w(i-1,j) .and. (state(i-1,j) == state(i,j))) .and. &
+          (ok_w(i+1,j) .and. (state(i+1,j) == state(i,j)))) then
         esum_x = e_w(i-1,j) + e_w(i+1,j) ; n_x = 2
-      elseif (ok_w(i-1,j)) then
+      elseif (ok_w(i-1,j) .and. (state(i-1,j) == state(i,j))) then
         esum_x = e_w(i-1,j) ; n_x = 1
-      elseif (ok_w(i+1,j)) then
+      elseif (ok_w(i+1,j) .and. (state(i+1,j) == state(i,j))) then
         esum_x = e_w(i+1,j) ; n_x = 1
       endif
-      if (ok_w(i,j-1) .and. ok_w(i,j+1)) then
+      if ((ok_w(i,j-1) .and. (state(i,j-1) == state(i,j))) .and. &
+          (ok_w(i,j+1) .and. (state(i,j+1) == state(i,j)))) then
         esum_y = e_w(i,j-1) + e_w(i,j+1) ; n_y = 2
-      elseif (ok_w(i,j-1)) then
+      elseif (ok_w(i,j-1) .and. (state(i,j-1) == state(i,j))) then
         esum_y = e_w(i,j-1) ; n_y = 1
-      elseif (ok_w(i,j+1)) then
+      elseif (ok_w(i,j+1) .and. (state(i,j+1) == state(i,j))) then
         esum_y = e_w(i,j+1) ; n_y = 1
       endif
       if (n_x + n_y > 0) then
