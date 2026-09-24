@@ -531,8 +531,6 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! max(u_cut - u_credit*|u_n|, 0)/dx on each axis [L T-1 ~> m s-1].
   real :: dg_tilt_relax_u_credit  !< Tilt relaxation: the fraction of the transport's own removal
                                   !! speed that the speed law credits [nondim].
-  logical :: dg_tilt_relax_spread !< Tilt relaxation: if true, a cell also takes half the gate of its
-                                  !! neighbours along each axis.
   logical :: dg_tilt_relax_twist  !< Tilt relaxation: if true, relax the twist as well as the tilts.
   logical :: dg_tilt_relax_free_edge !< Tilt relaxation: if true, also relax an axis on which the
                                   !! cell has no artificial-viscosity face on one side, so that its
@@ -11035,10 +11033,6 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "withdraws more than the flow returns. Under-crediting leaves the relaxation "//&
                  "on until |u_n| reaches U_CUT/U_CREDIT.", &
                  units="nondim", default=0.5, do_not_log=.not.CS%dg_tilt_relax)
-  call get_param(param_file, mdl, "DG1_TILT_RELAX_SPREAD", CS%dg_tilt_relax_spread, &
-                 "If true, a cell also takes half the tilt-relaxation gate of its neighbours "//&
-                 "along each axis, so the cells beside a flagged face are relaxed as well.", &
-                 default=.true., do_not_log=.not.CS%dg_tilt_relax)
   call get_param(param_file, mdl, "DG1_TILT_RELAX_TWIST", CS%dg_tilt_relax_twist, &
                  "If true, the tilt relaxation also relaxes the twist, toward the cross "//&
                  "difference of the four diagonal neighbours' means.", &
@@ -13795,8 +13789,7 @@ end subroutine dg_nodal_mode_damp_rate
 !! contamination from reading across the grounding line is better than leaving it to drift.
 !! The rate along each axis is a fraction of the
 !! viscosity's own jump decay rate on the cell's two faces on that axis, so the removal acts where
-!! and as fast as the penalty that feeds the alternating field.  It is optionally spread by half to
-!! the neighbours so the cells beside a flagged face are pinned too.
+!! and as fast as the penalty that feeds the alternating field.
 subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
   type(ice_shelf_dyn_CS), intent(in)  :: CS   !< Ice shelf dynamics control structure
   type(ocean_grid_type),  intent(inout) :: G  !< Ocean grid structure
@@ -13811,7 +13804,7 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
   real, dimension(SZDI_(G),SZDJ_(G)) :: e_xi, e_eta, e_w ! Tilt and twist less their
                                                ! mean-supported values [Z ~> m]
   logical, dimension(SZDI_(G),SZDJ_(G)) :: ok_xi, ok_eta, ok_w ! Those residuals exist
-  real :: gxs, gys   ! Rates after the spread [T-1 ~> s-1]
+  real :: gxs, gys   ! The rate on each axis for this cell [T-1 ~> s-1]
   real :: frac_use   ! Multiplier on the axis rate: 1 under the speed law [nondim]
   real :: unat_x, unat_y ! Credited part of the cell-centred speed on each axis [L T-1 ~> m s-1]
   real :: a_xi, a_eta, a_w ! Alternating part of each residual [Z ~> m]
@@ -14017,19 +14010,11 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
                     CS%dg_art_visc_nu_v(i,J) / (G%dyCv(i,J)*G%dyCv(i,J)))
     endif
   enddo ; enddo
-  if (CS%dg_tilt_relax_spread) then
-    call pass_var(gx, G%domain)
-    call pass_var(gy, G%domain)
-  endif
 
   do j = jsc, jec ; do i = isc, iec
     if (hmask(i,j) /= 1.0) cycle
     if (diag_on) CS%dg_tilt_relax_state(i,j) = real(state(i,j))
     gxs = gx(i,j) ; gys = gy(i,j)
-    if (CS%dg_tilt_relax_spread) then
-      gxs = max(gxs, 0.5*max(gx(i-1,j), gx(i+1,j)))
-      gys = max(gys, 0.5*max(gy(i,j-1), gy(i,j+1)))
-    endif
     if ((gxs <= 0.0) .and. (gys <= 0.0)) cycle
 
     ! Which axes may act.  A pure cell acts on both.  A cell the grounding line crosses acts only
