@@ -375,6 +375,12 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! (Seroussi et al. 2014 SEP2, extended to quadrilaterals) for the basal
                             !! friction, driving stress, and grounded fraction, instead of the
                             !! uniform Phisub sub-sampling ("SEP3").
+  logical :: gl_sub_float_nbr !< If true, a fully grounded cell with a floating ice neighbour (across
+                            !! an edge or a corner) uses the grounding-line sub-element quadrature for
+                            !! its basal friction and DG driving stress, as a grounding-line cell does.
+  real, pointer, dimension(:,:) :: gl_sub_nbr => NULL() !< 1 where a fully grounded cell uses the
+                            !! grounding-line sub-element quadrature because of its neighbours
+                            !! (set_gl_subgrid_neighbors), 0 elsewhere [nondim]
   logical :: fv_taud_vertex_grad !< If true, the FV (non-DG) driving stress evaluates the surface
                             !! gradient directly at B-grid nodes from the four surrounding cell
                             !! centers (Lipscomb et al. 2019 eq. 14, "option 3" margins), instead of
@@ -886,6 +892,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%h_source_rate(isd:ied,jsd:jed), source=0.0)
     allocate(CS%h_source_rate_bmb(isd:ied,jsd:jed), source=0.0)
     allocate(CS%xi_basal(isd:ied,jsd:jed,1:2,1:2), source=1.0)
+    allocate(CS%gl_sub_nbr(isd:ied,jsd:jed), source=0.0)
     allocate(CS%h_source_rate_last(isd:ied,jsd:jed), source=0.0)
     allocate(CS%phi_x_FV(IsdB:IedB,jsd:jed), source=1.0)
     allocate(CS%phi_y_FV(isd:ied,JsdB:JedB), source=1.0)
@@ -1048,6 +1055,15 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       case default  ; call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
                         "GROUNDING_LINE_SUBGRID_SCHEME must be 'SEP3' or 'SEP2'.")
     end select
+    call get_param(param_file, mdl, "GROUNDING_LINE_SUBGRID_FLOATING_NEIGHBOR", CS%gl_sub_float_nbr, &
+                 "If true, a fully grounded cell (ground_frac = 1) that shares an edge or a corner "//&
+                 "with a floating ice cell (ground_frac = 0) integrates its basal friction and its "//&
+                 "DG driving stress with the GROUNDING_LINE_SUBGRID_SCHEME quadrature, as a "//&
+                 "grounding-line cell does, instead of 2x2 Gauss. The grounding line then lies on "//&
+                 "the shared edge or corner. This only happens where the flotation deficit is "//&
+                 "discontinuous between cells: with the DG(1) thickness, or at a bed step with the "//&
+                 "cell-constant bed of the non-DG path. ground_frac itself is unchanged.", &
+                 default=.true., do_not_log=.not.CS%GL_regularize)
     call get_param(param_file, mdl, "GROUNDING_LINE_COUPLE", CS%GL_couple, &
                  "If true, let the floatation condition be determined by "//&
                  "ocean column thickness. This means that update_OD_ffrac "//&
@@ -5561,7 +5577,8 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
           ! and the per-quadrature-point weight gl_w_qp (below) carries the sub-cell structure.
           grounded_qp = CS%f_ground_cell(i,j) > 0.0
         else
-          grounded_qp = merge(CS%ground_frac(i,j) >= 1.0, CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
+          grounded_qp = merge((CS%ground_frac(i,j) >= 1.0) .and. .not.gl_subgrid_cell(CS, i, j), &
+                              CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
         endif
         if (grounded_qp) then
           ! DG: h_gp is only used for flotation and the effective pressure.
@@ -5688,7 +5705,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
       vret_b(I  ,J  ,1) = 0.25*((vret_qp(2,2,1)+vret_qp(2,2,4))+(vret_qp(2,2,2)+vret_qp(2,2,3)))
 
       if (CS%GL_regularize .and. .not. CS%gl_quad_friction .and. .not. CS%local_basal_friction .and. &
-          CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0) then
+          gl_subgrid_cell(CS, i, j)) then
         ! Subgrid grounding-line: evaluate basal friction at each grounded sub-quadrature point.
         ! Picard and Newton Jacobian are both computed inside CG_action_subgrid_basal.
         Hcell(:,:) = H_node(I-1:I,J-1:J)
@@ -6293,7 +6310,8 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
         ! per quadrature point by gl_w_qp so the preconditioner diagonal matches the operator.
         grounded_qp = CS%f_ground_cell(i,j) > 0.0
       else
-        grounded_qp = merge(CS%ground_frac(i,j) >= 1.0, CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
+        grounded_qp = merge((CS%ground_frac(i,j) >= 1.0) .and. .not.gl_subgrid_cell(CS, i, j), &
+                            CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
       endif
       if (grounded_qp) then
         if (do_DG) then
@@ -6428,7 +6446,7 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
     v_diag_b(I  ,J  ,1) = 0.25*((v_diag_qp(2,2,1)+v_diag_qp(2,2,4))+(v_diag_qp(2,2,2)+v_diag_qp(2,2,3)))
 
     if (CS%GL_regularize .and. .not. CS%gl_quad_friction .and. .not. CS%local_basal_friction .and. &
-        CS%ground_frac(i,j) > 0.0 .and. CS%ground_frac(i,j) < 1.0) then
+        gl_subgrid_cell(CS, i, j)) then
       ! Subgrid grounding-line: evaluate basal friction diagonal at each grounded sub-quadrature point.
       ! Returns separate u_diag_sub and v_diag_sub (differ in Newton term: u^2 vs v^2).
       ! The sub-qp flotation test handles grounding fraction; no external ground_frac scaling needed.
@@ -8117,7 +8135,52 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
   ! nodal source operators, so its halo has to be current before the next advect step.
   call pass_corner_field(CS%xi_basal, G)
 
+  call set_gl_subgrid_neighbors(CS, ISS, G)
+
 end subroutine compute_ground_frac
+
+!> Flag the fully grounded ice cells that use the grounding-line sub-element quadrature although
+!! no grounding line cuts them: those that share an edge or a corner with a floating ice cell
+!! (ground_frac = 0), so that the grounding line lies on the shared edge or corner. The friction
+!! and the DG driving stress then use one quadrature on both sides of the grounding line. Needs
+!! current ground_frac and hmask halos.
+subroutine set_gl_subgrid_neighbors(CS, ISS, G)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS  !< The ice shelf dynamics control structure
+  type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe
+                                               !! the ice-shelf state
+  type(ocean_grid_type),  intent(in)    :: G   !< The grid structure used by the ice shelf.
+
+  integer :: i, j, ii, jj
+
+  CS%gl_sub_nbr(:,:) = 0.0
+  if (.not. CS%gl_sub_float_nbr) return
+
+  do j=G%jsc,G%jec ; do i=G%isc,G%iec
+    if (ISS%hmask(i,j) /= 1 .and. ISS%hmask(i,j) /= 3) cycle
+    if (CS%ground_frac(i,j) < 1.0) cycle
+    do jj=j-1,j+1 ; do ii=i-1,i+1
+      if (ISS%hmask(ii,jj) /= 1 .and. ISS%hmask(ii,jj) /= 3) cycle
+      if (CS%ground_frac(ii,jj) <= 0.0) CS%gl_sub_nbr(i,j) = 1.0
+    enddo ; enddo
+  enddo ; enddo
+
+  call pass_var(CS%gl_sub_nbr, G%Domain)
+
+end subroutine set_gl_subgrid_neighbors
+
+!> True if cell (i,j) integrates its basal friction and DG driving stress with the grounding-line
+!! sub-element quadrature: a grounding-line cell (0 < ground_frac < 1), or a fully grounded cell
+!! flagged by set_gl_subgrid_neighbors.
+pure logical function gl_subgrid_cell(CS, i, j)
+  type(ice_shelf_dyn_CS), intent(in) :: CS !< The ice shelf dynamics control structure
+  integer,                intent(in) :: i  !< The i-index of the cell
+  integer,                intent(in) :: j  !< The j-index of the cell
+
+  gl_subgrid_cell = .false.
+  if (.not. CS%GL_regularize) return
+  gl_subgrid_cell = ((CS%ground_frac(i,j) > 0.0) .and. (CS%ground_frac(i,j) < 1.0)) .or. &
+                    (CS%gl_sub_nbr(i,j) > 0.0)
+end function gl_subgrid_cell
 
 !> Grounded-area fraction of a rectangular region from the flotation function at its four
 !! corners, via the analytic bilinear-flotation area integral of the quadrant grounding-line
@@ -9420,6 +9483,7 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%h_source_rate)) deallocate(CS%h_source_rate)
   if (associated(CS%h_source_rate_bmb)) deallocate(CS%h_source_rate_bmb)
   if (associated(CS%xi_basal)) deallocate(CS%xi_basal)
+  if (associated(CS%gl_sub_nbr)) deallocate(CS%gl_sub_nbr)
   if (associated(CS%h_source_rate_last)) deallocate(CS%h_source_rate_last)
   if (associated(CS%phi_x_FV)) deallocate(CS%phi_x_FV)
   if (associated(CS%phi_y_FV)) deallocate(CS%phi_y_FV)
@@ -10054,8 +10118,7 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, taudx, taudy)
     dyCu_W = G%dyCu(I-1,j) ; dyCu_E = G%dyCu(I,j)
 
     ! Volume integral: sub-element quadrature where the cell straddles flotation.
-    use_subgrid_cell = CS%GL_regularize .and. &
-                       (CS%ground_frac(i,j) > 0.0) .and. (CS%ground_frac(i,j) < 1.0)
+    use_subgrid_cell = gl_subgrid_cell(CS, i, j)
     if (use_subgrid_cell) then
       if (CS%use_sep2) then
         call calc_shelf_driving_stress_DG_sep2(CS, CS%h_nodal(i,j,:,:), bed_corners, &
