@@ -5997,13 +5997,17 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
   logical :: do_fvsub    ! Local flag for the FV sub-element mode (fls_cell supplied)
   real :: fls_loc        ! Flotation deficit r*h - bed at sub-qp [Z ~> m]
   real :: rho_ocean_g_LtoZ ! US%L_to_Z * density_ocean_avg * g_Earth [R L Z-1 T-2]
-  real, dimension(2,2,4,4,4) :: KQ ! Per-qp matrix contributions (qx,qy,c,n,blk) [R L2 Z T-1 ~> kg s-1]
-  real, allocatable, dimension(:,:,:,:,:) :: Ksub ! Per-sub-cell matrix sums [R L2 Z T-1 ~> kg s-1]
+  real, dimension(2,2,10,4) :: KQ ! Per-qp matrix contributions (qx,qy,pair,blk) [R L2 Z T-1 ~> kg s-1]
+  real, allocatable, dimension(:,:,:,:) :: Ksub ! Per-sub-cell matrix sums (i,j,pair,blk) [R L2 Z T-1 ~> kg s-1]
+  real :: Kp               ! One reduced matrix entry [R L2 Z T-1 ~> kg s-1]
   real :: wcn              ! Weight times the two corner basis values [nondim]
   integer, dimension(4), parameter :: mc = (/ 1, 2, 1, 2 /) ! x-index of corner c (SW,SE,NW,NE)
   integer, dimension(4), parameter :: nc = (/ 1, 1, 2, 2 /) ! y-index of corner c
   logical :: build_K       ! True if Kmat is to be returned
-  integer :: nsub, i, j, qx, qy, m, n, c, cn, blk
+  integer :: nsub, i, j, qx, qy, m, n, c, cn, blk, ip
+  ! The friction matrix is symmetric in its two corners, so only the 10 pairs c <= n are formed.
+  integer, dimension(10), parameter :: pc = (/ 1, 1, 2, 1, 2, 3, 1, 2, 3, 4 /) ! First corner of pair
+  integer, dimension(10), parameter :: pn = (/ 1, 2, 2, 3, 3, 3, 4, 4, 4, 4 /) ! Second corner of pair
 
   nsub    = size(Phisub, 3)
   subarea = 1.0 / real(nsub)**2
@@ -6026,12 +6030,12 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
   Ucontr_sub(:,:,:,:) = 0.0 ; Vcontr_sub(:,:,:,:) = 0.0
   build_K = present(Kmat)
   if (build_K) then
-    allocate(Ksub(nsub,nsub,4,4,4), source=0.0)
+    allocate(Ksub(nsub,nsub,10,4), source=0.0)
   endif
 
   do j=1,nsub ; do i=1,nsub
     U_qp_nd(:,:,:,:) = 0.0 ; V_qp_nd(:,:,:,:) = 0.0
-    if (build_K) KQ(:,:,:,:,:) = 0.0
+    if (build_K) KQ(:,:,:,:) = 0.0
     do qy=1,2 ; do qx=1,2
       if (do_fvsub) then
         ! FV sub-element mode: thickness and flotation deficit share one interpolant (the same
@@ -6070,10 +6074,14 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
                        ((Phisub(qx,qy,i,j,1,2)*U_curr(1,2))  + (Phisub(qx,qy,i,j,2,1)*U_curr(2,1))))
         v_curr_loc  = (((Phisub(qx,qy,i,j,1,1)*V_curr(1,1))  + (Phisub(qx,qy,i,j,2,2)*V_curr(2,2)))  + &
                        ((Phisub(qx,qy,i,j,1,2)*V_curr(1,2))  + (Phisub(qx,qy,i,j,2,1)*V_curr(2,1))))
-        u_delta_loc = (((Phisub(qx,qy,i,j,1,1)*U_delta(1,1)) + (Phisub(qx,qy,i,j,2,2)*U_delta(2,2))) + &
-                       ((Phisub(qx,qy,i,j,1,2)*U_delta(1,2)) + (Phisub(qx,qy,i,j,2,1)*U_delta(2,1))))
-        v_delta_loc = (((Phisub(qx,qy,i,j,1,1)*V_delta(1,1)) + (Phisub(qx,qy,i,j,2,2)*V_delta(2,2))) + &
-                       ((Phisub(qx,qy,i,j,1,2)*V_delta(1,2)) + (Phisub(qx,qy,i,j,2,1)*V_delta(2,1))))
+        if (.not. build_K) then
+          u_delta_loc = (((Phisub(qx,qy,i,j,1,1)*U_delta(1,1)) + (Phisub(qx,qy,i,j,2,2)*U_delta(2,2))) + &
+                         ((Phisub(qx,qy,i,j,1,2)*U_delta(1,2)) + (Phisub(qx,qy,i,j,2,1)*U_delta(2,1))))
+          v_delta_loc = (((Phisub(qx,qy,i,j,1,1)*V_delta(1,1)) + (Phisub(qx,qy,i,j,2,2)*V_delta(2,2))) + &
+                         ((Phisub(qx,qy,i,j,1,2)*V_delta(1,2)) + (Phisub(qx,qy,i,j,2,1)*V_delta(2,1))))
+        else
+          u_delta_loc = 0.0 ; v_delta_loc = 0.0
+        endif
 
         unorm2_loc = ((u_curr_loc**2) + (v_curr_loc**2)) + eps_vel2
 
@@ -6107,15 +6115,17 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
         jac_sub_wt = 0.25 * subarea * (a * d) * IareaT
 
         if (build_K) then
-          ! K(c,n) = sum_q w_q phi_c phi_n {coef, drag u u, drag u v, drag v v}; the uv block is formed
-          ! from the product u*v so that a quarter turn maps it to minus itself exactly.
-          do cn=1,4 ; do c=1,4
-            wcn = (jac_sub_wt * Phisub(qx,qy,i,j,mc(c),nc(c))) * Phisub(qx,qy,i,j,mc(cn),nc(cn))
-            KQ(qx,qy,c,cn,1) = wcn * basal_coef_loc
-            KQ(qx,qy,c,cn,2) = wcn * (drag_newt_loc * (u_curr_loc * u_curr_loc))
-            KQ(qx,qy,c,cn,3) = wcn * (drag_newt_loc * (u_curr_loc * v_curr_loc))
-            KQ(qx,qy,c,cn,4) = wcn * (drag_newt_loc * (v_curr_loc * v_curr_loc))
-          enddo ; enddo
+          ! K(c,n) = sum_q w_q phi_c phi_n {coef, drag u u, drag u v, drag v v}. phi_c*phi_n is formed
+          ! first so the entry does not depend on which corner is c, and the uv block from the product
+          ! u*v, so that a quarter turn maps each entry exactly onto its image.
+          do ip=1,10
+            c = pc(ip) ; cn = pn(ip)
+            wcn = jac_sub_wt * (Phisub(qx,qy,i,j,mc(c),nc(c)) * Phisub(qx,qy,i,j,mc(cn),nc(cn)))
+            KQ(qx,qy,ip,1) = wcn * basal_coef_loc
+            KQ(qx,qy,ip,2) = wcn * (drag_newt_loc * (u_curr_loc * u_curr_loc))
+            KQ(qx,qy,ip,3) = wcn * (drag_newt_loc * (u_curr_loc * v_curr_loc))
+            KQ(qx,qy,ip,4) = wcn * (drag_newt_loc * (v_curr_loc * v_curr_loc))
+          enddo
         else ; do n=1,2 ; do m=1,2
           phi_mn  = Phisub(qx,qy,i,j,m,n)
           contrib = jac_sub_wt * phi_mn
@@ -6132,7 +6142,7 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
     enddo ; enddo
 
     if (build_K) then
-      Ksub(i,j,:,:,:) = (KQ(1,1,:,:,:) + KQ(2,2,:,:,:)) + (KQ(1,2,:,:,:) + KQ(2,1,:,:,:))
+      Ksub(i,j,:,:) = (KQ(1,1,:,:) + KQ(2,2,:,:)) + (KQ(1,2,:,:) + KQ(2,1,:,:))
     endif
 
     do n=1,2 ; do m=1,2
@@ -6144,9 +6154,10 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
   enddo ; enddo
 
   if (build_K) then
-    do blk=1,4 ; do cn=1,4 ; do c=1,4
-      call sum_square_matrix(Kmat(c,cn,blk), Ksub(:,:,c,cn,blk), nsub)
-    enddo ; enddo ; enddo
+    do blk=1,4 ; do ip=1,10
+      call sum_square_matrix(Kp, Ksub(:,:,ip,blk), nsub)
+      Kmat(pc(ip),pn(ip),blk) = Kp ; Kmat(pn(ip),pc(ip),blk) = Kp
+    enddo ; enddo
     deallocate(Ksub)
     Ucontr(:,:) = 0.0 ; Vcontr(:,:) = 0.0
     return
@@ -7382,11 +7393,15 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
   real :: fls_loc           ! Flotation deficit at the QP [Z ~> m]
   logical :: do_DG          ! Local flag for DG mode
   logical :: do_fvsub       ! Local flag for the FV sub-element mode (fls_cell supplied)
-  real, dimension(4,4,4,SEP2_MAXQP) :: valK ! Per-QP matrix contributions (c,n,blk,k) [R L2 Z T-1 ~> kg s-1]
-  real, dimension(4,4,4,4) :: pK  ! Per-triangle matrix sums (c,n,blk,t) [R L2 Z T-1 ~> kg s-1]
+  real, dimension(10,4,SEP2_MAXQP) :: valK ! Per-QP matrix contributions (pair,blk,k) [R L2 Z T-1 ~> kg s-1]
+  real, dimension(10,4,4) :: pK   ! Per-triangle matrix sums (pair,blk,t) [R L2 Z T-1 ~> kg s-1]
+  real :: Kp                ! One reduced matrix entry [R L2 Z T-1 ~> kg s-1]
   real :: wcn               ! Weight times the two corner basis values [nondim]
   logical :: build_K        ! True if Kmat is to be returned
-  integer :: t, k, c, cn, blk
+  integer :: t, k, c, blk, ip
+  ! The friction matrix is symmetric in its two corners, so only the 10 pairs c <= n are formed.
+  integer, dimension(10), parameter :: pc = (/ 1, 1, 2, 1, 2, 3, 1, 2, 3, 4 /) ! First corner of pair
+  integer, dimension(10), parameter :: pn = (/ 1, 2, 2, 3, 3, 3, 4, 4, 4, 4 /) ! Second corner of pair
 
   coef_prefactor = CS%coef_prefactor(i_elem,j_elem)
   min_trac_area  = CS%min_basal_traction * G%areaT(i_elem,j_elem)
@@ -7433,7 +7448,7 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
 
   do t=1,4
     valu(:,1:nqp(t)) = 0.0 ; valv(:,1:nqp(t)) = 0.0
-    if (build_K) valK(:,:,:,1:nqp(t)) = 0.0
+    if (build_K) valK(:,:,1:nqp(t)) = 0.0
     do k=1,nqp(t)
       if (.not. qpg(k,t)) cycle ! floating piece: no basal traction
       b1 = beta(1,k,t) ; b2 = beta(2,k,t) ; b3 = beta(3,k,t) ; b4 = beta(4,k,t)
@@ -7483,14 +7498,14 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
       inner_dot_loc = (u_curr_loc * u_delta_loc) + (v_curr_loc * v_delta_loc)
 
       if (build_K) then
-        ! See CG_action_subgrid_basal: the uv block is formed from the product u*v.
-        do cn=1,4 ; do c=1,4
-          wcn = (jac * beta(c,k,t)) * beta(cn,k,t)
-          valK(c,cn,1,k) = wcn * basal_coef_loc
-          valK(c,cn,2,k) = wcn * (drag_newt_loc * (u_curr_loc * u_curr_loc))
-          valK(c,cn,3,k) = wcn * (drag_newt_loc * (u_curr_loc * v_curr_loc))
-          valK(c,cn,4,k) = wcn * (drag_newt_loc * (v_curr_loc * v_curr_loc))
-        enddo ; enddo
+        ! See CG_action_subgrid_basal for the product order.
+        do ip=1,10
+          wcn = jac * (beta(pc(ip),k,t) * beta(pn(ip),k,t))
+          valK(ip,1,k) = wcn * basal_coef_loc
+          valK(ip,2,k) = wcn * (drag_newt_loc * (u_curr_loc * u_curr_loc))
+          valK(ip,3,k) = wcn * (drag_newt_loc * (u_curr_loc * v_curr_loc))
+          valK(ip,4,k) = wcn * (drag_newt_loc * (v_curr_loc * v_curr_loc))
+        enddo
         cycle
       endif
 
@@ -7507,9 +7522,9 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
 
     ! Orbit-grouped QP sums (sep2_qp_sum), invariant under the reflections that permute the QPs.
     if (build_K) then
-      do blk=1,4 ; do cn=1,4 ; do c=1,4
-        pK(c,cn,blk,t) = sep2_qp_sum(valK(c,cn,blk,1:nqp(t)), nqp(t))
-      enddo ; enddo ; enddo
+      do blk=1,4 ; do ip=1,10
+        pK(ip,blk,t) = sep2_qp_sum(valK(ip,blk,1:nqp(t)), nqp(t))
+      enddo ; enddo
     else
       do c=1,4
         pu(c,t) = sep2_qp_sum(valu(c,1:nqp(t)), nqp(t))
@@ -7519,12 +7534,11 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
   enddo
 
   if (build_K) then
-    ! Role-grouped cross-triangle reduction for row c, as for Ucontr below.
-    do blk=1,4 ; do cn=1,4
-      Kmat(1,cn,blk) = (pK(1,cn,blk,1) + pK(1,cn,blk,4)) + (pK(1,cn,blk,2) + pK(1,cn,blk,3))
-      Kmat(2,cn,blk) = (pK(2,cn,blk,2) + pK(2,cn,blk,1)) + (pK(2,cn,blk,3) + pK(2,cn,blk,4))
-      Kmat(3,cn,blk) = (pK(3,cn,blk,4) + pK(3,cn,blk,3)) + (pK(3,cn,blk,1) + pK(3,cn,blk,2))
-      Kmat(4,cn,blk) = (pK(4,cn,blk,3) + pK(4,cn,blk,2)) + (pK(4,cn,blk,4) + pK(4,cn,blk,1))
+    ! Opposite-pair triangle grouping (S+N)+(E+W): a rotation or reflection only swaps terms within
+    ! or between the pairs, whichever corner of the entry is c, so the mirrored entry is exact.
+    do blk=1,4 ; do ip=1,10
+      Kp = (pK(ip,blk,1) + pK(ip,blk,3)) + (pK(ip,blk,2) + pK(ip,blk,4))
+      Kmat(pc(ip),pn(ip),blk) = Kp ; Kmat(pn(ip),pc(ip),blk) = Kp
     enddo ; enddo
     Ucontr(:,:) = 0.0 ; Vcontr(:,:) = 0.0
     return
