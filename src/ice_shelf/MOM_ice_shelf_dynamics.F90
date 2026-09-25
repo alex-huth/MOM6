@@ -119,6 +119,22 @@ real, parameter, dimension(2) :: SEP2_GP = (/ 0.5*(1.0 - sqrt(1.0/3.0)), &
 real, parameter, dimension(2) :: SEP2_GC = (/ SEP2_GP(2), SEP2_GP(1) /)
                                          !< Complementary Gauss factors (1-abscissa), stored as the
                                          !! same values swapped so reflection orbits are exact [nondim]
+! High-order SEP2 rules (GROUNDING_LINE_SUBGRID_BAND): a 6-pt degree-4 triangle rule (Dunavant 1985)
+! and 3x3 Gauss on quad pieces, so a cut parent triangle carries up to 6 + 9 QPs.
+integer, parameter :: SEP2_MAXQP = 15    !< Largest number of QPs on one SEP2 parent triangle
+real, parameter :: SEP2_T6L1 = 0.44594849091596488632 !< Light barycentric of 6-pt orbit 1 [nondim]
+real, parameter :: SEP2_T6H1 = 1.0 - 2.0*SEP2_T6L1    !< Heavy barycentric of 6-pt orbit 1 [nondim]
+real, parameter :: SEP2_T6L2 = 0.09157621350977074346 !< Light barycentric of 6-pt orbit 2 [nondim]
+real, parameter :: SEP2_T6H2 = 1.0 - 2.0*SEP2_T6L2    !< Heavy barycentric of 6-pt orbit 2 [nondim]
+real, parameter :: SEP2_T6W1 = 0.22338158967801146570 !< Area fraction per QP of 6-pt orbit 1 [nondim]
+real, parameter :: SEP2_T6W2 = 0.10995174365532186764 !< Area fraction per QP of 6-pt orbit 2 [nondim]
+real, parameter, dimension(3) :: SEP2_GP3 = (/ 0.5*(1.0 - sqrt(0.6)), 0.5, 0.5*(1.0 + sqrt(0.6)) /)
+                                         !< 3-pt Gauss abscissae on [0,1] [nondim]
+real, parameter, dimension(3) :: SEP2_GC3 = (/ SEP2_GP3(3), SEP2_GP3(2), SEP2_GP3(1) /)
+                                         !< Complementary 3-pt Gauss factors (1-abscissa), stored
+                                         !! as the same values reversed, as for SEP2_GC [nondim]
+real, parameter, dimension(3) :: SEP2_GW3 = (/ 5.0/18.0, 8.0/18.0, 5.0/18.0 /)
+                                         !< 3-pt Gauss weights on [0,1] [nondim]
 
 ! TVD slope limiters for thickness advection (ICE_SHELF_ADVECT_LIMITER)
 integer, parameter :: LIMITER_VANLEER = 0   !< Van Leer limiter (original scheme)
@@ -378,6 +394,9 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: gl_sub_float_nbr !< If true, a fully grounded cell with a floating ice neighbour (across
                             !! an edge or a corner) uses the grounding-line sub-element quadrature for
                             !! its basal friction and DG driving stress, as a grounding-line cell does.
+  logical :: gl_band        !< If true, widen gl_sub_float_nbr to every fully grounded cell with a
+                            !! neighbour whose ground_frac < 1, and raise the SEP2 rules to a 6-pt
+                            !! triangle rule and 3x3 Gauss on quad pieces.
   real, pointer, dimension(:,:) :: gl_sub_nbr => NULL() !< 1 where a fully grounded cell uses the
                             !! grounding-line sub-element quadrature because of its neighbours
                             !! (set_gl_subgrid_neighbors), 0 elsewhere [nondim]
@@ -1064,6 +1083,17 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "discontinuous between cells: with the DG(1) thickness, or at a bed step with the "//&
                  "cell-constant bed of the non-DG path. ground_frac itself is unchanged.", &
                  default=.true., do_not_log=.not.CS%GL_regularize)
+    call get_param(param_file, mdl, "GROUNDING_LINE_SUBGRID_BAND", CS%gl_band, &
+                 "If true, every fully grounded ice cell that shares an edge or a corner with an "//&
+                 "ice cell with ground_frac < 1 integrates its basal friction and its DG driving "//&
+                 "stress with the GROUNDING_LINE_SUBGRID_SCHEME quadrature, which widens "//&
+                 "GROUNDING_LINE_SUBGRID_FLOATING_NEIGHBOR from floating neighbours to "//&
+                 "grounding-line neighbours; and the SEP2 rules are raised from the 3-pt triangle "//&
+                 "rule and 2x2 Gauss to a 6-pt degree-4 triangle rule and 3x3 Gauss on the "//&
+                 "quadrilateral pieces. Together these reduce the jumps in a friction coefficient "//&
+                 "that varies steeply near flotation, such as the regularized Coulomb law, when "//&
+                 "the grounding line changes sub-element branch or a cell becomes fully grounded.", &
+                 default=.false., do_not_log=.not.CS%GL_regularize)
     call get_param(param_file, mdl, "GROUNDING_LINE_COUPLE", CS%GL_couple, &
                  "If true, let the floatation condition be determined by "//&
                  "ocean column thickness. This means that update_OD_ffrac "//&
@@ -6702,45 +6732,42 @@ end subroutine CG_diagonal_subgrid_basal
 
 !> Build the SEP2 sub-element quadrature of one grounding-line cell (Seroussi et al. 2014
 !! SEP2, extended to quadrilaterals). The cell is fanned into 4 triangles at its center;
-!! the bilinear flotation deficit f is linear on each, so the grounding line is a straight
-!! cut separating the unique minority-sign vertex (triangle piece) from the other two
-!! (quad piece, collapsed exactly when the cut passes through a vertex). QPs carry parent
-!! Q1 corner-basis weights (beta) and reference-space measures (wref); no physical metric
-!! enters here. All formulas are keyed to vertex roles and grouped in symmetry orbits so
-!! outputs are bitwise-covariant under grid rotations and reflections.
+!! the flotation deficit f is interpolated linearly on each (the corner mean at the center),
+!! so the grounding line is a straight cut separating the unique minority-sign vertex (triangle
+!! piece) from the other two (quad piece, collapsed exactly when the cut passes through a
+!! vertex). QPs carry corner-basis weights (beta) and reference-space measures (wref); no
+!! physical metric enters here. All formulas are keyed to vertex roles and grouped in symmetry
+!! orbits so outputs are bitwise-covariant under grid rotations and reflections.
 !!
-!! KNOWN LIMITATION: assembled basis-weighted quantities are discontinuous in the sub-cell
-!! grounding-line position, although the partition geometry is not. The two rules below are
-!! each exact for the parent Jacobian, so the weight sums -- hence areas and ground_frac --
-!! vary continuously through every topology change. They are not exact for beta_i*beta_j*J,
-!! which is total degree 4 (degree 5 per variable on a quad piece after the bilinear sub-map),
-!! while the 3-pt triangle rule is exact to degree 2 and the 2x2 tensor rule to degree 3 per
-!! variable. So the same region integrated by different rules returns different values, and the
-!! assembled basal friction and driving stress step whenever a branch change re-assigns the
-!! rules. The largest case is the centre deficit f_C changing sign, which switches all four
-!! parent triangles at once: two go uncut <-> centre-cut, and two swap the minority vertex
-!! between the corner-cut branches, which exchanges the triangle and quad rules over the same
-!! two pieces. Measured on MISMIP+ at 10 km (dg_thin/runs/glsweep.sh, z18_glsmooth.py): a 2.5%
-!! step in the local velocity at one grounding-line position, against a 0.02% background, not
-!! resolved by refining the sweep 5x, and absent under GROUNDING_LINE_SUBGRID_SCHEME="SEP3".
+!! beta is the P1-on-the-fan interpolant of the parent Q1 basis (the barycentric combination of
+!! its corner and center values), not the Q1 basis itself, so beta_i*beta_j is degree 2 on every
+!! piece. With the metric a*d the integrand of a constant-coefficient friction is total degree 4
+!! (degree 5 per variable on a quad piece after the bilinear sub-map). The default rules -- the
+!! 3-pt interior triangle rule (degree 2) and the 2x2 tensor rule (degree 3 per variable) -- are
+!! therefore exact for a constant coefficient on a uniform Cartesian grid, where a*d is constant,
+!! and exact for the area (hence ground_frac) on any grid.
 !!
-!! Raising the quadrature to 3x3 on quad pieces (exact to degree 5 per variable) and a
-!! degree-4-exact rule on triangle pieces would remove it: rules that are exact for the
-!! integrand agree whatever the parameterization, so a branch change cannot move the answer.
-!! Using one rule family everywhere is NOT sufficient on its own -- which corner of a collapsed
-!! quad is doubled up follows the branch's (X,Y,Z) role assignment, not the piece's geometry,
-!! so the same piece is parameterized differently in the two branches that produce it.
-!! Not done because it is not the cause of the steady grounding-line wobble (SEP3 removes these
-!! steps and makes the wobble 3-8x worse), P75R reversibility already passes as this stands, and
-!! the measured sensitivity to the quadrature choice away from a transition is about 0.2%.
-subroutine sep2_cell_qps(f, nqp, beta, wref, qp_grounded)
+!! They are not exact for a friction coefficient that varies steeply inside the cell. The
+!! regularized Coulomb law does: it follows alpha*N from N = 0 at flotation and saturates at the
+!! Weertman stress within a few metres of flotation deficit, which puts a bend inside the
+!! grounding-line cell. A branch change re-assigns the rules over the same region (the largest
+!! case switches the triangle and quad rules), and inexact rules then return different values,
+!! so the assembled friction steps at that grounding-line position. Measured on MISMIP+ at 10 km
+!! (dg_thin/runs/glsweep.sh, z18_glsmooth.py): a 0.9% step in the maximum speed, absent with
+!! Weertman friction and under GROUNDING_LINE_SUBGRID_SCHEME="SEP3". With high_order (set by
+!! GROUNDING_LINE_SUBGRID_BAND) the rules are raised to a 6-pt degree-4 triangle rule and 3x3
+!! Gauss (degree 5 per variable), which are exact for a constant coefficient on any separable
+!! metric and reduce the Coulomb steps.
+subroutine sep2_cell_qps(f, nqp, beta, wref, qp_grounded, high_order)
   real, dimension(4),     intent(in)  :: f    !< Flotation deficit r*h - bed at the cell corners,
                                               !! ordered SW, SE, NW, NE [Z ~> m]
-  integer, dimension(4),  intent(out) :: nqp  !< Number of QPs per parent triangle (3 or 7)
-  real, dimension(4,7,4), intent(out) :: beta !< Corner-basis weights per (corner, QP, triangle),
-                                              !! triangles ordered S, E, N, W [nondim]
-  real, dimension(7,4),   intent(out) :: wref !< Reference-space measure per (QP, triangle) [nondim]
-  logical, dimension(7,4), intent(out) :: qp_grounded !< True where the QP lies in a grounded piece
+  integer, dimension(4),  intent(out) :: nqp  !< Number of QPs per parent triangle (3 or 7, or
+                                              !! 6 or 15 with high_order)
+  real, dimension(4,SEP2_MAXQP,4), intent(out) :: beta !< Corner-basis weights per (corner, QP,
+                                              !! triangle), triangles ordered S, E, N, W [nondim]
+  real, dimension(SEP2_MAXQP,4),   intent(out) :: wref !< Reference-space measure per (QP, triangle) [nondim]
+  logical, dimension(SEP2_MAXQP,4), intent(out) :: qp_grounded !< True where the QP lies in a grounded piece
+  logical, optional,      intent(in)  :: high_order !< If true, use the 6-pt triangle and 3x3 quad rules
 
   ! Base-corner ids (A,B) of triangles S,E,N,W in counterclockwise order.
   integer, dimension(4), parameter :: iA = (/ 1, 2, 4, 3 /) ! First (CCW) base corner per triangle
@@ -6748,7 +6775,10 @@ subroutine sep2_cell_qps(f, nqp, beta, wref, qp_grounded)
   real, dimension(4) :: bC, bA, bB ! Corner-basis weights of the role vertices [nondim]
   real :: fC              ! Deficit at the cell center (bilinear value = corner mean) [Z ~> m]
   logical :: gC, gA, gB   ! Tie-broken grounded states (f > 0) of the role vertices
+  logical :: hi           ! Local copy of high_order
   integer :: k
+
+  hi = .false. ; if (present(high_order)) hi = high_order
 
   ! Diagonal-pair grouping: the two diagonals map to each other under any rotation/reflection.
   fC = 0.5 * ((0.5 * (f(1) + f(4))) + (0.5 * (f(2) + f(3))))
@@ -6758,45 +6788,52 @@ subroutine sep2_cell_qps(f, nqp, beta, wref, qp_grounded)
   do k=1,4
     gA = (f(iA(k)) > 0.0) ; gB = (f(iB(k)) > 0.0)
     if ((gA .eqv. gC) .and. (gB .eqv. gC)) then
-      ! Uncut triangle: interior 3-pt rule on (C, A, B); QPs (2,3) are a reflection orbit.
+      ! Uncut triangle: interior rule on (C, A, B); C-heavy QPs first, reflection pairs follow.
       bA(:) = 0.0 ; bA(iA(k)) = 1.0
       bB(:) = 0.0 ; bB(iB(k)) = 1.0
-      beta(:,1,k) = (SEP2_W23 * bC(:)) + ((SEP2_W16 * bA(:)) + (SEP2_W16 * bB(:)))
-      beta(:,2,k) = (SEP2_W16 * bC(:)) + ((SEP2_W23 * bA(:)) + (SEP2_W16 * bB(:)))
-      beta(:,3,k) = (SEP2_W16 * bC(:)) + ((SEP2_W16 * bA(:)) + (SEP2_W23 * bB(:)))
-      wref(1:3,k) = SEP2_TRI3
-      qp_grounded(1:3,k) = gC
-      nqp(k) = 3
+      if (hi) then
+        call sep2_tri6(bC, bA, bB, 0.25, beta(:,1:6,k), wref(1:6,k))
+        qp_grounded(1:6,k) = gC
+        nqp(k) = 6
+      else
+        beta(:,1,k) = (SEP2_W23 * bC(:)) + ((SEP2_W16 * bA(:)) + (SEP2_W16 * bB(:)))
+        beta(:,2,k) = (SEP2_W16 * bC(:)) + ((SEP2_W23 * bA(:)) + (SEP2_W16 * bB(:)))
+        beta(:,3,k) = (SEP2_W16 * bC(:)) + ((SEP2_W16 * bA(:)) + (SEP2_W23 * bB(:)))
+        wref(1:3,k) = SEP2_TRI3
+        qp_grounded(1:3,k) = gC
+        nqp(k) = 3
+      endif
     elseif (gA .eqv. gB) then
       ! Center vertex separated; cyclic role binding (C, A, B).
       bA(:) = 0.0 ; bA(iA(k)) = 1.0
       bB(:) = 0.0 ; bB(iB(k)) = 1.0
-      call sep2_cut_tri(fC, f(iA(k)), f(iB(k)), bC, bA, bB, gC, beta(:,:,k), wref(:,k), qp_grounded(:,k))
-      nqp(k) = 7
+      call sep2_cut_tri(fC, f(iA(k)), f(iB(k)), bC, bA, bB, gC, hi, beta(:,:,k), wref(:,k), &
+                        qp_grounded(:,k), nqp(k))
     elseif (gB .eqv. gC) then
       ! Corner A separated; cyclic role binding (A, B, C).
       bA(:) = 0.0 ; bA(iA(k)) = 1.0
       bB(:) = 0.0 ; bB(iB(k)) = 1.0
-      call sep2_cut_tri(f(iA(k)), f(iB(k)), fC, bA, bB, bC, gA, beta(:,:,k), wref(:,k), qp_grounded(:,k))
-      nqp(k) = 7
+      call sep2_cut_tri(f(iA(k)), f(iB(k)), fC, bA, bB, bC, gA, hi, beta(:,:,k), wref(:,k), &
+                        qp_grounded(:,k), nqp(k))
     else
       ! Corner B separated; cyclic role binding (B, C, A).
       bA(:) = 0.0 ; bA(iA(k)) = 1.0
       bB(:) = 0.0 ; bB(iB(k)) = 1.0
-      call sep2_cut_tri(f(iB(k)), fC, f(iA(k)), bB, bC, bA, gB, beta(:,:,k), wref(:,k), qp_grounded(:,k))
-      nqp(k) = 7
+      call sep2_cut_tri(f(iB(k)), fC, f(iA(k)), bB, bC, bA, gB, hi, beta(:,:,k), wref(:,k), &
+                        qp_grounded(:,k), nqp(k))
     endif
   enddo
 
 end subroutine sep2_cell_qps
 
 !> Quadrature of one cut parent triangle: minority vertex X separated from (Y, Z) by the
-!! straight zero contour of the linear deficit. QPs 1-3 sample the X-side triangle piece
-!! (interior 3-pt rule, X-heavy first; 2 and 3 are a reflection orbit); QPs 4-7 sample the
-!! (Y,Z)-side quad piece (2x2 tensor rule on the bilinear sub-map; pairs (4,5) and (6,7)
-!! are reflection orbits). A cut through a vertex collapses the quad exactly (zero-area
-!! side), so degenerate configurations need no special case.
-subroutine sep2_cut_tri(fX, fY, fZ, bX, bY, bZ, gX, betaT, wrefT, gT)
+!! straight zero contour of the linear deficit. The first QPs sample the X-side triangle piece
+!! (interior triangle rule, X-heavy first; the others come in reflection pairs); the rest sample
+!! the (Y,Z)-side quad piece (tensor Gauss rule on the bilinear sub-map; at each r abscissa the
+!! s abscissae s and 1-s are a reflection pair). Default: 3 + 2x2 = 7 QPs. With hi: 6 + 3x3 = 15.
+!! A cut through a vertex collapses the quad exactly (zero-area side), so degenerate
+!! configurations need no special case.
+subroutine sep2_cut_tri(fX, fY, fZ, bX, bY, bZ, gX, hi, betaT, wrefT, gT, nqpT)
   real,               intent(in)  :: fX     !< Deficit at the minority vertex [Z ~> m]
   real,               intent(in)  :: fY     !< Deficit at the first (CCW) majority vertex [Z ~> m]
   real,               intent(in)  :: fZ     !< Deficit at the second majority vertex [Z ~> m]
@@ -6804,16 +6841,18 @@ subroutine sep2_cut_tri(fX, fY, fZ, bX, bY, bZ, gX, betaT, wrefT, gT)
   real, dimension(4), intent(in)  :: bY     !< Corner-basis weights of vertex Y [nondim]
   real, dimension(4), intent(in)  :: bZ     !< Corner-basis weights of vertex Z [nondim]
   logical,            intent(in)  :: gX     !< Grounded state of the minority vertex
-  real, dimension(4,7), intent(out) :: betaT !< Corner-basis weights per (corner, QP) [nondim]
-  real, dimension(7),   intent(out) :: wrefT !< Reference-space measure per QP [nondim]
-  logical, dimension(7), intent(out) :: gT   !< Grounded state per QP
+  logical,            intent(in)  :: hi     !< If true, use the 6-pt triangle and 3x3 quad rules
+  real, dimension(4,SEP2_MAXQP), intent(out) :: betaT !< Corner-basis weights per (corner, QP) [nondim]
+  real, dimension(SEP2_MAXQP),   intent(out) :: wrefT !< Reference-space measure per QP [nondim]
+  logical, dimension(SEP2_MAXQP), intent(out) :: gT   !< Grounded state per QP
+  integer,            intent(out) :: nqpT   !< Number of QPs used (7, or 15 with hi)
 
   real :: cY1, cX1  ! Crossing weights on edge X-Y: v1 = cX1*X + cY1*Y [nondim]
   real :: cZ2, cX2  ! Crossing weights on edge Z-X: v4 = cX2*X + cZ2*Z [nondim]
   real, dimension(4) :: b1, b4 ! Corner-basis weights of the crossings [nondim]
   real :: t1, t2, t3, t4 ! Tensor-product factors at a quad QP [nondim]
   real :: wtri      ! Per-QP measure of the triangle piece [nondim]
-  integer :: k, ir, is
+  integer :: k, ir, is, ntri
 
   ! Exact edge crossings; both complements have their own role-anchored formula so a
   ! (Y,Z) swap permutes them bitwise (denominators are exact negations of each other).
@@ -6823,30 +6862,92 @@ subroutine sep2_cut_tri(fX, fY, fZ, bX, bY, bZ, gX, betaT, wrefT, gT)
   b4(:) = (cX2 * bX(:)) + (cZ2 * bZ(:))
 
   ! Triangle piece (X, v1, v4); ref area = cY1*cZ2 * (1/4), the parent-triangle area.
-  wtri = (cY1 * cZ2) * SEP2_TRI3
-  betaT(:,1) = (SEP2_W23 * bX(:)) + ((SEP2_W16 * b1(:)) + (SEP2_W16 * b4(:)))
-  betaT(:,2) = (SEP2_W16 * bX(:)) + ((SEP2_W23 * b1(:)) + (SEP2_W16 * b4(:)))
-  betaT(:,3) = (SEP2_W16 * bX(:)) + ((SEP2_W16 * b1(:)) + (SEP2_W23 * b4(:)))
-  wrefT(1:3) = wtri
-  gT(1:3) = gX
+  if (hi) then
+    call sep2_tri6(bX, b1, b4, (cY1 * cZ2) * 0.25, betaT(:,1:6), wrefT(1:6))
+    ntri = 6
+  else
+    wtri = (cY1 * cZ2) * SEP2_TRI3
+    betaT(:,1) = (SEP2_W23 * bX(:)) + ((SEP2_W16 * b1(:)) + (SEP2_W16 * b4(:)))
+    betaT(:,2) = (SEP2_W16 * bX(:)) + ((SEP2_W23 * b1(:)) + (SEP2_W16 * b4(:)))
+    betaT(:,3) = (SEP2_W16 * bX(:)) + ((SEP2_W16 * b1(:)) + (SEP2_W23 * b4(:)))
+    wrefT(1:3) = wtri
+    ntri = 3
+  endif
+  gT(1:ntri) = gX
 
   ! Quad piece (v1, Y, Z, v4) on the bilinear sub-map Q(r,s): r along v1->Y and v4->Z,
   ! s along v1->v4. Sub-map Jacobian (linear in r and s, derived analytically so a (Y,Z)
   ! swap maps it to J(r,1-s) bitwise; 0.5 = cross(Y-X, Z-X), twice the parent-tri area):
   !   J_sub = 0.5 * [ (1-s)*cX1*((1-r)*cZ2 + r) + s*cX2*((1-r)*cY1 + r) ]
-  ! QP weight = (1/4 Gauss) * J_sub; 0.125 = 0.25 * 0.5.
-  k = 3
-  do ir=1,2 ; do is=1,2
-    k = k + 1
-    t1 = SEP2_GC(ir) * SEP2_GC(is) ; t2 = SEP2_GP(ir) * SEP2_GC(is)
-    t3 = SEP2_GP(ir) * SEP2_GP(is) ; t4 = SEP2_GC(ir) * SEP2_GP(is)
-    betaT(:,k) = ((t1 * b1(:)) + (t4 * b4(:))) + ((t2 * bY(:)) + (t3 * bZ(:)))
-    wrefT(k) = 0.125 * ( ((SEP2_GC(is) * cX1) * ((SEP2_GC(ir) * cZ2) + SEP2_GP(ir))) + &
-                         ((SEP2_GP(is) * cX2) * ((SEP2_GC(ir) * cY1) + SEP2_GP(ir))) )
-    gT(k) = .not. gX
-  enddo ; enddo
+  ! QP weight = (Gauss weights) * J_sub; 0.125 = 0.25 * 0.5 for 2x2.
+  k = ntri
+  if (hi) then
+    do ir=1,3 ; do is=1,3
+      k = k + 1
+      t1 = SEP2_GC3(ir) * SEP2_GC3(is) ; t2 = SEP2_GP3(ir) * SEP2_GC3(is)
+      t3 = SEP2_GP3(ir) * SEP2_GP3(is) ; t4 = SEP2_GC3(ir) * SEP2_GP3(is)
+      betaT(:,k) = ((t1 * b1(:)) + (t4 * b4(:))) + ((t2 * bY(:)) + (t3 * bZ(:)))
+      wrefT(k) = (0.5 * (SEP2_GW3(ir) * SEP2_GW3(is))) * &
+                 ( ((SEP2_GC3(is) * cX1) * ((SEP2_GC3(ir) * cZ2) + SEP2_GP3(ir))) + &
+                   ((SEP2_GP3(is) * cX2) * ((SEP2_GC3(ir) * cY1) + SEP2_GP3(ir))) )
+      gT(k) = .not. gX
+    enddo ; enddo
+  else
+    do ir=1,2 ; do is=1,2
+      k = k + 1
+      t1 = SEP2_GC(ir) * SEP2_GC(is) ; t2 = SEP2_GP(ir) * SEP2_GC(is)
+      t3 = SEP2_GP(ir) * SEP2_GP(is) ; t4 = SEP2_GC(ir) * SEP2_GP(is)
+      betaT(:,k) = ((t1 * b1(:)) + (t4 * b4(:))) + ((t2 * bY(:)) + (t3 * bZ(:)))
+      wrefT(k) = 0.125 * ( ((SEP2_GC(is) * cX1) * ((SEP2_GC(ir) * cZ2) + SEP2_GP(ir))) + &
+                           ((SEP2_GP(is) * cX2) * ((SEP2_GC(ir) * cY1) + SEP2_GP(ir))) )
+      gT(k) = .not. gX
+    enddo ; enddo
+  endif
+  nqpT = k
 
 end subroutine sep2_cut_tri
+
+!> The 6-pt degree-4 interior rule (Dunavant 1985) on the triangle (X, Y, Z) of reference area
+!! area_ref. QPs 1-3 are the first orbit and 4-6 the second, X-heavy first in each, so (2,3)
+!! and (5,6) are reflection pairs, as in the 3-pt rule.
+subroutine sep2_tri6(bX, bY, bZ, area_ref, betaT, wrefT)
+  real, dimension(4),   intent(in)  :: bX       !< Corner-basis weights of vertex X [nondim]
+  real, dimension(4),   intent(in)  :: bY       !< Corner-basis weights of vertex Y [nondim]
+  real, dimension(4),   intent(in)  :: bZ       !< Corner-basis weights of vertex Z [nondim]
+  real,                 intent(in)  :: area_ref !< Reference-space area of the triangle [nondim]
+  real, dimension(4,6), intent(out) :: betaT    !< Corner-basis weights per (corner, QP) [nondim]
+  real, dimension(6),   intent(out) :: wrefT    !< Reference-space measure per QP [nondim]
+
+  betaT(:,1) = (SEP2_T6H1 * bX(:)) + ((SEP2_T6L1 * bY(:)) + (SEP2_T6L1 * bZ(:)))
+  betaT(:,2) = (SEP2_T6L1 * bX(:)) + ((SEP2_T6H1 * bY(:)) + (SEP2_T6L1 * bZ(:)))
+  betaT(:,3) = (SEP2_T6L1 * bX(:)) + ((SEP2_T6L1 * bY(:)) + (SEP2_T6H1 * bZ(:)))
+  betaT(:,4) = (SEP2_T6H2 * bX(:)) + ((SEP2_T6L2 * bY(:)) + (SEP2_T6L2 * bZ(:)))
+  betaT(:,5) = (SEP2_T6L2 * bX(:)) + ((SEP2_T6H2 * bY(:)) + (SEP2_T6L2 * bZ(:)))
+  betaT(:,6) = (SEP2_T6L2 * bX(:)) + ((SEP2_T6L2 * bY(:)) + (SEP2_T6H2 * bZ(:)))
+  wrefT(1:3) = area_ref * SEP2_T6W1
+  wrefT(4:6) = area_ref * SEP2_T6W2
+
+end subroutine sep2_tri6
+
+!> Sum of per-QP values over one SEP2 parent triangle, grouped by the symmetry orbits of the
+!! rule so the result is bitwise invariant under the reflections that permute the QPs.
+pure real function sep2_qp_sum(v, n)
+  real, dimension(:), intent(in) :: v !< Per-QP values, in sep2_cell_qps order [arbitrary]
+  integer,            intent(in) :: n !< Number of QPs: 3 or 7 (default rules), 6 or 15 (high order)
+
+  select case (n)
+    case (3)
+      sep2_qp_sum = v(1) + (v(2) + v(3))
+    case (6)
+      sep2_qp_sum = (v(1) + (v(2) + v(3))) + (v(4) + (v(5) + v(6)))
+    case (7)
+      sep2_qp_sum = (v(1) + (v(2) + v(3))) + ((v(4) + v(5)) + (v(6) + v(7)))
+    case default
+      ! 15: the 6-pt triangle piece, then the 3x3 quad piece by r row, each row as (s, 1-s) + 1/2.
+      sep2_qp_sum = ((v(1) + (v(2) + v(3))) + (v(4) + (v(5) + v(6)))) + &
+                    ((((v(7) + v(9)) + v(8)) + ((v(13) + v(15)) + v(14))) + ((v(10) + v(12)) + v(11)))
+  end select
+end function sep2_qp_sum
 
 !> Reference-space gradient of the P1 (linear) interpolant of a corner field on each of the four
 !! parent triangles of the sep2_cell_qps fan. Triangle t is (C, A, B) with C the cell center, whose
@@ -6941,10 +7042,10 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
   real, dimension(4)     :: duc, dvc  ! Corner search directions [L T-1 ~> m s-1]
   real, dimension(4)     :: fls       ! Corner flotation deficit r*h - bed [Z ~> m]
   integer, dimension(4)  :: nqp       ! QPs per parent triangle
-  real, dimension(4,7,4) :: beta      ! Corner-basis weights per (corner, QP, triangle) [nondim]
-  real, dimension(7,4)   :: wref      ! Reference measure per (QP, triangle) [nondim]
-  logical, dimension(7,4) :: qpg      ! Grounded state per (QP, triangle)
-  real, dimension(4,7)   :: valu, valv ! Per-QP nodal contributions [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(4,SEP2_MAXQP,4) :: beta      ! Corner-basis weights per (corner, QP, triangle) [nondim]
+  real, dimension(SEP2_MAXQP,4)   :: wref      ! Reference measure per (QP, triangle) [nondim]
+  logical, dimension(SEP2_MAXQP,4) :: qpg      ! Grounded state per (QP, triangle)
+  real, dimension(4,SEP2_MAXQP)   :: valu, valv ! Per-QP nodal contributions [R L3 Z T-2 ~> kg m s-2]
   real, dimension(4,4)   :: pu, pv    ! Per-(corner, triangle) partial sums [R L3 Z T-2 ~> kg m s-2]
   real :: b1, b2, b3, b4    ! Corner-basis weights at the QP [nondim]
   real :: mS, mN, mW, mE    ! Marginal sums: interpolation weights of the 4 cell edges [nondim]
@@ -7011,7 +7112,7 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
     ! Unclamped bilinear deficit defines the partition; magnitudes keep the min_h clamp below.
     fls(:) = (dens_ratio * hc(:)) - bedc(:)
   endif
-  call sep2_cell_qps(fls, nqp, beta, wref, qpg)
+  call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
 
   do t=1,4
     valu(:,1:nqp(t)) = 0.0 ; valv(:,1:nqp(t)) = 0.0
@@ -7074,20 +7175,11 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
       enddo
     enddo
 
-    ! Orbit-grouped QP sums: (2,3), (4,5) and (6,7) are reflection pairs.
-    if (nqp(t) == 3) then
-      do c=1,4
-        pu(c,t) = valu(c,1) + (valu(c,2) + valu(c,3))
-        pv(c,t) = valv(c,1) + (valv(c,2) + valv(c,3))
-      enddo
-    else
-      do c=1,4
-        pu(c,t) = (valu(c,1) + (valu(c,2) + valu(c,3))) + &
-                  ((valu(c,4) + valu(c,5)) + (valu(c,6) + valu(c,7)))
-        pv(c,t) = (valv(c,1) + (valv(c,2) + valv(c,3))) + &
-                  ((valv(c,4) + valv(c,5)) + (valv(c,6) + valv(c,7)))
-      enddo
-    endif
+    ! Orbit-grouped QP sums (sep2_qp_sum), invariant under the reflections that permute the QPs.
+    do c=1,4
+      pu(c,t) = sep2_qp_sum(valu(c,1:nqp(t)), nqp(t))
+      pv(c,t) = sep2_qp_sum(valv(c,1:nqp(t)), nqp(t))
+    enddo
   enddo
 
   ! Role-grouped cross-triangle reduction: each corner takes each of the roles
@@ -7139,10 +7231,10 @@ subroutine CG_diagonal_sep2_basal(CS, G, US, H, U_curr, V_curr, &
   real, dimension(4)     :: uc, vc    ! Corner frozen velocities [L T-1 ~> m s-1]
   real, dimension(4)     :: fls       ! Corner flotation deficit r*h - bed [Z ~> m]
   integer, dimension(4)  :: nqp       ! QPs per parent triangle
-  real, dimension(4,7,4) :: beta      ! Corner-basis weights per (corner, QP, triangle) [nondim]
-  real, dimension(7,4)   :: wref      ! Reference measure per (QP, triangle) [nondim]
-  logical, dimension(7,4) :: qpg      ! Grounded state per (QP, triangle)
-  real, dimension(4,7)   :: valu, valv ! Per-QP nodal diagonal contributions [R L2 Z T-1 ~> kg s-1]
+  real, dimension(4,SEP2_MAXQP,4) :: beta      ! Corner-basis weights per (corner, QP, triangle) [nondim]
+  real, dimension(SEP2_MAXQP,4)   :: wref      ! Reference measure per (QP, triangle) [nondim]
+  logical, dimension(SEP2_MAXQP,4) :: qpg      ! Grounded state per (QP, triangle)
+  real, dimension(4,SEP2_MAXQP)   :: valu, valv ! Per-QP nodal diagonal contributions [R L2 Z T-1 ~> kg s-1]
   real, dimension(4,4)   :: pu, pv    ! Per-(corner, triangle) partial sums [R L2 Z T-1 ~> kg s-1]
   real :: b1, b2, b3, b4    ! Corner-basis weights at the QP [nondim]
   real :: mS, mN, mW, mE    ! Marginal sums: interpolation weights of the 4 cell edges [nondim]
@@ -7197,7 +7289,7 @@ subroutine CG_diagonal_sep2_basal(CS, G, US, H, U_curr, V_curr, &
   vc(1) = V_curr(1,1) ; vc(2) = V_curr(2,1) ; vc(3) = V_curr(1,2) ; vc(4) = V_curr(2,2)
 
   fls(:) = (dens_ratio * hc(:)) - bedc(:)
-  call sep2_cell_qps(fls, nqp, beta, wref, qpg)
+  call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
 
   do t=1,4
     valu(:,1:nqp(t)) = 0.0 ; valv(:,1:nqp(t)) = 0.0
@@ -7258,20 +7350,11 @@ subroutine CG_diagonal_sep2_basal(CS, G, US, H, U_curr, V_curr, &
       enddo
     enddo
 
-    ! Orbit-grouped QP sums: (2,3), (4,5) and (6,7) are reflection pairs.
-    if (nqp(t) == 3) then
-      do c=1,4
-        pu(c,t) = valu(c,1) + (valu(c,2) + valu(c,3))
-        pv(c,t) = valv(c,1) + (valv(c,2) + valv(c,3))
-      enddo
-    else
-      do c=1,4
-        pu(c,t) = (valu(c,1) + (valu(c,2) + valu(c,3))) + &
-                  ((valu(c,4) + valu(c,5)) + (valu(c,6) + valu(c,7)))
-        pv(c,t) = (valv(c,1) + (valv(c,2) + valv(c,3))) + &
-                  ((valv(c,4) + valv(c,5)) + (valv(c,6) + valv(c,7)))
-      enddo
-    endif
+    ! Orbit-grouped QP sums (sep2_qp_sum), invariant under the reflections that permute the QPs.
+    do c=1,4
+      pu(c,t) = sep2_qp_sum(valu(c,1:nqp(t)), nqp(t))
+      pv(c,t) = sep2_qp_sum(valv(c,1:nqp(t)), nqp(t))
+    enddo
   enddo
 
   ! Role-grouped cross-triangle reduction (see CG_action_sep2_basal).
@@ -7908,16 +7991,16 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
   real :: g_ip                ! Flotation deficit r*h_ip - bed_ip at a sub-IP [Z ~> m]
   real, dimension(4)     :: fls_gf   ! Corner flotation deficit, flattened SW,SE,NW,NE [Z ~> m]
   integer, dimension(4)  :: nqp_gf   ! SEP2 QPs per parent triangle
-  real, dimension(4,7,4) :: beta_gf  ! SEP2 corner-basis weights per (corner, QP, triangle) [nondim]
-  real, dimension(7,4)   :: wref_gf  ! SEP2 reference measure per (QP, triangle) [nondim]
-  logical, dimension(7,4) :: qpg_gf  ! SEP2 grounded state per (QP, triangle)
-  real, dimension(7) :: vg_gf, vt_gf ! Per-QP grounded and total Jacobian weights [L2 ~> m2]
+  real, dimension(4,SEP2_MAXQP,4) :: beta_gf  ! SEP2 corner-basis weights per (corner, QP, triangle) [nondim]
+  real, dimension(SEP2_MAXQP,4)   :: wref_gf  ! SEP2 reference measure per (QP, triangle) [nondim]
+  logical, dimension(SEP2_MAXQP,4) :: qpg_gf  ! SEP2 grounded state per (QP, triangle)
+  real, dimension(SEP2_MAXQP) :: vg_gf, vt_gf ! Per-QP grounded and total Jacobian weights [L2 ~> m2]
   real, dimension(4) :: pg_gf, pt_gf ! Per-triangle grounded and total weight sums [L2 ~> m2]
   real :: b1_gf, b2_gf, b3_gf, b4_gf ! Corner-basis weights at a SEP2 QP [nondim]
   real :: mS_gf, mN_gf, mW_gf, mE_gf ! Marginal edge-interpolation weights [nondim]
   real :: a_gf, d_gf                 ! Interpolated cell-edge spacings at the QP [L ~> m]
   real :: w_ground, w_total          ! Grounded and total Jacobian weights of the cell [L2 ~> m2]
-  real, dimension(4,7) :: vxg_gf, vxt_gf ! Per-(corner,QP) grounded and total weights [L2 ~> m2]
+  real, dimension(4,SEP2_MAXQP) :: vxg_gf, vxt_gf ! Per-(corner,QP) grounded and total weights [L2 ~> m2]
   real, dimension(4,4) :: pxg_gf, pxt_gf ! Per-(corner,triangle) grounded and total sums [L2 ~> m2]
   real, dimension(4)   :: xg_gf, xt_gf   ! Per-corner grounded and total weights [L2 ~> m2]
   real, dimension(2,2) :: xi_num, xi_den ! Per-corner floating and total basis weights [nondim]
@@ -8015,7 +8098,7 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
       ! partition, so the diagnostic and gate agree with the friction geometry.
       fls_gf(1) = fls_corners(1,1) ; fls_gf(2) = fls_corners(2,1)
       fls_gf(3) = fls_corners(1,2) ; fls_gf(4) = fls_corners(2,2)
-      call sep2_cell_qps(fls_gf, nqp_gf, beta_gf, wref_gf, qpg_gf)
+      call sep2_cell_qps(fls_gf, nqp_gf, beta_gf, wref_gf, qpg_gf, high_order=CS%gl_band)
       do tq=1,4
         do kq=1,nqp_gf(tq)
           b1_gf = beta_gf(1,kq,tq) ; b2_gf = beta_gf(2,kq,tq)
@@ -8033,26 +8116,13 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
             vxg_gf(cq,kq) = merge(vxt_gf(cq,kq), 0.0, qpg_gf(kq,tq))
           enddo
         enddo
-        ! Orbit-grouped QP sums: (2,3), (4,5) and (6,7) are reflection pairs.
-        if (nqp_gf(tq) == 3) then
-          pg_gf(tq) = vg_gf(1) + (vg_gf(2) + vg_gf(3))
-          pt_gf(tq) = vt_gf(1) + (vt_gf(2) + vt_gf(3))
-          do cq=1,4
-            pxg_gf(cq,tq) = vxg_gf(cq,1) + (vxg_gf(cq,2) + vxg_gf(cq,3))
-            pxt_gf(cq,tq) = vxt_gf(cq,1) + (vxt_gf(cq,2) + vxt_gf(cq,3))
-          enddo
-        else
-          pg_gf(tq) = (vg_gf(1) + (vg_gf(2) + vg_gf(3))) + &
-                      ((vg_gf(4) + vg_gf(5)) + (vg_gf(6) + vg_gf(7)))
-          pt_gf(tq) = (vt_gf(1) + (vt_gf(2) + vt_gf(3))) + &
-                      ((vt_gf(4) + vt_gf(5)) + (vt_gf(6) + vt_gf(7)))
-          do cq=1,4
-            pxg_gf(cq,tq) = (vxg_gf(cq,1) + (vxg_gf(cq,2) + vxg_gf(cq,3))) + &
-                            ((vxg_gf(cq,4) + vxg_gf(cq,5)) + (vxg_gf(cq,6) + vxg_gf(cq,7)))
-            pxt_gf(cq,tq) = (vxt_gf(cq,1) + (vxt_gf(cq,2) + vxt_gf(cq,3))) + &
-                            ((vxt_gf(cq,4) + vxt_gf(cq,5)) + (vxt_gf(cq,6) + vxt_gf(cq,7)))
-          enddo
-        endif
+        ! Orbit-grouped QP sums (sep2_qp_sum), invariant under the reflections that permute the QPs.
+        pg_gf(tq) = sep2_qp_sum(vg_gf(1:nqp_gf(tq)), nqp_gf(tq))
+        pt_gf(tq) = sep2_qp_sum(vt_gf(1:nqp_gf(tq)), nqp_gf(tq))
+        do cq=1,4
+          pxg_gf(cq,tq) = sep2_qp_sum(vxg_gf(cq,1:nqp_gf(tq)), nqp_gf(tq))
+          pxt_gf(cq,tq) = sep2_qp_sum(vxt_gf(cq,1:nqp_gf(tq)), nqp_gf(tq))
+        enddo
       enddo
       ! Opposite-pair grouping is invariant under any rotation/reflection (S=1,E=2,N=3,W=4).
       w_ground = (pg_gf(1) + pg_gf(3)) + (pg_gf(2) + pg_gf(4))
@@ -8142,8 +8212,10 @@ end subroutine compute_ground_frac
 !> Flag the fully grounded ice cells that use the grounding-line sub-element quadrature although
 !! no grounding line cuts them: those that share an edge or a corner with a floating ice cell
 !! (ground_frac = 0), so that the grounding line lies on the shared edge or corner. The friction
-!! and the DG driving stress then use one quadrature on both sides of the grounding line. Needs
-!! current ground_frac and hmask halos.
+!! and the DG driving stress then use one quadrature on both sides of the grounding line. With
+!! GROUNDING_LINE_SUBGRID_BAND, those that share an edge or a corner with any ice cell with
+!! ground_frac < 1, which keeps a cell that has just grounded on the sub-element rule until the
+!! grounding line is a cell away. Needs current ground_frac and hmask halos.
 subroutine set_gl_subgrid_neighbors(CS, ISS, G)
   type(ice_shelf_dyn_CS), intent(inout) :: CS  !< The ice shelf dynamics control structure
   type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe
@@ -8153,14 +8225,18 @@ subroutine set_gl_subgrid_neighbors(CS, ISS, G)
   integer :: i, j, ii, jj
 
   CS%gl_sub_nbr(:,:) = 0.0
-  if (.not. CS%gl_sub_float_nbr) return
+  if (.not. (CS%gl_sub_float_nbr .or. CS%gl_band)) return
 
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
     if (ISS%hmask(i,j) /= 1 .and. ISS%hmask(i,j) /= 3) cycle
     if (CS%ground_frac(i,j) < 1.0) cycle
     do jj=j-1,j+1 ; do ii=i-1,i+1
       if (ISS%hmask(ii,jj) /= 1 .and. ISS%hmask(ii,jj) /= 3) cycle
-      if (CS%ground_frac(ii,jj) <= 0.0) CS%gl_sub_nbr(i,j) = 1.0
+      if (CS%gl_band) then
+        if (CS%ground_frac(ii,jj) < 1.0) CS%gl_sub_nbr(i,j) = 1.0
+      else
+        if (CS%ground_frac(ii,jj) <= 0.0) CS%gl_sub_nbr(i,j) = 1.0
+      endif
     enddo ; enddo
   enddo ; enddo
 
@@ -8938,15 +9014,15 @@ subroutine calc_shelf_driving_stress_i2n(CS, ISS, G, US, taudx, taudy)
   real, dimension(4)     :: hc     ! Corner thickness, flattened SW,SE,NW,NE [Z ~> m]
   real, dimension(4)     :: fls    ! Corner flotation deficit, flattened SW,SE,NW,NE [Z ~> m]
   integer, dimension(4)  :: nqp    ! SEP2 QPs per parent triangle
-  real, dimension(4,7,4) :: beta   ! SEP2 corner-basis weights per (corner, QP, triangle) [nondim]
-  real, dimension(7,4)   :: wref   ! SEP2 reference measure per (QP, triangle) [nondim]
-  logical, dimension(7,4) :: qpg   ! SEP2 grounded state per (QP, triangle)
-  real, dimension(4,7)   :: valx, valy ! Per-QP nodal contributions [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(4,SEP2_MAXQP,4) :: beta   ! SEP2 corner-basis weights per (corner, QP, triangle) [nondim]
+  real, dimension(SEP2_MAXQP,4)   :: wref   ! SEP2 reference measure per (QP, triangle) [nondim]
+  logical, dimension(SEP2_MAXQP,4) :: qpg   ! SEP2 grounded state per (QP, triangle)
+  real, dimension(4,SEP2_MAXQP)   :: valx, valy ! Per-QP nodal contributions [R L3 Z T-2 ~> kg m s-2]
   real, dimension(4,4)   :: px, py ! Per-(corner, triangle) partial sums [R L3 Z T-2 ~> kg m s-2]
   real, dimension(4)     :: dfxi, dfeta ! Per-triangle P1 gradient of fls in reference space [Z ~> m]
   real, dimension(4)     :: dhxi, dheta ! Per-triangle P1 gradient of H in reference space [Z ~> m]
-  real, dimension(7) :: vsx, vsy ! Per-QP weight-scaled surface slopes [Z L ~> m2 m-1]
-  real, dimension(7) :: vw       ! Per-QP quadrature weights [L2 ~> m2]
+  real, dimension(SEP2_MAXQP) :: vsx, vsy ! Per-QP weight-scaled surface slopes [Z L ~> m2 m-1]
+  real, dimension(SEP2_MAXQP) :: vw       ! Per-QP quadrature weights [L2 ~> m2]
   real, dimension(4) :: psx, psy ! Per-triangle weighted-slope sums [Z L ~> m2 m-1]
   real, dimension(4) :: pw       ! Per-triangle weight sums [L2 ~> m2]
   real :: w_total           ! Total quadrature weight over the cell [L2 ~> m2]
@@ -9003,7 +9079,7 @@ subroutine calc_shelf_driving_stress_i2n(CS, ISS, G, US, taudx, taudy)
     dxS = G%dxCv(i,j-1) ; dxN = G%dxCv(i,j)
     dyW = G%dyCu(i-1,j) ; dyE = G%dyCu(i,j)
 
-    call sep2_cell_qps(fls, nqp, beta, wref, qpg)
+    call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
 
     ! Per-triangle P1 gradients of BOTH corner fields. Both terms of S must use the same operator
     ! or the grounded branch does not telescope to grad(h) - grad(bed); see sep2_fan_gradient.
@@ -9049,29 +9125,15 @@ subroutine calc_shelf_driving_stress_i2n(CS, ISS, G, US, taudx, taudy)
         endif
       enddo
 
-      ! Orbit-grouped QP sums: (2,3), (4,5) and (6,7) are reflection pairs.
-      if (nqp(t) == 3) then
-        do c=1,4
-          px(c,t) = valx(c,1) + (valx(c,2) + valx(c,3))
-          py(c,t) = valy(c,1) + (valy(c,2) + valy(c,3))
-        enddo
-        if (calc_slope_diag) then
-          psx(t) = vsx(1) + (vsx(2) + vsx(3))
-          psy(t) = vsy(1) + (vsy(2) + vsy(3))
-          pw(t)  = vw(1) + (vw(2) + vw(3))
-        endif
-      else
-        do c=1,4
-          px(c,t) = (valx(c,1) + (valx(c,2) + valx(c,3))) + &
-                    ((valx(c,4) + valx(c,5)) + (valx(c,6) + valx(c,7)))
-          py(c,t) = (valy(c,1) + (valy(c,2) + valy(c,3))) + &
-                    ((valy(c,4) + valy(c,5)) + (valy(c,6) + valy(c,7)))
-        enddo
-        if (calc_slope_diag) then
-          psx(t) = (vsx(1) + (vsx(2) + vsx(3))) + ((vsx(4) + vsx(5)) + (vsx(6) + vsx(7)))
-          psy(t) = (vsy(1) + (vsy(2) + vsy(3))) + ((vsy(4) + vsy(5)) + (vsy(6) + vsy(7)))
-          pw(t)  = (vw(1) + (vw(2) + vw(3))) + ((vw(4) + vw(5)) + (vw(6) + vw(7)))
-        endif
+      ! Orbit-grouped QP sums (sep2_qp_sum), invariant under the reflections that permute the QPs.
+      do c=1,4
+        px(c,t) = sep2_qp_sum(valx(c,1:nqp(t)), nqp(t))
+        py(c,t) = sep2_qp_sum(valy(c,1:nqp(t)), nqp(t))
+      enddo
+      if (calc_slope_diag) then
+        psx(t) = sep2_qp_sum(vsx(1:nqp(t)), nqp(t))
+        psy(t) = sep2_qp_sum(vsy(1:nqp(t)), nqp(t))
+        pw(t)  = sep2_qp_sum(vw(1:nqp(t)), nqp(t))
       endif
     enddo
 
@@ -10463,13 +10525,13 @@ subroutine calc_shelf_driving_stress_DG_sep2(CS, h_nodal_cell, bed_corners, &
   real, dimension(4)     :: hc, bedc  ! Corner thickness and bed, flattened SW,SE,NW,NE [Z ~> m]
   real, dimension(4)     :: fls       ! Corner flotation deficit r*h - bed [Z ~> m]
   integer, dimension(4)  :: nqp       ! QPs per parent triangle
-  real, dimension(4,7,4) :: beta      ! Corner-basis weights per (corner, QP, triangle) [nondim]
-  real, dimension(7,4)   :: wref      ! Reference measure per (QP, triangle) [nondim]
-  logical, dimension(7,4) :: qpg      ! Grounded state per (QP, triangle)
-  real, dimension(4,7)   :: valx, valy ! Per-QP nodal contributions [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(4,SEP2_MAXQP,4) :: beta      ! Corner-basis weights per (corner, QP, triangle) [nondim]
+  real, dimension(SEP2_MAXQP,4)   :: wref      ! Reference measure per (QP, triangle) [nondim]
+  logical, dimension(SEP2_MAXQP,4) :: qpg      ! Grounded state per (QP, triangle)
+  real, dimension(4,SEP2_MAXQP)   :: valx, valy ! Per-QP nodal contributions [R L3 Z T-2 ~> kg m s-2]
   real, dimension(4,4)   :: px, py    ! Per-(corner, triangle) partial sums [R L3 Z T-2 ~> kg m s-2]
-  real, dimension(7) :: vsx, vsy      ! Per-QP Jacobian-weighted slopes [Z L ~> m2 m-1]
-  real, dimension(7) :: vw            ! Per-QP Jacobian weights [L2 ~> m2]
+  real, dimension(SEP2_MAXQP) :: vsx, vsy      ! Per-QP Jacobian-weighted slopes [Z L ~> m2 m-1]
+  real, dimension(SEP2_MAXQP) :: vw            ! Per-QP Jacobian weights [L2 ~> m2]
   real, dimension(4) :: psx, psy      ! Per-triangle weighted-slope sums [Z L ~> m2 m-1]
   real, dimension(4) :: pw            ! Per-triangle weight sums [L2 ~> m2]
   real, dimension(4) :: dhxi, dheta   ! Per-triangle P1 gradient of h in reference space [Z ~> m]
@@ -10492,7 +10554,7 @@ subroutine calc_shelf_driving_stress_DG_sep2(CS, h_nodal_cell, bed_corners, &
   bedc(3) = bed_corners(1,2) ; bedc(4) = bed_corners(2,2)
 
   fls(:) = (rhoi_rhow * hc(:)) - bedc(:)
-  call sep2_cell_qps(fls, nqp, beta, wref, qpg)
+  call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
 
   ! P1 fan gradients, the same interpolant sep2_cell_qps cut on.
   call sep2_fan_gradient(hc,   dhxi, dheta)
@@ -10533,29 +10595,15 @@ subroutine calc_shelf_driving_stress_DG_sep2(CS, h_nodal_cell, bed_corners, &
       endif
     enddo
 
-    ! Orbit-grouped QP sums: (2,3), (4,5) and (6,7) are reflection pairs.
-    if (nqp(t) == 3) then
-      do c=1,4
-        px(c,t) = valx(c,1) + (valx(c,2) + valx(c,3))
-        py(c,t) = valy(c,1) + (valy(c,2) + valy(c,3))
-      enddo
-      if (calc_slope_diag) then
-        psx(t) = vsx(1) + (vsx(2) + vsx(3))
-        psy(t) = vsy(1) + (vsy(2) + vsy(3))
-        pw(t)  = vw(1) + (vw(2) + vw(3))
-      endif
-    else
-      do c=1,4
-        px(c,t) = (valx(c,1) + (valx(c,2) + valx(c,3))) + &
-                  ((valx(c,4) + valx(c,5)) + (valx(c,6) + valx(c,7)))
-        py(c,t) = (valy(c,1) + (valy(c,2) + valy(c,3))) + &
-                  ((valy(c,4) + valy(c,5)) + (valy(c,6) + valy(c,7)))
-      enddo
-      if (calc_slope_diag) then
-        psx(t) = (vsx(1) + (vsx(2) + vsx(3))) + ((vsx(4) + vsx(5)) + (vsx(6) + vsx(7)))
-        psy(t) = (vsy(1) + (vsy(2) + vsy(3))) + ((vsy(4) + vsy(5)) + (vsy(6) + vsy(7)))
-        pw(t)  = (vw(1) + (vw(2) + vw(3))) + ((vw(4) + vw(5)) + (vw(6) + vw(7)))
-      endif
+    ! Orbit-grouped QP sums (sep2_qp_sum), invariant under the reflections that permute the QPs.
+    do c=1,4
+      px(c,t) = sep2_qp_sum(valx(c,1:nqp(t)), nqp(t))
+      py(c,t) = sep2_qp_sum(valy(c,1:nqp(t)), nqp(t))
+    enddo
+    if (calc_slope_diag) then
+      psx(t) = sep2_qp_sum(vsx(1:nqp(t)), nqp(t))
+      psy(t) = sep2_qp_sum(vsy(1:nqp(t)), nqp(t))
+      pw(t)  = sep2_qp_sum(vw(1:nqp(t)), nqp(t))
     endif
   enddo
 
