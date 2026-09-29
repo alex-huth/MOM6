@@ -97,6 +97,17 @@ real, parameter :: FB_NO_COULOMB_DRAG = -1.0 !< fB value meaning zero effective 
 !! makes amp exactly 2 at every face [nondim].
 real, parameter :: DG1_WB_JUMP_RATE_AMP = 2.0
 
+! Why the DG(1) tilt relaxation did or did not act on one mode of one cell.  These are posted
+! as reals in dg_tilt_relax_why_x, _y and _w, one code per cell per mode.  A cell that is not
+! ice keeps TRW_NONE, because the field is zero where the term is never evaluated.
+integer, parameter :: TRW_NONE = 0     !< No ice, or the term did not run
+integer, parameter :: TRW_ACTED = 1    !< The mode was relaxed at the rate the speed law asked for
+integer, parameter :: TRW_CAPPED = 2   !< The mode was relaxed, but the explicit-step cap held the rate down
+integer, parameter :: TRW_REACH = 3    !< The speed law gave zero rate: the ice is past U_CUT/U_CREDIT
+integer, parameter :: TRW_CROSSED = 4  !< The grounding line crosses the cell and this axis is not widened
+integer, parameter :: TRW_NO_REF = 5   !< This cell could not build its own reference on this mode
+integer, parameter :: TRW_NO_NB = 6    !< No neighbour residual was usable, so a zigzag is not separable
+
 ! CISM-style grounding-line treatment modes (CISM_FRICTION, CISM_TAUD)
 integer, parameter :: CISM_OFF = 0       !< No CISM-style treatment of this term
 integer, parameter :: CISM_LOCAL = 1     !< Quadrant grounded fraction with the local/lumped nodal assembly
@@ -575,6 +586,34 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! of the twist residual, where it is formed [Z ~> m].
   real, pointer, dimension(:,:) :: dg_tilt_relax_state => NULL() !< Tilt relaxation: flotation state
                                   !! of each ice cell, 1 grounded, -1 floating, 0 crossed (skipped) [nondim].
+  real, pointer, dimension(:,:) :: dg_tilt_relax_rate_x => NULL() !< Tilt relaxation: delivered rate
+                                  !! on the x tilt alone [T-1 ~> s-1].
+  real, pointer, dimension(:,:) :: dg_tilt_relax_rate_y => NULL() !< Tilt relaxation: delivered rate
+                                  !! on the y tilt alone [T-1 ~> s-1].
+  real, pointer, dimension(:,:) :: dg_tilt_relax_rate_w => NULL() !< Tilt relaxation: delivered rate
+                                  !! on the twist alone [T-1 ~> s-1].
+  real, pointer, dimension(:,:) :: dg_tilt_relax_r_x => NULL() !< Tilt relaxation: signed thickness
+                                  !! removal rate on the x tilt, rate times residual [Z T-1 ~> m s-1].
+  real, pointer, dimension(:,:) :: dg_tilt_relax_r_y => NULL() !< Tilt relaxation: signed thickness
+                                  !! removal rate on the y tilt [Z T-1 ~> m s-1].
+  real, pointer, dimension(:,:) :: dg_tilt_relax_r_w => NULL() !< Tilt relaxation: signed thickness
+                                  !! removal rate on the twist [Z T-1 ~> m s-1].
+  real, pointer, dimension(:,:) :: dg_tilt_relax_why_x => NULL() !< Tilt relaxation: why the x tilt
+                                  !! was or was not relaxed, one TRW_ code [nondim].
+  real, pointer, dimension(:,:) :: dg_tilt_relax_why_y => NULL() !< Tilt relaxation: why the y tilt
+                                  !! was or was not relaxed, one TRW_ code [nondim].
+  real, pointer, dimension(:,:) :: dg_tilt_relax_why_w => NULL() !< Tilt relaxation: why the twist
+                                  !! was or was not relaxed, one TRW_ code [nondim].
+  real, pointer, dimension(:,:) :: dg_tilt_relax_u_x => NULL() !< Tilt relaxation: the cell speed the
+                                  !! x speed law read, BEFORE the credit [L T-1 ~> m s-1].
+  real, pointer, dimension(:,:) :: dg_tilt_relax_u_y => NULL() !< Tilt relaxation: the cell speed the
+                                  !! y speed law read, BEFORE the credit [L T-1 ~> m s-1].
+  real, pointer, dimension(:,:) :: dg_tilt_relax_acc_x => NULL() !< Tilt relaxation: signed thickness
+                                  !! the term removed from the x tilt since the run started [Z ~> m].
+  real, pointer, dimension(:,:) :: dg_tilt_relax_acc_y => NULL() !< Tilt relaxation: signed thickness
+                                  !! the term removed from the y tilt since the run started [Z ~> m].
+  real, pointer, dimension(:,:) :: dg_tilt_relax_acc_w => NULL() !< Tilt relaxation: signed thickness
+                                  !! the term removed from the twist since the run started [Z ~> m].
   real :: dg_art_visc_r_hi        !< Artificial viscosity: surface jump over mean thickness at which the
                                   !! face coefficient reaches 1 [nondim].
   real :: dg_art_visc_kcell       !< Artificial viscosity: per-cell bound on dt times the summed face
@@ -666,6 +705,15 @@ type, public :: ice_shelf_dyn_CS ; private
              id_dg_tilt_relax_rate = -1, id_dg_tilt_relax_tend = -1, &
              id_dg_tilt_relax_alt_x = -1, id_dg_tilt_relax_alt_y = -1, &
              id_dg_tilt_relax_alt_w = -1, id_dg_tilt_relax_state = -1, &
+             id_dg_tilt_relax_rate_x = -1, id_dg_tilt_relax_rate_y = -1, &
+             id_dg_tilt_relax_rate_w = -1, &
+             id_dg_tilt_relax_r_x = -1, id_dg_tilt_relax_r_y = -1, &
+             id_dg_tilt_relax_r_w = -1, &
+             id_dg_tilt_relax_why_x = -1, id_dg_tilt_relax_why_y = -1, &
+             id_dg_tilt_relax_why_w = -1, &
+             id_dg_tilt_relax_u_x = -1, id_dg_tilt_relax_u_y = -1, &
+             id_dg_tilt_relax_acc_x = -1, id_dg_tilt_relax_acc_y = -1, &
+             id_dg_tilt_relax_acc_w = -1, &
              id_ground_frac = -1, id_col_thick = -1, id_OD_av = -1, &
              id_f_ground_cell = -1, id_f_ground_node = -1, &
              id_u_mask = -1, id_v_mask = -1, id_ufb_mask =-1, id_vfb_mask = -1, id_t_mask = -1, &
@@ -697,7 +745,8 @@ type, public :: ice_shelf_dyn_CS ; private
              id_h_jump_face_u_signed = -1, id_h_jump_face_v_signed = -1, &
              id_s_jump_face_u_signed = -1, id_s_jump_face_v_signed = -1, &
              id_un_face_u = -1, id_un_face_v = -1, &
-             id_dg_eps_face_u = -1, id_dg_eps_face_v = -1
+             id_dg_eps_face_u = -1, id_dg_eps_face_v = -1, &
+             id_dg_art_visc_alpha_u = -1, id_dg_art_visc_alpha_v = -1
   real, pointer, dimension(:,:) :: dg_art_visc_coef_u => NULL() !< DG(1) art-visc coefficient on u-faces
                                                        !! after the per-cell cap [nondim].
   real, pointer, dimension(:,:) :: dg_art_visc_coef_v => NULL() !< DG(1) art-visc coefficient on v-faces
@@ -880,6 +929,20 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%dg_tilt_relax_alt_y(isd:ied,jsd:jed), source=0.0)
     allocate(CS%dg_tilt_relax_alt_w(isd:ied,jsd:jed), source=0.0)
     allocate(CS%dg_tilt_relax_state(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_tilt_relax_rate_x(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_tilt_relax_rate_y(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_tilt_relax_rate_w(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_tilt_relax_r_x(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_tilt_relax_r_y(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_tilt_relax_r_w(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_tilt_relax_why_x(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_tilt_relax_why_y(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_tilt_relax_why_w(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_tilt_relax_u_x(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_tilt_relax_u_y(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_tilt_relax_acc_x(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_tilt_relax_acc_y(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_tilt_relax_acc_w(isd:ied,jsd:jed), source=0.0)
     allocate(CS%f_ground_node(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%f_ground_cell(isd:ied,jsd:jed), source=0.0)
     allocate(CS%H_node(IsdB:IedB,JsdB:JedB), source=0.0)
@@ -1794,6 +1857,69 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          CS%diag%axesT1, Time, 'flotation state used by the DG(1) tilt relaxation: 1 grounded, '//&
          '-1 floating, 0 partly grounded (skipped, or relaxed in surface form along an '//&
          'unpinned axis) or no ice', 'nondim')
+      ! Per-mode rate.  dg_tilt_relax_rate above is the LARGEST of these three, so on a cell whose
+      ! two sides differ in length it reports the short axis and says nothing about which mode
+      ! that rate acted on.  These three separate it.
+      CS%id_dg_tilt_relax_rate_x = register_diag_field('ice_shelf_model','dg_tilt_relax_rate_x', &
+         CS%diag%axesT1, Time, 'DG(1) tilt-relaxation rate delivered on the x tilt alone, '//&
+         'U_CUT-based rate over dxT; zero where that mode was not relaxed', &
+         's-1', conversion=US%s_to_T)
+      CS%id_dg_tilt_relax_rate_y = register_diag_field('ice_shelf_model','dg_tilt_relax_rate_y', &
+         CS%diag%axesT1, Time, 'DG(1) tilt-relaxation rate delivered on the y tilt alone, '//&
+         'U_CUT-based rate over dyT; zero where that mode was not relaxed', &
+         's-1', conversion=US%s_to_T)
+      CS%id_dg_tilt_relax_rate_w = register_diag_field('ice_shelf_model','dg_tilt_relax_rate_w', &
+         CS%diag%axesT1, Time, 'DG(1) tilt-relaxation rate delivered on the twist alone. The '//&
+         'twist takes the LARGER of the two axis rates, so on a long thin cell it is relaxed '//&
+         'at the short axis rate; zero where the twist was not relaxed', &
+         's-1', conversion=US%s_to_T)
+      ! Per-mode signed removal.  dg_tilt_relax_tend is one L2 norm over all three modes, so the
+      ! removal cannot be attributed from it, and rate times residual is wrong whenever the
+      ! posted rate belongs to a different mode from the posted residual.
+      CS%id_dg_tilt_relax_r_x = register_diag_field('ice_shelf_model','dg_tilt_relax_r_x', &
+         CS%diag%axesT1, Time, 'signed DG(1) tilt-relaxation thickness removal rate on the x '//&
+         'tilt, after the cell flotation conversion; sign follows the residual it removes', &
+         'm s-1', conversion=US%Z_to_m*US%s_to_T)
+      CS%id_dg_tilt_relax_r_y = register_diag_field('ice_shelf_model','dg_tilt_relax_r_y', &
+         CS%diag%axesT1, Time, 'signed DG(1) tilt-relaxation thickness removal rate on the y '//&
+         'tilt, after the cell flotation conversion', &
+         'm s-1', conversion=US%Z_to_m*US%s_to_T)
+      CS%id_dg_tilt_relax_r_w = register_diag_field('ice_shelf_model','dg_tilt_relax_r_w', &
+         CS%diag%axesT1, Time, 'signed DG(1) tilt-relaxation thickness removal rate on the '//&
+         'twist, after the cell flotation conversion', &
+         'm s-1', conversion=US%Z_to_m*US%s_to_T)
+      ! Why each mode did or did not act.  The codes are the TRW_ parameters of this module.
+      CS%id_dg_tilt_relax_why_x = register_diag_field('ice_shelf_model','dg_tilt_relax_why_x', &
+         CS%diag%axesT1, Time, 'why the DG(1) tilt relaxation did or did not act on the x tilt: '//&
+         '0 no ice, 1 acted, 2 acted but the explicit-step cap held the rate down, '//&
+         '3 past the reach U_CUT/U_CREDIT, 4 grounding line crosses the cell and this axis is '//&
+         'not widened, 5 no reference in this cell, 6 no usable neighbour residual', 'nondim')
+      CS%id_dg_tilt_relax_why_y = register_diag_field('ice_shelf_model','dg_tilt_relax_why_y', &
+         CS%diag%axesT1, Time, 'why the DG(1) tilt relaxation did or did not act on the y tilt; '//&
+         'codes as dg_tilt_relax_why_x', 'nondim')
+      CS%id_dg_tilt_relax_why_w = register_diag_field('ice_shelf_model','dg_tilt_relax_why_w', &
+         CS%diag%axesT1, Time, 'why the DG(1) tilt relaxation did or did not act on the twist; '//&
+         'codes as dg_tilt_relax_why_x, with 3 set only when BOTH axis rates are zero', 'nondim')
+      ! The speed the law read, before the credit, so that the reach test reads as u > U_CUT/U_CREDIT.
+      CS%id_dg_tilt_relax_u_x = register_diag_field('ice_shelf_model','dg_tilt_relax_u_x', &
+         CS%diag%axesT1, Time, 'cell |u| that the DG(1) tilt-relaxation speed law read on the x '//&
+         'axis, BEFORE the U_CREDIT factor, as a four-corner mean in diagonal pairs', &
+         'm s-1', conversion=US%L_T_to_m_s)
+      CS%id_dg_tilt_relax_u_y = register_diag_field('ice_shelf_model','dg_tilt_relax_u_y', &
+         CS%diag%axesT1, Time, 'cell |v| that the DG(1) tilt-relaxation speed law read on the y '//&
+         'axis, BEFORE the U_CREDIT factor', 'm s-1', conversion=US%L_T_to_m_s)
+      ! Running totals.  These accumulate from the start of THIS run only: they are not in the
+      ! restart file, so a continuation starts them again from zero.
+      CS%id_dg_tilt_relax_acc_x = register_diag_field('ice_shelf_model','dg_tilt_relax_acc_x', &
+         CS%diag%axesT1, Time, 'signed thickness the DG(1) tilt relaxation removed from the x '//&
+         'tilt since this run started, both RK stages at SSP-RK2 weight; NOT carried across a '//&
+         'restart', 'm', conversion=US%Z_to_m)
+      CS%id_dg_tilt_relax_acc_y = register_diag_field('ice_shelf_model','dg_tilt_relax_acc_y', &
+         CS%diag%axesT1, Time, 'signed thickness the DG(1) tilt relaxation removed from the y '//&
+         'tilt since this run started; NOT carried across a restart', 'm', conversion=US%Z_to_m)
+      CS%id_dg_tilt_relax_acc_w = register_diag_field('ice_shelf_model','dg_tilt_relax_acc_w', &
+         CS%diag%axesT1, Time, 'signed thickness the DG(1) tilt relaxation removed from the '//&
+         'twist since this run started; NOT carried across a restart', 'm', conversion=US%Z_to_m)
     endif
 
     CS%id_ground_frac = register_diag_field('ice_shelf_model','ice_ground_frac',CS%diag%axesT1, Time, &
@@ -1858,6 +1984,17 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          'dg_art_visc_cell_scale', CS%diag%axesT1, Time, &
          'DG(1) artificial-viscosity cap factor: 1 where the DG1_ART_VISC_KCELL cap is inactive, '//&
          '< 1 cap engaged and face coefficients scaled by this factor', 'nondim')
+      ! alpha decides how fast TRANSPORT clears the tilt mode: the decay factor f(alpha) peaks at
+      ! alpha = 2*sqrt(3)-1 and break-even against no viscosity at all is alpha = 5.5.  This is
+      ! the one route by which DG1_ART_VISC_TAU_FLOOR reaches the tilt relaxation.
+      CS%id_dg_art_visc_alpha_u = register_diag_field('ice_shelf_model','dg_art_visc_alpha_u', &
+         CS%diag%axesCu1, Time, &
+         'DG(1) artificial-viscosity ratio alpha = 2*nu/(dx*|u_n|) on u-faces, capped at '//&
+         '1e4; zero where nu or |u_n| is zero', 'nondim')
+      CS%id_dg_art_visc_alpha_v = register_diag_field('ice_shelf_model','dg_art_visc_alpha_v', &
+         CS%diag%axesCv1, Time, &
+         'DG(1) artificial-viscosity ratio alpha = 2*nu/(dy*|u_n|) on v-faces, capped at '//&
+         '1e4; zero where nu or |u_n| is zero', 'nondim')
       CS%id_dg_slow_idle_face_u = register_diag_field('ice_shelf_model','dg_slow_idle_face_u', &
          CS%diag%axesCu1, Time, &
          '1 on u-faces with a jump where speed and strain rate — and their damping — are negligible','nondim')
@@ -2231,6 +2368,9 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
   real, dimension(SZDI_(G),SZDJB_(G)) :: un_fv    ! v-face |v| [L T-1 ~> m s-1]
   real, dimension(SZDIB_(G),SZDJ_(G)) :: eps_fu   ! u-face eps_e [T-1 ~> s-1]
   real, dimension(SZDI_(G),SZDJB_(G)) :: eps_fv   ! v-face eps_e [T-1 ~> s-1]
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: alpha_fu ! u-face 2*nu/(dx*|u_n|) [nondim]
+  real, dimension(SZDI_(G),SZDJB_(G)) :: alpha_fv ! v-face 2*nu/(dy*|u_n|) [nondim]
+  real :: u_fn                                    ! Face normal speed for alpha [L T-1 ~> m s-1]
   real :: Hbar_face_avg                           ! Mean thickness of the two cells [Z ~> m]
   real :: rr                                      ! Ice to ocean density ratio [nondim]
   real :: bed1, bed2                              ! Bed at the face endpoints [Z ~> m]
@@ -2294,6 +2434,34 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       call post_data(CS%id_dg_tilt_relax_alt_w, CS%dg_tilt_relax_alt_w, CS%diag)
     if (CS%id_dg_tilt_relax_state > 0) &
       call post_data(CS%id_dg_tilt_relax_state, CS%dg_tilt_relax_state, CS%diag)
+    if (CS%id_dg_tilt_relax_rate_x > 0) &
+      call post_data(CS%id_dg_tilt_relax_rate_x, CS%dg_tilt_relax_rate_x, CS%diag)
+    if (CS%id_dg_tilt_relax_rate_y > 0) &
+      call post_data(CS%id_dg_tilt_relax_rate_y, CS%dg_tilt_relax_rate_y, CS%diag)
+    if (CS%id_dg_tilt_relax_rate_w > 0) &
+      call post_data(CS%id_dg_tilt_relax_rate_w, CS%dg_tilt_relax_rate_w, CS%diag)
+    if (CS%id_dg_tilt_relax_r_x > 0) &
+      call post_data(CS%id_dg_tilt_relax_r_x, CS%dg_tilt_relax_r_x, CS%diag)
+    if (CS%id_dg_tilt_relax_r_y > 0) &
+      call post_data(CS%id_dg_tilt_relax_r_y, CS%dg_tilt_relax_r_y, CS%diag)
+    if (CS%id_dg_tilt_relax_r_w > 0) &
+      call post_data(CS%id_dg_tilt_relax_r_w, CS%dg_tilt_relax_r_w, CS%diag)
+    if (CS%id_dg_tilt_relax_why_x > 0) &
+      call post_data(CS%id_dg_tilt_relax_why_x, CS%dg_tilt_relax_why_x, CS%diag)
+    if (CS%id_dg_tilt_relax_why_y > 0) &
+      call post_data(CS%id_dg_tilt_relax_why_y, CS%dg_tilt_relax_why_y, CS%diag)
+    if (CS%id_dg_tilt_relax_why_w > 0) &
+      call post_data(CS%id_dg_tilt_relax_why_w, CS%dg_tilt_relax_why_w, CS%diag)
+    if (CS%id_dg_tilt_relax_u_x > 0) &
+      call post_data(CS%id_dg_tilt_relax_u_x, CS%dg_tilt_relax_u_x, CS%diag)
+    if (CS%id_dg_tilt_relax_u_y > 0) &
+      call post_data(CS%id_dg_tilt_relax_u_y, CS%dg_tilt_relax_u_y, CS%diag)
+    if (CS%id_dg_tilt_relax_acc_x > 0) &
+      call post_data(CS%id_dg_tilt_relax_acc_x, CS%dg_tilt_relax_acc_x, CS%diag)
+    if (CS%id_dg_tilt_relax_acc_y > 0) &
+      call post_data(CS%id_dg_tilt_relax_acc_y, CS%dg_tilt_relax_acc_y, CS%diag)
+    if (CS%id_dg_tilt_relax_acc_w > 0) &
+      call post_data(CS%id_dg_tilt_relax_acc_w, CS%dg_tilt_relax_acc_w, CS%diag)
     if (CS%id_ground_frac > 0) call post_data(CS%id_ground_frac, CS%ground_frac, CS%diag)
     if (CS%id_f_ground_cell > 0) call post_data(CS%id_f_ground_cell, CS%f_ground_cell, CS%diag)
     if (CS%id_f_ground_node > 0) call post_data(CS%id_f_ground_node, CS%f_ground_node, CS%diag)
@@ -2474,6 +2642,30 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         eps_fv(i,J) = dg1_eps_face_v(CS, G, i, J)
       enddo ; enddo
       call post_data(CS%id_dg_eps_face_v, eps_fv, CS%diag)
+    endif
+    ! alpha = 2*nu/(dx*|u_n|), the viscosity-to-transport ratio that sets how fast the upwind flux
+    ! clears the DG(1) tilt mode.  The face normal speed is the same two-node mean the viscosity
+    ! and un_face_u use.  The cap keeps the tail finite where the ice is nearly at rest, because
+    ! alpha diverges as |u_n| goes to zero and every value past break-even means the same thing.
+    if (CS%id_dg_art_visc_alpha_u > 0 .and. associated(CS%dg_art_visc_nu_u)) then
+      alpha_fu(:,:) = 0.0
+      do j = G%jsc, G%jec ; do I = G%IscB, G%IecB
+        if (CS%dg_art_visc_nu_u(I,j) <= 0.0) cycle
+        u_fn = abs(0.5*(CS%u_shelf(I,j-1) + CS%u_shelf(I,j)))
+        if (u_fn <= 0.0) cycle
+        alpha_fu(I,j) = min(2.0*CS%dg_art_visc_nu_u(I,j) / (G%dxCu(I,j)*u_fn), 1.0e4)
+      enddo ; enddo
+      call post_data(CS%id_dg_art_visc_alpha_u, alpha_fu, CS%diag)
+    endif
+    if (CS%id_dg_art_visc_alpha_v > 0 .and. associated(CS%dg_art_visc_nu_v)) then
+      alpha_fv(:,:) = 0.0
+      do J = G%JscB, G%JecB ; do i = G%isc, G%iec
+        if (CS%dg_art_visc_nu_v(i,J) <= 0.0) cycle
+        u_fn = abs(0.5*(CS%v_shelf(i-1,J) + CS%v_shelf(i,J)))
+        if (u_fn <= 0.0) cycle
+        alpha_fv(i,J) = min(2.0*CS%dg_art_visc_nu_v(i,J) / (G%dyCv(i,J)*u_fn), 1.0e4)
+      enddo ; enddo
+      call post_data(CS%id_dg_art_visc_alpha_v, alpha_fv, CS%diag)
     endif
     if (CS%id_h_source_rate > 0 .and. associated(CS%h_source_rate_last)) &
         call post_data(CS%id_h_source_rate, CS%h_source_rate_last, CS%diag)
@@ -9569,6 +9761,20 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_tilt_relax_alt_y)) deallocate(CS%dg_tilt_relax_alt_y)
   if (associated(CS%dg_tilt_relax_alt_w)) deallocate(CS%dg_tilt_relax_alt_w)
   if (associated(CS%dg_tilt_relax_state)) deallocate(CS%dg_tilt_relax_state)
+  if (associated(CS%dg_tilt_relax_rate_x)) deallocate(CS%dg_tilt_relax_rate_x)
+  if (associated(CS%dg_tilt_relax_rate_y)) deallocate(CS%dg_tilt_relax_rate_y)
+  if (associated(CS%dg_tilt_relax_rate_w)) deallocate(CS%dg_tilt_relax_rate_w)
+  if (associated(CS%dg_tilt_relax_r_x)) deallocate(CS%dg_tilt_relax_r_x)
+  if (associated(CS%dg_tilt_relax_r_y)) deallocate(CS%dg_tilt_relax_r_y)
+  if (associated(CS%dg_tilt_relax_r_w)) deallocate(CS%dg_tilt_relax_r_w)
+  if (associated(CS%dg_tilt_relax_why_x)) deallocate(CS%dg_tilt_relax_why_x)
+  if (associated(CS%dg_tilt_relax_why_y)) deallocate(CS%dg_tilt_relax_why_y)
+  if (associated(CS%dg_tilt_relax_why_w)) deallocate(CS%dg_tilt_relax_why_w)
+  if (associated(CS%dg_tilt_relax_u_x)) deallocate(CS%dg_tilt_relax_u_x)
+  if (associated(CS%dg_tilt_relax_u_y)) deallocate(CS%dg_tilt_relax_u_y)
+  if (associated(CS%dg_tilt_relax_acc_x)) deallocate(CS%dg_tilt_relax_acc_x)
+  if (associated(CS%dg_tilt_relax_acc_y)) deallocate(CS%dg_tilt_relax_acc_y)
+  if (associated(CS%dg_tilt_relax_acc_w)) deallocate(CS%dg_tilt_relax_acc_w)
   if (associated(CS%Jac)) deallocate(CS%Jac)
   if (associated(CS%Phi)) deallocate(CS%Phi)
   if (associated(CS%Phisub)) deallocate(CS%Phisub)
@@ -11186,6 +11392,18 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "stress. Uses DG1_TILT_DAMP_U_CUT and DG1_TILT_DAMP_R_HI.", &
                  default=.true., do_not_log=(.not.CS%use_DG_thickness))
   if (.not.CS%use_DG_thickness) CS%dg_twist_damp = .false.
+
+  ! The tilt relaxation and the older mode damper both remove the same three modes, from different
+  ! references and through different gates, so a run with both on damps each mode twice.  The trap
+  ! is that DG1_TWIST_DAMP defaults to true and the damper starts if EITHER damper flag is set, so
+  ! DG1_TILT_DAMP = False on its own does not turn the damper off.
+  if (CS%dg_tilt_relax .and. (CS%dg_tilt_damp .or. CS%dg_twist_damp)) then
+    call MOM_error(WARNING, "MOM_ice_shelf_dynamics: DG1_TILT_RELAX is on together with the "//&
+         "older mode damper (DG1_TILT_DAMP and/or DG1_TWIST_DAMP). Both terms remove the same "//&
+         "grid-scale tilt and twist modes, so every mode they share is damped twice, by two "//&
+         "different references. Set BOTH DG1_TILT_DAMP = False and DG1_TWIST_DAMP = False. "//&
+         "Note that DG1_TWIST_DAMP defaults to True.")
+  endif
 
   call get_param(param_file, mdl, "DG1_TILT_DAMP_ADVECTIVE", CS%dg_damp_advective, &
                  "If true, the mode damper supplies only the rate the transport does not "//&
@@ -13901,13 +14119,15 @@ end subroutine dg_nodal_mode_damp_rate
 !! The rate along each axis is a fraction of the
 !! viscosity's own jump decay rate on the cell's two faces on that axis, so the removal acts where
 !! and as fast as the penalty that feeds the alternating field.
-subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
+subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt)
   type(ice_shelf_dyn_CS), intent(in)  :: CS   !< Ice shelf dynamics control structure
   type(ocean_grid_type),  intent(inout) :: G  !< Ocean grid structure
   real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Cell mask
   real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in)  :: h_nodal_in !< Corner thicknesses [Z ~> m]
   real,                   intent(in)  :: dt   !< Time step [T ~> s]
   real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out) :: R_node !< Nodal relaxation rate [Z T-1 ~> m s-1]
+  real,         optional, intent(in)  :: acc_wt !< Weight of this RK stage in the step, used only
+                                              !! to add acc_wt*dt*r to the running totals [nondim]
 
   integer, dimension(SZDI_(G),SZDJ_(G)) :: state ! 1 grounded, -1 floating, 0 crossed or not ice
   real, dimension(SZDI_(G),SZDJ_(G)) :: gx, gy ! Viscosity jump decay rate along each axis, the
@@ -13931,6 +14151,9 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
   real :: Tbar      ! Cell mean of the nodal increment, removed so no mass moves [Z T-1 ~> m s-1]
   logical :: use_m, use_p ! The neighbour behind or ahead is usable
   logical :: diag_on
+  logical :: acc_on  ! A running total is registered and this call carries a stage weight
+  real :: acc_dt     ! acc_wt*dt, the time this stage contributes to the running totals [T ~> s]
+  integer :: why_x, why_y, why_w ! Why each mode did or did not act, one TRW_ code
   ! For the unpinned cells the grounding line crosses, whose tilts are read in surface elevation.
   real, dimension(SZDI_(G),SZDJ_(G)) :: sbar   ! Mean of the corner surface elevations [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: es_xi, es_eta, es_w ! Surface tilts and twist less their
@@ -13958,13 +14181,32 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
   R_node(isc:iec,jsc:jec,:,:) = 0.0
+  acc_on = ((CS%id_dg_tilt_relax_acc_x > 0) .or. (CS%id_dg_tilt_relax_acc_y > 0) .or. &
+            (CS%id_dg_tilt_relax_acc_w > 0)) .and. present(acc_wt)
+  acc_dt = 0.0
+  if (acc_on) acc_dt = acc_wt * dt
   diag_on = (CS%id_dg_tilt_relax_rate > 0) .or. (CS%id_dg_tilt_relax_tend > 0) .or. &
             (CS%id_dg_tilt_relax_alt_x > 0) .or. (CS%id_dg_tilt_relax_alt_y > 0) .or. &
-            (CS%id_dg_tilt_relax_alt_w > 0) .or. (CS%id_dg_tilt_relax_state > 0)
+            (CS%id_dg_tilt_relax_alt_w > 0) .or. (CS%id_dg_tilt_relax_state > 0) .or. &
+            (CS%id_dg_tilt_relax_rate_x > 0) .or. (CS%id_dg_tilt_relax_rate_y > 0) .or. &
+            (CS%id_dg_tilt_relax_rate_w > 0) .or. (CS%id_dg_tilt_relax_r_x > 0) .or. &
+            (CS%id_dg_tilt_relax_r_y > 0) .or. (CS%id_dg_tilt_relax_r_w > 0) .or. &
+            (CS%id_dg_tilt_relax_why_x > 0) .or. (CS%id_dg_tilt_relax_why_y > 0) .or. &
+            (CS%id_dg_tilt_relax_why_w > 0) .or. (CS%id_dg_tilt_relax_u_x > 0) .or. &
+            (CS%id_dg_tilt_relax_u_y > 0) .or. acc_on
+  ! The instantaneous fields are rebuilt each stage, so the last stage of the step is what is
+  ! posted.  The running totals are NOT zeroed here: they carry the whole run.
   if (diag_on) then
     CS%dg_tilt_relax_rate(:,:) = 0.0 ; CS%dg_tilt_relax_tend(:,:) = 0.0
     CS%dg_tilt_relax_alt_x(:,:) = 0.0 ; CS%dg_tilt_relax_alt_y(:,:) = 0.0
     CS%dg_tilt_relax_alt_w(:,:) = 0.0 ; CS%dg_tilt_relax_state(:,:) = 0.0
+    CS%dg_tilt_relax_rate_x(:,:) = 0.0 ; CS%dg_tilt_relax_rate_y(:,:) = 0.0
+    CS%dg_tilt_relax_rate_w(:,:) = 0.0
+    CS%dg_tilt_relax_r_x(:,:) = 0.0 ; CS%dg_tilt_relax_r_y(:,:) = 0.0
+    CS%dg_tilt_relax_r_w(:,:) = 0.0
+    CS%dg_tilt_relax_why_x(:,:) = 0.0 ; CS%dg_tilt_relax_why_y(:,:) = 0.0
+    CS%dg_tilt_relax_why_w(:,:) = 0.0
+    CS%dg_tilt_relax_u_x(:,:) = 0.0 ; CS%dg_tilt_relax_u_y(:,:) = 0.0
   endif
   if (.not.CS%dg_tilt_relax) return
   if (.not.associated(CS%bed_node)) call MOM_error(FATAL, &
@@ -14114,6 +14356,17 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
                 (abs(CS%v_shelf(I,J-1))   + abs(CS%v_shelf(I-1,J))))
       gx(i,j) = max(CS%dg_tilt_relax_u_cut - unat_x, 0.0) * G%IdxT(i,j)
       gy(i,j) = max(CS%dg_tilt_relax_u_cut - unat_y, 0.0) * G%IdyT(i,j)
+      if (diag_on) then
+        ! The same four-corner mean WITHOUT the credit, so that the reach test reads straight off
+        ! the field as |u| > U_CUT/U_CREDIT.  It is recomputed rather than divided back out, so
+        ! that the two expressions above keep their exact arithmetic.
+        CS%dg_tilt_relax_u_x(i,j) = 0.25 * &
+               ((abs(CS%u_shelf(I-1,J-1)) + abs(CS%u_shelf(I,J))) + &
+                (abs(CS%u_shelf(I,J-1))   + abs(CS%u_shelf(I-1,J))))
+        CS%dg_tilt_relax_u_y(i,j) = 0.25 * &
+               ((abs(CS%v_shelf(I-1,J-1)) + abs(CS%v_shelf(I,J))) + &
+                (abs(CS%v_shelf(I,J-1))   + abs(CS%v_shelf(I-1,J))))
+      endif
     else
       gx(i,j) = (4.0*DG1_WB_JUMP_RATE_AMP) * &
                 max(CS%dg_art_visc_nu_u(I-1,j) / (G%dxCu(I-1,j)*G%dxCu(I-1,j)), &
@@ -14128,7 +14381,28 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
     if (hmask(i,j) /= 1.0) cycle
     if (diag_on) CS%dg_tilt_relax_state(i,j) = real(state(i,j))
     gxs = gx(i,j) ; gys = gy(i,j)
-    if ((gxs <= 0.0) .and. (gys <= 0.0)) cycle
+
+    ! Why each mode did or did not act.  Each code starts at the first test that mode faces and is
+    ! narrowed as the later tests pass, so whatever the mode fell at is what stays.  The twist
+    ! takes the LARGER of the two axis rates, so the reach stops it only when both axes are past.
+    why_x = TRW_REACH ; why_y = TRW_REACH
+    if (gxs > 0.0) why_x = TRW_NO_REF
+    if (gys > 0.0) why_y = TRW_NO_REF
+    if (CS%dg_tilt_relax_twist) then
+      why_w = TRW_REACH
+      if (max(gxs, gys) > 0.0) why_w = TRW_NO_REF
+    else
+      why_w = TRW_NONE
+    endif
+
+    if ((gxs <= 0.0) .and. (gys <= 0.0)) then
+      if (diag_on) then
+        CS%dg_tilt_relax_why_x(i,j) = real(why_x)
+        CS%dg_tilt_relax_why_y(i,j) = real(why_y)
+        CS%dg_tilt_relax_why_w(i,j) = real(why_w)
+      endif
+      cycle
+    endif
 
     ! Which axes may act.  A pure cell acts on both.  A cell the grounding line crosses acts only
     ! where the wide rule is on, or where the axis has a free edge and nothing else holds its outer
@@ -14139,7 +14413,17 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
     ay = wide .or. (CS%dg_tilt_relax_free_edge .and. fe_y(i,j))
     wx = (state(i,j) /= 0) .or. ax
     wy = (state(i,j) /= 0) .or. ay
-    if (.not.(wx .or. wy)) cycle
+    if (.not.wx) why_x = TRW_CROSSED
+    if (.not.wy) why_y = TRW_CROSSED
+    if (.not.(wx .or. wy)) then
+      if (CS%dg_tilt_relax_twist) why_w = TRW_CROSSED
+      if (diag_on) then
+        CS%dg_tilt_relax_why_x(i,j) = real(why_x)
+        CS%dg_tilt_relax_why_y(i,j) = real(why_y)
+        CS%dg_tilt_relax_why_w(i,j) = real(why_w)
+      endif
+      cycle
+    endif
 
     r_xi = 0.0 ; r_eta = 0.0 ; r_w = 0.0 ; k_xi = 0.0 ; k_eta = 0.0 ; k_w = 0.0
     a_xi = 0.0 ; a_eta = 0.0 ; a_w = 0.0
@@ -14164,6 +14448,10 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
         a_xi = e_xi(i,j) - (esum / real(nnb))
         k_xi = min(frac_use*gxs, rate_cap)
         r_xi = k_xi * a_xi
+        why_x = TRW_ACTED
+        if (frac_use*gxs > rate_cap) why_x = TRW_CAPPED
+      else
+        why_x = TRW_NO_NB
       endif
     endif
 
@@ -14182,6 +14470,10 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
         a_eta = e_eta(i,j) - (esum / real(nnb))
         k_eta = min(frac_use*gys, rate_cap)
         r_eta = k_eta * a_eta
+        why_y = TRW_ACTED
+        if (frac_use*gys > rate_cap) why_y = TRW_CAPPED
+      else
+        why_y = TRW_NO_NB
       endif
     endif
 
@@ -14209,6 +14501,10 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
         a_w = e_w(i,j) - ((esum_x + esum_y) / real(n_x + n_y))
         k_w = min(frac_use*max(gxs, gys), rate_cap)
         r_w = k_w * a_w
+        why_w = TRW_ACTED
+        if (frac_use*max(gxs, gys) > rate_cap) why_w = TRW_CAPPED
+      else
+        why_w = TRW_NO_NB
       endif
     endif
 
@@ -14241,6 +14537,22 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node)
       CS%dg_tilt_relax_tend(i,j) = sqrt((((r_xi**2) + (r_eta**2)) / 12.0) + ((r_w**2) / 144.0))
       CS%dg_tilt_relax_alt_x(i,j) = a_xi ; CS%dg_tilt_relax_alt_y(i,j) = a_eta
       CS%dg_tilt_relax_alt_w(i,j) = a_w
+      ! Each mode on its own.  The rate above is the largest of the three, and the tendency above
+      ! is one norm over all three, so neither says which mode carried the removal.
+      CS%dg_tilt_relax_rate_x(i,j) = k_xi ; CS%dg_tilt_relax_rate_y(i,j) = k_eta
+      CS%dg_tilt_relax_rate_w(i,j) = k_w
+      CS%dg_tilt_relax_r_x(i,j) = r_xi ; CS%dg_tilt_relax_r_y(i,j) = r_eta
+      CS%dg_tilt_relax_r_w(i,j) = r_w
+      CS%dg_tilt_relax_why_x(i,j) = real(why_x)
+      CS%dg_tilt_relax_why_y(i,j) = real(why_y)
+      CS%dg_tilt_relax_why_w(i,j) = real(why_w)
+    endif
+    ! The running totals take both RK stages at the SSP-RK2 weight the caller passes, so they hold
+    ! the thickness the term actually removed over the step, not one stage of it.
+    if (acc_on) then
+      CS%dg_tilt_relax_acc_x(i,j) = CS%dg_tilt_relax_acc_x(i,j) + (acc_dt * r_xi)
+      CS%dg_tilt_relax_acc_y(i,j) = CS%dg_tilt_relax_acc_y(i,j) + (acc_dt * r_eta)
+      CS%dg_tilt_relax_acc_w(i,j) = CS%dg_tilt_relax_acc_w(i,j) + (acc_dt * r_w)
     endif
   enddo ; enddo
 
@@ -14348,7 +14660,8 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
 
   call dg_nodal_mode_damp_rate(CS, G, hmask, CS%h_nodal, time_step, T_node)
   if (CS%dg_tilt_relax) then
-    call dg1_tilt_relax_rate(CS, G, hmask, CS%h_nodal, time_step, R_node)
+    ! SSP-RK2 gives each stage half the step, so each stage adds half to the running totals.
+    call dg1_tilt_relax_rate(CS, G, hmask, CS%h_nodal, time_step, R_node, acc_wt=0.5)
     do j = jsc, jec ; do i = isc, iec ; do b = 1, 2 ; do a = 1, 2
       T_node(i,j,a,b) = T_node(i,j,a,b) + R_node(i,j,a,b)
     enddo ; enddo ; enddo ; enddo
@@ -14370,7 +14683,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   call DG1_nodal_spatial_operator(CS, G, hmask, h_curr, rhs, uh_ice, vh_ice, time_step)
   call dg_nodal_mode_damp_rate(CS, G, hmask, h_curr, time_step, T_node)
   if (CS%dg_tilt_relax) then
-    call dg1_tilt_relax_rate(CS, G, hmask, h_curr, time_step, R_node)
+    call dg1_tilt_relax_rate(CS, G, hmask, h_curr, time_step, R_node, acc_wt=0.5)
     do j = jsc, jec ; do i = isc, iec ; do b = 1, 2 ; do a = 1, 2
       T_node(i,j,a,b) = T_node(i,j,a,b) + R_node(i,j,a,b)
     enddo ; enddo ; enddo ; enddo
