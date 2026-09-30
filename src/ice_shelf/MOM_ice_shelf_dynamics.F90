@@ -11204,6 +11204,11 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "Moves no mass. This supersedes DG1_TILT_DAMP and DG1_TWIST_DAMP; never run "//&
                  "both, because they remove the same modes from different references.", &
                  default=.true., do_not_log=.not.CS%use_DG_thickness)
+  ! The term acts on the DG(1) corner thicknesses, so it has nothing to do without them.  The
+  ! advection path that calls it already runs only under USE_DG_THICKNESS, so this changes no
+  ! answer; it keeps the logged value honest and stops 22 diagnostics being registered for a
+  ! finite-volume run, where they would all stay zero.
+  if (.not.CS%use_DG_thickness) CS%dg_tilt_relax = .false.
   call get_param(param_file, mdl, "DG1_TILT_RELAX_U_CUT", CS%dg_tilt_relax_u_cut, &
                  "The tilt-relaxation rate is the speed law max(U_CUT - "//&
                  "DG1_TILT_RELAX_U_CREDIT*|u_n|, 0)/dx along each axis, where u_n is the "//&
