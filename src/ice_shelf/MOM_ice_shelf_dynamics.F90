@@ -11324,8 +11324,9 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "alternating tilt that no face jump reveals; this gives the penalty a target "//&
                  "that excludes it. The reference is taken in surface form from neighbours of "//&
                  "the same flotation state, and a cell the grounding line crosses is left alone. "//&
-                 "Moves no mass.", &
-                 default=.false., do_not_log=.not.CS%use_DG_thickness)
+                 "Moves no mass. This supersedes DG1_TILT_DAMP and DG1_TWIST_DAMP; never run "//&
+                 "both, because they remove the same modes from different references.", &
+                 default=.true., do_not_log=.not.CS%use_DG_thickness)
   call get_param(param_file, mdl, "DG1_TILT_RELAX_FRAC", CS%dg_tilt_relax_frac, &
                  "The tilt-relaxation rate as a fraction of the artificial viscosity's jump "//&
                  "decay rate on the cell's faces along the same axis. Ignored unless "//&
@@ -11378,8 +11379,9 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "If true, damp the grid-scale DG(1) in-cell tilt. A tilt alternating between "//&
                  "cells gives no face jump, so the upwind flux and the artificial viscosity "//&
                  "cannot see it, yet it adds a spurious surface slope. The correction is zero "//&
-                 "on a uniform tilt and moves no mass.", &
-                 default=.true., do_not_log=(.not.CS%use_DG_thickness))
+                 "on a uniform tilt and moves no mass. SUPERSEDED by DG1_TILT_RELAX, which is "//&
+                 "the default; never run both.", &
+                 default=.false., do_not_log=(.not.CS%use_DG_thickness))
   if (.not.CS%use_DG_thickness) CS%dg_tilt_damp = .false.
   if (CS%use_DG_thickness .and. .not.CS%GL_regularize) call MOM_error(FATAL, &
     "USE_DG_THICKNESS requires GROUNDING_LINE_INTERPOLATE=True: the sub-element "//&
@@ -11389,8 +11391,9 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   call get_param(param_file, mdl, "DG1_TWIST_DAMP", CS%dg_twist_damp, &
                  "If true, also damp the grid-scale DG(1) in-cell twist, which is invisible "//&
                  "to the face jumps for the same reason as the tilt. It gives no net driving "//&
-                 "stress. Uses DG1_TILT_DAMP_U_CUT and DG1_TILT_DAMP_R_HI.", &
-                 default=.true., do_not_log=(.not.CS%use_DG_thickness))
+                 "stress. Uses DG1_TILT_DAMP_U_CUT and DG1_TILT_DAMP_R_HI. SUPERSEDED by "//&
+                 "DG1_TILT_RELAX_TWIST; never run both.", &
+                 default=.false., do_not_log=(.not.CS%use_DG_thickness))
   if (.not.CS%use_DG_thickness) CS%dg_twist_damp = .false.
 
   ! The tilt relaxation and the older mode damper both remove the same three modes, from different
