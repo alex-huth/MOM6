@@ -542,6 +542,9 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! by its grounded fraction, in place of the speed law.
   real :: dg_tilt_relax_crossed_scale !< Tilt relaxation: factor on the crossed-cell floor of
                                   !! DG1_TILT_RELAX_CROSSED_FLOOR [nondim].
+  real :: dg_tilt_relax_deep_crossed_time !< Tilt relaxation: if positive, the e-folding time of the floor on
+                                  !! every mode of a crossed cell none of whose eight neighbours is wholly
+                                  !! grounded or floating ice or a thickness boundary cell [T ~> s].
   logical :: dg_tilt_relax_bounded_free !< Tilt relaxation: if true, the bounded excess uses cell-mean
                                   !! surfaces formed from the mean thickness and mean bed of each cell.
   logical :: dg_tilt_relax_ssa_edge_margins !< Tilt relaxation: if true, the edge option also accepts
@@ -11596,6 +11599,15 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "Zero leaves the free-edge axis of a crossed cell with the bounded part only.", &
                  units="nondim", default=1.0, &
                  do_not_log=(.not.CS%dg_tilt_relax) .or. (.not.CS%dg_tilt_relax_crossed_floor))
+  call get_param(param_file, mdl, "DG1_TILT_RELAX_DEEP_CROSSED_TIME", CS%dg_tilt_relax_deep_crossed_time, &
+                 "If positive, a cell the grounding line crosses whose eight neighbours hold no wholly "//&
+                 "grounded or wholly floating ice and no thickness boundary cell (the inside of a wide "//&
+                 "patch of crossed cells, or a narrow crossed valley between walls or ice margins) is "//&
+                 "relaxed on its tilts and twist at the rate 1/DG1_TILT_RELAX_DEEP_CROSSED_TIME, less the "//&
+                 "transport credits of the two floors weighted by the grounded fraction.  No node of such "//&
+                 "a cell is held through an artificial-viscosity face by a relaxed neighbour.  Its "//&
+                 "references come from its crossed neighbours.  Non-positive disables it.", &
+                 units="s", default=0.0, scale=US%s_to_T, do_not_log=.not.CS%dg_tilt_relax)
   call get_param(param_file, mdl, "DG1_TILT_RELAX_BOUNDED_MEAN", bounded_mean_str, &
                  "The cell-mean surfaces the bounded excess compares the tilts with. 'CORNER': the "//&
                  "mean of the corner surfaces. 'FREE': max(hbar - Dbar, (1 - rho_i/rho_w) hbar) from "//&
@@ -12668,6 +12680,11 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt)
   real :: k_cross    ! The grounded-fraction weighted floor of a crossed cell [T-1 ~> s-1]
   real :: c_cross    ! The grounded-fraction weighted transport credit of a crossed cell [nondim]
   real :: u_fx, v_fy ! The normal speed through the slower face of each axis [L T-1 ~> m s-1]
+  real :: k_deep     ! 1/DG1_TILT_RELAX_DEEP_CROSSED_TIME, or 0 [T-1 ~> s-1]
+  real :: kdx, kdy   ! The deep crossed floor on each axis, after the transport credit [T-1 ~> s-1]
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: deep ! A crossed cell none of whose eight neighbours is wholly
+                                               ! grounded or floating ice or a thickness boundary cell
+  logical :: dp_c    ! This cell is such a cell and the deep crossed floor is on
   logical :: stn_on  ! The shallow-shelf part or the grounded floor is in use, so the stencil rule runs
   real :: rbx, rby  ! Bounded removal rates [Z T-1 ~> m s-1]
   real :: Rb(2,2)    ! The corner pattern of the bounded removal [Z T-1 ~> m s-1]
@@ -12789,6 +12806,8 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt)
   if (CS%dg_tilt_relax_float_time > 0.0) k_float = 1.0 / CS%dg_tilt_relax_float_time
   k_ground = 0.0
   if (CS%dg_tilt_relax_ground_time > 0.0) k_ground = 1.0 / CS%dg_tilt_relax_ground_time
+  k_deep = 0.0
+  if (CS%dg_tilt_relax_deep_crossed_time > 0.0) k_deep = 1.0 / CS%dg_tilt_relax_deep_crossed_time
   ! The grounded floor takes the shallow-shelf part's place, so it needs the same stencil rule.
   stn_on = ssa_on .or. (k_ground > 0.0) .or. &
            ((CS%dg_tilt_relax_float_stencil .and. CS%dg_tilt_relax_float_exclusive) .and. (k_float > 0.0))
@@ -12841,6 +12860,20 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt)
     enddo ; enddo
     sbar(i,j) = 0.25*((s_c(1,1) + s_c(2,2)) + (s_c(2,1) + s_c(1,2)))
   enddo ; enddo
+  ! A crossed cell is held through its artificial-viscosity faces wherever a neighbour sharing one of its
+  ! nodes is relaxed (wholly grounded or floating ice) or fixed (a thickness boundary cell).  One with no
+  ! such neighbour has no held node at all, and only the deep crossed floor can hold it.
+  deep(:,:) = .false.
+  if (k_deep > 0.0) then
+    do j = jsc, jec ; do i = isc, iec
+      if (.not.ice(i,j)) cycle
+      if (state(i,j) /= 0) cycle
+      deep(i,j) = .true.
+      do n = -1, 1 ; do m = -1, 1
+        if ((ice(i+m,j+n) .and. (state(i+m,j+n) /= 0)) .or. (hmask(i+m,j+n) == 3.0)) deep(i,j) = .false.
+      enddo ; enddo
+    enddo ; enddo
+  endif
   ! The bounded excess may instead use a mean surface built from the cell means of thickness and bed,
   ! which the mode does not change, also where the grounding line crosses the cell.
   sbnd(:,:) = sbar(:,:)
@@ -13006,7 +13039,8 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt)
       if (wall_s(i,j)) jm = j
       if (wall_n(i,j)) jp = j
       use_m = (ice(im,jm) .and. ice(ip,jp)) .and. (ice(im,jp) .and. ice(ip,jm))
-      use_m = use_m .and. (state(i,j) /= 0)
+      ! A crossed cell has a twist reference only for the deep crossed floor, from crossed diagonals.
+      use_m = use_m .and. ((state(i,j) /= 0) .or. (k_deep > 0.0))
       if (.not.wide) use_m = use_m .and. &
         (((state(im,jm) == state(i,j)) .and. (state(ip,jp) == state(i,j))) .and. &
          ((state(im,jp) == state(i,j)) .and. (state(ip,jm) == state(i,j))))
@@ -13237,6 +13271,28 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt)
       if (ax) gxs = kgx
       if (ay) gys = kgy
     endif
+    ! A crossed cell with no held node: the deep crossed floor on every mode, less the two floors'
+    ! transport credits weighted by the grounded fraction, with the split twist where there is a credit.
+    dp_c = .false.
+    if (k_deep > 0.0) dp_c = deep(i,j)
+    if (dp_c) then
+      fg_cell = min(max(CS%ground_frac(i,j), 0.0), 1.0)
+      c_cross = (fg_cell * CS%dg_tilt_relax_ground_u_credit) + ((1.0 - fg_cell) * CS%dg_tilt_relax_float_u_credit)
+      kdx = k_deep ; kdy = k_deep
+      if (c_cross > 0.0) then
+        u_fx = min(abs(0.5*(CS%u_shelf(I-1,J-1) + CS%u_shelf(I-1,J))), abs(0.5*(CS%u_shelf(I,J-1) + CS%u_shelf(I,J))))
+        v_fy = min(abs(0.5*(CS%v_shelf(I-1,J-1) + CS%v_shelf(I,J-1))), abs(0.5*(CS%v_shelf(I-1,J) + CS%v_shelf(I,J))))
+        kdx = max(k_deep - ((c_cross * G%IdxT(i,j)) * u_fx), 0.0)
+        kdy = max(k_deep - ((c_cross * G%IdyT(i,j)) * v_fy), 0.0)
+      endif
+      gxs = max(gxs, kdx) ; gys = max(gys, kdy)
+      if (c_cross > 0.0) then
+        split_w = .true.
+        gws_x = max(gws, kdx) ; gws_y = max(gws, kdy) ; gws = max(gws_x, gws_y)
+      else
+        gws = max(gws, k_deep)
+      endif
+    endif
     if ((k_float > 0.0) .and. (state(i,j) == -1)) then
       if (CS%dg_tilt_relax_float_exclusive) then ; gxs = 0.0 ; gys = 0.0 ; gws = 0.0 ; endif
       flt_x = .true. ; flt_y = .true.
@@ -13304,9 +13360,12 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt)
     ! where the wide rule is on, or where the axis has a free edge and nothing else holds its outer
     ! node.  Everything below is then common to every cell.
     ! wx, wy: this axis may act at all.  A pure cell always may; a crossed cell only where an axis
-    ! is widened (ax, ay above).
-    wx = (state(i,j) /= 0) .or. ax
-    wy = (state(i,j) /= 0) .or. ay
+    ! is widened (ax, ay above), or on every axis under the deep crossed floor.
+    wx = (state(i,j) /= 0) .or. ax .or. dp_c
+    wy = (state(i,j) /= 0) .or. ay .or. dp_c
+    ! With the deep crossed floor on, every crossed cell has a twist reference, but only one under that
+    ! floor relaxes its twist.
+    if ((k_deep > 0.0) .and. (state(i,j) == 0) .and. (.not.dp_c)) gws = 0.0
     if (.not.wx) why_x = TRW_CROSSED
     if (.not.wy) why_y = TRW_CROSSED
     if (.not.(wx .or. wy)) then
