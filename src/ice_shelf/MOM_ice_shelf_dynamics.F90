@@ -528,6 +528,9 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! floating floor and the bounded part only.
   logical :: dg_tilt_relax_float_onesided !< Tilt relaxation: if false, the floating floor is not
                                   !! applied on an axis where a neighbour holds ice of another flotation state.
+  logical :: dg_tilt_relax_float_stencil !< Tilt relaxation: if true, under DG1_TILT_RELAX_FLOAT_EXCLUSIVE the
+                                  !! floating floor takes the shallow-shelf part's place in the stencil rule,
+                                  !! which then chooses its detector beside a grounding line.
   real :: dg_tilt_relax_ground_time !< Tilt relaxation: if positive, the shallow-shelf part of a wholly
                                   !! grounded cell is replaced by a floor of 1/this rate [T ~> s].
   real :: dg_tilt_relax_ground_u_credit !< Tilt relaxation: the fraction of the transport rate through the
@@ -11552,6 +11555,15 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "floating, nor on its twist; there the detector reads one side across the grounding "//&
                  "line. The other parts of the rate still act.", &
                  default=.true., do_not_log=(.not.CS%dg_tilt_relax) .or. (CS%dg_tilt_relax_float_time <= 0.0))
+  call get_param(param_file, mdl, "DG1_TILT_RELAX_FLOAT_STENCIL", CS%dg_tilt_relax_float_stencil, &
+                 "If true, under DG1_TILT_RELAX_FLOAT_EXCLUSIVE the floating floor stands in for the "//&
+                 "shallow-shelf part in the stencil rule (DG1_TILT_RELAX_SSA_STENCIL), so that beside a "//&
+                 "grounding line the floor uses the rule's detector (the one-sided second difference of "//&
+                 "EDGE2) whatever DG1_TILT_RELAX_SSA_FRAC is.  The rule never withholds the floating floor; "//&
+                 "DG1_TILT_RELAX_FLOAT_ONESIDED decides that.  If false, the rule runs on a floating cell only "//&
+                 "where the shallow-shelf part is positive, and with DG1_TILT_RELAX_SSA_FRAC = 0 the floating "//&
+                 "floor uses the plain detector.", &
+                 default=.false., do_not_log=(.not.CS%dg_tilt_relax) .or. (.not.CS%dg_tilt_relax_float_exclusive))
   call get_param(param_file, mdl, "DG1_TILT_RELAX_GROUND_TIME", CS%dg_tilt_relax_ground_time, &
                  "If positive, the shallow-shelf part of the rate of a wholly grounded cell is "//&
                  "replaced by the floor 1/DG1_TILT_RELAX_GROUND_TIME on each axis and the twist. "//&
@@ -12778,7 +12790,8 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt)
   k_ground = 0.0
   if (CS%dg_tilt_relax_ground_time > 0.0) k_ground = 1.0 / CS%dg_tilt_relax_ground_time
   ! The grounded floor takes the shallow-shelf part's place, so it needs the same stencil rule.
-  stn_on = ssa_on .or. (k_ground > 0.0) .or. (CS%dg_tilt_relax_float_exclusive .and. (k_float > 0.0))
+  stn_on = ssa_on .or. (k_ground > 0.0) .or. &
+           ((CS%dg_tilt_relax_float_stencil .and. CS%dg_tilt_relax_float_exclusive) .and. (k_float > 0.0))
   ! The EDGE2 rule reads residuals two cells away, which read means one further still.
   nr = 1
   if (stn_on .and. (CS%dg_tilt_relax_ssa_stencil == SSA_STENCIL_EDGE2)) nr = 2
@@ -13108,8 +13121,9 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt)
         sx = kgx ; sy = kgy ; sw = max(kgx, kgy)
       elseif (CS%dg_tilt_relax_ground_exclusive .and. (state(i,j) == 1)) then
         sx = 0.0 ; sy = 0.0 ; sw = 0.0
-      elseif (CS%dg_tilt_relax_float_exclusive .and. (k_float > 0.0) .and. (state(i,j) == -1)) then
-        ! Under DG1_TILT_RELAX_FLOAT_EXCLUSIVE the floating floor stands in for the shallow-shelf part here too,
+      elseif ((CS%dg_tilt_relax_float_stencil .and. CS%dg_tilt_relax_float_exclusive) .and. &
+              (k_float > 0.0) .and. (state(i,j) == -1)) then
+        ! Under DG1_TILT_RELAX_FLOAT_STENCIL the floating floor stands in for the shallow-shelf part here too,
         ! so that the stencil rule chooses its detector whatever the shallow-shelf rate.  The rule does not
         ! withhold the floating floor; DG1_TILT_RELAX_FLOAT_ONESIDED decides that, below.
         kfx = k_float ; kfy = k_float
