@@ -500,8 +500,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! second difference of the cell-mean surfaces across the face [nondim].
   logical :: dg_tilt_relax        !< Tilt relaxation: if true, relax the tilts and twist toward the ones
                                   !! the neighbours' means imply wherever the artificial viscosity acts.
-  real :: dg_tilt_relax_u_cut     !< Tilt relaxation: if positive, its rate is the speed law
-                                  !! max(u_cut - u_credit*|u_n|, 0)/dx on each axis [L T-1 ~> m s-1].
+  real :: dg_tilt_relax_u_cut     !< Tilt relaxation: the speed law max(u_cut - u_credit*|u_n|, 0)/dx
+                                  !! on each axis; zero turns the speed law off [L T-1 ~> m s-1].
   real :: dg_tilt_relax_u_credit  !< Tilt relaxation: the fraction of the transport's own removal
                                   !! speed that the speed law credits [nondim].
   real :: dg_tilt_relax_ssa_frac  !< Tilt relaxation: the fraction of the shallow-shelf restoring
@@ -11414,7 +11414,8 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   call get_param(param_file, mdl, "DG1_TILT_RELAX_U_CUT", CS%dg_tilt_relax_u_cut, &
                  "The tilt-relaxation rate is the speed law max(U_CUT - "//&
                  "DG1_TILT_RELAX_U_CREDIT*|u_n|, 0)/dx along each axis, where u_n is the "//&
-                 "cell-centred velocity component on that axis. Must be positive. "//&
+                 "cell-centred velocity component on that axis. Zero turns the speed law off, "//&
+                 "which leaves the floors, the shallow-shelf part and the bounded part. "//&
                  "A speed is the grid-invariant form, because both the rate the "//&
                  "transport supplies and the harm the mode does scale as 1/dx. The rate then "//&
                  "carries no dependence on the artificial viscosity, whose gate reads the face "//&
@@ -11667,11 +11668,11 @@ subroutine read_DG_params(param_file, mdl, CS, US)
 
 
 
-  ! DG1_TILT_RELAX_U_CUT is the rate, not a mode switch: the artificial-viscosity form it
-  ! once selected has been removed, so a non-positive value is a configuration error.
-  if (CS%dg_tilt_relax .and. (CS%dg_tilt_relax_u_cut <= 0.0)) call MOM_error(FATAL, &
-    "read_DG_params: DG1_TILT_RELAX_U_CUT must be positive; it sets the relaxation rate, "//&
-    "which would otherwise be zero.  To turn the term off set DG1_TILT_RELAX = False.")
+  ! DG1_TILT_RELAX_U_CUT is the speed law's rate, not a mode switch: zero gives the law an exact
+  ! zero rate everywhere, so a negative value is the only configuration error.
+  if (CS%dg_tilt_relax .and. (CS%dg_tilt_relax_u_cut < 0.0)) call MOM_error(FATAL, &
+    "read_DG_params: DG1_TILT_RELAX_U_CUT must not be negative.  Zero turns the speed law "//&
+    "off; to turn the whole term off set DG1_TILT_RELAX = False.")
 
 
 
