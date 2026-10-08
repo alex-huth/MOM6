@@ -545,6 +545,8 @@ type, public :: ice_shelf_dyn_CS ; private
   real :: dg_tilt_relax_deep_crossed_time !< Tilt relaxation: if positive, the e-folding time of the floor on
                                   !! every mode of a crossed cell none of whose eight neighbours is wholly
                                   !! grounded or floating ice or a thickness boundary cell [T ~> s].
+  logical :: dg_tilt_relax_min_h_stop !< Tilt relaxation: if true, the components that would take a
+                                  !! corner below MIN_H_SHELF in a stage are scaled back.
   logical :: dg_tilt_relax_bounded_free !< Tilt relaxation: if true, the bounded excess uses cell-mean
                                   !! surfaces formed from the mean thickness and mean bed of each cell.
   logical :: dg_tilt_relax_ssa_edge_margins !< Tilt relaxation: if true, the edge option also accepts
@@ -605,6 +607,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! removal rate of the bounded excess on the x tilt [Z T-1 ~> m s-1].
   real, pointer, dimension(:,:) :: dg_tilt_relax_bnd_y => NULL() !< Tilt relaxation: signed thickness
                                   !! removal rate of the bounded excess on the y tilt [Z T-1 ~> m s-1].
+  real, pointer, dimension(:,:) :: dg_tilt_relax_minh_frac => NULL() !< Tilt relaxation: the smallest
+                                  !! factor DG1_TILT_RELAX_MIN_H_STOP put on a component, 1 if none [nondim].
   real, pointer, dimension(:,:) :: dg_tilt_relax_ssa_w => NULL() !< Tilt relaxation: the rate the
                                   !! shallow-shelf part asks for on the twist, before the cap [T-1 ~> s-1].
   real, pointer, dimension(:,:) :: dg_tilt_relax_acc_x => NULL() !< Tilt relaxation: signed thickness
@@ -716,7 +720,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_dg_tilt_relax_ssa_x = -1, id_dg_tilt_relax_ssa_y = -1, &
              id_dg_tilt_relax_ssa_w = -1, id_dg_tilt_relax_bnd_x = -1, id_dg_tilt_relax_bnd_y = -1, &
              id_dg_tilt_relax_acc_x = -1, id_dg_tilt_relax_acc_y = -1, &
-             id_dg_tilt_relax_acc_w = -1, &
+             id_dg_tilt_relax_acc_w = -1, id_dg_tilt_relax_minh_frac = -1, &
              id_ground_frac = -1, id_col_thick = -1, id_OD_av = -1, &
              id_f_ground_cell = -1, id_f_ground_node = -1, &
              id_u_mask = -1, id_v_mask = -1, id_ufb_mask =-1, id_vfb_mask = -1, id_t_mask = -1, &
@@ -942,6 +946,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%dg_tilt_relax_ssa_w(isd:ied,jsd:jed), source=0.0)
     allocate(CS%dg_tilt_relax_bnd_x(isd:ied,jsd:jed), source=0.0)
     allocate(CS%dg_tilt_relax_bnd_y(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%dg_tilt_relax_minh_frac(isd:ied,jsd:jed), source=1.0)
     allocate(CS%dg_tilt_relax_acc_x(isd:ied,jsd:jed), source=0.0)
     allocate(CS%dg_tilt_relax_acc_y(isd:ied,jsd:jed), source=0.0)
     allocate(CS%dg_tilt_relax_acc_w(isd:ied,jsd:jed), source=0.0)
@@ -1928,6 +1933,10 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          CS%diag%axesT1, Time, 'signed DG(1) tilt-relaxation thickness removal rate of the bounded '//&
          'excess on the y tilt; as dg_tilt_relax_bnd_x', &
          'm s-1', conversion=US%Z_to_m*US%s_to_T)
+      if (CS%dg_tilt_relax_min_h_stop) &
+        CS%id_dg_tilt_relax_minh_frac = register_diag_field('ice_shelf_model','dg_tilt_relax_minh_frac', &
+           CS%diag%axesT1, Time, 'smallest factor DG1_TILT_RELAX_MIN_H_STOP put on a tilt-relaxation '//&
+           'component of the cell in the last stage; 1 where no corner would go below MIN_H_SHELF', 'nondim')
       ! Running totals.  These accumulate from the start of THIS run only: they are not in the
       ! restart file, so a continuation starts them again from zero.
       CS%id_dg_tilt_relax_acc_x = register_diag_field('ice_shelf_model','dg_tilt_relax_acc_x', &
@@ -2492,6 +2501,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       call post_data(CS%id_dg_tilt_relax_bnd_x, CS%dg_tilt_relax_bnd_x, CS%diag)
     if (CS%id_dg_tilt_relax_bnd_y > 0) &
       call post_data(CS%id_dg_tilt_relax_bnd_y, CS%dg_tilt_relax_bnd_y, CS%diag)
+    if (CS%id_dg_tilt_relax_minh_frac > 0) &
+      call post_data(CS%id_dg_tilt_relax_minh_frac, CS%dg_tilt_relax_minh_frac, CS%diag)
     if (CS%id_dg_tilt_relax_acc_x > 0) &
       call post_data(CS%id_dg_tilt_relax_acc_x, CS%dg_tilt_relax_acc_x, CS%diag)
     if (CS%id_dg_tilt_relax_acc_y > 0) &
@@ -9822,6 +9833,7 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_tilt_relax_ssa_w)) deallocate(CS%dg_tilt_relax_ssa_w)
   if (associated(CS%dg_tilt_relax_bnd_x)) deallocate(CS%dg_tilt_relax_bnd_x)
   if (associated(CS%dg_tilt_relax_bnd_y)) deallocate(CS%dg_tilt_relax_bnd_y)
+  if (associated(CS%dg_tilt_relax_minh_frac)) deallocate(CS%dg_tilt_relax_minh_frac)
   if (associated(CS%dg_tilt_relax_acc_x)) deallocate(CS%dg_tilt_relax_acc_x)
   if (associated(CS%dg_tilt_relax_acc_y)) deallocate(CS%dg_tilt_relax_acc_y)
   if (associated(CS%dg_tilt_relax_acc_w)) deallocate(CS%dg_tilt_relax_acc_w)
@@ -11609,6 +11621,14 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "a cell is held through an artificial-viscosity face by a relaxed neighbour.  Its "//&
                  "references come from its crossed neighbours.  Non-positive disables it.", &
                  units="s", default=0.0, scale=US%s_to_T, do_not_log=.not.CS%dg_tilt_relax)
+  call get_param(param_file, mdl, "DG1_TILT_RELAX_MIN_H_STOP", CS%dg_tilt_relax_min_h_stop, &
+                 "If true, the tilt relaxation never takes a corner below MIN_H_SHELF.  In each RK "//&
+                 "stage, the components (x tilt, y tilt, twist) that would take a corner below it, "//&
+                 "after the other terms of the stage, are scaled back by one common factor, and the "//&
+                 "others act in full.  Without this the positivity limit takes up each such push by "//&
+                 "scaling every mode of the cell toward its mean, and a residual the thickness cannot "//&
+                 "remove (thin ice on a bed peak) then flattens the cell again in every step.", &
+                 default=.false., do_not_log=.not.CS%dg_tilt_relax)
   call get_param(param_file, mdl, "DG1_TILT_RELAX_BOUNDED_MEAN", bounded_mean_str, &
                  "The cell-mean surfaces the bounded excess compares the tilts with. 'CORNER': the "//&
                  "mean of the corner surfaces. 'FREE': max(hbar - Dbar, (1 - rho_i/rho_w) hbar) from "//&
@@ -12637,7 +12657,7 @@ end subroutine DG1_nodal_spatial_operator
 !! The rate along each axis is a fraction of the
 !! viscosity's own jump decay rate on the cell's two faces on that axis, so the removal acts where
 !! and as fast as the penalty that feeds the alternating field.
-subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt)
+subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_base)
   type(ice_shelf_dyn_CS), intent(in)  :: CS   !< Ice shelf dynamics control structure
   type(ocean_grid_type),  intent(inout) :: G  !< Ocean grid structure
   real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Cell mask
@@ -12646,6 +12666,9 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt)
   real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out) :: R_node !< Nodal relaxation rate [Z T-1 ~> m s-1]
   real,         optional, intent(in)  :: acc_wt !< Weight of this RK stage in the step, used only
                                               !! to add acc_wt*dt*r to the running totals [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), &
+                optional, intent(in)  :: h_base !< Corner thicknesses at the end of this stage
+                                              !! without the relaxation, for DG1_TILT_RELAX_MIN_H_STOP [Z ~> m]
 
   integer, dimension(SZDI_(G),SZDJ_(G)) :: state ! 1 grounded, -1 floating, 0 crossed or not ice
   real, dimension(SZDI_(G),SZDJ_(G)) :: gx, gy ! Viscosity jump decay rate along each axis, the
@@ -12689,6 +12712,13 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt)
   logical :: stn_on  ! The shallow-shelf part or the grounded floor is in use, so the stencil rule runs
   real :: rbx, rby  ! Bounded removal rates [Z T-1 ~> m s-1]
   real :: Rb(2,2)    ! The corner pattern of the bounded removal [Z T-1 ~> m s-1]
+  logical :: minh_on ! DG1_TILT_RELAX_MIN_H_STOP is on and the stage's base corners were passed
+  real, dimension(SZDI_(G),SZDJ_(G)) :: cr_x, cr_y, cr_w ! With minh_on, each cell's removal rate on
+                                               ! the x tilt, y tilt and twist [Z T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: cb_x, cb_y ! With minh_on, each cell's bounded removal rate
+                                               ! on the x and y tilts [Z T-1 ~> m s-1]
+  real :: Pc(2,2,3)  ! The corner pattern of each component, its own cell mean taken out [Z T-1 ~> m s-1]
+  real :: fac(3)     ! The factor DG1_TILT_RELAX_MIN_H_STOP puts on each component [nondim]
   logical :: edge_on ! DG1_TILT_RELAX_SSA_EDGE_ONESIDED is in use
   logical :: edge_xm, edge_xp, edge_ym, edge_yp ! The side behind or ahead along x or y is a wall
                                 ! with a mirror ghost, or, with edge_on, holds no ice
@@ -12794,6 +12824,11 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt)
     CS%dg_tilt_relax_bnd_x(:,:) = 0.0 ; CS%dg_tilt_relax_bnd_y(:,:) = 0.0
   endif
   if (.not.CS%dg_tilt_relax) return
+  minh_on = CS%dg_tilt_relax_min_h_stop .and. present(h_base)
+  if (minh_on) then
+    cr_x(:,:) = 0.0 ; cr_y(:,:) = 0.0 ; cr_w(:,:) = 0.0 ; cb_x(:,:) = 0.0 ; cb_y(:,:) = 0.0
+    if (CS%id_dg_tilt_relax_minh_frac > 0) CS%dg_tilt_relax_minh_frac(:,:) = 1.0
+  endif
   if (.not.associated(CS%bed_node)) call MOM_error(FATAL, &
     "dg1_tilt_relax_rate: DG1_TILT_RELAX requires a nodal bed (CS%bed_node).")
   ! The residuals are needed one cell beyond the compute domain and read means one further, and the
@@ -13550,9 +13585,14 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt)
       CS%dg_tilt_relax_why_y(i,j) = real(why_y)
       CS%dg_tilt_relax_why_w(i,j) = real(why_w)
     endif
+    ! With DG1_TILT_RELAX_MIN_H_STOP the pattern above is rebuilt after the bounded part, from the
+    ! components kept here, and the running totals are added there.
+    if (minh_on) then
+      cr_x(i,j) = r_xi ; cr_y(i,j) = r_eta ; cr_w(i,j) = r_w
+    endif
     ! The running totals take both RK stages at the SSP-RK2 weight the caller passes, so they hold
     ! the thickness the term actually removed over the step, not one stage of it.
-    if (acc_on) then
+    if (acc_on .and. (.not.minh_on)) then
       CS%dg_tilt_relax_acc_x(i,j) = CS%dg_tilt_relax_acc_x(i,j) + (acc_dt * r_xi)
       CS%dg_tilt_relax_acc_y(i,j) = CS%dg_tilt_relax_acc_y(i,j) + (acc_dt * r_eta)
       CS%dg_tilt_relax_acc_w(i,j) = CS%dg_tilt_relax_acc_w(i,j) + (acc_dt * r_w)
@@ -13603,10 +13643,108 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt)
       if (diag_on) then
         CS%dg_tilt_relax_bnd_x(i,j) = rbx ; CS%dg_tilt_relax_bnd_y(i,j) = rby
       endif
+      if (minh_on) then
+        cb_x(i,j) = rbx ; cb_y(i,j) = rby
+      endif
+    enddo ; enddo
+  endif
+
+  ! DG1_TILT_RELAX_MIN_H_STOP: rebuild each cell's pattern from its three components, each scaled
+  ! so that no corner goes below MIN_H_SHELF at the end of the stage.  The positivity limit would
+  ! otherwise take up the excess by scaling every mode of the cell toward its mean.
+  if (minh_on) then
+    do j = jsc, jec ; do i = isc, iec
+      if (hmask(i,j) /= 1.0) cycle
+      if (((cr_x(i,j) == 0.0) .and. (cb_x(i,j) == 0.0)) .and. &
+          ((cr_y(i,j) == 0.0) .and. (cb_y(i,j) == 0.0)) .and. (cr_w(i,j) == 0.0)) cycle
+      rbx = cr_x(i,j) + cb_x(i,j) ; rby = cr_y(i,j) + cb_y(i,j)
+      ! The x tilt, the y tilt and the twist, each with its own cell mean taken out.
+      Pc(1,1,1) = 0.5*rbx ; Pc(2,1,1) = -(0.5*rbx) ; Pc(1,2,1) = 0.5*rbx ; Pc(2,2,1) = -(0.5*rbx)
+      Pc(1,1,2) = 0.5*rby ; Pc(1,2,2) = -(0.5*rby) ; Pc(2,1,2) = 0.5*rby ; Pc(2,2,2) = -(0.5*rby)
+      Pc(1,1,3) = -(0.25*cr_w(i,j)) ; Pc(2,2,3) = -(0.25*cr_w(i,j))
+      Pc(2,1,3) = 0.25*cr_w(i,j) ; Pc(1,2,3) = 0.25*cr_w(i,j)
+      do m = 1, 3
+        Tbar = nodal_cell_mean(Pc(:,:,m), CS%cell_mean_w(i,j,:,:))
+        Pc(:,:,m) = Pc(:,:,m) - Tbar
+      enddo
+      call dg1_min_h_scale(Pc, h_base(i,j,:,:), dt, CS%min_h_shelf, fac)
+      do n = 1, 2 ; do m = 1, 2
+        R_node(i,j,m,n) = ((fac(1)*Pc(m,n,1)) + (fac(2)*Pc(m,n,2))) + (fac(3)*Pc(m,n,3))
+      enddo ; enddo
+      if (CS%id_dg_tilt_relax_minh_frac > 0) &
+        CS%dg_tilt_relax_minh_frac(i,j) = min(min(fac(1), fac(2)), fac(3))
+      if (acc_on) then
+        CS%dg_tilt_relax_acc_x(i,j) = CS%dg_tilt_relax_acc_x(i,j) + (acc_dt * (fac(1)*cr_x(i,j)))
+        CS%dg_tilt_relax_acc_y(i,j) = CS%dg_tilt_relax_acc_y(i,j) + (acc_dt * (fac(2)*cr_y(i,j)))
+        CS%dg_tilt_relax_acc_w(i,j) = CS%dg_tilt_relax_acc_w(i,j) + (acc_dt * (fac(3)*cr_w(i,j)))
+      endif
     enddo ; enddo
   endif
 
 end subroutine dg1_tilt_relax_rate
+
+!> The factors that DG1_TILT_RELAX_MIN_H_STOP puts on the three relaxation components of one cell.
+!! A component that pushes down a corner the full relaxation would take below h_min joins the scaled
+!! set, which shares one factor, the largest that keeps every corner at or above h_min (or where the
+!! corner is below h_min without the relaxation, keeps the scaled set from lowering it).  If even a
+!! zero factor leaves a corner below h_min, the other components that lower that corner join the set,
+!! and the factor is found again; with all three in the set the factor zero always works.  The set is
+!! chosen by sign and the sums pair the x and y tilts, so a quarter turn or a mirror changes nothing.
+pure subroutine dg1_min_h_scale(Pc, h_base, dt, h_min, fac)
+  real, intent(in)  :: Pc(2,2,3)   !< Corner pattern of the x tilt, y tilt and twist [Z T-1 ~> m s-1]
+  real, intent(in)  :: h_base(2,2) !< Corner thicknesses at the end of the stage without the relaxation [Z ~> m]
+  real, intent(in)  :: dt          !< Time step [T ~> s]
+  real, intent(in)  :: h_min       !< The thickness no corner may be taken below [Z ~> m]
+  real, intent(out) :: fac(3)      !< The factor on each component [nondim]
+  logical :: in_set(3) ! The component is in the scaled set
+  logical :: joins(3)  ! The component joins the set after this pass, decided from the set at its start
+  logical :: added     ! A component joined the set in this pass
+  real :: P_out(3), P_in(3) ! The components outside and inside the set at a corner [Z T-1 ~> m s-1]
+  real :: room   ! What the corner may lose to the scaled set [Z ~> m]
+  real :: down   ! What the scaled set takes from the corner at full rate [Z ~> m]
+  real :: theta  ! The common factor of the set [nondim]
+  integer :: a, b, k, pass
+
+  fac(:) = 1.0
+  in_set(:) = .false.
+  do b = 1, 2 ; do a = 1, 2
+    if (h_base(a,b) + (dt * ((Pc(a,b,1) + Pc(a,b,2)) + Pc(a,b,3))) < h_min) then
+      do k = 1, 3
+        if (Pc(a,b,k) < 0.0) in_set(k) = .true.
+      enddo
+    endif
+  enddo ; enddo
+  if (.not.(in_set(1) .or. in_set(2) .or. in_set(3))) return
+
+  theta = 1.0
+  do pass = 1, 4
+    theta = 1.0 ; added = .false. ; joins(:) = .false.
+    do b = 1, 2 ; do a = 1, 2
+      do k = 1, 3
+        P_out(k) = 0.0 ; P_in(k) = 0.0
+        if (in_set(k)) then ; P_in(k) = Pc(a,b,k) ; else ; P_out(k) = Pc(a,b,k) ; endif
+      enddo
+      room = (h_base(a,b) + (dt * ((P_out(1) + P_out(2)) + P_out(3)))) - h_min
+      down = dt * ((P_in(1) + P_in(2)) + P_in(3))
+      if (room < 0.0) then
+        do k = 1, 3
+          if ((.not.in_set(k)) .and. (Pc(a,b,k) < 0.0)) then
+            joins(k) = .true. ; added = .true.
+          endif
+        enddo
+      endif
+      if (down < 0.0) theta = min(theta, max(room, 0.0) / (-down))
+    enddo ; enddo
+    if (.not.added) exit
+    do k = 1, 3
+      if (joins(k)) in_set(k) = .true.
+    enddo
+  enddo
+  theta = max(0.0, min(1.0, theta))
+  do k = 1, 3
+    if (in_set(k)) fac(k) = theta
+  enddo
+end subroutine dg1_min_h_scale
 
 !> The bounded excess of one DG(1) surface tilt along one axis: the part of the tilt outside the range
 !! of slopes that the cell means of the cell and of up to two neighbours on each side allow, with their
@@ -13748,6 +13886,9 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: S_node ! Nodal source rate [Z T-1 ~> m s-1]
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: T_node ! Nodal mode-damping rate [Z T-1 ~> m s-1]
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: R_node ! Nodal tilt-relaxation rate [Z T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: h_base ! Corners at the end of a stage without the tilt
+                                                   ! relaxation, for DG1_TILT_RELAX_MIN_H_STOP [Z ~> m]
+  logical :: minh_on  ! DG1_TILT_RELAX_MIN_H_STOP is on
   real, dimension(2,2) :: dh
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_v  ! Artificial-viscosity part of rhs, for the budget
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: h_pre  ! Thickness before a positivity limit [Z ~> m]
@@ -13839,7 +13980,19 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   endif
 
   ! SSP-RK2 gives each stage half the step, so each stage adds half to the running totals.
-  if (CS%dg_tilt_relax) then
+  minh_on = CS%dg_tilt_relax .and. CS%dg_tilt_relax_min_h_stop
+  if (minh_on) then
+    ! The corners stage 1 reaches without the relaxation, from the same h0 the update below uses.
+    h_base(:,:,:,:) = 0.0
+    do j = jsc, jec ; do i = isc, iec
+      if (hmask(i,j) /= 1.0) cycle
+      call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), rhs(i,j,:,:), dh)
+      do b = 1, 2 ; do a = 1, 2
+        h_base(i,j,a,b) = h0(i,j,a,b) + time_step * (dh(a,b) + S_node(i,j,a,b))
+      enddo ; enddo
+    enddo ; enddo
+    call dg1_tilt_relax_rate(CS, G, hmask, CS%h_nodal, time_step, T_node, acc_wt=0.5, h_base=h_base)
+  elseif (CS%dg_tilt_relax) then
     call dg1_tilt_relax_rate(CS, G, hmask, CS%h_nodal, time_step, T_node, acc_wt=0.5)
   else
     T_node(:,:,:,:) = 0.0
@@ -13877,7 +14030,19 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   else
     call DG1_nodal_spatial_operator(CS, G, hmask, h_curr, rhs, uh_ice, vh_ice, time_step)
   endif
-  if (CS%dg_tilt_relax) then
+  if (minh_on) then
+    ! Stage 2 averages with h0, which is already at or above the floor, so its own end value is
+    ! the one to keep there.
+    h_base(:,:,:,:) = 0.0
+    do j = jsc, jec ; do i = isc, iec
+      if (hmask(i,j) /= 1.0) cycle
+      call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), rhs(i,j,:,:), dh)
+      do b = 1, 2 ; do a = 1, 2
+        h_base(i,j,a,b) = h_curr(i,j,a,b) + time_step * (dh(a,b) + S_node(i,j,a,b))
+      enddo ; enddo
+    enddo ; enddo
+    call dg1_tilt_relax_rate(CS, G, hmask, h_curr, time_step, T_node, acc_wt=0.5, h_base=h_base)
+  elseif (CS%dg_tilt_relax) then
     call dg1_tilt_relax_rate(CS, G, hmask, h_curr, time_step, T_node, acc_wt=0.5)
   else
     T_node(:,:,:,:) = 0.0
