@@ -498,6 +498,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! grounding-line cell and a wholly floating cell.
   real :: dg_art_visc_kink_c      !< Artificial viscosity: the allowed surface jump as a multiple of the
                                   !! second difference of the cell-mean surfaces across the face [nondim].
+  logical :: dg_art_visc_floor_target = .false. !< Artificial viscosity: if true, leave the part of a
+                                  !! face surface jump between zero and the tilt-relaxation target's jump.
   logical :: dg_tilt_relax        !< Tilt relaxation: if true, relax the tilts and twist toward the ones
                                   !! the neighbours' means imply wherever the artificial viscosity acts.
   real :: dg_tilt_relax_u_cut     !< Tilt relaxation: the speed law max(u_cut - u_credit*|u_n|, 0)/dx
@@ -11406,6 +11408,21 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "slope change at a kink and as dx**2 times the curvature on smooth ice.", &
                  units="nondim", default=1.0, &
                  do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_art_visc_kink_allow == 0))
+  call get_param(param_file, mdl, "DG1_ART_VISC_FLOOR_TARGET", CS%dg_art_visc_floor_target, &
+                 "If true, the artificial viscosity leaves the part of each face surface jump that lies "//&
+                 "between zero and the jump, of the same sign, of the reconstruction the tilt-relaxation "//&
+                 "floor steers toward, and damps the rest; it never pushes a face toward that jump.  The "//&
+                 "reconstruction is the "//&
+                 "cell-mean surface plus the x and y tilts the neighbouring means imply, and the twist "//&
+                 "the diagonal means imply where all four are of one flotation state (else the cell's "//&
+                 "own twist).  This applies at a face only where both cells and all their face "//&
+                 "neighbours are wholly grounded or all wholly floating ice; elsewhere, including at "//&
+                 "every face beside a grounding line or an ice margin, the whole jump is damped.  "//&
+                 "Without this the floor keeps making these jumps and the viscosity keeps closing "//&
+                 "them, which moves mass between cell means at a rate set by the floor, not by the "//&
+                 "flow.  The target is that of the same-state reference; it ignores "//&
+                 "DG1_TILT_RELAX_WIDE_NEIGHBOURS, _FREE_EDGE and _WALL_MIRROR.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
 
   call get_param(param_file, mdl, "DG1_TILT_RELAX", CS%dg_tilt_relax, &
                  "If true, relax the DG(1) tilts and twist toward the ones the neighbouring "//&
@@ -12080,7 +12097,7 @@ end function dg1_eps_face_v
 !! and whether the face is a stagnant jump. Endpoint values are ordered along the face.
 subroutine dg1_art_visc_face(CS, bc_A, bc_B, hbc_A_min, hbc_B_min, h_A, h_B, bed, u, v, H_ref, dx_perp, &
                              eps_e_face, rhoi_rhow, advect_grid_inv, advect_inv_L, inv_tau_floor, &
-                             ueff, dheq, coef_face, rate_face, idle, ds_allow)
+                             ueff, dheq, coef_face, rate_face, idle, ds_allow, ds_tgt)
   type(ice_shelf_dyn_CS), intent(in)  :: CS    !< Ice shelf dynamics control structure
   logical,                intent(in)  :: bc_A  !< True if cell A is a thickness boundary (hmask=3)
   logical,                intent(in)  :: bc_B  !< True if cell B is a thickness boundary (hmask=3)
@@ -12106,6 +12123,9 @@ subroutine dg1_art_visc_face(CS, bc_A, bc_B, hbc_A_min, hbc_B_min, h_A, h_B, bed
   logical,                intent(out) :: idle  !< True for a stagnant jump
   real,         optional, intent(in)  :: ds_allow !< The part of the surface jump the cell means
                                                !! justify, left unpenalized; 0 or absent for none [Z ~> m]
+  real, dimension(2), optional, intent(in) :: ds_tgt !< The surface jump of the tilt-relaxation target
+                                               !! at each face QP; the part of the jump between zero
+                                               !! and it is left unpenalized [Z ~> m]
 
   ! 2-point Gauss-Legendre on [0,1], with 1-gp1 == gp2 and 1-gp2 == gp1 exactly.
   real, parameter :: gp1 = 0.5 * (1.0 - sqrt(1.0/3.0))
@@ -12145,6 +12165,10 @@ subroutine dg1_art_visc_face(CS, bc_A, bc_B, hbc_A_min, hbc_B_min, h_A, h_B, bed
     if (bc_B) h_B_qp = max(h_B_qp, hbc_B_min)
     bed_qp = (t_co*bed(1)) + (t_face*bed(2))
     ds_use = dg1_wb_surface_jump(h_A_qp, h_B_qp, bed_qp, rhoi_rhow)
+    ! The target's jump is only an allowance: the part of the jump between zero and it is left,
+    ! and the penalty never pushes the face toward it.
+    if (present(ds_tgt)) &
+      ds_use = ds_use - min(max(ds_use, min(0.0, ds_tgt(gp))), max(0.0, ds_tgt(gp)))
     if (present(ds_allow)) then
       if (ds_allow > 0.0) ds_use = sign(max(abs(ds_use) - ds_allow, 0.0), ds_use)
     endif
@@ -12232,6 +12256,10 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   logical, dimension(SZDI_(G),SZDJ_(G)) :: cross_k ! The grounding line crosses the cell
   logical, dimension(SZDI_(G),SZDJ_(G)) :: flt_k   ! The cell is wholly floating
   logical :: kink_face       ! DG1_ART_VISC_KINK_ALLOW applies at this face
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: tgt_s ! Tilt-relaxation target corner surfaces [Z ~> m]
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: tgt_ok ! The target is set in the cell
+  real, dimension(2) :: ds_tgt ! The target's surface jump at the two face QPs [Z ~> m]
+  logical :: use_tgt         ! DG1_ART_VISC_FLOOR_TARGET applies at this face
   ! Art-visc pass-1 results: face coefficient and rate, and per-QP u_eff and Delta h_eq.
   real, dimension(SZDIB_(G),SZDJ_(G))   :: cK_E, rate_E
   real, dimension(SZDI_(G),SZDJB_(G))   :: cK_N, rate_N
@@ -12272,6 +12300,9 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   if (CS%dg_art_visc_tau_floor > 0.0) inv_tau_floor = 1.0 / CS%dg_art_visc_tau_floor
 
   ! Cell-mean surfaces for DG1_ART_VISC_KINK_ALLOW, each corner on its own flotation branch.
+  if (CS%dg_art_visc_floor_target) &
+    call dg1_av_floor_target(CS, G, hmask, h_nodal_in, rhoi_rhow_wb, tgt_s, tgt_ok)
+
   if (CS%dg_art_visc_kink_allow > 0) then
     sbar_k(:,:) = 0.0 ; have_k(:,:) = .false. ; cross_k(:,:) = .false. ; flt_k(:,:) = .false.
     do j = G%jsd+1, G%jed ; do i = G%isd+1, G%ied
@@ -12437,12 +12468,28 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         ds_allow = CS%dg_art_visc_kink_c * max(d2_A, d2_B)
       endif
     endif
-    call dg1_art_visc_face(CS, hmask(i,j) == 3.0, hmask(i+1,j) == 3.0, &
-             CS%min_h_shelf, CS%min_h_shelf, &
-             h_nodal_in(i,j,2,:), h_nodal_in(i+1,j,1,:), CS%bed_node(i,j-1:j), &
-             CS%u_shelf(i,j-1:j), CS%v_shelf(i,j-1:j), H_ref, G%dxCu(i,j), eps_e_face, &
-             rhoi_rhow_wb, advect_grid_inv, advect_inv_L, inv_tau_floor, &
-             ueff_E(i,j,:), dheq_E(i,j,:), cK_E(i,j), rate_E(i,j), idle_face, ds_allow)
+    use_tgt = .false.
+    if (CS%dg_art_visc_floor_target) use_tgt = tgt_ok(i,j) .and. tgt_ok(i+1,j)
+    if (use_tgt) then
+      ! The target traces along the face, south node to north node, at the two face QPs.
+      ds_tgt(1) = (((1.0-gp1)*tgt_s(i+1,j,1,1)) + (gp1*tgt_s(i+1,j,1,2))) - &
+                  (((1.0-gp1)*tgt_s(i,j,2,1)) + (gp1*tgt_s(i,j,2,2)))
+      ds_tgt(2) = (((1.0-gp2)*tgt_s(i+1,j,1,1)) + (gp2*tgt_s(i+1,j,1,2))) - &
+                  (((1.0-gp2)*tgt_s(i,j,2,1)) + (gp2*tgt_s(i,j,2,2)))
+      call dg1_art_visc_face(CS, hmask(i,j) == 3.0, hmask(i+1,j) == 3.0, &
+               CS%min_h_shelf, CS%min_h_shelf, &
+               h_nodal_in(i,j,2,:), h_nodal_in(i+1,j,1,:), CS%bed_node(i,j-1:j), &
+               CS%u_shelf(i,j-1:j), CS%v_shelf(i,j-1:j), H_ref, G%dxCu(i,j), eps_e_face, &
+               rhoi_rhow_wb, advect_grid_inv, advect_inv_L, inv_tau_floor, &
+               ueff_E(i,j,:), dheq_E(i,j,:), cK_E(i,j), rate_E(i,j), idle_face, ds_allow, ds_tgt)
+    else
+      call dg1_art_visc_face(CS, hmask(i,j) == 3.0, hmask(i+1,j) == 3.0, &
+               CS%min_h_shelf, CS%min_h_shelf, &
+               h_nodal_in(i,j,2,:), h_nodal_in(i+1,j,1,:), CS%bed_node(i,j-1:j), &
+               CS%u_shelf(i,j-1:j), CS%v_shelf(i,j-1:j), H_ref, G%dxCu(i,j), eps_e_face, &
+               rhoi_rhow_wb, advect_grid_inv, advect_inv_L, inv_tau_floor, &
+               ueff_E(i,j,:), dheq_E(i,j,:), cK_E(i,j), rate_E(i,j), idle_face, ds_allow)
+    endif
     if (associated(CS%dg_slow_idle_face_u)) then
       if (idle_face) CS%dg_slow_idle_face_u(i,j) = 1.0
     endif
@@ -12538,12 +12585,28 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         ds_allow = CS%dg_art_visc_kink_c * max(d2_A, d2_B)
       endif
     endif
-    call dg1_art_visc_face(CS, hmask(i,j) == 3.0, hmask(i,j+1) == 3.0, &
-             CS%min_h_shelf, CS%min_h_shelf, &
-             h_nodal_in(i,j,:,2), h_nodal_in(i,j+1,:,1), CS%bed_node(i-1:i,j), &
-             CS%u_shelf(i-1:i,j), CS%v_shelf(i-1:i,j), H_ref, G%dyCv(i,j), eps_e_face, &
-             rhoi_rhow_wb, advect_grid_inv, advect_inv_L, inv_tau_floor, &
-             ueff_N(i,j,:), dheq_N(i,j,:), cK_N(i,j), rate_N(i,j), idle_face, ds_allow)
+    use_tgt = .false.
+    if (CS%dg_art_visc_floor_target) use_tgt = tgt_ok(i,j) .and. tgt_ok(i,j+1)
+    if (use_tgt) then
+      ! The target traces along the face, west node to east node, at the two face QPs.
+      ds_tgt(1) = (((1.0-gp1)*tgt_s(i,j+1,1,1)) + (gp1*tgt_s(i,j+1,2,1))) - &
+                  (((1.0-gp1)*tgt_s(i,j,1,2)) + (gp1*tgt_s(i,j,2,2)))
+      ds_tgt(2) = (((1.0-gp2)*tgt_s(i,j+1,1,1)) + (gp2*tgt_s(i,j+1,2,1))) - &
+                  (((1.0-gp2)*tgt_s(i,j,1,2)) + (gp2*tgt_s(i,j,2,2)))
+      call dg1_art_visc_face(CS, hmask(i,j) == 3.0, hmask(i,j+1) == 3.0, &
+               CS%min_h_shelf, CS%min_h_shelf, &
+               h_nodal_in(i,j,:,2), h_nodal_in(i,j+1,:,1), CS%bed_node(i-1:i,j), &
+               CS%u_shelf(i-1:i,j), CS%v_shelf(i-1:i,j), H_ref, G%dyCv(i,j), eps_e_face, &
+               rhoi_rhow_wb, advect_grid_inv, advect_inv_L, inv_tau_floor, &
+               ueff_N(i,j,:), dheq_N(i,j,:), cK_N(i,j), rate_N(i,j), idle_face, ds_allow, ds_tgt)
+    else
+      call dg1_art_visc_face(CS, hmask(i,j) == 3.0, hmask(i,j+1) == 3.0, &
+               CS%min_h_shelf, CS%min_h_shelf, &
+               h_nodal_in(i,j,:,2), h_nodal_in(i,j+1,:,1), CS%bed_node(i-1:i,j), &
+               CS%u_shelf(i-1:i,j), CS%v_shelf(i-1:i,j), H_ref, G%dyCv(i,j), eps_e_face, &
+               rhoi_rhow_wb, advect_grid_inv, advect_inv_L, inv_tau_floor, &
+               ueff_N(i,j,:), dheq_N(i,j,:), cK_N(i,j), rate_N(i,j), idle_face, ds_allow)
+    endif
     if (associated(CS%dg_slow_idle_face_v)) then
       if (idle_face) CS%dg_slow_idle_face_v(i,j) = 1.0
     endif
@@ -13682,6 +13745,74 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
   endif
 
 end subroutine dg1_tilt_relax_rate
+
+!> The corner surfaces of the reconstruction the tilt-relaxation floor steers each cell toward, for
+!! DG1_ART_VISC_FLOOR_TARGET: the mean of the corner surfaces, the x and y tilts of the same-state
+!! reference (the least-squares slope of the neighbouring means, as in dg1_tilt_relax_rate), and the
+!! twist of the diagonal means where all four diagonals share the cell's state (else the cell's own
+!! twist).  It is set only in a wholly grounded or wholly floating ice cell whose four face neighbours
+!! are ice of the same state, which keeps every face beside a grounding line or a margin out of it.
+subroutine dg1_av_floor_target(CS, G, hmask, h_nodal_in, rr, tgt_s, tgt_ok)
+  type(ice_shelf_dyn_CS), intent(in)  :: CS   !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in)  :: G    !< Ocean grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Cell mask
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in) :: h_nodal_in !< Corner thicknesses [Z ~> m]
+  real,                   intent(in)  :: rr   !< Ratio of ice to ocean density [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out) :: tgt_s !< Target corner surfaces [Z ~> m]
+  logical, dimension(SZDI_(G),SZDJ_(G)), intent(out) :: tgt_ok !< The target is set in the cell
+
+  integer, dimension(SZDI_(G),SZDJ_(G)) :: state ! 1 grounded, -1 floating, 0 crossed or not ice
+  real, dimension(SZDI_(G),SZDJ_(G)) :: sbar ! Mean of the corner surfaces [Z ~> m]
+  real :: s_c(2,2)   ! Surface at the cell's corners [Z ~> m]
+  real :: f          ! Grounded fraction clipped to [0,1] [nondim]
+  real :: dm, dp     ! Distances to the neighbours behind and ahead [L ~> m]
+  real :: tx, ty, tw ! Target x tilt, y tilt and twist [Z ~> m]
+  logical :: same    ! The cell and the neighbours a test reads share one state
+  real, parameter :: f_eps = 1.0e-6 ! Grounded-fraction tolerance for a pure flotation state [nondim]
+  integer :: i, j, m, n
+
+  state(:,:) = 0 ; sbar(:,:) = 0.0
+  tgt_s(:,:,:,:) = 0.0 ; tgt_ok(:,:) = .false.
+  do j = G%jsd+1, G%jed ; do i = G%isd+1, G%ied
+    if (hmask(i,j) /= 1.0) cycle
+    f = min(max(CS%ground_frac(i,j), 0.0), 1.0)
+    if (f >= 1.0 - f_eps) then
+      state(i,j) = 1
+    elseif (f <= f_eps) then
+      state(i,j) = -1
+    endif
+    do n = 1, 2 ; do m = 1, 2
+      s_c(m,n) = max(h_nodal_in(i,j,m,n) - CS%bed_node(i-2+m,j-2+n), (1.0-rr)*h_nodal_in(i,j,m,n))
+    enddo ; enddo
+    sbar(i,j) = 0.25*((s_c(1,1) + s_c(2,2)) + (s_c(2,1) + s_c(1,2)))
+  enddo ; enddo
+
+  do j = G%jsc-1, G%jec+1 ; do i = G%isc-1, G%iec+1
+    if (state(i,j) == 0) cycle
+    same = ((state(i-1,j) == state(i,j)) .and. (state(i+1,j) == state(i,j))) .and. &
+           ((state(i,j-1) == state(i,j)) .and. (state(i,j+1) == state(i,j)))
+    if (.not.same) cycle
+    tgt_ok(i,j) = .true.
+    dm = G%dxCu(I-1,j) ; dp = G%dxCu(I,j)
+    tx = (((dp*(sbar(i+1,j) - sbar(i,j))) + (dm*(sbar(i,j) - sbar(i-1,j)))) / ((dp*dp) + (dm*dm))) * G%dxT(i,j)
+    dm = G%dyCv(i,J-1) ; dp = G%dyCv(i,J)
+    ty = (((dp*(sbar(i,j+1) - sbar(i,j))) + (dm*(sbar(i,j) - sbar(i,j-1)))) / ((dp*dp) + (dm*dm))) * G%dyT(i,j)
+    same = ((state(i-1,j-1) == state(i,j)) .and. (state(i+1,j+1) == state(i,j))) .and. &
+           ((state(i-1,j+1) == state(i,j)) .and. (state(i+1,j-1) == state(i,j)))
+    if (same) then
+      tw = 0.25*((sbar(i+1,j+1) + sbar(i-1,j-1)) - (sbar(i-1,j+1) + sbar(i+1,j-1)))
+    else
+      do n = 1, 2 ; do m = 1, 2
+        s_c(m,n) = max(h_nodal_in(i,j,m,n) - CS%bed_node(i-2+m,j-2+n), (1.0-rr)*h_nodal_in(i,j,m,n))
+      enddo ; enddo
+      tw = (s_c(2,2) - s_c(1,2)) - (s_c(2,1) - s_c(1,1))
+    endif
+    tgt_s(i,j,1,1) = sbar(i,j) + (((-0.5*tx) + (-0.5*ty)) + (0.25*tw))
+    tgt_s(i,j,2,1) = sbar(i,j) + (((0.5*tx) + (-0.5*ty)) - (0.25*tw))
+    tgt_s(i,j,1,2) = sbar(i,j) + (((-0.5*tx) + (0.5*ty)) - (0.25*tw))
+    tgt_s(i,j,2,2) = sbar(i,j) + (((0.5*tx) + (0.5*ty)) + (0.25*tw))
+  enddo ; enddo
+end subroutine dg1_av_floor_target
 
 !> The factors that DG1_TILT_RELAX_MIN_H_STOP puts on the three relaxation components of one cell.
 !! A component that pushes down a corner the full relaxation would take below h_min joins the scaled
