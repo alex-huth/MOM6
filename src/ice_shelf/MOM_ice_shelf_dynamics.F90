@@ -539,6 +539,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! which then chooses its detector beside a grounding line.
   real :: dg_tilt_relax_ground_time !< Tilt relaxation: if positive, the shallow-shelf part of a wholly
                                   !! grounded cell is replaced by a floor of 1/this rate [T ~> s].
+  integer :: dg_tilt_relax_ground_band !< Tilt relaxation: if positive, the grounded floor acts only within
+                                  !! this many cells (chessboard) of an ice cell that is not wholly grounded.
   real :: dg_tilt_relax_ground_u_credit !< Tilt relaxation: the fraction of the transport rate through the
                                   !! slower face of each axis taken off the grounded floor [nondim].
   logical :: dg_tilt_relax_ground_exclusive !< Tilt relaxation: if true, a wholly grounded cell gets the
@@ -11612,6 +11614,14 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "DG1_TILT_RELAX_SSA_EDGE_ONESIDED) as the shallow-shelf part, so it is withheld in "//&
                  "the same cells and axes beside a grounding line. Non-positive disables it.", &
                  units="s", default=0.0, scale=US%s_to_T, do_not_log=.not.CS%dg_tilt_relax)
+  call get_param(param_file, mdl, "DG1_TILT_RELAX_GROUND_BAND", CS%dg_tilt_relax_ground_band, &
+                 "If positive, the floor of DG1_TILT_RELAX_GROUND_TIME acts only on a wholly grounded cell "//&
+                 "within this many cells (chessboard distance) of an ice cell that is not wholly grounded "//&
+                 "(a cell the grounding line crosses, or floating ice); farther inland the cell is treated "//&
+                 "as if the grounded floor were off.  It must be less than the halo width.  Zero or less "//&
+                 "puts no limit on it.", &
+                 units="nondim", default=0, &
+                 do_not_log=(.not.CS%dg_tilt_relax) .or. (CS%dg_tilt_relax_ground_time <= 0.0))
   call get_param(param_file, mdl, "DG1_TILT_RELAX_GROUND_U_CREDIT", CS%dg_tilt_relax_ground_u_credit, &
                  "The floor of DG1_TILT_RELAX_GROUND_TIME on each axis is reduced by this fraction of "//&
                  "the transport rate |u_n|/dx through the slower of the axis's two faces, as "//&
@@ -12933,6 +12943,8 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
   real :: rr        ! Ratio of ice to ocean density [nondim]
   logical :: pin_x, pin_y ! The cell has a relaxed neighbour on both sides along that axis
   integer :: m, n
+  integer :: gbn     ! DG1_TILT_RELAX_GROUND_BAND, or 0 for no limit
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: gband ! A wholly grounded cell the grounded floor may act on
   real, parameter :: f_eps = 1.0e-6 ! Grounded-fraction tolerance for a pure flotation state [nondim]
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed
 
@@ -13055,6 +13067,22 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
       deep(i,j) = .true.
       do n = -1, 1 ; do m = -1, 1
         if ((ice(i+m,j+n) .and. (state(i+m,j+n) /= 0)) .or. (hmask(i+m,j+n) == 3.0)) deep(i,j) = .false.
+      enddo ; enddo
+    enddo ; enddo
+  endif
+  ! The grounded floor's band: within gbn cells of ice that is not wholly grounded, or everywhere.
+  gbn = 0
+  if (k_ground > 0.0) gbn = max(CS%dg_tilt_relax_ground_band, 0)
+  if ((gbn > 0) .and. ((G%isc - G%isd <= gbn) .or. (G%jsc - G%jsd <= gbn))) call MOM_error(FATAL, &
+    "dg1_tilt_relax_rate: DG1_TILT_RELAX_GROUND_BAND must be less than the halo width.")
+  gband(:,:) = .true.
+  if (gbn > 0) then
+    do j = jsc, jec ; do i = isc, iec
+      gband(i,j) = .false.
+      if (.not.ice(i,j)) cycle
+      if (state(i,j) /= 1) cycle
+      do n = -gbn, gbn ; do m = -gbn, gbn
+        if (ice(i+m,j+n) .and. (state(i+m,j+n) /= 1)) gband(i,j) = .true.
       enddo ; enddo
     enddo ; enddo
   endif
@@ -13328,7 +13356,7 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
       ! The grounded floor takes the shallow-shelf part's place in a wholly grounded cell, before the
       ! stencil rule, so that it is withheld exactly where that part would be.  Its own transport
       ! credit reads the slower face of each axis, as the floating floor does.
-      if ((k_ground > 0.0) .and. (state(i,j) == 1)) then
+      if ((k_ground > 0.0) .and. (state(i,j) == 1) .and. gband(i,j)) then
         kgx = k_ground ; kgy = k_ground
         if (CS%dg_tilt_relax_ground_u_credit > 0.0) then
           u_fx = min(abs(0.5*(CS%u_shelf(I-1,J-1) + CS%u_shelf(I-1,J))), abs(0.5*(CS%u_shelf(I,J-1) + CS%u_shelf(I,J))))
