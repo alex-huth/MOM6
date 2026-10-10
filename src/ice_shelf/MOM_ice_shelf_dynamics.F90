@@ -254,6 +254,10 @@ type, public :: ice_shelf_dyn_CS ; private
                                    !! Minv_nodal(i,j,a,b,p,q) = Minv_xi(a,p)*Minv_eta(b,q). It maps the
                                    !! right-hand side at corner (p,q) to the rate at corner (a,b);
                                    !! a and p are 1 (W) or 2 (E), b and q are 1 (S) or 2 (N) [L-2 ~> m-2].
+  real, pointer, dimension(:,:,:,:,:,:) :: Minv_av_nodal => NULL() !< As Minv_nodal, but the inverse of the
+                                   !! mass matrix blended toward its lumped (row-sum diagonal) form by
+                                   !! DG1_ART_VISC_LUMP_FRAC along xi and along eta, for the artificial-
+                                   !! viscosity part of the right-hand side only [L-2 ~> m-2].
   real, pointer, dimension(:,:,:,:) :: cell_mean_w => NULL() !< Integral over the cell of the basis function of
                                    !! corner (a,b). The four sum to the cell area, and sum w*h / sum w is
                                    !! the area-weighted cell mean of a corner field. Used for cell means,
@@ -628,6 +632,9 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! face coefficient reaches 1 [nondim].
   real :: dg_art_visc_kcell       !< Artificial viscosity: per-cell bound on dt times the summed face
                                   !! decay rates; SSP-RK2 needs < 2 [nondim].
+  real :: dg_art_visc_lump_frac   !< Artificial viscosity: the lumped fraction theta of the mass matrix whose
+                                  !! inverse the artificial-viscosity part of the right-hand side takes;
+                                  !! 0 is the consistent mass matrix [nondim].
   real :: dg_slow_idle_u_tiny     !< Artificial viscosity: stagnant-jump flag threshold on |u_face| [L T-1 ~> m s-1].
   real :: dg_slow_idle_eps_tiny   !< Artificial viscosity: stagnant-jump flag threshold on eps_e_face [T-1 ~> s-1].
   real :: dg_slow_idle_s_tol      !< Artificial viscosity: stagnant-jump flag threshold on |Delta h_eq| [Z ~> m].
@@ -9797,6 +9804,7 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%bed_node)) deallocate(CS%bed_node)
   if (associated(CS%h_nodal)) deallocate(CS%h_nodal)
   if (associated(CS%Minv_nodal)) deallocate(CS%Minv_nodal)
+  if (associated(CS%Minv_av_nodal)) deallocate(CS%Minv_av_nodal)
   if (associated(CS%cell_mean_w)) deallocate(CS%cell_mean_w)
   if (associated(CS%h_source_rate)) deallocate(CS%h_source_rate)
   if (associated(CS%h_source_rate_bmb)) deallocate(CS%h_source_rate_bmb)
@@ -11726,6 +11734,22 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "SSP-RK2 requires < 2.", &
                  units="nondim", default=1.0, &
                  do_not_log=.not.CS%use_DG_thickness)
+  call get_param(param_file, mdl, "DG1_ART_VISC_LUMP_FRAC", CS%dg_art_visc_lump_frac, &
+                 "The fraction theta by which the mass matrix is lumped for the DG(1) artificial-"//&
+                 "viscosity part of the right-hand side: (1-theta) M + theta diag(row sums of M), along "//&
+                 "each cell axis.  Transport, sources and the tilt relaxation keep the "//&
+                 "consistent M.  With the consistent M a face flux that closes a jump also moves the "//&
+                 "far node of the same cell the other way, which opens the next face upstream and "//&
+                 "spreads a local disturbance as an alternation; lumping confines the correction to "//&
+                 "the face node, at the cost of moving a little mass between cell means.  The cell "//&
+                 "means respond exactly as with M.  The per-cell cap (DG1_ART_VISC_KCELL) still uses "//&
+                 "the consistent rate, which is the larger, so it stays a safe bound; the jump decay "//&
+                 "actually delivered is slower, by up to a factor 2 at theta = 1.  0 is the consistent "//&
+                 "mass matrix.", &
+                 units="nondim", default=0.0, &
+                 do_not_log=.not.CS%use_DG_thickness)
+  if (CS%use_DG_thickness .and. ((CS%dg_art_visc_lump_frac < 0.0) .or. (CS%dg_art_visc_lump_frac > 1.0))) &
+    call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: DG1_ART_VISC_LUMP_FRAC must be in [0, 1].")
   if (CS%use_DG_thickness .and. (CS%dg_art_visc_r_hi <= 0.0)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics, initialize_ice_shelf_dyn: DG1_ART_VISC_R_HI must be positive.")
 
@@ -11749,9 +11773,16 @@ subroutine init_nodal_DG_metric(CS, G)
   real :: det                   ! 1D mass-matrix determinant [L2 ~> m2]
   real, dimension(2,2) :: Minv_xi  ! Inverse 1D mass matrix along xi [L-1 ~> m-1]
   real, dimension(2,2) :: Minv_eta ! Inverse 1D mass matrix along eta [L-1 ~> m-1]
+  real, dimension(2,2) :: Lxi, Leta ! Inverse 1D mass matrices blended toward lumped [L-1 ~> m-1]
+  real :: th                    ! DG1_ART_VISC_LUMP_FRAC [nondim]
+  logical :: lump_on            ! The blended table is built
   integer :: i, j, isd, ied, jsd, jed, a, b, p, q
 
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+  th = CS%dg_art_visc_lump_frac
+  lump_on = (th > 0.0)
+  if (lump_on .and. (.not.associated(CS%Minv_av_nodal))) &
+    allocate(CS%Minv_av_nodal(isd:ied,jsd:jed,1:2,1:2,1:2,1:2), source=0.0)
 
   do j = jsd, jed ; do i = isd, ied
     call cell_face_lengths(G, i, j, CS%reentrant_x, CS%reentrant_y, dxS, dxN, dyW, dyE)
@@ -11769,6 +11800,7 @@ subroutine init_nodal_DG_metric(CS, G)
       Minv_xi(1,2) = -M12 / det
       Minv_xi(2,1) = -M12 / det
     endif
+    if (lump_on) call dg1_blended_inverse_1d(M11, M12, M22, th, Lxi)
 
     ! M_eta: int_0^1 N_b*N_b'*a(eta) deta where a(eta) = dxS*(1-eta) + dxN*eta.
     M11 = (dxS/4.0) + (dxN/12.0)
@@ -11782,14 +11814,47 @@ subroutine init_nodal_DG_metric(CS, G)
       Minv_eta(1,2) = -M12 / det
       Minv_eta(2,1) = -M12 / det
     endif
+    if (lump_on) call dg1_blended_inverse_1d(M11, M12, M22, th, Leta)
 
     do q = 1, 2 ; do p = 1, 2 ; do b = 1, 2 ; do a = 1, 2
       CS%Minv_nodal(i,j,a,b,p,q) = Minv_xi(a,p) * Minv_eta(b,q)
     enddo ; enddo ; enddo ; enddo
+    if (lump_on) then
+      do q = 1, 2 ; do p = 1, 2 ; do b = 1, 2 ; do a = 1, 2
+        CS%Minv_av_nodal(i,j,a,b,p,q) = Lxi(a,p) * Leta(b,q)
+      enddo ; enddo ; enddo ; enddo
+    endif
 
     call corner_cell_weights(dxS, dxN, dyW, dyE, CS%cell_mean_w(i,j,:,:))
   enddo ; enddo
 end subroutine init_nodal_DG_metric
+
+!> The inverse of a 1D two-node mass matrix [M11 M12; M12 M22] blended toward its lumped form,
+!! (1-theta) M + theta diag(M11+M12, M12+M22).  The row sums, and so the response of the mean,
+!! are those of M.  On a cell with equal faces the mean and the tilt stay its eigenvectors, so in
+!! the tensor product the four modes of a rectangle stay uncoupled; the tilt is driven
+!! 3/(1+2 theta) times as hard as the mean by a face flux, against 3 with M.
+subroutine dg1_blended_inverse_1d(M11, M12, M22, theta, Minv)
+  real,                 intent(in)  :: M11   !< First diagonal entry of M [L ~> m]
+  real,                 intent(in)  :: M12   !< Off-diagonal entry of M [L ~> m]
+  real,                 intent(in)  :: M22   !< Second diagonal entry of M [L ~> m]
+  real,                 intent(in)  :: theta !< Lumped fraction, 0 to 1 [nondim]
+  real, dimension(2,2), intent(out) :: Minv  !< Inverse of the blended matrix [L-1 ~> m-1]
+  real :: B11, B22, B12  ! Blended entries [L ~> m]
+  real :: det            ! Determinant of the blended matrix [L2 ~> m2]
+
+  B11 = M11 + (theta * M12)
+  B22 = M22 + (theta * M12)
+  B12 = (1.0 - theta) * M12
+  det = B11*B22 - B12*B12
+  Minv(:,:) = 0.0
+  if (det > 0.0) then
+    Minv(1,1) =  B22 / det
+    Minv(2,2) =  B11 / det
+    Minv(1,2) = -B12 / det
+    Minv(2,1) = -B12 / det
+  endif
+end subroutine dg1_blended_inverse_1d
 
 !> At initialization on a symmetric reentrant grid, copy the DG corners across the wrap so both
 !! cells at a periodic boundary node start with the same value.
@@ -11960,6 +12025,26 @@ subroutine apply_nodal_DG_mass_inverse(Minv_cell, rhs, out)
                                Minv_cell(a,b,2,1) * rhs(2,1), Minv_cell(a,b,1,2) * rhs(1,2))
   enddo ; enddo
 end subroutine apply_nodal_DG_mass_inverse
+
+!> The rate of change of one cell's corners from its spatial operator when DG1_ART_VISC_LUMP_FRAC is
+!! on: the consistent inverse mass matrix for everything but the artificial viscosity, and the
+!! blended one for that.
+subroutine dg1_split_mass_inverse(CS, i, j, rhs, rhs_v, dh, dh_v)
+  type(ice_shelf_dyn_CS), intent(in)  :: CS    !< The ice shelf dynamics control structure
+  integer,                intent(in)  :: i     !< Cell index along x
+  integer,                intent(in)  :: j     !< Cell index along y
+  real, dimension(2,2),   intent(in)  :: rhs   !< The whole right-hand side [Z L2 T-1 ~> m3 s-1]
+  real, dimension(2,2),   intent(in)  :: rhs_v !< Its artificial-viscosity part [Z L2 T-1 ~> m3 s-1]
+  real, dimension(2,2),   intent(out) :: dh    !< The corner rates [Z T-1 ~> m s-1]
+  real, dimension(2,2),   intent(out) :: dh_v  !< Their artificial-viscosity part [Z T-1 ~> m s-1]
+  real, dimension(2,2) :: r_t  ! The rest of the right-hand side [Z L2 T-1 ~> m3 s-1]
+  real, dimension(2,2) :: dh_t ! Its corner rates [Z T-1 ~> m s-1]
+
+  r_t(:,:) = rhs(:,:) - rhs_v(:,:)
+  call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), r_t, dh_t)
+  call apply_nodal_DG_mass_inverse(CS%Minv_av_nodal(i,j,:,:,:,:), rhs_v, dh_v)
+  dh(:,:) = dh_t(:,:) + dh_v(:,:)
+end subroutine dg1_split_mass_inverse
 
 !> Surface jump s_B - s_A at a face point, each side taking its own flotation branch.
 pure function dg1_wb_surface_jump(h_A, h_B, bed_qp, rhoi_rhow) result(ds)
@@ -14022,9 +14107,12 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   logical :: minh_on  ! DG1_TILT_RELAX_MIN_H_STOP is on
   real, dimension(2,2) :: dh
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_v  ! Artificial-viscosity part of rhs, for the budget
+                                                   ! and DG1_ART_VISC_LUMP_FRAC [Z L2 T-1 ~> m3 s-1]
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: h_pre  ! Thickness before a positivity limit [Z ~> m]
   real, dimension(2,2) :: dh_v    ! Artificial-viscosity part of dh [Z T-1 ~> m s-1]
   logical :: bud_on               ! The tilt budget is written
+  logical :: lump_on              ! DG1_ART_VISC_LUMP_FRAC is on, so the art visc takes its own M^-1
+  logical :: need_v               ! The artificial-viscosity part of rhs is needed
   real :: tau_chk ! Shortest mode-damper relaxation time in the domain [T ~> s]
   real :: u_chk   ! Fastest removal speed either tilt term asks for in a cell [L T-1 ~> m s-1]
   character(len=24) :: n1, n2 ! Numbers for the warnings; the text is concatenated separately
@@ -14049,6 +14137,8 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   call project_h_source_rate_to_nodes(CS, ISS, G, S_node)
   bud_on = associated(CS%dg_bud)
   if (bud_on) bud_on = any(CS%id_dg_bud(:) > 0)
+  lump_on = (CS%dg_art_visc_lump_frac > 0.0)
+  need_v = bud_on .or. lump_on
 
   if (CS%debug) then
     call check_nodal_source_conservation(CS, ISS, G, CS%h_source_rate, S_node, "basal+surface")
@@ -14057,7 +14147,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
 
   ! Stage 1: positivity limit, spatial operator, M^-1, Euler step.
   call nodal_positivity_limit(CS, G, ISS)
-  if (bud_on) then
+  if (need_v) then
     call DG1_nodal_spatial_operator(CS, G, hmask, CS%h_nodal, rhs, uh_ice, vh_ice, time_step, rhs_v)
   else
     call DG1_nodal_spatial_operator(CS, G, hmask, CS%h_nodal, rhs, uh_ice, vh_ice, time_step)
@@ -14117,7 +14207,11 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
     h_base(:,:,:,:) = 0.0
     do j = jsc, jec ; do i = isc, iec
       if (hmask(i,j) /= 1.0) cycle
-      call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), rhs(i,j,:,:), dh)
+      if (lump_on) then
+        call dg1_split_mass_inverse(CS, i, j, rhs(i,j,:,:), rhs_v(i,j,:,:), dh, dh_v)
+      else
+        call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), rhs(i,j,:,:), dh)
+      endif
       do b = 1, 2 ; do a = 1, 2
         h_base(i,j,a,b) = h0(i,j,a,b) + time_step * (dh(a,b) + S_node(i,j,a,b))
       enddo ; enddo
@@ -14130,14 +14224,19 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   endif
   do j = jsc, jec ; do i = isc, iec
     if (hmask(i,j) /= 1.0) cycle
-    call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), &
-                                     rhs(i,j,:,:), dh)
+    if (lump_on) then
+      call dg1_split_mass_inverse(CS, i, j, rhs(i,j,:,:), rhs_v(i,j,:,:), dh, dh_v)
+    else
+      call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), &
+                                       rhs(i,j,:,:), dh)
+    endif
     do b = 1, 2 ; do a = 1, 2
       CS%h_nodal(i,j,a,b) = h0(i,j,a,b) &
                            + time_step * (dh(a,b) + S_node(i,j,a,b) + T_node(i,j,a,b))
     enddo ; enddo
     if (bud_on) then
-      call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), rhs_v(i,j,:,:), dh_v)
+      if (.not.lump_on) &
+        call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), rhs_v(i,j,:,:), dh_v)
       call dg1_bud_add(CS, i, j, 1, 0.5*time_step, dh - dh_v)
       call dg1_bud_add(CS, i, j, 2, 0.5*time_step, dh_v)
       call dg1_bud_add(CS, i, j, 3, 0.5*time_step, S_node(i,j,:,:))
@@ -14156,7 +14255,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
     enddo ; enddo
   endif
   h_curr(:,:,:,:) = CS%h_nodal(:,:,:,:)
-  if (bud_on) then
+  if (need_v) then
     call DG1_nodal_spatial_operator(CS, G, hmask, h_curr, rhs, uh_ice, vh_ice, time_step, rhs_v)
   else
     call DG1_nodal_spatial_operator(CS, G, hmask, h_curr, rhs, uh_ice, vh_ice, time_step)
@@ -14167,7 +14266,11 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
     h_base(:,:,:,:) = 0.0
     do j = jsc, jec ; do i = isc, iec
       if (hmask(i,j) /= 1.0) cycle
-      call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), rhs(i,j,:,:), dh)
+      if (lump_on) then
+        call dg1_split_mass_inverse(CS, i, j, rhs(i,j,:,:), rhs_v(i,j,:,:), dh, dh_v)
+      else
+        call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), rhs(i,j,:,:), dh)
+      endif
       do b = 1, 2 ; do a = 1, 2
         h_base(i,j,a,b) = h_curr(i,j,a,b) + time_step * (dh(a,b) + S_node(i,j,a,b))
       enddo ; enddo
@@ -14180,15 +14283,20 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   endif
   do j = jsc, jec ; do i = isc, iec
     if (hmask(i,j) /= 1.0) cycle
-    call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), &
-                                     rhs(i,j,:,:), dh)
+    if (lump_on) then
+      call dg1_split_mass_inverse(CS, i, j, rhs(i,j,:,:), rhs_v(i,j,:,:), dh, dh_v)
+    else
+      call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), &
+                                       rhs(i,j,:,:), dh)
+    endif
     do b = 1, 2 ; do a = 1, 2
       CS%h_nodal(i,j,a,b) = 0.5*h0(i,j,a,b) &
                            + 0.5*(h_curr(i,j,a,b) &
                                   + time_step*(dh(a,b) + S_node(i,j,a,b) + T_node(i,j,a,b)))
     enddo ; enddo
     if (bud_on) then
-      call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), rhs_v(i,j,:,:), dh_v)
+      if (.not.lump_on) &
+        call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), rhs_v(i,j,:,:), dh_v)
       call dg1_bud_add(CS, i, j, 1, 0.5*time_step, dh - dh_v)
       call dg1_bud_add(CS, i, j, 2, 0.5*time_step, dh_v)
       call dg1_bud_add(CS, i, j, 3, 0.5*time_step, S_node(i,j,:,:))
