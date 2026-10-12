@@ -633,6 +633,9 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! face coefficient reaches 1 [nondim].
   real :: dg_art_visc_kcell       !< Artificial viscosity: per-cell bound on dt times the summed face
                                   !! decay rates; SSP-RK2 needs < 2 [nondim].
+  integer :: dg_art_visc_ground_band !< Artificial viscosity: a face between two wholly grounded cells acts only
+                                  !! within this many cells (chessboard) of an ice cell that is not wholly
+                                  !! grounded, at half strength one cell farther; negative for everywhere.
   real :: dg_band_diff_time       !< Band diffusion: decay time of the crosswind tilt mode under the
                                   !! crosswind diffusion of the surface near the grounding line, or 0 for
                                   !! none [T ~> s].
@@ -11774,6 +11777,16 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "SSP-RK2 requires < 2.", &
                  units="nondim", default=1.0, &
                  do_not_log=.not.CS%use_DG_thickness)
+  call get_param(param_file, mdl, "DG1_ART_VISC_GROUND_BAND", CS%dg_art_visc_ground_band, &
+                 "If zero or positive, the DG(1) artificial viscosity acts on a face between two "//&
+                 "wholly grounded cells only if one of them is within this many cells (chessboard "//&
+                 "distance) of an ice cell that is not wholly grounded (crossed, floating or a "//&
+                 "partly filled front cell), and at half strength if the nearer is one cell farther.  "//&
+                 "Faces that touch such a cell keep the full viscosity.  On grounded ice outside the "//&
+                 "band the face jumps are left to the upwind flux: the viscosity there closes them "//&
+                 "with fixed cell means, which spreads an alternation of the tilts upstream.  It must "//&
+                 "be less than the halo width.  Negative keeps the viscosity on every face.", &
+                 units="nondim", default=-1, do_not_log=.not.CS%use_DG_thickness)
   call get_param(param_file, mdl, "DG1_BAND_DIFF_TIME", CS%dg_band_diff_time, &
                  "If positive, grounded DG(1) cells near the grounding line (the band of "//&
                  "DG1_BAND_DIFF_WIDTH) diffuse the surface across the flow: the thickness equation gains "//&
@@ -12625,6 +12638,46 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
     enddo ; enddo
   enddo ; enddo
 end subroutine dg1_band_diffusion
+
+!> DG1_ART_VISC_GROUND_BAND: the artificial-viscosity weight of each cell, 1 for an ice cell that is not
+!! wholly grounded or a wholly grounded cell within the band, 0.5 one cell farther and 0 beyond.  A face
+!! takes the larger weight of its two cells.
+subroutine dg1_av_ground_band_weight(CS, G, hmask, wgt)
+  type(ice_shelf_dyn_CS), intent(in) :: CS  !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in) :: G   !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in)  :: hmask !< Mask of ice cells [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(out) :: wgt   !< Cell weight, valid in the halo [nondim]
+
+  real, parameter :: f_eps = 1.0e-6 ! Grounded-fraction tolerance for a pure flotation state [nondim]
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: src ! An ice cell that is not wholly grounded
+  integer :: i, j, m, n, nb, dmin
+
+  nb = CS%dg_art_visc_ground_band
+  if ((G%isc - G%isd < nb + 1) .or. (G%jsc - G%jsd < nb + 1)) call MOM_error(FATAL, &
+    "dg1_av_ground_band_weight: DG1_ART_VISC_GROUND_BAND must be less than the halo width.")
+  src(:,:) = .false.
+  do j = G%jsd, G%jed ; do i = G%isd, G%ied
+    if (hmask(i,j) == 3.0) then
+      src(i,j) = .true.
+    elseif (hmask(i,j) == 1.0) then
+      src(i,j) = (CS%ground_frac(i,j) < 1.0 - f_eps)
+    endif
+  enddo ; enddo
+  wgt(:,:) = 0.0
+  do j = G%jsc, G%jec ; do i = G%isc, G%iec
+    dmin = nb + 2
+    do n = -(nb+1), nb+1 ; do m = -(nb+1), nb+1
+      if (src(i+m,j+n)) dmin = min(dmin, max(abs(m), abs(n)))
+    enddo ; enddo
+    if (dmin <= nb) then
+      wgt(i,j) = 1.0
+    elseif (dmin == nb + 1) then
+      wgt(i,j) = 0.5
+    endif
+  enddo ; enddo
+  call pass_var(wgt, G%domain)
+end subroutine dg1_av_ground_band_weight
+
 !> DG(1) right-hand side M dh/dt = int grad(N).(u h) dA - int N (u.n) h_upwind ds + art visc,
 !! with 2x2 Gauss points in the cell and 2 per face. Specified-flux faces split their flux
 !! equally between the two corners.
@@ -12662,6 +12715,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: rhoi_rhow_wb       ! Ice/ocean density ratio for the well-balanced jump [nondim]
   real :: advect_inv_L       ! 1/DG1_ART_VISC_ADVECT_L_REF, or 0 [L-1 ~> m-1]
   real :: inv_tau_floor      ! 1/DG1_ART_VISC_TAU_FLOOR, or 0 [T-1 ~> s-1]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: avg_w ! DG1_ART_VISC_GROUND_BAND cell weight [nondim]
+  real :: wf                 ! DG1_ART_VISC_GROUND_BAND face weight [nondim]
   logical :: advect_grid_inv ! If true, scale the advective term by dx_perp/L_ref.
   real :: eps_e_face         ! Effective strain rate at the face midpoint [T-1 ~> s-1]
   logical :: valid_A_visc, valid_B_visc ! Side A/B is hmask 1 or 3.
@@ -12718,6 +12773,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   if (advect_grid_inv) advect_inv_L = 1.0 / CS%dg_art_visc_advect_L_ref
   inv_tau_floor = 0.0
   if (CS%dg_art_visc_tau_floor > 0.0) inv_tau_floor = 1.0 / CS%dg_art_visc_tau_floor
+
+  if (CS%dg_art_visc_ground_band >= 0) call dg1_av_ground_band_weight(CS, G, hmask, avg_w)
 
   ! Cell-mean surfaces for DG1_ART_VISC_KINK_ALLOW, each corner on its own flotation branch.
   if (CS%dg_art_visc_floor_target) &
@@ -12854,6 +12911,9 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     valid_B_visc = (hmask(i+1,j) == 1.0 .or. hmask(i+1,j) == 3.0)
     if (.not. (valid_A_visc .and. valid_B_visc)) cycle
     if (.not. (hmask(i,j) == 1.0 .or. hmask(i+1,j) == 1.0)) cycle
+    wf = 1.0
+    if (CS%dg_art_visc_ground_band >= 0) wf = max(avg_w(i,j), avg_w(i+1,j))
+    if (wf <= 0.0) cycle
     active_E(i,j) = .true.
 
     if (hmask(i,j) == 3.0) then
@@ -12909,6 +12969,9 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
                CS%u_shelf(i,j-1:j), CS%v_shelf(i,j-1:j), H_ref, G%dxCu(i,j), eps_e_face, &
                rhoi_rhow_wb, advect_grid_inv, advect_inv_L, inv_tau_floor, &
                ueff_E(i,j,:), dheq_E(i,j,:), cK_E(i,j), rate_E(i,j), idle_face, ds_allow)
+    endif
+    if (wf < 1.0) then
+      cK_E(i,j) = wf * cK_E(i,j) ; rate_E(i,j) = wf * rate_E(i,j)
     endif
     if (associated(CS%dg_slow_idle_face_u)) then
       if (idle_face) CS%dg_slow_idle_face_u(i,j) = 1.0
@@ -12971,6 +13034,9 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     valid_B_visc = (hmask(i,j+1) == 1.0 .or. hmask(i,j+1) == 3.0)
     if (.not. (valid_A_visc .and. valid_B_visc)) cycle
     if (.not. (hmask(i,j) == 1.0 .or. hmask(i,j+1) == 1.0)) cycle
+    wf = 1.0
+    if (CS%dg_art_visc_ground_band >= 0) wf = max(avg_w(i,j), avg_w(i,j+1))
+    if (wf <= 0.0) cycle
     active_N(i,j) = .true.
 
     if (hmask(i,j) == 3.0) then
@@ -13026,6 +13092,9 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
                CS%u_shelf(i-1:i,j), CS%v_shelf(i-1:i,j), H_ref, G%dyCv(i,j), eps_e_face, &
                rhoi_rhow_wb, advect_grid_inv, advect_inv_L, inv_tau_floor, &
                ueff_N(i,j,:), dheq_N(i,j,:), cK_N(i,j), rate_N(i,j), idle_face, ds_allow)
+    endif
+    if (wf < 1.0) then
+      cK_N(i,j) = wf * cK_N(i,j) ; rate_N(i,j) = wf * rate_N(i,j)
     endif
     if (associated(CS%dg_slow_idle_face_v)) then
       if (idle_face) CS%dg_slow_idle_face_v(i,j) = 1.0
