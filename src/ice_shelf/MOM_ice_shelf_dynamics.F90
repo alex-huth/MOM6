@@ -84,9 +84,9 @@ integer, parameter :: TRW_REACH = 3    !< The speed law gave zero rate: the ice 
 integer, parameter :: TRW_CROSSED = 4  !< The grounding line crosses the cell and this axis is not widened
 integer, parameter :: TRW_NO_REF = 5   !< This cell could not build its own reference on this mode
 integer, parameter :: TRW_NO_NB = 6    !< No neighbour residual was usable, so a zigzag is not separable
-integer, parameter :: TRW_SSA_ONESIDED = 7 !< The shallow-shelf part was withheld because the detector
+integer, parameter :: TRW_SSA_ONESIDED = 7 !< The floor part was withheld because the detector
                                           !! was one-sided, so only the speed law decided the rate
-!>@{ The detectors the shallow-shelf part of the tilt relaxation may use (DG1_TILT_RELAX_SSA_STENCIL)
+!>@{ The detectors the floor part of the tilt relaxation may use (DG1_TILT_RELAX_SSA_STENCIL)
 integer, parameter :: SSA_STENCIL_ANY = 0    !< Any detector the speed law uses, one-sided included
 integer, parameter :: SSA_STENCIL_LOOSE = 1  !< A two-sided reference and two neighbour residuals
 integer, parameter :: SSA_STENCIL_STRICT = 2 !< LOOSE, and both neighbour residuals are two-sided
@@ -95,7 +95,6 @@ integer, parameter :: SSA_STENCIL_EDGE2 = 3  !< STRICT, but where only one side'
 !>@}
 
 !> pi squared, for the wavenumber of a wave two cells long, k = pi/dx [nondim]
-real, parameter :: DG1_PI_SQ = 9.869604401089358
 
 ! CISM-style grounding-line treatment modes (CISM_FRICTION, CISM_TAUD)
 integer, parameter :: CISM_OFF = 0       !< No CISM-style treatment of this term
@@ -510,20 +509,10 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! on each axis; zero turns the speed law off [L T-1 ~> m s-1].
   real :: dg_tilt_relax_u_credit  !< Tilt relaxation: the fraction of the transport's own removal
                                   !! speed that the speed law credits [nondim].
-  real :: dg_tilt_relax_ssa_frac  !< Tilt relaxation: the fraction of the shallow-shelf restoring
-                                  !! rate of a surface wave two cells long that each mode of a
-                                  !! grounded or floating cell is relaxed at, at least [nondim].
-  integer :: dg_tilt_relax_ssa_stencil !< Tilt relaxation: which detector the shallow-shelf part
-                                  !! needs, one of the SSA_STENCIL_ parameters.
-  real :: dg_tilt_relax_ssa_u_credit !< Tilt relaxation: the fraction of the transport removal rate
-                                  !! |u_n|/dx taken off the shallow-shelf part [nondim].
+  integer :: dg_tilt_relax_ssa_stencil !< Tilt relaxation: which detector the grounded floor (and, under
+                                  !! FLOAT_STENCIL, the floating floor) needs, one of the SSA_STENCIL_ parameters.
   logical :: dg_tilt_relax_speed_no_ssa !< Tilt relaxation: if true, the speed law acts only on a
-                                  !! mode where the shallow-shelf part is not formed.
-  logical :: dg_tilt_relax_ssa_free_edge !< Tilt relaxation: if true, a crossed cell gets the SSA part
-                                  !! on an axis that FREE_EDGE or WIDE_NEIGHBOURS opens, with rho' and
-                                  !! beta weighted by the grounded fraction.
-  logical :: dg_tilt_relax_bounded !< Tilt relaxation: if true, remove the bounded excess of the tilts
-                                  !! at the shallow-shelf rate where the shallow-shelf part does not act.
+                                  !! mode where the floor part is not formed.
   real :: dg_tilt_relax_bounded_time !< Tilt relaxation: if positive, also remove the bounded excess
                                   !! everywhere with this e-folding time [T ~> s].
   real :: dg_tilt_relax_float_time !< Tilt relaxation: if positive, every mode of a wholly floating
@@ -535,10 +524,10 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: dg_tilt_relax_float_onesided !< Tilt relaxation: if false, the floating floor is not
                                   !! applied on an axis where a neighbour holds ice of another flotation state.
   logical :: dg_tilt_relax_float_stencil !< Tilt relaxation: if true, under DG1_TILT_RELAX_FLOAT_EXCLUSIVE the
-                                  !! floating floor takes the shallow-shelf part's place in the stencil rule,
+                                  !! floating floor goes through the stencil rule,
                                   !! which then chooses its detector beside a grounding line.
-  real :: dg_tilt_relax_ground_time !< Tilt relaxation: if positive, the shallow-shelf part of a wholly
-                                  !! grounded cell is replaced by a floor of 1/this rate [T ~> s].
+  real :: dg_tilt_relax_ground_time !< Tilt relaxation: if positive, a wholly grounded cell is relaxed
+                                  !! at least at 1/this rate [T ~> s].
   integer :: dg_tilt_relax_ground_band !< Tilt relaxation: if positive, the grounded floor acts only within
                                   !! this many cells (chessboard) of an ice cell that is not wholly grounded.
   real :: dg_tilt_relax_ground_u_credit !< Tilt relaxation: the fraction of the transport rate through the
@@ -559,8 +548,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! surfaces formed from the mean thickness and mean bed of each cell.
   logical :: dg_tilt_relax_ssa_edge_margins !< Tilt relaxation: if true, the edge option also accepts
                                   !! a one-sided detector beside an ice margin inside the domain.
-  logical :: dg_tilt_relax_ssa_edge_onesided !< Tilt relaxation: if true, the SSA stencil rule
-                                  !! withholds the SSA part only where a neighbour is ice of another
+  logical :: dg_tilt_relax_ssa_edge_onesided !< Tilt relaxation: if true, the stencil rule
+                                  !! withholds the floor part only where a neighbour is ice of another
                                   !! flotation state, not where a neighbour holds no ice.
   logical :: dg_tilt_relax_wall_mirror !< Tilt relaxation: if true, a free-slip wall supplies a
                                   !! mirror image of the cell as the neighbour beyond it.
@@ -608,9 +597,9 @@ type, public :: ice_shelf_dyn_CS ; private
   real, pointer, dimension(:,:) :: dg_tilt_relax_u_y => NULL() !< Tilt relaxation: the cell speed the
                                   !! y speed law read, BEFORE the credit [L T-1 ~> m s-1].
   real, pointer, dimension(:,:) :: dg_tilt_relax_ssa_x => NULL() !< Tilt relaxation: the rate the
-                                  !! shallow-shelf part asks for on the x tilt, before the cap [T-1 ~> s-1].
+                                  !! floor part asks for on the x tilt, before the cap [T-1 ~> s-1].
   real, pointer, dimension(:,:) :: dg_tilt_relax_ssa_y => NULL() !< Tilt relaxation: the rate the
-                                  !! shallow-shelf part asks for on the y tilt, before the cap [T-1 ~> s-1].
+                                  !! floor part asks for on the y tilt, before the cap [T-1 ~> s-1].
   real, pointer, dimension(:,:) :: dg_tilt_relax_bnd_x => NULL() !< Tilt relaxation: signed thickness
                                   !! removal rate of the bounded excess on the x tilt [Z T-1 ~> m s-1].
   real, pointer, dimension(:,:) :: dg_tilt_relax_bnd_y => NULL() !< Tilt relaxation: signed thickness
@@ -618,7 +607,7 @@ type, public :: ice_shelf_dyn_CS ; private
   real, pointer, dimension(:,:) :: dg_tilt_relax_minh_frac => NULL() !< Tilt relaxation: the smallest
                                   !! factor DG1_TILT_RELAX_MIN_H_STOP put on a component, 1 if none [nondim].
   real, pointer, dimension(:,:) :: dg_tilt_relax_ssa_w => NULL() !< Tilt relaxation: the rate the
-                                  !! shallow-shelf part asks for on the twist, before the cap [T-1 ~> s-1].
+                                  !! floor part asks for on the twist, before the cap [T-1 ~> s-1].
   real, pointer, dimension(:,:) :: dg_tilt_relax_acc_x => NULL() !< Tilt relaxation: signed thickness
                                   !! the term removed from the x tilt since the run started [Z ~> m].
   real, pointer, dimension(:,:) :: dg_tilt_relax_acc_y => NULL() !< Tilt relaxation: signed thickness
@@ -1906,7 +1895,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          '0 no ice, 1 acted, 2 acted but the explicit-step cap held the rate down, '//&
          '3 past the reach U_CUT/U_CREDIT, 4 grounding line crosses the cell and this axis is '//&
          'not widened, 5 no reference in this cell, 6 no usable neighbour residual, '//&
-         '7 the shallow-shelf part was withheld by DG1_TILT_RELAX_SSA_STENCIL and the speed law '//&
+         '7 the floor part was withheld by DG1_TILT_RELAX_SSA_STENCIL and the speed law '//&
          'alone set the rate', 'nondim')
       CS%id_dg_tilt_relax_why_y = register_diag_field('ice_shelf_model','dg_tilt_relax_why_y', &
          CS%diag%axesT1, Time, 'why the DG(1) tilt relaxation did or did not act on the y tilt; '//&
@@ -1922,23 +1911,22 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       CS%id_dg_tilt_relax_u_y = register_diag_field('ice_shelf_model','dg_tilt_relax_u_y', &
          CS%diag%axesT1, Time, 'cell |v| that the DG(1) tilt-relaxation speed law read on the y '//&
          'axis, BEFORE the U_CREDIT factor', 'm s-1', conversion=US%L_T_to_m_s)
-      ! The shallow-shelf part of the rate on its own, wherever it is formed, so that a map of it
-      ! can be read beside the speed law and the delivered rate.
+      ! The floor part of the rate on its own, wherever it is formed, so that a map of it can be
+      ! read beside the speed law and the delivered rate.
       CS%id_dg_tilt_relax_ssa_x = register_diag_field('ice_shelf_model','dg_tilt_relax_ssa_x', &
-         CS%diag%axesT1, Time, 'rate the DG1_TILT_RELAX_SSA_FRAC part asks for on the x tilt, '//&
-         'SSA_FRAC/2 times the shallow-shelf restoring rate of a surface wave two cells long, '//&
-         'before the explicit-step cap; zero in cells the grounding line crosses', &
+         CS%diag%axesT1, Time, 'rate the floor part (the grounded floor of DG1_TILT_RELAX_GROUND_TIME, '//&
+         'or the floating floor under DG1_TILT_RELAX_FLOAT_STENCIL) asks for on the x tilt after the '//&
+         'stencil rule, before the explicit-step cap; zero in cells the grounding line crosses', &
          's-1', conversion=US%s_to_T)
       CS%id_dg_tilt_relax_ssa_y = register_diag_field('ice_shelf_model','dg_tilt_relax_ssa_y', &
-         CS%diag%axesT1, Time, 'rate the DG1_TILT_RELAX_SSA_FRAC part asks for on the y tilt; '//&
+         CS%diag%axesT1, Time, 'rate the floor part asks for on the y tilt; '//&
          'as dg_tilt_relax_ssa_x', 's-1', conversion=US%s_to_T)
       CS%id_dg_tilt_relax_ssa_w = register_diag_field('ice_shelf_model','dg_tilt_relax_ssa_w', &
-         CS%diag%axesT1, Time, 'rate the DG1_TILT_RELAX_SSA_FRAC part asks for on the twist, '//&
-         'whose wave is two cells long on both axes; as dg_tilt_relax_ssa_x', &
+         CS%diag%axesT1, Time, 'rate the floor part asks for on the twist; as dg_tilt_relax_ssa_x', &
          's-1', conversion=US%s_to_T)
       CS%id_dg_tilt_relax_bnd_x = register_diag_field('ice_shelf_model','dg_tilt_relax_bnd_x', &
          CS%diag%axesT1, Time, 'signed DG(1) tilt-relaxation thickness removal rate of the bounded '//&
-         'excess on the x tilt (DG1_TILT_RELAX_BOUNDED and _BOUNDED_TIME)', &
+         'excess on the x tilt (DG1_TILT_RELAX_BOUNDED_TIME)', &
          'm s-1', conversion=US%Z_to_m*US%s_to_T)
       CS%id_dg_tilt_relax_bnd_y = register_diag_field('ice_shelf_model','dg_tilt_relax_bnd_y', &
          CS%diag%axesT1, Time, 'signed DG(1) tilt-relaxation thickness removal rate of the bounded '//&
@@ -11454,7 +11442,7 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "The tilt-relaxation rate is the speed law max(U_CUT - "//&
                  "DG1_TILT_RELAX_U_CREDIT*|u_n|, 0)/dx along each axis, where u_n is the "//&
                  "cell-centred velocity component on that axis. Zero turns the speed law off, "//&
-                 "which leaves the floors, the shallow-shelf part and the bounded part. "//&
+                 "which leaves the floors and the bounded part. "//&
                  "A speed is the grid-invariant form, because both the rate the "//&
                  "transport supplies and the harm the mode does scale as 1/dx. The rate then "//&
                  "carries no dependence on the artificial viscosity, whose gate reads the face "//&
@@ -11470,18 +11458,6 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "withdraws more than the flow returns. Under-crediting leaves the relaxation "//&
                  "on until |u_n| reaches U_CUT/U_CREDIT.", &
                  units="nondim", default=0.5, do_not_log=.not.CS%dg_tilt_relax)
-  call get_param(param_file, mdl, "DG1_TILT_RELAX_SSA_FRAC", CS%dg_tilt_relax_ssa_frac, &
-                 "If positive, each mode of a wholly grounded or wholly floating cell is relaxed "//&
-                 "at least at SSA_FRAC times the rate at which the shallow-shelf approximation "//&
-                 "flattens a surface wave two cells long, r = rho' g H^2 k^2/(beta + 4 eta H k^2), "//&
-                 "with k = pi/dx for the x tilt, pi/dy for the y tilt and both for the twist, "//&
-                 "rho' the ice density (times 1 - rho_ice/rho_ocean afloat), eta H and beta the "//&
-                 "cell's own viscosity and secant basal drag from the last velocity solve. The "//&
-                 "nodal driving force of these grid-scale modes cancels exactly, so the velocity "//&
-                 "solve cannot flatten them as it flattens any longer wave; this restores that "//&
-                 "missing part of the physical damping. The speed law still acts where it asks "//&
-                 "for more. Cells the grounding line crosses are left out. 0 disables it.", &
-                 units="nondim", default=0.0, do_not_log=.not.CS%dg_tilt_relax)
   call get_param(param_file, mdl, "DG1_TILT_RELAX_TWIST", CS%dg_tilt_relax_twist, &
                  "If true, the tilt relaxation also relaxes the twist, toward the cross "//&
                  "difference of the four diagonal neighbours' means.", &
@@ -11506,7 +11482,8 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "a thickness reference cannot be read across a grounding line.", &
                  default=.false., do_not_log=.not.CS%dg_tilt_relax)
   call get_param(param_file, mdl, "DG1_TILT_RELAX_SSA_STENCIL", ssa_stencil_str, &
-                 "Which detector the DG1_TILT_RELAX_SSA_FRAC part of the tilt relaxation needs "//&
+                 "Which detector the grounded floor (DG1_TILT_RELAX_GROUND_TIME) and, under "//&
+                 "DG1_TILT_RELAX_FLOAT_STENCIL, the floating floor of the tilt relaxation need "//&
                  "on each mode. 'ANY': whatever detector the speed law uses, including a "//&
                  "one-sided reference and a single neighbour residual. 'LOOSE': a two-sided "//&
                  "reference and a usable residual on both sides along the axis (three cells in "//&
@@ -11519,7 +11496,7 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "the twist follows LOOSE. Where the rule fails the speed law alone sets the "//&
                  "rate. A one-sided detector beside a grounding line reads the real steepening of "//&
                  "the surface there as a mode.", &
-                 default="ANY", do_not_log=(.not.CS%dg_tilt_relax) .or. (CS%dg_tilt_relax_ssa_frac <= 0.0))
+                 default="ANY", do_not_log=.not.CS%dg_tilt_relax)
   select case (trim(ssa_stencil_str))
     case ("ANY") ; CS%dg_tilt_relax_ssa_stencil = SSA_STENCIL_ANY
     case ("LOOSE") ; CS%dg_tilt_relax_ssa_stencil = SSA_STENCIL_LOOSE
@@ -11528,17 +11505,8 @@ subroutine read_DG_params(param_file, mdl, CS, US)
     case default ; call MOM_error(FATAL, "read_DG_params: DG1_TILT_RELAX_SSA_STENCIL must be "//&
                                   "ANY, LOOSE, STRICT or EDGE2, not "//trim(ssa_stencil_str)//".")
   end select
-  call get_param(param_file, mdl, "DG1_TILT_RELAX_SSA_FREE_EDGE", CS%dg_tilt_relax_ssa_free_edge, &
-                 "If true, a cell the grounding line crosses also gets the DG1_TILT_RELAX_SSA_FRAC "//&
-                 "part, on an axis that DG1_TILT_RELAX_FREE_EDGE (or DG1_TILT_RELAX_WIDE_NEIGHBOURS) "//&
-                 "opens, which is where the speed law acts in such a cell today. The density "//&
-                 "rho' and the basal drag beta are weighted by the grounded area fraction. The "//&
-                 "twist of such a cell is not relaxed. The reference on that axis reads neighbours "//&
-                 "of any flotation state, as the speed law does there, and DG1_TILT_RELAX_SSA_STENCIL "//&
-                 "does not apply to it.", &
-                 default=.false., do_not_log=(.not.CS%dg_tilt_relax) .or. (CS%dg_tilt_relax_ssa_frac <= 0.0))
   call get_param(param_file, mdl, "DG1_TILT_RELAX_SSA_EDGE_ONESIDED", CS%dg_tilt_relax_ssa_edge_onesided, &
-                 "If true, DG1_TILT_RELAX_SSA_STENCIL withholds the shallow-shelf part where the "//&
+                 "If true, DG1_TILT_RELAX_SSA_STENCIL withholds the floor part where the "//&
                  "detector is one-sided because a neighbour is ice of another flotation state (a "//&
                  "grounding line), but accepts a one-sided detector where the absent neighbour lies "//&
                  "across a velocity boundary face (any face code but 2, the calving front) or outside "//&
@@ -11547,32 +11515,25 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "neighbours' rules. The twist is then withheld only where a face neighbour is ice of "//&
                  "another flotation state. An ice margin inside the domain is treated like a "//&
                  "grounding line unless DG1_TILT_RELAX_SSA_EDGE_MARGINS is true.", &
-                 default=.false., do_not_log=(.not.CS%dg_tilt_relax) .or. (CS%dg_tilt_relax_ssa_frac <= 0.0))
+                 default=.false., do_not_log=.not.CS%dg_tilt_relax)
   call get_param(param_file, mdl, "DG1_TILT_RELAX_SSA_EDGE_MARGINS", CS%dg_tilt_relax_ssa_edge_margins, &
                  "If true, DG1_TILT_RELAX_SSA_EDGE_ONESIDED also accepts a one-sided detector beside an "//&
                  "ice margin inside the domain (a land-terminating margin or a calving front). There "//&
                  "the real surface often steepens toward the edge, and a one-sided detector reads "//&
                  "that steepening as a mode.", &
                  default=.false., do_not_log=(.not.CS%dg_tilt_relax) .or. (.not.CS%dg_tilt_relax_ssa_edge_onesided))
-  call get_param(param_file, mdl, "DG1_TILT_RELAX_BOUNDED", CS%dg_tilt_relax_bounded, &
-                 "If true, on each axis of every ice cell where the DG1_TILT_RELAX_SSA_FRAC part does "//&
-                 "not act (a cell the grounding line crosses, a mode the stencil rule withholds, a "//&
-                 "cell beside an ice margin), remove the bounded excess of the tilt at that cell's "//&
-                 "shallow-shelf rate (with rho' and beta weighted by the grounded fraction in a "//&
-                 "crossed cell). The bounded excess is the part of the surface tilt outside the range "//&
-                 "of the slopes the neighbouring cell means allow, including their extrapolations; the "//&
-                 "tilt is a positively weighted average of the slope across the cell, so no surface "//&
-                 "consistent with those means can produce it, and the mode does not change means.", &
-                 default=.false., do_not_log=(.not.CS%dg_tilt_relax) .or. (CS%dg_tilt_relax_ssa_frac <= 0.0))
   call get_param(param_file, mdl, "DG1_TILT_RELAX_BOUNDED_TIME", CS%dg_tilt_relax_bounded_time, &
-                 "If positive, also remove the bounded excess of the tilts (see DG1_TILT_RELAX_BOUNDED) "//&
-                 "in every ice cell with this e-folding time, on top of the other parts. Non-positive "//&
-                 "disables it.", &
+                 "If positive, also remove the bounded excess of the tilts in every ice cell with this "//&
+                 "e-folding time, on top of the other parts. The bounded excess is the part of the "//&
+                 "surface tilt outside the range of the slopes the neighbouring cell means allow, "//&
+                 "including their extrapolations; the tilt is a positively weighted average of the "//&
+                 "slope across the cell, so no surface consistent with those means can produce it, "//&
+                 "and the mode does not change means. Non-positive disables it.", &
                  units="s", default=0.0, scale=US%s_to_T, do_not_log=.not.CS%dg_tilt_relax)
   call get_param(param_file, mdl, "DG1_TILT_RELAX_FLOAT_TIME", CS%dg_tilt_relax_float_time, &
                  "If positive, every mode of a wholly floating cell is relaxed at least at the rate "//&
                  "1/DG1_TILT_RELAX_FLOAT_TIME, with the detector the speed law uses. On a thin, fast "//&
-                 "shelf the shallow-shelf part is near zero and the speed law is off along the flow, "//&
+                 "shelf the speed law is off along the flow, "//&
                  "so without this nothing but transport removes the mode there. A floating cell's "//&
                  "geometry reaches the grounding line only through the velocity solve, which cannot "//&
                  "see the mode. Non-positive disables it.", &
@@ -11588,8 +11549,8 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  do_not_log=(.not.CS%dg_tilt_relax) .or. (CS%dg_tilt_relax_float_time <= 0.0))
   call get_param(param_file, mdl, "DG1_TILT_RELAX_FLOAT_EXCLUSIVE", CS%dg_tilt_relax_float_exclusive, &
                  "If true, a wholly floating cell is relaxed by the floor of DG1_TILT_RELAX_FLOAT_TIME "//&
-                 "alone, with the bounded part of DG1_TILT_RELAX_BOUNDED_TIME on top; the speed law and "//&
-                 "the shallow-shelf part do not act there. An axis the floor leaves out under "//&
+                 "alone, with the bounded part of DG1_TILT_RELAX_BOUNDED_TIME on top; the speed law "//&
+                 "does not act there. An axis the floor leaves out under "//&
                  "DG1_TILT_RELAX_FLOAT_ONESIDED then gets the bounded part only.", &
                  default=.false., do_not_log=(.not.CS%dg_tilt_relax) .or. (CS%dg_tilt_relax_float_time <= 0.0))
   call get_param(param_file, mdl, "DG1_TILT_RELAX_FLOAT_ONESIDED", CS%dg_tilt_relax_float_onesided, &
@@ -11599,20 +11560,18 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "line. The other parts of the rate still act.", &
                  default=.true., do_not_log=(.not.CS%dg_tilt_relax) .or. (CS%dg_tilt_relax_float_time <= 0.0))
   call get_param(param_file, mdl, "DG1_TILT_RELAX_FLOAT_STENCIL", CS%dg_tilt_relax_float_stencil, &
-                 "If true, under DG1_TILT_RELAX_FLOAT_EXCLUSIVE the floating floor stands in for the "//&
-                 "shallow-shelf part in the stencil rule (DG1_TILT_RELAX_SSA_STENCIL), so that beside a "//&
-                 "grounding line the floor uses the rule's detector (the one-sided second difference of "//&
-                 "EDGE2) whatever DG1_TILT_RELAX_SSA_FRAC is.  The rule never withholds the floating floor; "//&
-                 "DG1_TILT_RELAX_FLOAT_ONESIDED decides that.  If false, the rule runs on a floating cell only "//&
-                 "where the shallow-shelf part is positive, and with DG1_TILT_RELAX_SSA_FRAC = 0 the floating "//&
-                 "floor uses the plain detector.", &
+                 "If true, under DG1_TILT_RELAX_FLOAT_EXCLUSIVE the floating floor goes through the "//&
+                 "stencil rule (DG1_TILT_RELAX_SSA_STENCIL), so that beside a grounding line the floor "//&
+                 "uses the rule's detector (the one-sided second difference of EDGE2).  The rule never "//&
+                 "withholds the floating floor; DG1_TILT_RELAX_FLOAT_ONESIDED decides that.  If false, "//&
+                 "the floating floor uses the plain detector.", &
                  default=.false., do_not_log=(.not.CS%dg_tilt_relax) .or. (.not.CS%dg_tilt_relax_float_exclusive))
   call get_param(param_file, mdl, "DG1_TILT_RELAX_GROUND_TIME", CS%dg_tilt_relax_ground_time, &
-                 "If positive, the shallow-shelf part of the rate of a wholly grounded cell is "//&
-                 "replaced by the floor 1/DG1_TILT_RELAX_GROUND_TIME on each axis and the twist. "//&
-                 "The floor goes through the same stencil rule (DG1_TILT_RELAX_SSA_STENCIL and "//&
-                 "DG1_TILT_RELAX_SSA_EDGE_ONESIDED) as the shallow-shelf part, so it is withheld in "//&
-                 "the same cells and axes beside a grounding line. Non-positive disables it.", &
+                 "If positive, a wholly grounded cell is relaxed at least at the floor "//&
+                 "1/DG1_TILT_RELAX_GROUND_TIME on each axis and the twist. The floor goes through the "//&
+                 "stencil rule (DG1_TILT_RELAX_SSA_STENCIL and DG1_TILT_RELAX_SSA_EDGE_ONESIDED), so it "//&
+                 "is withheld on the cells and axes the rule names beside a grounding line. "//&
+                 "Non-positive disables it.", &
                  units="s", default=0.0, scale=US%s_to_T, do_not_log=.not.CS%dg_tilt_relax)
   call get_param(param_file, mdl, "DG1_TILT_RELAX_GROUND_BAND", CS%dg_tilt_relax_ground_band, &
                  "If positive, the floor of DG1_TILT_RELAX_GROUND_TIME acts only on a wholly grounded cell "//&
@@ -11632,7 +11591,7 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  do_not_log=(.not.CS%dg_tilt_relax) .or. (CS%dg_tilt_relax_ground_time <= 0.0))
   call get_param(param_file, mdl, "DG1_TILT_RELAX_GROUND_EXCLUSIVE", CS%dg_tilt_relax_ground_exclusive, &
                  "If true, a wholly grounded cell is relaxed by the floor of DG1_TILT_RELAX_GROUND_TIME "//&
-                 "alone, with the bounded part on top; the speed law and the shallow-shelf part do not "//&
+                 "alone, with the bounded part on top; the speed law does not "//&
                  "act there. With DG1_TILT_RELAX_GROUND_TIME off, such a cell gets the bounded part only.", &
                  default=.false., do_not_log=.not.CS%dg_tilt_relax)
   call get_param(param_file, mdl, "DG1_TILT_RELAX_CROSSED_FLOOR", CS%dg_tilt_relax_crossed_floor, &
@@ -11671,29 +11630,21 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "is wholly grounded or wholly floating; in a cell the grounding line crosses the mode "//&
                  "moves the corner mean, but not the FREE one.", &
                  default="CORNER", do_not_log=(.not.CS%dg_tilt_relax) .or. &
-                 ((.not.CS%dg_tilt_relax_bounded) .and. (CS%dg_tilt_relax_bounded_time <= 0.0)))
+                 (CS%dg_tilt_relax_bounded_time <= 0.0))
   select case (trim(bounded_mean_str))
     case ("CORNER") ; CS%dg_tilt_relax_bounded_free = .false.
     case ("FREE") ; CS%dg_tilt_relax_bounded_free = .true.
     case default ; call MOM_error(FATAL, "read_DG_params: DG1_TILT_RELAX_BOUNDED_MEAN must be "//&
                                   "CORNER or FREE, not "//trim(bounded_mean_str)//".")
   end select
-  call get_param(param_file, mdl, "DG1_TILT_RELAX_SSA_U_CREDIT", CS%dg_tilt_relax_ssa_u_credit, &
-                 "The fraction of the transport removal rate |u_n|/dx that is taken off the "//&
-                 "DG1_TILT_RELAX_SSA_FRAC rate before it is used, so that transport and "//&
-                 "relaxation together deliver about SSA_FRAC times the physical rate. For the "//&
-                 "twist the credit is |u|/dx + |v|/dy. 0 credits nothing.", &
-                 units="nondim", default=0.0, &
-                 do_not_log=(.not.CS%dg_tilt_relax) .or. (CS%dg_tilt_relax_ssa_frac <= 0.0))
   call get_param(param_file, mdl, "DG1_TILT_RELAX_SPEED_LAW_WHERE", speed_where_str, &
                  "Where the speed law of DG1_TILT_RELAX_U_CUT acts. 'EVERYWHERE': on every "//&
-                 "mode, and the larger of it and the DG1_TILT_RELAX_SSA_FRAC part is used. "//&
-                 "'NO_SSA': only on a mode where the shallow-shelf part is not formed, which is "//&
-                 "a cell the grounding line crosses, a mode whose detector fails "//&
-                 "DG1_TILT_RELAX_SSA_STENCIL, a mode the credit takes to zero, or any cell "//&
-                 "before the first velocity solve.", &
-                 default="EVERYWHERE", &
-                 do_not_log=(.not.CS%dg_tilt_relax) .or. (CS%dg_tilt_relax_ssa_frac <= 0.0))
+                 "mode, and the larger of it and the floor part (DG1_TILT_RELAX_GROUND_TIME, or the "//&
+                 "floating floor under DG1_TILT_RELAX_FLOAT_STENCIL) is used. 'NO_SSA': only on a mode "//&
+                 "where the floor part is not formed, which is a cell the grounding line crosses, a "//&
+                 "mode whose detector fails DG1_TILT_RELAX_SSA_STENCIL, or a mode the credit takes "//&
+                 "to zero.", &
+                 default="EVERYWHERE", do_not_log=.not.CS%dg_tilt_relax)
   select case (trim(speed_where_str))
     case ("EVERYWHERE") ; CS%dg_tilt_relax_speed_no_ssa = .false.
     case ("NO_SSA") ; CS%dg_tilt_relax_speed_no_ssa = .true.
@@ -11707,7 +11658,7 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "away, and its tilt and twist residuals are the cell's own with the sign "//&
                  "flipped on the axis normal to the wall. A cell beside the wall then has a "//&
                  "two-sided reference, as in the interior. It changes the residuals of both the "//&
-                 "speed law and the shallow-shelf part.", &
+                 "speed law and the floors.", &
                  default=.false., do_not_log=.not.CS%dg_tilt_relax)
 
   if (CS%use_DG_thickness .and. .not.CS%GL_regularize) call MOM_error(FATAL, &
@@ -12836,13 +12787,11 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
   logical, dimension(SZDI_(G),SZDJ_(G)) :: ok_xi, ok_eta, ok_w ! Those residuals exist
   real :: gxs, gys   ! The rate on each axis for this cell [T-1 ~> s-1]
   real :: gws        ! The rate on the twist for this cell [T-1 ~> s-1]
-  real :: sx, sy, sw ! The shallow-shelf part of the rate on each mode of this cell [T-1 ~> s-1]
-  logical :: ssa_on  ! The shallow-shelf part is in use
-  logical :: wh_x, wh_y, wh_w ! The shallow-shelf part of this mode was withheld by the stencil rule
+  real :: sx, sy, sw ! The floor part of the rate on each mode of this cell [T-1 ~> s-1]
+  logical :: wh_x, wh_y, wh_w ! The floor part of this mode was withheld by the stencil rule
   logical :: pass    ! The detector of this mode passes the stencil rule
   logical :: qm, qp  ! The neighbour residual behind or ahead is usable and two-sided
   logical :: bnd_on  ! The bounded excess is removed somewhere
-  logical, dimension(SZDI_(G),SZDJ_(G)) :: ssa_dx, ssa_dy ! The shallow-shelf part acted on that axis
   real, dimension(SZDI_(G),SZDJ_(G)) :: tsx, tsy ! The surface tilts of each cell [Z ~> m]
   real :: sbl(-2:2)  ! Mean surfaces of a cell and its neighbours along one axis [Z ~> m]
   real :: ddl(-2:1)  ! Distances between the centres of those cells [L ~> m]
@@ -12867,7 +12816,7 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
   logical, dimension(SZDI_(G),SZDJ_(G)) :: deep ! A crossed cell none of whose eight neighbours is wholly
                                                ! grounded or floating ice or a thickness boundary cell
   logical :: dp_c    ! This cell is such a cell and the deep crossed floor is on
-  logical :: stn_on  ! The shallow-shelf part or the grounded floor is in use, so the stencil rule runs
+  logical :: stn_on  ! A floor that goes through the stencil rule is in use, so the rule runs
   real :: rbx, rby  ! Bounded removal rates [Z T-1 ~> m s-1]
   real :: Rb(2,2)    ! The corner pattern of the bounded removal [Z T-1 ~> m s-1]
   logical :: minh_on ! DG1_TILT_RELAX_MIN_H_STOP is on and the stage's base corners were passed
@@ -12890,8 +12839,6 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
   integer :: sd_x, sd_y ! Side (-1 behind, 1 ahead) whose two residuals give a one-sided second
                         ! difference under the EDGE2 rule, or 0
   integer :: nr      ! Number of halo cells on which the residuals are needed
-  real :: ua_x, ua_y ! Cell-centred speed on each axis, with no credit [L T-1 ~> m s-1]
-  real :: half_c     ! Half of DG1_TILT_RELAX_SSA_U_CREDIT [nondim]
   real :: em, ep     ! The neighbour residuals behind and ahead, or a mirror ghost's [Z ~> m]
   real :: sm, sp     ! The neighbour mean surfaces behind and ahead, or a mirror ghost's [Z ~> m]
   logical :: xm, xp, ym, yp ! The neighbour tilt residual behind or ahead along x or y is usable
@@ -12997,22 +12944,20 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
     "dg1_tilt_relax_rate: DG1_TILT_RELAX needs a halo of at least 3 cells; increase NIHALO/NJHALO.")
 
   rate_cap = 0.5 / max(dt, tiny(dt))
-  ssa_on = (CS%dg_tilt_relax_ssa_frac > 0.0)
   k_float = 0.0
   if (CS%dg_tilt_relax_float_time > 0.0) k_float = 1.0 / CS%dg_tilt_relax_float_time
   k_ground = 0.0
   if (CS%dg_tilt_relax_ground_time > 0.0) k_ground = 1.0 / CS%dg_tilt_relax_ground_time
   k_deep = 0.0
   if (CS%dg_tilt_relax_deep_crossed_time > 0.0) k_deep = 1.0 / CS%dg_tilt_relax_deep_crossed_time
-  ! The grounded floor takes the shallow-shelf part's place, so it needs the same stencil rule.
-  stn_on = ssa_on .or. (k_ground > 0.0) .or. &
+  ! The grounded floor, and the floating floor under FLOAT_STENCIL, go through the stencil rule.
+  stn_on = (k_ground > 0.0) .or. &
            ((CS%dg_tilt_relax_float_stencil .and. CS%dg_tilt_relax_float_exclusive) .and. (k_float > 0.0))
   ! The EDGE2 rule reads residuals two cells away, which read means one further still.
   nr = 1
   if (stn_on .and. (CS%dg_tilt_relax_ssa_stencil == SSA_STENCIL_EDGE2)) nr = 2
   if ((nr == 2) .and. ((G%isc - G%isd < 4) .or. (G%jsc - G%jsd < 4))) call MOM_error(FATAL, &
     "dg1_tilt_relax_rate: DG1_TILT_RELAX_SSA_STENCIL = EDGE2 needs a halo of at least 4 cells.")
-  half_c = 0.5 * CS%dg_tilt_relax_ssa_u_credit
 
   ! Flotation state on the data domain.  The comparison variable itself is the corner surface,
   ! built where the residuals are; only the state is needed here, to decide which neighbours a
@@ -13116,7 +13061,7 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
     enddo ; enddo
   endif
   r2_xi(:,:) = .false. ; r2_eta(:,:) = .false.
-  ssa_dx(:,:) = .false. ; ssa_dy(:,:) = .false. ; tsx(:,:) = 0.0 ; tsy(:,:) = 0.0
+  tsx(:,:) = 0.0 ; tsy(:,:) = 0.0
   gl_xi(:,:) = .false. ; gl_eta(:,:) = .false.
   edge_on = stn_on .and. CS%dg_tilt_relax_ssa_edge_onesided
   ! The sides on which an absent neighbour is a real boundary of the model rather than an ice margin:
@@ -13171,7 +13116,7 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
       use_p = use_p .and. (state(i+1,j) == state(i,j))
     endif
     ! A side the reference lacks for any reason but a model boundary (a grounding line, or an ice
-    ! margin inside the domain) keeps the residual one-sided for the shallow-shelf stencil rule.
+    ! margin inside the domain) keeps the residual one-sided for the stencil rule.
     gl_xi(i,j) = (ice(i-1,j) .and. (.not.use_m)) .or. (ice(i+1,j) .and. (.not.use_p)) .or. &
                  ((.not.ice(i-1,j)) .and. (.not.bf_w(i,j))) .or. ((.not.ice(i+1,j)) .and. (.not.bf_e(i,j)))
     ! A mirror ghost beyond a free-slip wall has the cell's own mean, one cell width away.
@@ -13266,7 +13211,7 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
   enddo ; enddo
 
   ! A residual that is one-sided only because a neighbour holds no ice is as good as a two-sided
-  ! one for the shallow-shelf stencil rule: there is no grounding-line steepening for it to read.
+  ! one for the stencil rule: there is no grounding-line steepening for it to read.
   if (edge_on) then
     r2_xi(:,:) = r2_xi(:,:) .or. (oks_xi(:,:) .and. (.not.gl_xi(:,:)))
     r2_eta(:,:) = r2_eta(:,:) .or. (oks_eta(:,:) .and. (.not.gl_eta(:,:)))
@@ -13326,36 +13271,14 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
     wym = ok_w(i,j-1) .and. (state(i,j-1) == state(i,j))
     wyp = ok_w(i,j+1) .and. (state(i,j+1) == state(i,j))
 
-    ! The shallow-shelf part, only in a cell of one flotation state: across a grounding line the
-    ! restoring rate is not that of a uniform slab, and the real change of slope is there.  It is a
-    ! floor on the speed law, so where the law asks for more the law is what acts.
+    ! The floor part, only in a cell of one flotation state, where the real change of slope is not.
+    ! It is a floor on the speed law, so where the law asks for more the law is what acts.
     sx = 0.0 ; sy = 0.0 ; sw = 0.0
     wh_x = .false. ; wh_y = .false. ; wh_w = .false. ; sd_x = 0 ; sd_y = 0
-    if (stn_on .and. ((state(i,j) /= 0) .or. &
-        (CS%dg_tilt_relax_ssa_free_edge .and. (ax .or. ay)))) then
-      if (ssa_on) call dg1_tilt_relax_ssa_rates(CS, G, i, j, h_nodal_in(i,j,:,:), state(i,j), sx, sy, sw)
-      ! A crossed cell gets the shallow-shelf part only on an axis that is opened to neighbours of
-      ! any flotation state, where the speed law would otherwise act, and never on its twist.
-      if (state(i,j) == 0) then
-        if (.not.ax) sx = 0.0
-        if (.not.ay) sy = 0.0
-        sw = 0.0
-      endif
-      ! Transport removes the alternating pattern at about |u_n|/dx on its own, so the credited
-      ! part of that is taken off what the relaxation must add.  The relaxation delivers twice its
-      ! rate on an alternating pattern, hence the half.
-      if (half_c > 0.0) then
-        ua_x = 0.25 * ((abs(CS%u_shelf(I-1,J-1)) + abs(CS%u_shelf(I,J))) + &
-                       (abs(CS%u_shelf(I,J-1))   + abs(CS%u_shelf(I-1,J))))
-        ua_y = 0.25 * ((abs(CS%v_shelf(I-1,J-1)) + abs(CS%v_shelf(I,J))) + &
-                       (abs(CS%v_shelf(I,J-1))   + abs(CS%v_shelf(I-1,J))))
-        sx = max(sx - ((half_c * ua_x) * G%IdxT(i,j)), 0.0)
-        sy = max(sy - ((half_c * ua_y) * G%IdyT(i,j)), 0.0)
-        sw = max(sw - (half_c * ((ua_x * G%IdxT(i,j)) + (ua_y * G%IdyT(i,j)))), 0.0)
-      endif
-      ! The grounded floor takes the shallow-shelf part's place in a wholly grounded cell, before the
-      ! stencil rule, so that it is withheld exactly where that part would be.  Its own transport
-      ! credit reads the slower face of each axis, as the floating floor does.
+    if (stn_on .and. (state(i,j) /= 0)) then
+      ! The grounded floor in a wholly grounded cell, before the stencil rule, so that the rule decides
+      ! where it is withheld.  Its own transport credit reads the slower face of each axis, as the
+      ! floating floor does.
       if ((k_ground > 0.0) .and. (state(i,j) == 1) .and. gband(i,j)) then
         kgx = k_ground ; kgy = k_ground
         if (CS%dg_tilt_relax_ground_u_credit > 0.0) then
@@ -13369,9 +13292,9 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
         sx = 0.0 ; sy = 0.0 ; sw = 0.0
       elseif ((CS%dg_tilt_relax_float_stencil .and. CS%dg_tilt_relax_float_exclusive) .and. &
               (k_float > 0.0) .and. (state(i,j) == -1)) then
-        ! Under DG1_TILT_RELAX_FLOAT_STENCIL the floating floor stands in for the shallow-shelf part here too,
-        ! so that the stencil rule chooses its detector whatever the shallow-shelf rate.  The rule does not
-        ! withhold the floating floor; DG1_TILT_RELAX_FLOAT_ONESIDED decides that, below.
+        ! Under DG1_TILT_RELAX_FLOAT_STENCIL the floating floor goes through the stencil rule too, so
+        ! that the rule chooses its detector.  The rule does not withhold the floating floor;
+        ! DG1_TILT_RELAX_FLOAT_ONESIDED decides that, below.
         kfx = k_float ; kfy = k_float
         if (CS%dg_tilt_relax_float_u_credit > 0.0) then
           cfx = (CS%dg_tilt_relax_float_u_credit * G%IdxT(i,j)) * &
@@ -13383,9 +13306,7 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
         sx = kfx ; sy = kfy ; sw = max(kfx, kfy)
       endif
       ! A one-sided detector beside a grounding line reads the real steepening there as a mode,
-      ! so the shallow-shelf part may ask for a detector with neighbours on both sides.  A crossed
-      ! cell under DG1_TILT_RELAX_SSA_FREE_EDGE skips the rule: its opened axis reads across the
-      ! grounding line by design, as the speed law there does, because nothing else holds its node.
+      ! so the floor part may ask for a detector with neighbours on both sides.
       if ((CS%dg_tilt_relax_ssa_stencil /= SSA_STENCIL_ANY) .and. (state(i,j) /= 0)) then
         ! A side that is a mirrored wall, or (edge_on) holds no ice, is no obstacle to the rule.
         edge_xm = wall_w(i,j) .or. bf_w(i,j) ; edge_xp = wall_e(i,j) .or. bf_e(i,j)
@@ -13443,12 +13364,12 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
       endif
     endif
     if (CS%dg_tilt_relax_speed_no_ssa) then
-      ! The speed law only where the shallow-shelf part is not formed.
+      ! The speed law only where the floor part is not formed.
       gxs = gx(i,j) ; if (sx > 0.0) gxs = sx
       gys = gy(i,j) ; if (sy > 0.0) gys = sy
       gws = max(gx(i,j), gy(i,j)) ; if (sw > 0.0) gws = sw
     elseif (wh_w) then
-      ! The twist's own shallow-shelf part was withheld, so neither axis's may stand in for it.
+      ! The twist's own floor part was withheld, so neither axis's may stand in for it.
       gxs = max(gx(i,j), sx) ; gys = max(gy(i,j), sy) ; gws = max(gx(i,j), gy(i,j))
     else
       gxs = max(gx(i,j), sx) ; gys = max(gy(i,j), sy) ; gws = max(max(gxs, gys), sw)
@@ -13543,7 +13464,7 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
 
     ! Why each mode did or did not act.  Each code starts at the first test that mode faces and is
     ! narrowed as the later tests pass, so whatever the mode fell at is what stays.  The twist
-    ! usually takes the largest of the two axis rates and its own shallow-shelf rate, but not where
+    ! usually takes the largest of the two axis rates and its own floor rate, but not where
     ! its own part is withheld or the floating floor leaves it out, so the cell is skipped only when
     ! all three rates are zero.
     why_x = TRW_REACH ; why_y = TRW_REACH
@@ -13735,10 +13656,6 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
     R_node(i,j,2,1) = R_node(i,j,2,1) - Tbar
     R_node(i,j,1,2) = R_node(i,j,1,2) - Tbar
 
-    ! Where the shallow-shelf part acted, the bounded pass below adds only its fast part.
-    ssa_dx(i,j) = (sx > 0.0) .and. (k_xi > 0.0)
-    ssa_dy(i,j) = (sy > 0.0) .and. (k_eta > 0.0)
-
     if (diag_on) then
       CS%dg_tilt_relax_rate(i,j) = max(max(k_xi, k_eta), k_w)
       CS%dg_tilt_relax_tend(i,j) = sqrt((((r_xi**2) + (r_eta**2)) / 12.0) + ((r_w**2) / 144.0))
@@ -13750,7 +13667,7 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
       CS%dg_tilt_relax_rate_w(i,j) = k_w
       CS%dg_tilt_relax_r_x(i,j) = r_xi ; CS%dg_tilt_relax_r_y(i,j) = r_eta
       CS%dg_tilt_relax_r_w(i,j) = r_w
-      ! Where the shallow-shelf part was withheld, say so wherever the speed law then decided.
+      ! Where the floor part was withheld, say so wherever the speed law then decided.
       if (wh_x .and. ((why_x == TRW_ACTED) .or. (why_x == TRW_CAPPED) .or. (why_x == TRW_REACH))) &
         why_x = TRW_SSA_ONESIDED
       if (wh_y .and. ((why_y == TRW_ACTED) .or. (why_y == TRW_CAPPED) .or. (why_y == TRW_REACH))) &
@@ -13776,22 +13693,16 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
   enddo ; enddo
 
   ! The bounded excess: the part of each tilt that no surface consistent with the neighbouring cell
-  ! means can produce, removed at the shallow-shelf rate where that part did not act and, with
-  ! DG1_TILT_RELAX_BOUNDED_TIME, everywhere at a fixed rate.  It is added as a pure tilt with its own
-  ! cell mean taken out, so no mass moves.
+  ! means can produce, removed everywhere at the fixed rate of DG1_TILT_RELAX_BOUNDED_TIME.  It is
+  ! added as a pure tilt with its own cell mean taken out, so no mass moves.
   k_fast = 0.0
   if (CS%dg_tilt_relax_bounded_time > 0.0) k_fast = 1.0 / CS%dg_tilt_relax_bounded_time
-  bnd_on = (CS%dg_tilt_relax_bounded .and. ssa_on) .or. (k_fast > 0.0)
+  bnd_on = (k_fast > 0.0)
   if (bnd_on) then
     rr = CS%density_ice / CS%density_ocean_avg
     do j = jsc, jec ; do i = isc, iec
       if (.not.ice(i,j)) cycle
       kbx = k_fast ; kby = k_fast
-      if (CS%dg_tilt_relax_bounded .and. ssa_on .and. ((.not.ssa_dx(i,j)) .or. (.not.ssa_dy(i,j)))) then
-        call dg1_tilt_relax_ssa_rates(CS, G, i, j, h_nodal_in(i,j,:,:), state(i,j), sx, sy, sw)
-        if (.not.ssa_dx(i,j)) kbx = max(kbx, sx)
-        if (.not.ssa_dy(i,j)) kby = max(kby, sy)
-      endif
       kbx = min(kbx, rate_cap) ; kby = min(kby, rate_cap)
       if ((kbx <= 0.0) .and. (kby <= 0.0)) cycle
       hvl(:) = (/ ice(i-2,j), ice(i-1,j), .true., ice(i+1,j), ice(i+2,j) /)
@@ -14033,75 +13944,6 @@ pure function dg1_bounded_excess(tilt, sb, dd, have, width) result(excess)
   lo = minval(v(1:n)) ; hi = maxval(v(1:n))
   excess = tilt - min(max(tilt, lo), hi)
 end function dg1_bounded_excess
-
-!> The shallow-shelf part of the tilt-relaxation rate for each mode of one cell of a single
-!! flotation state: DG1_TILT_RELAX_SSA_FRAC/2 times the rate r = rho' g H^2 k^2/(beta + 4 eta H k^2)
-!! at which the linearized shallow-shelf equations flatten a surface wave of wavenumber k, with
-!! k = pi/dx for the x tilt, pi/dy for the y tilt and both for the twist.  The relaxation removes
-!! an alternating pattern at twice its rate, hence the half.
-!!
-!! The nodal driving force of these grid-scale patterns cancels exactly between the two cells that
-!! share each node, so the velocity solve never sees them and cannot flatten them, as it flattens
-!! every longer wave at close to r.  The coefficients are the cell's own: the cell mean thickness,
-!! the depth-integrated viscosity and the secant basal drag from the last velocity solve.  The
-!! rate of a cell is not built from smoothed or averaged coefficients, because on a rough bed a
-!! sticky cell would then set the rate of its slippery neighbours.  Before the first velocity
-!! solve of a run the viscosity may still be zero, and the rate is then left at zero.
-subroutine dg1_tilt_relax_ssa_rates(CS, G, i, j, h_nodal_cell, state, kx, ky, kw)
-  type(ice_shelf_dyn_CS), intent(in)  :: CS    !< Ice shelf dynamics control structure
-  type(ocean_grid_type),  intent(in)  :: G     !< Ocean grid structure
-  integer,                intent(in)  :: i     !< The cell's i index
-  integer,                intent(in)  :: j     !< The cell's j index
-  real, dimension(2,2),   intent(in)  :: h_nodal_cell !< The cell's corner thicknesses [Z ~> m]
-  integer,                intent(in)  :: state !< 1 wholly grounded, -1 wholly floating, 0 crossed
-  real,                   intent(out) :: kx    !< Rate on the x tilt [T-1 ~> s-1]
-  real,                   intent(out) :: ky    !< Rate on the y tilt [T-1 ~> s-1]
-  real,                   intent(out) :: kw    !< Rate on the twist [T-1 ~> s-1]
-
-  real :: H_cell   ! Cell-mean thickness [Z ~> m]
-  real :: nuH      ! Depth-integrated viscosity per unit area [R L2 Z T-1 ~> Pa s m]
-  real :: beta     ! Secant basal drag per unit area [R Z T-1 ~> Pa s m-1]
-  real :: rho_p    ! Ice density, times 1 - rho_ice/rho_ocean where afloat [R ~> kg m-3]
-  real :: push     ! rho_p g H^2, the driving force per unit slope and wavenumber [R L2 Z T-2 ~> Pa m]
-  real :: k2x, k2y, k2w ! Squared wavenumbers of each mode's wave [L-2 ~> m-2]
-  real :: half_frac ! Half of DG1_TILT_RELAX_SSA_FRAC [nondim]
-  real :: fg        ! Grounded area fraction of a crossed cell, clipped to [0,1] [nondim]
-
-  kx = 0.0 ; ky = 0.0 ; kw = 0.0
-  if (CS%visc_qps == 4) then
-    nuH = (0.25 * G%IareaT(i,j)) * &
-      ((CS%ice_visc(i,j,1) + CS%ice_visc(i,j,4)) + (CS%ice_visc(i,j,2) + CS%ice_visc(i,j,3)))
-  else
-    nuH = CS%ice_visc(i,j,1) * G%IareaT(i,j)
-  endif
-  if (nuH <= 0.0) return
-
-  H_cell = max(nodal_cell_mean(h_nodal_cell, CS%cell_mean_w(i,j,:,:)), CS%min_h_shelf)
-  if (state == 1) then
-    rho_p = CS%density_ice
-    beta = cell_basal_traction(CS, G, i, j, H_cell) * G%IareaT(i,j)
-  elseif (state == 0) then
-    ! A crossed cell: the grounded part carries the drag and the full density, the floating part
-    ! the reduced density and no drag.
-    fg = min(max(CS%ground_frac(i,j), 0.0), 1.0)
-    rho_p = (fg * CS%density_ice) + &
-            ((1.0 - fg) * (CS%density_ice * (1.0 - (CS%density_ice / CS%density_ocean_avg))))
-    beta = fg * (cell_basal_traction(CS, G, i, j, H_cell) * G%IareaT(i,j))
-  else
-    rho_p = CS%density_ice * (1.0 - (CS%density_ice / CS%density_ocean_avg))
-    beta = 0.0
-  endif
-  push = (rho_p * CS%g_Earth) * (H_cell * H_cell)
-  k2x = DG1_PI_SQ * (G%IdxT(i,j) * G%IdxT(i,j))
-  k2y = DG1_PI_SQ * (G%IdyT(i,j) * G%IdyT(i,j))
-  k2w = k2x + k2y
-  half_frac = 0.5 * CS%dg_tilt_relax_ssa_frac
-  kx = half_frac * ((push * k2x) / (beta + (4.0 * nuH) * k2x))
-  ky = half_frac * ((push * k2y) / (beta + (4.0 * nuH) * k2y))
-  kw = half_frac * ((push * k2w) / (beta + (4.0 * nuH) * k2w))
-
-end subroutine dg1_tilt_relax_ssa_rates
-
 
 !> Advance CS%h_nodal one step with SSP-RK2, including the sources and mode damping, and return
 !! the stage-averaged face fluxes.
