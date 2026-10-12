@@ -633,7 +633,18 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! face coefficient reaches 1 [nondim].
   real :: dg_art_visc_kcell       !< Artificial viscosity: per-cell bound on dt times the summed face
                                   !! decay rates; SSP-RK2 needs < 2 [nondim].
-  real :: dg_art_visc_lump_frac   !< Artificial viscosity: the lumped fraction theta of the mass matrix whose
+  real :: dg_band_diff_time       !< Band diffusion: decay time of the crosswind tilt mode under the
+                                  !! crosswind diffusion of the surface near the grounding line, or 0 for
+                                  !! none [T ~> s].
+  integer :: dg_band_diff_width   !< Band diffusion: the band's width in cells (chessboard distance).
+  real :: dg_band_diff_u_iso      !< Band diffusion: speed below which the diffusion becomes isotropic
+                                  !! [L T-1 ~> m s-1].
+  real :: dg_band_diff_penalty    !< Band diffusion: interior-penalty constant C, sigma = C kappa_nn/dx [nondim].
+  logical :: dg_band_diff_crossed !< Band diffusion: if true, cells the grounding line crosses are in the band
+                                  !! as well as wholly grounded cells.
+  real, pointer, dimension(:,:) :: dg_band_kappa => NULL() !< Band diffusivity of each cell, weight
+                                  !! included, from the last call [L2 T-1 ~> m2 s-1].
+  real :: dg_art_visc_lump_frac  !< Artificial viscosity: the lumped fraction theta of the mass matrix whose
                                   !! inverse the artificial-viscosity part of the right-hand side takes;
                                   !! 0 is the consistent mass matrix [nondim].
   real :: dg_slow_idle_u_tiny     !< Artificial viscosity: stagnant-jump flag threshold on |u_face| [L T-1 ~> m s-1].
@@ -754,7 +765,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_phi_x_FV = -1, id_phi_y_FV = -1, &
              id_dg_art_visc_coef_u = -1, id_dg_art_visc_coef_v = -1, &
              id_dg_art_visc_nu_u = -1, id_dg_art_visc_nu_v = -1, &
-             id_dg_art_visc_cell_scale = -1, &
+             id_dg_art_visc_cell_scale = -1, id_dg_band_kappa = -1, &
              id_dg_slow_idle_face_u = -1, id_dg_slow_idle_face_v = -1, &
              id_h_jump_face_u = -1, id_h_jump_face_v = -1, &
              id_s_jump_face_u = -1, id_s_jump_face_v = -1, &
@@ -2051,6 +2062,13 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          'dg_art_visc_cell_scale', CS%diag%axesT1, Time, &
          'DG(1) artificial-viscosity cap factor: 1 where the DG1_ART_VISC_KCELL cap is inactive, '//&
          '< 1 cap engaged and face coefficients scaled by this factor', 'nondim')
+      if (CS%dg_band_diff_time > 0.0) then
+        allocate(CS%dg_band_kappa(G%isd:G%ied,G%jsd:G%jed), source=0.0)
+        CS%id_dg_band_kappa = register_diag_field('ice_shelf_model', 'dg_band_kappa', &
+           CS%diag%axesT1, Time, 'DG(1) band diffusivity of DG1_BAND_DIFF_TIME in each cell, its band '//&
+           'weight included; zero outside the band', 'm2 yr-1', &
+           conversion=365.0*86400.0*US%L_T_to_m_s*US%L_to_m)
+      endif
       ! alpha decides how fast TRANSPORT clears the tilt mode: the decay factor f(alpha) peaks at
       ! alpha = 2*sqrt(3)-1 and break-even against no viscosity at all is alpha = 5.5.  This is
       ! the one route by which DG1_ART_VISC_TAU_FLOOR reaches the tilt relaxation.
@@ -2762,6 +2780,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_art_visc_nu_u, CS%dg_art_visc_nu_u, CS%diag)
     if (CS%id_dg_art_visc_nu_v > 0 .and. associated(CS%dg_art_visc_nu_v)) &
         call post_data(CS%id_dg_art_visc_nu_v, CS%dg_art_visc_nu_v, CS%diag)
+    if (CS%id_dg_band_kappa > 0) &
+        call post_data(CS%id_dg_band_kappa, CS%dg_band_kappa, CS%diag)
     if (CS%id_dg_art_visc_cell_scale > 0 .and. associated(CS%dg_art_visc_cell_scale)) &
         call post_data(CS%id_dg_art_visc_cell_scale, CS%dg_art_visc_cell_scale, CS%diag)
     if (CS%id_dg_slow_idle_face_u > 0 .and. associated(CS%dg_slow_idle_face_u)) &
@@ -9840,6 +9860,7 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_art_visc_nu_u)) deallocate(CS%dg_art_visc_nu_u)
   if (associated(CS%dg_art_visc_nu_v)) deallocate(CS%dg_art_visc_nu_v)
   if (associated(CS%dg_art_visc_cell_scale)) deallocate(CS%dg_art_visc_cell_scale)
+  if (associated(CS%dg_band_kappa)) deallocate(CS%dg_band_kappa)
   if (associated(CS%dg_slow_idle_face_u)) deallocate(CS%dg_slow_idle_face_u)
   if (associated(CS%dg_slow_idle_face_v)) deallocate(CS%dg_slow_idle_face_v)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
@@ -11753,6 +11774,51 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "SSP-RK2 requires < 2.", &
                  units="nondim", default=1.0, &
                  do_not_log=.not.CS%use_DG_thickness)
+  call get_param(param_file, mdl, "DG1_BAND_DIFF_TIME", CS%dg_band_diff_time, &
+                 "If positive, grounded DG(1) cells near the grounding line (the band of "//&
+                 "DG1_BAND_DIFF_WIDTH) diffuse the surface across the flow: the thickness equation gains "//&
+                 "div(kappa K grad s), with K = n n^T for the crosswind unit vector n of the cell-mean "//&
+                 "velocity, discretized by the symmetric interior penalty method.  kappa = "//&
+                 "(Kxx dx^2 + Kyy dy^2)/(12 (Kxx + Kyy) DG1_BAND_DIFF_TIME), which makes a crosswind "//&
+                 "alternation of the tilts decay in this time.  Unlike the jump-only artificial "//&
+                 "viscosity, the operator is a consistent diffusion, which has no alternating null "//&
+                 "vector; it moves the cell means with the tilts, so it smooths real crosswind "//&
+                 "structure in the band as well.  Mass is conserved and the flux enters uh_ice and "//&
+                 "vh_ice.  The rate is capped at 0.5/dt for SSP-RK2.  Zero or less turns it off.", &
+                 units="s", default=0.0, scale=US%s_to_T, do_not_log=.not.CS%use_DG_thickness)
+  call get_param(param_file, mdl, "DG1_BAND_DIFF_WIDTH", CS%dg_band_diff_width, &
+                 "The band of DG1_BAND_DIFF_TIME: grounded and crossed ice cells within this many cells "//&
+                 "(chessboard distance) of an ice cell that is not wholly grounded take the full "//&
+                 "diffusivity, and those one cell farther take half.  Faces diffuse only between two "//&
+                 "cells that both take some.  It must be at most the halo width minus 1.", &
+                 units="nondim", default=3, &
+                 do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_diff_time <= 0.0))
+  call get_param(param_file, mdl, "DG1_BAND_DIFF_U_ISO", CS%dg_band_diff_u_iso, &
+                 "The speed u_iso below which DG1_BAND_DIFF_TIME becomes isotropic: K = (u_iso^2 I + "//&
+                 "|u|^2 n n^T)/(|u|^2 + u_iso^2), which is crosswind for |u| >> u_iso and isotropic at rest.", &
+                 units="m s-1", default=3.17e-8, scale=US%m_s_to_L_T, &
+                 do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_diff_time <= 0.0))
+  call get_param(param_file, mdl, "DG1_BAND_DIFF_CROSSED", CS%dg_band_diff_crossed, &
+                 "If true, cells the grounding line crosses are in the band of DG1_BAND_DIFF_TIME as "//&
+                 "well as wholly grounded cells.  If false, only faces between two wholly grounded "//&
+                 "cells diffuse, so the diffusion only moves mass among grounded cells, which leaves "//&
+                 "the volume above flotation unchanged while they stay grounded.  With crossed cells "//&
+                 "in, the surface step at a grounding line drives mass into the floating part: at a "//&
+                 "side grounding line, where the crosswind direction crosses the line, MISMIP+ x10 at "//&
+                 "10 km lost two grounded cells along each wall in 100 yr.", &
+                 default=.false., do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_diff_time <= 0.0))
+  call get_param(param_file, mdl, "DG1_BAND_DIFF_PENALTY", CS%dg_band_diff_penalty, &
+                 "The interior-penalty constant C of DG1_BAND_DIFF_TIME, sigma = C kappa_nn/dx_perp.  "//&
+                 "A prototype of the operator on Q1 cells is positive semi-definite for C >= 3 at any "//&
+                 "flow angle and not below.", &
+                 units="nondim", default=3.0, &
+                 do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_diff_time <= 0.0))
+  if (CS%dg_band_diff_time > 0.0) then
+    if (CS%dg_band_diff_width < 0) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
+        "DG1_BAND_DIFF_WIDTH must not be negative.")
+    if (CS%dg_band_diff_penalty < 3.0) call MOM_error(WARNING, "MOM_ice_shelf_dynamics: "//&
+        "DG1_BAND_DIFF_PENALTY below 3 can make the band diffusion unstable at oblique flow.")
+  endif
   call get_param(param_file, mdl, "DG1_ART_VISC_LUMP_FRAC", CS%dg_art_visc_lump_frac, &
                  "The fraction theta by which the mass matrix is lumped for the DG(1) artificial-"//&
                  "viscosity part of the right-hand side: (1-theta) M + theta diag(row sums of M), along "//&
@@ -12311,6 +12377,254 @@ subroutine dg1_art_visc_face(CS, bc_A, bc_B, hbc_A_min, hbc_B_min, h_A, h_B, bed
          (dh_eq_face_max > CS%dg_slow_idle_s_tol)
 end subroutine dg1_art_visc_face
 
+!> Values and xi- and eta-derivatives of the four Q1 basis functions at (xi, eta) on the unit cell, and those
+!! of the corner field s there.  The corner sums pair opposite corners, as the other corner reductions do.
+subroutine dg1_q1_eval(xi, eta, s, Nv, dNx, dNy, s_v, s_xi, s_eta)
+  real,                 intent(in)  :: xi    !< Position along the cell's x axis [nondim]
+  real,                 intent(in)  :: eta   !< Position along the cell's y axis [nondim]
+  real, dimension(2,2), intent(in)  :: s     !< Corner values of the field [A]
+  real, dimension(2,2), intent(out) :: Nv    !< Basis values [nondim]
+  real, dimension(2,2), intent(out) :: dNx   !< Basis derivatives along xi [nondim]
+  real, dimension(2,2), intent(out) :: dNy   !< Basis derivatives along eta [nondim]
+  real,                 intent(out) :: s_v   !< The field's value [A]
+  real,                 intent(out) :: s_xi  !< Its derivative along xi [A]
+  real,                 intent(out) :: s_eta !< Its derivative along eta [A]
+
+  Nv(1,1) = (1.0-xi)*(1.0-eta) ; Nv(2,1) = xi*(1.0-eta)
+  Nv(1,2) = (1.0-xi)*eta       ; Nv(2,2) = xi*eta
+  dNx(1,1) = -(1.0-eta) ; dNx(2,1) = (1.0-eta) ; dNx(1,2) = -eta     ; dNx(2,2) = eta
+  dNy(1,1) = -(1.0-xi)  ; dNy(2,1) = -xi       ; dNy(1,2) = (1.0-xi) ; dNy(2,2) = xi
+  s_v   = dg_sum4_rounded(Nv(1,1)*s(1,1),  Nv(2,2)*s(2,2),  Nv(2,1)*s(2,1),  Nv(1,2)*s(1,2))
+  s_xi  = dg_sum4_rounded(dNx(1,1)*s(1,1), dNx(2,2)*s(2,2), dNx(2,1)*s(2,1), dNx(1,2)*s(1,2))
+  s_eta = dg_sum4_rounded(dNy(1,1)*s(1,1), dNy(2,2)*s(2,2), dNy(2,1)*s(2,1), dNy(1,2)*s(1,2))
+end subroutine dg1_q1_eval
+
+!> DG1_BAND_DIFF_TIME: the right-hand side M dh/dt of a crosswind diffusion of the surface,
+!! div(kappa K grad s), in wholly grounded cells near the grounding line (and crossed cells under
+!! DG1_BAND_DIFF_CROSSED), by the symmetric interior
+!! penalty method.  For each corner test function phi,
+!!   rhs(phi) = - int kappa K grad s . grad phi dA
+!!              + sum over faces of int ( {kappa K grad s}.n [phi] + {kappa K grad phi}.n [s] - sigma [s][phi] ) dl,
+!! where [v] = v_A - v_B across a face whose normal n points from cell A to cell B, {v} is the average of
+!! the two sides, and sigma = C {kappa n.K.n}/dx_perp.  K = (u_iso^2 I + |u|^2 n n^T)/(|u|^2 + u_iso^2)
+!! with n the crosswind unit vector of the cell-mean velocity, and kappa = w (Kxx dx^2 + Kyy dy^2) /
+!! (12 (Kxx + Kyy) T), which makes a continuous crosswind alternation of the tilts decay in T; w is the band
+!! weight.  The volume, x-face and y-face parts are returned apart, to be summed with the faces paired.
+subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_y, uh_ice, vh_ice)
+  type(ice_shelf_dyn_CS), intent(in) :: CS  !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in) :: G   !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)),     intent(in)    :: hmask  !< Mask of ice cells [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in)    :: h_nodal_in !< Corner thicknesses [Z ~> m]
+  real,                                   intent(in)    :: dt     !< Advection time step [T ~> s]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out)   :: rhs_vol !< Volume part [Z L2 T-1 ~> m3 s-1]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out)   :: rhs_x  !< x-face part [Z L2 T-1 ~> m3 s-1]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out)   :: rhs_y  !< y-face part [Z L2 T-1 ~> m3 s-1]
+  real, dimension(SZDIB_(G),SZDJ_(G)),    intent(inout) :: uh_ice !< Eastward volume flux [Z L2 T-1 ~> m3 s-1]
+  real, dimension(SZDI_(G),SZDJB_(G)),    intent(inout) :: vh_ice !< Northward volume flux [Z L2 T-1 ~> m3 s-1]
+
+  ! 2-point Gauss-Legendre on [0,1], with 1-gp1 == gp2 and 1-gp2 == gp1 exactly.
+  real, parameter :: gp1 = 0.5 * (1.0 - sqrt(1.0/3.0))
+  real, parameter :: gp2 = 1.0 - gp1
+  real, parameter :: gw  = 0.5
+  real, parameter :: f_eps = 1.0e-6 ! Grounded-fraction tolerance for a pure flotation state [nondim]
+  integer, dimension(SZDI_(G),SZDJ_(G)) :: state ! 1 wholly grounded, 0 crossed, -1 floating, -2 no ice
+  real, dimension(SZDI_(G),SZDJ_(G)) :: wgt      ! Band weight [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: kxx, kyy, kxy ! Components of kappa K [L2 T-1 ~> m2 s-1]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: s_c  ! Corner surfaces [Z ~> m]
+  real, dimension(2,2,2,2) :: qv     ! Per-QP volume contribution, indexed (qx,qy,a,b) [Z L2 T-1 ~> m3 s-1]
+  real, dimension(2,2) :: Nv, dNx, dNy    ! Side-A (or cell) basis values and derivatives [nondim]
+  real, dimension(2,2) :: NvB, dNxB, dNyB ! Side-B basis values and derivatives [nondim]
+  real :: rr          ! Ice/ocean density ratio [nondim]
+  real :: f           ! Grounded fraction clipped to [0,1] [nondim]
+  real :: inv_T       ! Decay rate of the crosswind mode, capped at 0.5/dt [T-1 ~> s-1]
+  real :: uc, vc      ! Cell-mean velocity [L T-1 ~> m s-1]
+  real :: u2, v2, ui2, den ! Squared speeds [L2 T-2 ~> m2 s-2]
+  real :: Kxx_c, Kyy_c, Kxy_c ! Components of K [nondim]
+  real :: kap         ! Cell diffusivity [L2 T-1 ~> m2 s-1]
+  real :: xi_q, eta_q ! Quadrature point in the cell [nondim]
+  real :: a_qp, d_qp  ! Cell lengths along x and y through the QP [L ~> m]
+  real :: s_v, s_xi, s_eta    ! Side-A (or cell) surface and its xi- and eta-derivatives [Z ~> m]
+  real :: sB_v, sB_xi, sB_eta ! Side-B surface and its derivatives [Z ~> m]
+  real :: aA, aB, dA, dB      ! Cell lengths along x and y at a face QP, sides A and B [L ~> m]
+  real :: FA, FB, Fm  ! Normal component of kappa K grad s on sides A and B, and its average [Z L T-1 ~> m2 s-1]
+  real :: js          ! Surface jump s_A - s_B [Z ~> m]
+  real :: sig         ! Penalty sigma [L T-1 ~> m s-1]
+  real :: q           ! Volume flux into side A per unit face length [Z L T-1 ~> m2 s-1]
+  real :: wq          ! Quadrature weight times face length [L ~> m]
+  real :: t_face      ! Position along a face [nondim]
+  real :: ftot        ! A face's flux summed over its two QPs [Z L2 T-1 ~> m3 s-1]
+  ! Face parts kept by the side of the cell they come from and summed in pairs at the end, so that a
+  ! quarter turn, which reverses the order in which a cell's two faces on an axis are visited, gives
+  ! the same sum bit for bit [Z L2 T-1 ~> m3 s-1].
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rx_m, rx_p, ry_m, ry_p
+  integer :: i, j, m, n, a, b, qx, qy, gp, nb, dmin
+  integer :: isc, iec, jsc, jec, isd, ied, jsd, jed
+
+  isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
+  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+  rhs_vol(:,:,:,:) = 0.0 ; rhs_x(:,:,:,:) = 0.0 ; rhs_y(:,:,:,:) = 0.0
+  rx_m(:,:,:,:) = 0.0 ; rx_p(:,:,:,:) = 0.0 ; ry_m(:,:,:,:) = 0.0 ; ry_p(:,:,:,:) = 0.0
+  nb = max(CS%dg_band_diff_width, 0)
+  if ((isc - isd < nb + 1) .or. (jsc - jsd < nb + 1)) call MOM_error(FATAL, &
+    "dg1_band_diffusion: DG1_BAND_DIFF_WIDTH must be at most the halo width minus 1.")
+  rr = CS%density_ice / CS%density_ocean_avg
+  inv_T = min(1.0 / CS%dg_band_diff_time, 0.5 / dt)
+  ui2 = CS%dg_band_diff_u_iso * CS%dg_band_diff_u_iso
+
+  do j = jsd, jed ; do i = isd, ied
+    state(i,j) = -2
+    if (hmask(i,j) /= 1.0) cycle
+    f = min(max(CS%ground_frac(i,j), 0.0), 1.0)
+    state(i,j) = 0
+    if (f >= 1.0 - f_eps) then
+      state(i,j) = 1
+    elseif (f <= f_eps) then
+      state(i,j) = -1
+    endif
+  enddo ; enddo
+
+  ! The band weight on the computational domain, then on the halo cells the faces reach.
+  wgt(:,:) = 0.0 ; kxx(:,:) = 0.0 ; kyy(:,:) = 0.0 ; kxy(:,:) = 0.0 ; s_c(:,:,:,:) = 0.0
+  do j = jsc, jec ; do i = isc, iec
+    if (state(i,j) < 0) cycle
+    if ((state(i,j) == 0) .and. (.not.CS%dg_band_diff_crossed)) cycle
+    dmin = nb + 2
+    do n = -(nb+1), nb+1 ; do m = -(nb+1), nb+1
+      if ((state(i+m,j+n) == 0) .or. (state(i+m,j+n) == -1)) dmin = min(dmin, max(abs(m), abs(n)))
+    enddo ; enddo
+    if (dmin <= nb) then
+      wgt(i,j) = 1.0
+    elseif (dmin == nb + 1) then
+      wgt(i,j) = 0.5
+    endif
+  enddo ; enddo
+  call pass_var(wgt, G%domain)
+
+  ! The tensor and corner surfaces of the band cells the faces of the computational domain reach.
+  do j = jsc-1, jec+1 ; do i = isc-1, iec+1
+    if ((state(i,j) < 0) .or. (wgt(i,j) <= 0.0)) cycle
+    ! Opposite corners paired, as in dg1_eps_face_u.
+    uc = 0.25*((CS%u_shelf(i-1,j-1) + CS%u_shelf(i,j)) + (CS%u_shelf(i,j-1) + CS%u_shelf(i-1,j)))
+    vc = 0.25*((CS%v_shelf(i-1,j-1) + CS%v_shelf(i,j)) + (CS%v_shelf(i,j-1) + CS%v_shelf(i-1,j)))
+    u2 = uc*uc ; v2 = vc*vc
+    den = (u2 + v2) + ui2
+    if (den > 0.0) then
+      Kxx_c = (ui2 + v2) / den ; Kyy_c = (ui2 + u2) / den ; Kxy_c = -(uc*vc) / den
+    else
+      Kxx_c = 1.0 ; Kyy_c = 1.0 ; Kxy_c = 0.0
+    endif
+    kap = (wgt(i,j) * inv_T) * (((Kxx_c*(G%dxT(i,j)*G%dxT(i,j))) + (Kyy_c*(G%dyT(i,j)*G%dyT(i,j)))) / &
+                                (12.0 * (Kxx_c + Kyy_c)))
+    kxx(i,j) = kap*Kxx_c ; kyy(i,j) = kap*Kyy_c ; kxy(i,j) = kap*Kxy_c
+    if (associated(CS%dg_band_kappa)) CS%dg_band_kappa(i,j) = kap
+    do b = 1, 2 ; do a = 1, 2
+      s_c(i,j,a,b) = max(h_nodal_in(i,j,a,b) - CS%bed_node(i-2+a,j-2+b), (1.0 - rr) * h_nodal_in(i,j,a,b))
+    enddo ; enddo
+  enddo ; enddo
+  if (associated(CS%dg_band_kappa)) then
+    do j = jsc, jec ; do i = isc, iec
+      if (wgt(i,j) <= 0.0) CS%dg_band_kappa(i,j) = 0.0
+    enddo ; enddo
+  endif
+
+  ! Volume term, the xx and yy parts paired and the cross part added, and the QPs summed in diagonal pairs.
+  do j = jsc, jec ; do i = isc, iec
+    if (wgt(i,j) <= 0.0) cycle
+    do qy = 1, 2 ; do qx = 1, 2
+      if (qx == 1) then ; xi_q  = gp1 ; else ; xi_q  = gp2 ; endif
+      if (qy == 1) then ; eta_q = gp1 ; else ; eta_q = gp2 ; endif
+      a_qp = (G%dxCv(i,j-1)*(1.0 - eta_q)) + (G%dxCv(i,j)*eta_q)
+      d_qp = (G%dyCu(i-1,j)*(1.0 - xi_q))  + (G%dyCu(i,j)*xi_q)
+      call dg1_q1_eval(xi_q, eta_q, s_c(i,j,:,:), Nv, dNx, dNy, s_v, s_xi, s_eta)
+      do b = 1, 2 ; do a = 1, 2
+        qv(qx,qy,a,b) = -(gw*gw) * ( (((kxx(i,j)*s_xi)*dNx(a,b))*(d_qp/a_qp) + &
+                                      ((kyy(i,j)*s_eta)*dNy(a,b))*(a_qp/d_qp)) + &
+                                     kxy(i,j)*((s_xi*dNy(a,b)) + (s_eta*dNx(a,b))) )
+      enddo ; enddo
+    enddo ; enddo
+    do b = 1, 2 ; do a = 1, 2
+      rhs_vol(i,j,a,b) = (qv(1,1,a,b) + qv(2,2,a,b)) + (qv(1,2,a,b) + qv(2,1,a,b))
+    enddo ; enddo
+  enddo ; enddo
+
+  ! x faces between cells A = (i,j) and B = (i+1,j); n = +x.
+  do j = jsc, jec ; do i = isc-1, iec
+    if ((wgt(i,j) <= 0.0) .or. (wgt(i+1,j) <= 0.0)) cycle
+    if (CS%u_face_mask(i,j) == 4.0) cycle
+    sig = (CS%dg_band_diff_penalty * (0.5*(kxx(i,j) + kxx(i+1,j)))) / G%dxCu(i,j)
+    wq = gw * G%dyCu(i,j)
+    ftot = 0.0
+    do gp = 1, 2
+      if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
+      call dg1_q1_eval(1.0, t_face, s_c(i,j,:,:), Nv, dNx, dNy, s_v, s_xi, s_eta)
+      call dg1_q1_eval(0.0, t_face, s_c(i+1,j,:,:), NvB, dNxB, dNyB, sB_v, sB_xi, sB_eta)
+      aA = (G%dxCv(i,j-1)*(1.0 - t_face)) + (G%dxCv(i,j)*t_face) ; dA = G%dyCu(i,j)
+      aB = (G%dxCv(i+1,j-1)*(1.0 - t_face)) + (G%dxCv(i+1,j)*t_face) ; dB = G%dyCu(i,j)
+      FA = (kxx(i,j)*(s_xi/aA)) + (kxy(i,j)*(s_eta/dA))
+      FB = (kxx(i+1,j)*(sB_xi/aB)) + (kxy(i+1,j)*(sB_eta/dB))
+      Fm = 0.5*(FA + FB)
+      js = s_v - sB_v
+      q = Fm - (sig*js)
+      ftot = ftot + (wq*q)
+      if (i >= isc) then
+        do b = 1, 2 ; do a = 1, 2
+          rx_p(i,j,a,b) = rx_p(i,j,a,b) + wq*((q*Nv(a,b)) + &
+                           (0.5*js)*((kxx(i,j)*(dNx(a,b)/aA)) + (kxy(i,j)*(dNy(a,b)/dA))))
+        enddo ; enddo
+      endif
+      if (i+1 <= iec) then
+        do b = 1, 2 ; do a = 1, 2
+          rx_m(i+1,j,a,b) = rx_m(i+1,j,a,b) + wq*((-q*NvB(a,b)) + &
+                             (0.5*js)*((kxx(i+1,j)*(dNxB(a,b)/aB)) + (kxy(i+1,j)*(dNyB(a,b)/dB))))
+        enddo ; enddo
+      endif
+    enddo
+    uh_ice(i,j) = uh_ice(i,j) - ftot
+  enddo ; enddo
+
+  ! y faces between cells A = (i,j) and B = (i,j+1); n = +y.  Written in the x faces' shape, the normal
+  ! component first, so that a quarter turn carries one loop onto the other.
+  do j = jsc-1, jec ; do i = isc, iec
+    if ((wgt(i,j) <= 0.0) .or. (wgt(i,j+1) <= 0.0)) cycle
+    if (CS%v_face_mask(i,j) == 4.0) cycle
+    sig = (CS%dg_band_diff_penalty * (0.5*(kyy(i,j) + kyy(i,j+1)))) / G%dyCv(i,j)
+    wq = gw * G%dxCv(i,j)
+    ftot = 0.0
+    do gp = 1, 2
+      if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
+      call dg1_q1_eval(t_face, 1.0, s_c(i,j,:,:), Nv, dNx, dNy, s_v, s_xi, s_eta)
+      call dg1_q1_eval(t_face, 0.0, s_c(i,j+1,:,:), NvB, dNxB, dNyB, sB_v, sB_xi, sB_eta)
+      dA = (G%dyCu(i-1,j)*(1.0 - t_face)) + (G%dyCu(i,j)*t_face) ; aA = G%dxCv(i,j)
+      dB = (G%dyCu(i-1,j+1)*(1.0 - t_face)) + (G%dyCu(i,j+1)*t_face) ; aB = G%dxCv(i,j)
+      FA = (kyy(i,j)*(s_eta/dA)) + (kxy(i,j)*(s_xi/aA))
+      FB = (kyy(i,j+1)*(sB_eta/dB)) + (kxy(i,j+1)*(sB_xi/aB))
+      Fm = 0.5*(FA + FB)
+      js = s_v - sB_v
+      q = Fm - (sig*js)
+      ftot = ftot + (wq*q)
+      if (j >= jsc) then
+        do b = 1, 2 ; do a = 1, 2
+          ry_p(i,j,a,b) = ry_p(i,j,a,b) + wq*((q*Nv(a,b)) + &
+                           (0.5*js)*((kyy(i,j)*(dNy(a,b)/dA)) + (kxy(i,j)*(dNx(a,b)/aA))))
+        enddo ; enddo
+      endif
+      if (j+1 <= jec) then
+        do b = 1, 2 ; do a = 1, 2
+          ry_m(i,j+1,a,b) = ry_m(i,j+1,a,b) + wq*((-q*NvB(a,b)) + &
+                             (0.5*js)*((kyy(i,j+1)*(dNyB(a,b)/dB)) + (kxy(i,j+1)*(dNxB(a,b)/aB))))
+        enddo ; enddo
+      endif
+    enddo
+    vh_ice(i,j) = vh_ice(i,j) - ftot
+  enddo ; enddo
+
+  do j = jsc, jec ; do i = isc, iec
+    do b = 1, 2 ; do a = 1, 2
+      rhs_x(i,j,a,b) = rx_m(i,j,a,b) + rx_p(i,j,a,b)
+      rhs_y(i,j,a,b) = ry_m(i,j,a,b) + ry_p(i,j,a,b)
+    enddo ; enddo
+  enddo ; enddo
+end subroutine dg1_band_diffusion
 !> DG(1) right-hand side M dh/dt = int grad(N).(u h) dA - int N (u.n) h_upwind ds + art visc,
 !! with 2x2 Gauss points in the cell and 2 per face. Specified-flux faces split their flux
 !! equally between the two corners.
@@ -12380,6 +12694,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_vol
   ! Face terms kept per direction and summed pairwise at the end, for rotation invariance.
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_advx, rhs_advy, rhs_viscx, rhs_viscy
+  ! DG1_BAND_DIFF_TIME: volume, x-face and y-face parts [Z L2 T-1 ~> m3 s-1]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_bdv, rhs_bdx, rhs_bdy
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   rhoi_rhow_wb = CS%density_ice / CS%density_ocean_avg
@@ -12794,6 +13110,16 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
          (rhs_viscx(i,j,a,b) + rhs_viscy(i,j,a,b)))
     enddo ; enddo
   enddo ; enddo
+  ! The band diffusion is a separate term, so with it off the sum above is unchanged.
+  if (CS%dg_band_diff_time > 0.0) then
+    call dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_bdv, rhs_bdx, rhs_bdy, uh_ice, vh_ice)
+    do j = jsc, jec ; do i = isc, iec
+      if (hmask(i,j) /= 1.0) cycle
+      do b = 1, 2 ; do a = 1, 2
+        rhs(i,j,a,b) = rhs(i,j,a,b) + (rhs_bdv(i,j,a,b) + (rhs_bdx(i,j,a,b) + rhs_bdy(i,j,a,b)))
+      enddo ; enddo
+    enddo ; enddo
+  endif
   if (present(rhs_visc)) then
     rhs_visc(:,:,:,:) = 0.0
     do j = jsc, jec ; do i = isc, iec
