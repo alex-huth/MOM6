@@ -530,6 +530,16 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! at least at 1/this rate [T ~> s].
   integer :: dg_tilt_relax_ground_band !< Tilt relaxation: if positive, the grounded floor acts only within
                                   !! this many cells (chessboard) of an ice cell that is not wholly grounded.
+  real :: dg_tilt_relax_ground_mig_len !< Tilt relaxation: if positive, the grounded floor in the band adds
+                                  !! the local grounding-line migration speed divided by this length [L ~> m].
+  real :: dg_tilt_relax_ground_mig_time !< Tilt relaxation: time over which the rate of change of the
+                                  !! grounded fraction is averaged for the migration speed [T ~> s].
+  real, pointer, dimension(:,:) :: dg_mig_f_old => NULL() !< Grounded fraction of each cell at the last
+                                  !! migration update, or -1 before the first [nondim].
+  real, pointer, dimension(:,:) :: dg_mig_rate => NULL() !< Time-averaged rate of change of the grounded
+                                  !! fraction of each cell [T-1 ~> s-1].
+  real, pointer, dimension(:,:) :: dg_tilt_relax_mig => NULL() !< Grounding-line migration speed the
+                                  !! grounded floor read in each band cell [L T-1 ~> m s-1].
   real :: dg_tilt_relax_ground_u_credit !< Tilt relaxation: the fraction of the transport rate through the
                                   !! slower face of each axis taken off the grounded floor [nondim].
   logical :: dg_tilt_relax_ground_exclusive !< Tilt relaxation: if true, a wholly grounded cell gets the
@@ -711,7 +721,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_dg_tilt_relax_alt_x = -1, id_dg_tilt_relax_alt_y = -1, &
              id_dg_tilt_relax_alt_w = -1, id_dg_tilt_relax_state = -1, &
              id_dg_tilt_relax_rate_x = -1, id_dg_tilt_relax_rate_y = -1, &
-             id_dg_tilt_relax_rate_w = -1, &
+             id_dg_tilt_relax_rate_w = -1, id_dg_tilt_relax_mig = -1, &
              id_dg_tilt_relax_r_x = -1, id_dg_tilt_relax_r_y = -1, &
              id_dg_tilt_relax_r_w = -1, &
              id_dg_tilt_relax_why_x = -1, id_dg_tilt_relax_why_y = -1, &
@@ -853,6 +863,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
   logical :: shelf_mass_is_dynamic, override_shelf_movement, active_shelf_dynamics
   logical :: DG_thickness   ! If true, DG(1) carries the thickness (USE_DG_THICKNESS)
   logical :: thickness_nodal ! If true, the thickness is read at nodes (INIT_ICE_THICKNESS_NODAL)
+  real :: mig_len ! DG1_TILT_RELAX_GROUND_MIG_LENGTH, read here only to decide what is restarted [m]
   character(len=40)  :: mdl = "MOM_ice_shelf_dyn"  ! This module's name.
   integer :: isd, ied, jsd, jed, IsdB, IedB, JsdB, JedB
 
@@ -1039,6 +1050,20 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
                                   "DG(1) nodal Q1 thickness, NW corner", "m", conversion=US%Z_to_m)
       call register_restart_field(CS%h_nodal(:,:,2,2), "h_nodal_NE_DG", .true., restart_CS, &
                                   "DG(1) nodal Q1 thickness, NE corner", "m", conversion=US%Z_to_m)
+      ! The grounding-line migration speed of DG1_TILT_RELAX_GROUND_MIG_LENGTH is a running average,
+      ! so it is restarted.  A restart without it starts the average afresh (dg_mig_f_old = -1).
+      call get_param(param_file, mdl, "DG1_TILT_RELAX_GROUND_MIG_LENGTH", mig_len, &
+                     units="m", default=0.0, do_not_log=.true.)
+      if (mig_len > 0.0) then
+        allocate(CS%dg_mig_f_old(isd:ied,jsd:jed), source=-1.0)
+        allocate(CS%dg_mig_rate(isd:ied,jsd:jed), source=0.0)
+        allocate(CS%dg_tilt_relax_mig(isd:ied,jsd:jed), source=0.0)
+        call register_restart_field(CS%dg_mig_f_old, "dg_mig_f_old", .false., restart_CS, &
+                                    "Grounded fraction at the last grounding-line migration update", "nondim")
+        call register_restart_field(CS%dg_mig_rate, "dg_mig_rate", .false., restart_CS, &
+                                    "Time-averaged rate of change of the grounded fraction", "s-1", &
+                                    conversion=US%s_to_T)
+      endif
     endif
     call register_restart_field(CS%first_dir_restart_IS, "first_direction_IS", .false., restart_CS, &
                                 "Indicator of the first direction in split ice shelf calculations.", "nondim")
@@ -1874,6 +1899,11 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          'thin cell it is relaxed at least at the short axis rate; zero where the twist was '//&
          'not relaxed', &
          's-1', conversion=US%s_to_T)
+      if (associated(CS%dg_tilt_relax_mig)) &
+        CS%id_dg_tilt_relax_mig = register_diag_field('ice_shelf_model','dg_tilt_relax_mig', &
+           CS%diag%axesT1, Time, 'Grounding-line migration speed that the grounded floor of '//&
+           'DG1_TILT_RELAX_GROUND_MIG_LENGTH read in each band cell; zero outside the band', &
+           'm yr-1', conversion=365.0*86400.0*US%L_T_to_m_s)
       ! Per-mode signed removal.  dg_tilt_relax_tend is one L2 norm over all three modes, so the
       ! removal cannot be attributed from it, and rate times residual is wrong whenever the
       ! posted rate belongs to a different mode from the posted residual.
@@ -2474,6 +2504,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       call post_data(CS%id_dg_tilt_relax_rate_y, CS%dg_tilt_relax_rate_y, CS%diag)
     if (CS%id_dg_tilt_relax_rate_w > 0) &
       call post_data(CS%id_dg_tilt_relax_rate_w, CS%dg_tilt_relax_rate_w, CS%diag)
+    if (CS%id_dg_tilt_relax_mig > 0) &
+      call post_data(CS%id_dg_tilt_relax_mig, CS%dg_tilt_relax_mig, CS%diag)
     if (CS%id_dg_tilt_relax_r_x > 0) &
       call post_data(CS%id_dg_tilt_relax_r_x, CS%dg_tilt_relax_r_x, CS%diag)
     if (CS%id_dg_tilt_relax_r_y > 0) &
@@ -11573,6 +11605,24 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "is withheld on the cells and axes the rule names beside a grounding line. "//&
                  "Non-positive disables it.", &
                  units="s", default=0.0, scale=US%s_to_T, do_not_log=.not.CS%dg_tilt_relax)
+  call get_param(param_file, mdl, "DG1_TILT_RELAX_GROUND_MIG_LENGTH", CS%dg_tilt_relax_ground_mig_len, &
+                 "If positive, the grounded floor in the band of DG1_TILT_RELAX_GROUND_BAND adds the rate "//&
+                 "|v_gl|/DG1_TILT_RELAX_GROUND_MIG_LENGTH, where v_gl is the local grounding-line "//&
+                 "migration speed: the net area that changed flotation state in the band's box around "//&
+                 "the cell, per unit time (averaged over DG1_TILT_RELAX_GROUND_MIG_TIME), divided by the "//&
+                 "length of grounding line in the box (its crossed cells times the cell width).  The "//&
+                 "mode that a moving grounding line leaves grows with the distance the line moves, so "//&
+                 "the floor is this length's share of that distance; it is zero where the line is still.  "//&
+                 "It adds to 1/DG1_TILT_RELAX_GROUND_TIME, which may be off, and takes the same transport "//&
+                 "credit and stencil rule.  It needs DG1_TILT_RELAX_GROUND_BAND > 0.  Zero or less "//&
+                 "disables it.", &
+                 units="m", default=0.0, scale=US%m_to_L, do_not_log=.not.CS%dg_tilt_relax)
+  call get_param(param_file, mdl, "DG1_TILT_RELAX_GROUND_MIG_TIME", CS%dg_tilt_relax_ground_mig_time, &
+                 "The time over which the rate of change of each cell's grounded fraction is averaged "//&
+                 "for DG1_TILT_RELAX_GROUND_MIG_LENGTH, so that a line that wobbles in place without net "//&
+                 "motion reads as still.", &
+                 units="s", default=3.156e8, scale=US%s_to_T, &
+                 do_not_log=(.not.CS%dg_tilt_relax) .or. (CS%dg_tilt_relax_ground_mig_len <= 0.0))
   call get_param(param_file, mdl, "DG1_TILT_RELAX_GROUND_BAND", CS%dg_tilt_relax_ground_band, &
                  "If positive, the floor of DG1_TILT_RELAX_GROUND_TIME acts only on a wholly grounded cell "//&
                  "within this many cells (chessboard distance) of an ice cell that is not wholly grounded "//&
@@ -11580,7 +11630,14 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "as if the grounded floor were off.  It must be less than the halo width.  Zero or less "//&
                  "puts no limit on it.", &
                  units="nondim", default=0, &
-                 do_not_log=(.not.CS%dg_tilt_relax) .or. (CS%dg_tilt_relax_ground_time <= 0.0))
+                 do_not_log=(.not.CS%dg_tilt_relax) .or. ((CS%dg_tilt_relax_ground_time <= 0.0) .and. &
+                                                          (CS%dg_tilt_relax_ground_mig_len <= 0.0)))
+  if (CS%dg_tilt_relax .and. (CS%dg_tilt_relax_ground_mig_len > 0.0)) then
+    if (CS%dg_tilt_relax_ground_band <= 0) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
+        "DG1_TILT_RELAX_GROUND_MIG_LENGTH > 0 needs DG1_TILT_RELAX_GROUND_BAND > 0.")
+    if (.not.associated(CS%dg_mig_rate)) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
+        "DG1_TILT_RELAX_GROUND_MIG_LENGTH > 0 needs USE_DG_THICKNESS.")
+  endif
   call get_param(param_file, mdl, "DG1_TILT_RELAX_GROUND_U_CREDIT", CS%dg_tilt_relax_ground_u_credit, &
                  "The floor of DG1_TILT_RELAX_GROUND_TIME on each axis is reduced by this fraction of "//&
                  "the transport rate |u_n|/dx through the slower of the axis's two faces, as "//&
@@ -11588,7 +11645,8 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "DG1_TILT_RELAX_GROUND_EXCLUSIVE the twist's x- and y-alternating parts take their "//&
                  "own axis's floor.  Zero gives the plain floor.", &
                  units="nondim", default=0.0, &
-                 do_not_log=(.not.CS%dg_tilt_relax) .or. (CS%dg_tilt_relax_ground_time <= 0.0))
+                 do_not_log=(.not.CS%dg_tilt_relax) .or. ((CS%dg_tilt_relax_ground_time <= 0.0) .and. &
+                                                          (CS%dg_tilt_relax_ground_mig_len <= 0.0)))
   call get_param(param_file, mdl, "DG1_TILT_RELAX_GROUND_EXCLUSIVE", CS%dg_tilt_relax_ground_exclusive, &
                  "If true, a wholly grounded cell is relaxed by the floor of DG1_TILT_RELAX_GROUND_TIME "//&
                  "alone, with the bounded part on top; the speed law does not "//&
@@ -12892,6 +12950,13 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
   integer :: m, n
   integer :: gbn     ! DG1_TILT_RELAX_GROUND_BAND, or 0 for no limit
   logical, dimension(SZDI_(G),SZDJ_(G)) :: gband ! A wholly grounded cell the grounded floor may act on
+  logical :: mig_on  ! DG1_TILT_RELAX_GROUND_MIG_LENGTH is on
+  real, dimension(SZDI_(G),SZDJ_(G)) :: kmig ! The migration part of the grounded floor [T-1 ~> s-1]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: mig_area ! Rate of change of grounded area of each ice cell [L2 T-1 ~> m2 s-1]
+  real :: k_gr       ! The grounded floor of this cell before the transport credit [T-1 ~> s-1]
+  real :: a_mig      ! Net rate at which area changed flotation state in the band's box [L2 T-1 ~> m2 s-1]
+  real :: v_gl       ! Grounding-line migration speed in the band's box [L T-1 ~> m s-1]
+  integer :: n_gl    ! Number of crossed cells in the band's box
   real, parameter :: f_eps = 1.0e-6 ! Grounded-fraction tolerance for a pure flotation state [nondim]
   integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed
 
@@ -12948,10 +13013,11 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
   if (CS%dg_tilt_relax_float_time > 0.0) k_float = 1.0 / CS%dg_tilt_relax_float_time
   k_ground = 0.0
   if (CS%dg_tilt_relax_ground_time > 0.0) k_ground = 1.0 / CS%dg_tilt_relax_ground_time
+  mig_on = (CS%dg_tilt_relax_ground_mig_len > 0.0)
   k_deep = 0.0
   if (CS%dg_tilt_relax_deep_crossed_time > 0.0) k_deep = 1.0 / CS%dg_tilt_relax_deep_crossed_time
   ! The grounded floor, and the floating floor under FLOAT_STENCIL, go through the stencil rule.
-  stn_on = (k_ground > 0.0) .or. &
+  stn_on = (k_ground > 0.0) .or. mig_on .or. &
            ((CS%dg_tilt_relax_float_stencil .and. CS%dg_tilt_relax_float_exclusive) .and. (k_float > 0.0))
   ! The EDGE2 rule reads residuals two cells away, which read means one further still.
   nr = 1
@@ -13017,7 +13083,7 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
   endif
   ! The grounded floor's band: within gbn cells of ice that is not wholly grounded, or everywhere.
   gbn = 0
-  if (k_ground > 0.0) gbn = max(CS%dg_tilt_relax_ground_band, 0)
+  if ((k_ground > 0.0) .or. mig_on) gbn = max(CS%dg_tilt_relax_ground_band, 0)
   if ((gbn > 0) .and. ((G%isc - G%isd <= gbn) .or. (G%jsc - G%jsd <= gbn))) call MOM_error(FATAL, &
     "dg1_tilt_relax_rate: DG1_TILT_RELAX_GROUND_BAND must be less than the halo width.")
   gband(:,:) = .true.
@@ -13029,6 +13095,35 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
       do n = -gbn, gbn ; do m = -gbn, gbn
         if (ice(i+m,j+n) .and. (state(i+m,j+n) /= 1)) gband(i,j) = .true.
       enddo ; enddo
+    enddo ; enddo
+  endif
+  ! The migration part of the grounded floor in each band cell: the net area that changed flotation
+  ! state in the band's box, per unit time, over the length of grounding line in the box.
+  kmig(:,:) = 0.0
+  if (mig_on) then
+    CS%dg_tilt_relax_mig(:,:) = 0.0
+    mig_area(:,:) = 0.0
+    do j = jsd, jed ; do i = isd, ied
+      if (ice(i,j)) mig_area(i,j) = CS%dg_mig_rate(i,j) * G%areaT(i,j)
+    enddo ; enddo
+    do j = jsc, jec ; do i = isc, iec
+      if (.not.gband(i,j)) cycle
+      if (state(i,j) /= 1) cycle
+      ! The box is summed over the orbits of a quarter turn, (m,n), (-n,m), (-m,-n), (n,-m), with
+      ! opposite offsets paired first and the orbits in a fixed order, so a rotated grid gives the
+      ! same sum bit for bit.
+      a_mig = mig_area(i,j) ; n_gl = 0
+      do m = 1, gbn ; do n = 0, gbn
+        a_mig = a_mig + ((mig_area(i+m,j+n) + mig_area(i-m,j-n)) + &
+                         (mig_area(i-n,j+m) + mig_area(i+n,j-m)))
+        if (ice(i+m,j+n) .and. (state(i+m,j+n) == 0)) n_gl = n_gl + 1
+        if (ice(i-n,j+m) .and. (state(i-n,j+m) == 0)) n_gl = n_gl + 1
+        if (ice(i-m,j-n) .and. (state(i-m,j-n) == 0)) n_gl = n_gl + 1
+        if (ice(i+n,j-m) .and. (state(i+n,j-m) == 0)) n_gl = n_gl + 1
+      enddo ; enddo
+      v_gl = abs(a_mig) / (real(max(n_gl, 1)) * (0.5*(G%dxT(i,j) + G%dyT(i,j))))
+      kmig(i,j) = v_gl / CS%dg_tilt_relax_ground_mig_len
+      CS%dg_tilt_relax_mig(i,j) = v_gl
     enddo ; enddo
   endif
   ! The bounded excess may instead use a mean surface built from the cell means of thickness and bed,
@@ -13279,13 +13374,15 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
       ! The grounded floor in a wholly grounded cell, before the stencil rule, so that the rule decides
       ! where it is withheld.  Its own transport credit reads the slower face of each axis, as the
       ! floating floor does.
-      if ((k_ground > 0.0) .and. (state(i,j) == 1) .and. gband(i,j)) then
-        kgx = k_ground ; kgy = k_ground
+      k_gr = k_ground
+      if (mig_on) k_gr = k_ground + kmig(i,j)
+      if ((k_gr > 0.0) .and. (state(i,j) == 1) .and. gband(i,j)) then
+        kgx = k_gr ; kgy = k_gr
         if (CS%dg_tilt_relax_ground_u_credit > 0.0) then
           u_fx = min(abs(0.5*(CS%u_shelf(I-1,J-1) + CS%u_shelf(I-1,J))), abs(0.5*(CS%u_shelf(I,J-1) + CS%u_shelf(I,J))))
           v_fy = min(abs(0.5*(CS%v_shelf(I-1,J-1) + CS%v_shelf(I,J-1))), abs(0.5*(CS%v_shelf(I-1,J) + CS%v_shelf(I,J))))
-          kgx = max(k_ground - ((CS%dg_tilt_relax_ground_u_credit * G%IdxT(i,j)) * u_fx), 0.0)
-          kgy = max(k_ground - ((CS%dg_tilt_relax_ground_u_credit * G%IdyT(i,j)) * v_fy), 0.0)
+          kgx = max(k_gr - ((CS%dg_tilt_relax_ground_u_credit * G%IdxT(i,j)) * u_fx), 0.0)
+          kgy = max(k_gr - ((CS%dg_tilt_relax_ground_u_credit * G%IdyT(i,j)) * v_fy), 0.0)
         endif
         sx = kgx ; sy = kgy ; sw = max(kgx, kgy)
       elseif (CS%dg_tilt_relax_ground_exclusive .and. (state(i,j) == 1)) then
@@ -13382,7 +13479,7 @@ subroutine dg1_tilt_relax_rate(CS, G, hmask, h_nodal_in, dt, R_node, acc_wt, h_b
     ! credit the twist's x- and y-alternating parts each take their own axis's floor.
     if (CS%dg_tilt_relax_ground_exclusive .and. (state(i,j) == 1)) then
       gxs = sx ; gys = sy ; gws = sw
-      if ((k_ground > 0.0) .and. (CS%dg_tilt_relax_ground_u_credit > 0.0) .and. (sw > 0.0)) then
+      if (((k_ground > 0.0) .or. mig_on) .and. (CS%dg_tilt_relax_ground_u_credit > 0.0) .and. (sw > 0.0)) then
         split_w = .true.
         gws_x = kgx ; gws_y = kgy
       endif
@@ -13959,6 +14056,33 @@ subroutine dg1_bud_add(CS, i, j, n_term, w, f)
   CS%dg_bud(i,j,2*n_term)   = CS%dg_bud(i,j,2*n_term)   + w*(0.5*((f(1,2) - f(1,1)) + (f(2,2) - f(2,1))))
 end subroutine dg1_bud_add
 
+!> Update the time-averaged rate of change of each cell's grounded fraction, from which the grounded
+!! floor of DG1_TILT_RELAX_GROUND_MIG_LENGTH reads the local grounding-line migration speed.  The
+!! average is exponential over DG1_TILT_RELAX_GROUND_MIG_TIME, and its weight is proportional to dt,
+!! so the change it accumulates does not depend on how the time is split into steps.
+subroutine dg1_ground_migration_update(CS, G, dt)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS   !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in)    :: G    !< Ocean grid structure
+  real,                   intent(in)    :: dt   !< Time since the last update [T ~> s]
+
+  real :: f   ! Grounded fraction clipped to [0,1] [nondim]
+  real :: w   ! Weight of this step in the running average [nondim]
+  integer :: i, j
+
+  if (.not.associated(CS%dg_mig_rate)) return
+  if (dt <= 0.0) return
+  w = 1.0
+  if (CS%dg_tilt_relax_ground_mig_time > dt) w = dt / CS%dg_tilt_relax_ground_mig_time
+  do j = G%jsd, G%jed ; do i = G%isd, G%ied
+    f = min(max(CS%ground_frac(i,j), 0.0), 1.0)
+    if (CS%dg_mig_f_old(i,j) >= 0.0) &
+      CS%dg_mig_rate(i,j) = CS%dg_mig_rate(i,j) + &
+                            w * (((f - CS%dg_mig_f_old(i,j)) / dt) - CS%dg_mig_rate(i,j))
+    CS%dg_mig_f_old(i,j) = f
+  enddo ; enddo
+
+end subroutine dg1_ground_migration_update
+
 subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_ice)
   type(ice_shelf_dyn_CS), intent(inout) :: CS
   type(ice_shelf_state),  intent(in)    :: ISS
@@ -13992,6 +14116,11 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
 
   uh_ice(:,:) = 0.0 ; vh_ice(:,:) = 0.0
+
+  ! The grounded fraction now is the one the last step left, so its change since the last call is
+  ! that step's grounding-line motion.
+  if (CS%dg_tilt_relax .and. (CS%dg_tilt_relax_ground_mig_len > 0.0)) &
+    call dg1_ground_migration_update(CS, G, time_step)
 
   ! Dirichlet thickness BC.  A boundary cell keeps the nodal thicknesses it was given, so that it
   ! can carry a profile along the inflow face; the stage update below already steps only hmask == 1
