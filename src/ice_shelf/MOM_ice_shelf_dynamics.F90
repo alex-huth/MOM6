@@ -488,6 +488,13 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: dg_basal_source_sem2 !< If true, distribute the basal DG(1) source by CS%xi_basal (SEM2).
   logical :: dg_surface_source_local !< If true, apply the surface DG(1) source with SRC_OP_LOCAL,
                                   !! otherwise with SRC_OP_AVERAGED.
+  logical :: dg_source_positive   !< If true, the DG(1) source cannot take a cell mean below zero
+                                  !! (DG1_SOURCE_POSITIVE).
+  logical :: dg_fully_melt        !< FULLY_MELT_ICE_SHEET_CELLS, which sets how DG1_SOURCE_POSITIVE cuts.
+  real, pointer, dimension(:,:) :: dg_src_cut_smb => NULL() !< DG1_SOURCE_POSITIVE: the surface ablation
+                                  !! rate not applied in the last step, positive [Z T-1 ~> m s-1].
+  real, pointer, dimension(:,:) :: dg_src_cut_bmb => NULL() !< DG1_SOURCE_POSITIVE: the basal melt rate
+                                  !! not applied in the last step, positive [Z T-1 ~> m s-1].
   ! DG(1) tilt/twist mode damper (dg_nodal_mode_damp_rate)
   ! DG(1) artificial viscosity (DG1_nodal_spatial_operator)
   real :: dg_art_visc_advect_coef !< Artificial viscosity: coefficient on |u_face| in u_eff [nondim].
@@ -785,6 +792,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_dg_art_visc_nu_u = -1, id_dg_art_visc_nu_v = -1, &
              id_dg_art_visc_cell_scale = -1, id_dg_band_kappa = -1, id_dg_band_w = -1, &
              id_dg_lim_phi_t = -1, id_dg_lim_phi_w = -1, &
+             id_dg_src_cut_smb = -1, id_dg_src_cut_bmb = -1, &
              id_dg_slow_idle_face_u = -1, id_dg_slow_idle_face_v = -1, &
              id_h_jump_face_u = -1, id_h_jump_face_v = -1, &
              id_s_jump_face_u = -1, id_s_jump_face_v = -1, &
@@ -2102,6 +2110,16 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
            'DG(1) grounded limiter: smallest factor on the twist over the stages of the last step, '//&
            'band weight included; 1 where it does not act', 'nondim')
       endif
+      if (CS%dg_source_positive) then
+        allocate(CS%dg_src_cut_smb(G%isd:G%ied,G%jsd:G%jed), source=0.0)
+        allocate(CS%dg_src_cut_bmb(G%isd:G%ied,G%jsd:G%jed), source=0.0)
+        CS%id_dg_src_cut_smb = register_diag_field('ice_shelf_model', 'dg_src_cut_smb', CS%diag%axesT1, &
+           Time, 'DG(1) surface ablation rate that DG1_SOURCE_POSITIVE did not apply in the last step '//&
+           'because the cell held no ice for it', 'm s-1', conversion=US%Z_to_m*US%s_to_T)
+        CS%id_dg_src_cut_bmb = register_diag_field('ice_shelf_model', 'dg_src_cut_bmb', CS%diag%axesT1, &
+           Time, 'DG(1) basal melt rate that DG1_SOURCE_POSITIVE did not apply in the last step '//&
+           'because the cell held no ice for it', 'm s-1', conversion=US%Z_to_m*US%s_to_T)
+      endif
       ! alpha decides how fast TRANSPORT clears the tilt mode: the decay factor f(alpha) peaks at
       ! alpha = 2*sqrt(3)-1 and break-even against no viscosity at all is alpha = 5.5.  This is
       ! the one route by which DG1_ART_VISC_TAU_FLOOR reaches the tilt relaxation.
@@ -2821,6 +2839,10 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_lim_phi_t, CS%dg_lim_phi(:,:,1), CS%diag)
     if (CS%id_dg_lim_phi_w > 0) &
         call post_data(CS%id_dg_lim_phi_w, CS%dg_lim_phi(:,:,2), CS%diag)
+    if (CS%id_dg_src_cut_smb > 0) &
+        call post_data(CS%id_dg_src_cut_smb, CS%dg_src_cut_smb, CS%diag)
+    if (CS%id_dg_src_cut_bmb > 0) &
+        call post_data(CS%id_dg_src_cut_bmb, CS%dg_src_cut_bmb, CS%diag)
     if (CS%id_dg_art_visc_cell_scale > 0 .and. associated(CS%dg_art_visc_cell_scale)) &
         call post_data(CS%id_dg_art_visc_cell_scale, CS%dg_art_visc_cell_scale, CS%diag)
     if (CS%id_dg_slow_idle_face_u > 0 .and. associated(CS%dg_slow_idle_face_u)) &
@@ -9902,6 +9924,8 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_band_kappa)) deallocate(CS%dg_band_kappa)
   if (associated(CS%dg_band_w)) deallocate(CS%dg_band_w)
   if (associated(CS%dg_lim_phi)) deallocate(CS%dg_lim_phi)
+  if (associated(CS%dg_src_cut_smb)) deallocate(CS%dg_src_cut_smb)
+  if (associated(CS%dg_src_cut_bmb)) deallocate(CS%dg_src_cut_bmb)
   if (associated(CS%dg_slow_idle_face_u)) deallocate(CS%dg_slow_idle_face_u)
   if (associated(CS%dg_slow_idle_face_v)) deallocate(CS%dg_slow_idle_face_v)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
@@ -11116,7 +11140,7 @@ end subroutine accumulate_DG_source_rate
 !!  - SRC_OP_AVERAGED: each B-grid corner takes the cell_mean_w-weighted average of its ice cells.
 !!  - SRC_OP_SUBGRID: as AVERAGED but weighted by floating area (cell_mean_w*xi_basal), and each
 !!    cell's corner gets that average times its own xi_basal.
-subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
+subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi, part)
   type(ice_shelf_dyn_CS), intent(in)  :: CS  !< Ice shelf dynamics control structure.
   type(ice_shelf_state),  intent(in)  :: ISS !< Ice shelf state (hmask, h_shelf).
   type(ocean_grid_type),  intent(in)  :: G   !< The grid structure.
@@ -11129,6 +11153,8 @@ subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
   logical,      optional, intent(in)  :: use_xi !< If true, distribute each cell's total within
                                              !! the cell in proportion to CS%xi_basal instead of
                                              !! uniformly (the SEM2 in-cell distribution).
+  logical, dimension(SZDI_(G),SZDJ_(G)), optional, intent(in) :: part !< The cells that take part in
+                                             !! the corner averages; the others take their own rate.
 
   real, dimension(SZDIB_(G),SZDJB_(G)) :: S_corner ! Projected B-grid corner source [Z T-1 ~> m s-1]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: w_corner ! Total cell_mean_w at a corner [L2 ~> m2]
@@ -11189,6 +11215,7 @@ subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
     ! give nor receive. A uniform rate reduces to SRC_OP_LOCAL.
     do j = G%jsd, G%jed ; do i = G%isd, G%ied
       if (ISS%hmask(i,j) /= 1.0) cycle
+      if (present(part)) then ; if (.not.part(i,j)) cycle ; endif
       !SW corner
       w_contrib = CS%cell_mean_w(i,j,1,1) * CS%xi_basal(i,j,1,1)
       S_corner_b(I-1, J-1, 4) = w_contrib * m_eff(i,j)
@@ -11217,6 +11244,9 @@ subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
 
     do j = G%jsc, G%jec ; do i = G%isc, G%iec
       if (ISS%hmask(i,j) /= 1.0) cycle
+      if (present(part)) then ; if (.not.part(i,j)) then
+        S_node(i,j,:,:) = S_loc(i,j,:,:) ; cycle
+      endif ; endif
       S_node(i,j,1,1) = CS%xi_basal(i,j,1,1) * S_corner(I-1, J-1)
       S_node(i,j,2,1) = CS%xi_basal(i,j,2,1) * S_corner(I,   J-1)
       S_node(i,j,1,2) = CS%xi_basal(i,j,1,2) * S_corner(I-1, J  )
@@ -11229,6 +11259,7 @@ subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
   ! Weighted contributions of each hmask=1 cell to its 4 B-grid corners.
   do j = G%jsd, G%jed ; do i = G%isd, G%ied
     if (ISS%hmask(i,j) /= 1.0) cycle
+    if (present(part)) then ; if (.not.part(i,j)) cycle ; endif
     !SW corner
     w_contrib = CS%cell_mean_w(i,j,1,1)
     S_corner_b(I-1, J-1, 4) = w_contrib * S_loc(i,j,1,1)
@@ -11258,6 +11289,9 @@ subroutine project_source_to_nodes(CS, ISS, G, src, op, S_node, use_xi)
 
   do j = G%jsc, G%jec ; do i = G%isc, G%iec
     if (ISS%hmask(i,j) /= 1.0) cycle
+    if (present(part)) then ; if (.not.part(i,j)) then
+      S_node(i,j,:,:) = S_loc(i,j,:,:) ; cycle
+    endif ; endif
     S_node(i,j,1,1) = S_corner(I-1, J-1)
     S_node(i,j,2,1) = S_corner(I,   J-1)
     S_node(i,j,1,2) = S_corner(I-1, J  )
@@ -11267,47 +11301,106 @@ end subroutine project_source_to_nodes
 
 !> Build the nodal source S_node for ice_shelf_advect_DG1_nodal, projecting the basal and surface
 !! parts with their own operators, or the combined buffer in one pass when their operators agree.
-subroutine project_h_source_rate_to_nodes(CS, ISS, G, S_node)
+!! With DG1_SOURCE_POSITIVE (and dt given), a cell takes part in the corner averages only if its
+!! mean can supply the largest ablation of the cells that share its corners over one step, and the
+!! basal and surface parts are also returned on their own.
+subroutine project_h_source_rate_to_nodes(CS, ISS, G, S_node, dt, S_bmb_out, S_smb_out)
   type(ice_shelf_dyn_CS), intent(in)    :: CS  !< Ice shelf dynamics control structure.
   type(ice_shelf_state),  intent(in)    :: ISS !< Ice shelf state (hmask, h_shelf).
   type(ocean_grid_type),  intent(in)    :: G   !< The grid structure.
   real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out) :: S_node !< Q1 nodal source per
                                              !! cell at the 4 corners [Z T-1 ~> m s-1].
+  real,                         optional, intent(in)  :: dt !< The advection time step, which
+                                             !! DG1_SOURCE_POSITIVE needs [T ~> s].
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), optional, intent(out) :: S_bmb_out !< The basal part of
+                                             !! S_node [Z T-1 ~> m s-1].
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), optional, intent(out) :: S_smb_out !< The surface part of
+                                             !! S_node [Z T-1 ~> m s-1].
 
   real, dimension(SZDI_(G),SZDJ_(G)) :: src_smb ! Surface part of the source rate [Z T-1 ~> m s-1]
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: S_smb ! Surface part of the nodal source [Z T-1 ~> m s-1]
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: part ! The cell takes part in the corner averages
+  real :: abl_s, abl_b ! Largest surface and basal ablation of the cells around a cell [Z T-1 ~> m s-1]
+  real :: Hbar         ! A cell's mean thickness [Z ~> m]
+  logical :: part_on   ! The cells that cannot supply the shared ablation take their own rate
   integer :: surface_op ! The cross-cell operator applied to the surface source
-  integer :: i, j, a, b
+  integer :: i, j, ii, jj, a, b
 
   surface_op = SRC_OP_AVERAGED
   if (CS%dg_surface_source_local) surface_op = SRC_OP_LOCAL
 
   call pass_var(CS%h_source_rate, G%domain)
 
-  ! One pass when both parts share an operator and SEM2 is off.
-  if ((CS%dg_basal_source_op == surface_op) .and. .not.CS%dg_basal_source_sem2) then
-    call project_source_to_nodes(CS, ISS, G, CS%h_source_rate, surface_op, S_node)
-    return
+  part_on = CS%dg_source_positive
+  if (part_on) part_on = present(dt)
+  if (part_on) then
+    call pass_var(CS%h_source_rate_bmb, G%domain)
+    ! Over one step a cell can be given at most the largest surface and the largest basal
+    ! ablation of the cells that share its corners, so a cell whose mean covers both may share.
+    part(:,:) = .true.
+    do j = G%jsd+1, G%jed-1 ; do i = G%isd+1, G%ied-1
+      if (ISS%hmask(i,j) /= 1.0) cycle
+      abl_s = 0.0 ; abl_b = 0.0
+      do jj = j-1, j+1 ; do ii = i-1, i+1
+        if (ISS%hmask(ii,jj) /= 1.0) cycle
+        abl_s = max(abl_s, CS%h_source_rate_bmb(ii,jj) - CS%h_source_rate(ii,jj))
+        abl_b = max(abl_b, -CS%h_source_rate_bmb(ii,jj))
+      enddo ; enddo
+      Hbar = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
+      part(i,j) = (Hbar >= dt * (abl_s + abl_b))
+    enddo ; enddo
   endif
 
-  ! Otherwise project the parts separately and sum. src_smb is formed on the data domain.
-  call pass_var(CS%h_source_rate_bmb, G%domain)
+  ! One pass when both parts share an operator and SEM2 is off.
+  if ((CS%dg_basal_source_op == surface_op) .and. .not.CS%dg_basal_source_sem2) then
+    if (part_on) then
+      call project_source_to_nodes(CS, ISS, G, CS%h_source_rate, surface_op, S_node, part=part)
+    else
+      call project_source_to_nodes(CS, ISS, G, CS%h_source_rate, surface_op, S_node)
+    endif
+  else
+    ! Otherwise project the parts separately and sum. src_smb is formed on the data domain.
+    call pass_var(CS%h_source_rate_bmb, G%domain)
 
-  ! Calculate surface part
-  src_smb(:,:) = 0.0
-  do j = G%jsd, G%jed ; do i = G%isd, G%ied
-    src_smb(i,j) = CS%h_source_rate(i,j) - CS%h_source_rate_bmb(i,j)
-  enddo ; enddo
-
-  call project_source_to_nodes(CS, ISS, G, CS%h_source_rate_bmb, CS%dg_basal_source_op, S_node, &
-                               use_xi=CS%dg_basal_source_sem2)
-  call project_source_to_nodes(CS, ISS, G, src_smb, surface_op, S_smb)
-
-  do b = 1, 2 ; do a = 1, 2
-    do j = G%jsc, G%jec ; do i = G%isc, G%iec
-      S_node(i,j,a,b) = S_node(i,j,a,b) + S_smb(i,j,a,b)
+    ! Calculate surface part
+    src_smb(:,:) = 0.0
+    do j = G%jsd, G%jed ; do i = G%isd, G%ied
+      src_smb(i,j) = CS%h_source_rate(i,j) - CS%h_source_rate_bmb(i,j)
     enddo ; enddo
-  enddo ; enddo
+
+    if (part_on) then
+      call project_source_to_nodes(CS, ISS, G, CS%h_source_rate_bmb, CS%dg_basal_source_op, S_node, &
+                                   use_xi=CS%dg_basal_source_sem2, part=part)
+      call project_source_to_nodes(CS, ISS, G, src_smb, surface_op, S_smb, part=part)
+    else
+      call project_source_to_nodes(CS, ISS, G, CS%h_source_rate_bmb, CS%dg_basal_source_op, S_node, &
+                                   use_xi=CS%dg_basal_source_sem2)
+      call project_source_to_nodes(CS, ISS, G, src_smb, surface_op, S_smb)
+    endif
+
+    do b = 1, 2 ; do a = 1, 2
+      do j = G%jsc, G%jec ; do i = G%isc, G%iec
+        S_node(i,j,a,b) = S_node(i,j,a,b) + S_smb(i,j,a,b)
+      enddo ; enddo
+    enddo ; enddo
+  endif
+
+  ! The two parts on their own, for the cut of DG1_SOURCE_POSITIVE.
+  if (present(S_bmb_out) .and. present(S_smb_out)) then
+    src_smb(:,:) = 0.0
+    do j = G%jsd, G%jed ; do i = G%isd, G%ied
+      src_smb(i,j) = CS%h_source_rate(i,j) - CS%h_source_rate_bmb(i,j)
+    enddo ; enddo
+    if (part_on) then
+      call project_source_to_nodes(CS, ISS, G, CS%h_source_rate_bmb, CS%dg_basal_source_op, S_bmb_out, &
+                                   use_xi=CS%dg_basal_source_sem2, part=part)
+      call project_source_to_nodes(CS, ISS, G, src_smb, surface_op, S_smb_out, part=part)
+    else
+      call project_source_to_nodes(CS, ISS, G, CS%h_source_rate_bmb, CS%dg_basal_source_op, S_bmb_out, &
+                                   use_xi=CS%dg_basal_source_sem2)
+      call project_source_to_nodes(CS, ISS, G, src_smb, surface_op, S_smb_out)
+    endif
+  endif
 end subroutine project_h_source_rate_to_nodes
 
 !> Debug check that the global sum_ab cell_mean_w*S_node equals the global sum_ab cell_mean_w*S_cell,
@@ -11446,6 +11539,18 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "each corner takes the weighted average of its cells. Both are "//&
                  "mass-conservative. Requires USE_DG_THICKNESS.", &
                  default=.false., do_not_log=.not.CS%use_DG_thickness)
+  call get_param(param_file, mdl, "DG1_SOURCE_POSITIVE", CS%dg_source_positive, &
+                 "If true, the DG(1) thickness source cannot take a cell mean below zero.  A cell "//&
+                 "takes part in the corner averages of the source only if its mean can supply the "//&
+                 "largest ablation of the cells that share its corners over one step; otherwise it "//&
+                 "takes its own rate, so no ablation is lent to a cell that cannot supply it.  In "//&
+                 "each SSP-RK stage, a cell whose mean the transport and the source would take below "//&
+                 "zero has its surface ablation cut first and then its basal melt: with "//&
+                 "FULLY_MELT_ICE_SHEET_CELLS just enough to leave a zero mean, otherwise all of it.  "//&
+                 "The part cut goes to the mass hole with the rest of the ablation that finds no ice.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
+  call get_param(param_file, mdl, "FULLY_MELT_ICE_SHEET_CELLS", CS%dg_fully_melt, &
+                 default=.false., do_not_log=.true.)
 
 
   call get_param(param_file, mdl, "DG1_ART_VISC_ADVECT_COEF", CS%dg_art_visc_advect_coef, &
@@ -12249,6 +12354,77 @@ subroutine dg1_split_mass_inverse(CS, i, j, rhs, rhs_v, dh, dh_v)
   endif
   dh(:,:) = dh_t(:,:) + dh_v(:,:)
 end subroutine dg1_split_mass_inverse
+
+!> DG1_SOURCE_POSITIVE: the source of one SSP-RK stage, cut where the transport and the source
+!! together would take a cell mean below zero.  The surface ablation is cut first and then the basal
+!! melt: with FULLY_MELT_ICE_SHEET_CELLS just enough to leave a zero mean, otherwise all of it, as
+!! change_thickness_using_precip and change_thickness_using_melt do for a whole step.  The mean
+!! change of the transport is the sum of the right-hand side, because the rows of the mass matrix
+!! (and of its lumped blends) sum to the corner weights w.  Elsewhere S_use is S_node.
+subroutine dg1_source_cap(CS, G, hmask, h_start, rhs, S_node, S_bmb, S_smb, dt, wt, S_use)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in)    :: G  !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)),     intent(in)  :: hmask   !< Mask of ice cells [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in)  :: h_start !< Corners at the start of the
+                                                                 !! stage [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in)  :: rhs     !< Transport right-hand side of the
+                                                                 !! stage [Z L2 T-1 ~> m3 s-1]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in)  :: S_node  !< Nodal source [Z T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in)  :: S_bmb   !< Its basal part [Z T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in)  :: S_smb   !< Its surface part [Z T-1 ~> m s-1]
+  real,                                   intent(in)  :: dt      !< The stage time step [T ~> s]
+  real,                                   intent(in)  :: wt      !< The weight of the stage in the
+                                                                 !! step, for the diagnostics [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out) :: S_use   !< The source to apply [Z T-1 ~> m s-1]
+
+  real, dimension(2,2) :: w ! The corner weights of a cell [L2 ~> m2]
+  real :: area          ! The cell's DG area, sum of w [L2 ~> m2]
+  real :: vol_t         ! The cell's ice volume after the transport of the stage [Z L2 ~> m3]
+  real :: src_all, src_s, src_b ! The cell totals of S_node, S_smb and S_bmb [Z L2 T-1 ~> m3 s-1]
+  real :: deficit       ! The volume the stage would take below zero [Z L2 ~> m3]
+  real :: cut           ! The volume of ablation cut [Z L2 ~> m3]
+  real :: th_s, th_b    ! The fractions of the surface and basal parts applied [nondim]
+  integer :: i, j
+
+  S_use(:,:,:,:) = S_node(:,:,:,:)
+  do j = G%jsc, G%jec ; do i = G%isc, G%iec
+    if (hmask(i,j) /= 1.0) cycle
+    w(:,:) = CS%cell_mean_w(i,j,:,:)
+    area = (w(1,1) + w(2,2)) + (w(2,1) + w(1,2))
+    vol_t = (((w(1,1)*h_start(i,j,1,1)) + (w(2,2)*h_start(i,j,2,2))) + &
+             ((w(2,1)*h_start(i,j,2,1)) + (w(1,2)*h_start(i,j,1,2)))) + &
+            dt * ((rhs(i,j,1,1) + rhs(i,j,2,2)) + (rhs(i,j,2,1) + rhs(i,j,1,2)))
+    src_all = ((w(1,1)*S_node(i,j,1,1)) + (w(2,2)*S_node(i,j,2,2))) + &
+              ((w(2,1)*S_node(i,j,2,1)) + (w(1,2)*S_node(i,j,1,2)))
+    deficit = -(vol_t + dt*src_all)
+    if (deficit <= 0.0) cycle
+    src_s = ((w(1,1)*S_smb(i,j,1,1)) + (w(2,2)*S_smb(i,j,2,2))) + &
+            ((w(2,1)*S_smb(i,j,2,1)) + (w(1,2)*S_smb(i,j,1,2)))
+    src_b = ((w(1,1)*S_bmb(i,j,1,1)) + (w(2,2)*S_bmb(i,j,2,2))) + &
+            ((w(2,1)*S_bmb(i,j,2,1)) + (w(1,2)*S_bmb(i,j,1,2)))
+    th_s = 1.0 ; th_b = 1.0
+    if (src_s < 0.0) then
+      if (CS%dg_fully_melt) then
+        cut = min(deficit, -dt*src_s) ; th_s = 1.0 - cut / (-dt*src_s)
+      else
+        cut = -dt*src_s ; th_s = 0.0
+      endif
+      deficit = deficit - cut
+    endif
+    if ((deficit > 0.0) .and. (src_b < 0.0)) then
+      if (CS%dg_fully_melt) then
+        cut = min(deficit, -dt*src_b) ; th_b = 1.0 - cut / (-dt*src_b)
+      else
+        th_b = 0.0
+      endif
+    endif
+    S_use(i,j,:,:) = (S_node(i,j,:,:) - ((1.0 - th_s) * S_smb(i,j,:,:))) - ((1.0 - th_b) * S_bmb(i,j,:,:))
+    if (associated(CS%dg_src_cut_smb)) &
+      CS%dg_src_cut_smb(i,j) = CS%dg_src_cut_smb(i,j) + (wt * ((1.0 - th_s) * (-src_s / area)))
+    if (associated(CS%dg_src_cut_bmb)) &
+      CS%dg_src_cut_bmb(i,j) = CS%dg_src_cut_bmb(i,j) + (wt * ((1.0 - th_b) * (-src_b / area)))
+  enddo ; enddo
+end subroutine dg1_source_cap
 
 !> Surface jump s_B - s_A at a face point, each side taking its own flotation branch.
 pure function dg1_wb_surface_jump(h_A, h_B, bed_qp, rhoi_rhow) result(ds)
@@ -14942,11 +15118,15 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
 
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: h0, h_curr, rhs
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: S_node ! Nodal source rate [Z T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: S_bmb, S_smb ! Basal and surface parts of S_node,
+                                                   ! for DG1_SOURCE_POSITIVE [Z T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: S_use  ! The source a stage applies [Z T-1 ~> m s-1]
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: T_node ! Nodal mode-damping rate [Z T-1 ~> m s-1]
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: R_node ! Nodal tilt-relaxation rate [Z T-1 ~> m s-1]
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: h_base ! Corners at the end of a stage without the tilt
                                                    ! relaxation, for DG1_TILT_RELAX_MIN_H_STOP [Z ~> m]
   logical :: minh_on  ! DG1_TILT_RELAX_MIN_H_STOP is on
+  logical :: cap_on   ! DG1_SOURCE_POSITIVE is on
   real, dimension(2,2) :: dh
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_v  ! Artificial-viscosity part of rhs, for the budget
                                                    ! and DG1_ART_VISC_LUMP_FRAC [Z L2 T-1 ~> m3 s-1]
@@ -14984,7 +15164,13 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   call pass_corner_field(h0, G)
 
   ! A nodal source S enters as M*S, so after M^-1 it is added to dh/dt directly.
-  call project_h_source_rate_to_nodes(CS, ISS, G, S_node)
+  cap_on = CS%dg_source_positive
+  if (cap_on) then
+    call project_h_source_rate_to_nodes(CS, ISS, G, S_node, dt=time_step, S_bmb_out=S_bmb, S_smb_out=S_smb)
+    CS%dg_src_cut_smb(:,:) = 0.0 ; CS%dg_src_cut_bmb(:,:) = 0.0
+  else
+    call project_h_source_rate_to_nodes(CS, ISS, G, S_node)
+  endif
   bud_on = associated(CS%dg_bud)
   if (bud_on) bud_on = any(CS%id_dg_bud(:) > 0)
   lump_on = (CS%dg_art_visc_lump_frac > 0.0) .or. (CS%dg_band_ramp_lump .and. (CS%dg_band_width >= 0))
@@ -15001,6 +15187,13 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
     call DG1_nodal_spatial_operator(CS, G, hmask, CS%h_nodal, rhs, uh_ice, vh_ice, time_step, rhs_v)
   else
     call DG1_nodal_spatial_operator(CS, G, hmask, CS%h_nodal, rhs, uh_ice, vh_ice, time_step)
+  endif
+  ! The source of the stage, cut by DG1_SOURCE_POSITIVE where it would take a mean below zero.
+  ! The stage steps from h0, which has the same means as the limited corners above.
+  if (cap_on) then
+    call dg1_source_cap(CS, G, hmask, h0, rhs, S_node, S_bmb, S_smb, time_step, 0.5, S_use)
+  else
+    S_use(:,:,:,:) = S_node(:,:,:,:)
   endif
 
   ! One floor on the delivered relaxation time, warned once. It is not a stability
@@ -15063,7 +15256,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
         call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), rhs(i,j,:,:), dh)
       endif
       do b = 1, 2 ; do a = 1, 2
-        h_base(i,j,a,b) = h0(i,j,a,b) + time_step * (dh(a,b) + S_node(i,j,a,b))
+        h_base(i,j,a,b) = h0(i,j,a,b) + time_step * (dh(a,b) + S_use(i,j,a,b))
       enddo ; enddo
     enddo ; enddo
     call dg1_tilt_relax_rate(CS, G, hmask, CS%h_nodal, time_step, T_node, acc_wt=0.5, h_base=h_base)
@@ -15082,14 +15275,14 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
     endif
     do b = 1, 2 ; do a = 1, 2
       CS%h_nodal(i,j,a,b) = h0(i,j,a,b) &
-                           + time_step * (dh(a,b) + S_node(i,j,a,b) + T_node(i,j,a,b))
+                           + time_step * (dh(a,b) + S_use(i,j,a,b) + T_node(i,j,a,b))
     enddo ; enddo
     if (bud_on) then
       if (.not.lump_on) &
         call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), rhs_v(i,j,:,:), dh_v)
       call dg1_bud_add(CS, i, j, 1, 0.5*time_step, dh - dh_v)
       call dg1_bud_add(CS, i, j, 2, 0.5*time_step, dh_v)
-      call dg1_bud_add(CS, i, j, 3, 0.5*time_step, S_node(i,j,:,:))
+      call dg1_bud_add(CS, i, j, 3, 0.5*time_step, S_use(i,j,:,:))
       call dg1_bud_add(CS, i, j, 4, 0.5*time_step, T_node(i,j,:,:))
     endif
   enddo ; enddo
@@ -15111,6 +15304,11 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   else
     call DG1_nodal_spatial_operator(CS, G, hmask, h_curr, rhs, uh_ice, vh_ice, time_step)
   endif
+  if (cap_on) then
+    call dg1_source_cap(CS, G, hmask, h_curr, rhs, S_node, S_bmb, S_smb, time_step, 0.5, S_use)
+  else
+    S_use(:,:,:,:) = S_node(:,:,:,:)
+  endif
   if (minh_on) then
     ! Stage 2 averages with h0, which is already at or above the floor, so its own end value is
     ! the one to keep there.
@@ -15123,7 +15321,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
         call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), rhs(i,j,:,:), dh)
       endif
       do b = 1, 2 ; do a = 1, 2
-        h_base(i,j,a,b) = h_curr(i,j,a,b) + time_step * (dh(a,b) + S_node(i,j,a,b))
+        h_base(i,j,a,b) = h_curr(i,j,a,b) + time_step * (dh(a,b) + S_use(i,j,a,b))
       enddo ; enddo
     enddo ; enddo
     call dg1_tilt_relax_rate(CS, G, hmask, h_curr, time_step, T_node, acc_wt=0.5, h_base=h_base)
@@ -15143,14 +15341,14 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
     do b = 1, 2 ; do a = 1, 2
       CS%h_nodal(i,j,a,b) = 0.5*h0(i,j,a,b) &
                            + 0.5*(h_curr(i,j,a,b) &
-                                  + time_step*(dh(a,b) + S_node(i,j,a,b) + T_node(i,j,a,b)))
+                                  + time_step*(dh(a,b) + S_use(i,j,a,b) + T_node(i,j,a,b)))
     enddo ; enddo
     if (bud_on) then
       if (.not.lump_on) &
         call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), rhs_v(i,j,:,:), dh_v)
       call dg1_bud_add(CS, i, j, 1, 0.5*time_step, dh - dh_v)
       call dg1_bud_add(CS, i, j, 2, 0.5*time_step, dh_v)
-      call dg1_bud_add(CS, i, j, 3, 0.5*time_step, S_node(i,j,:,:))
+      call dg1_bud_add(CS, i, j, 3, 0.5*time_step, S_use(i,j,:,:))
       call dg1_bud_add(CS, i, j, 4, 0.5*time_step, T_node(i,j,:,:))
     endif
   enddo ; enddo
