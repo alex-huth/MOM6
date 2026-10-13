@@ -650,6 +650,11 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! as well as wholly grounded cells.
   real, pointer, dimension(:,:) :: dg_band_kappa => NULL() !< Band diffusivity of each cell, weight
                                   !! included, from the last call [L2 T-1 ~> m2 s-1].
+  integer :: dg_band_width        !< Shared band: the full band N in cells from the grounding line, or
+                                  !! negative for none.
+  real :: dg_band_ramp            !< Shared band: the ramp R in cells over which the weight falls to 0 [nondim].
+  real, pointer, dimension(:,:) :: dg_band_w => NULL() !< Shared band: the weight w of each cell from
+                                  !! its distance to the grounding line, valid in the halo [nondim].
   real :: dg_art_visc_lump_frac  !< Artificial viscosity: the lumped fraction theta of the mass matrix whose
                                   !! inverse the artificial-viscosity part of the right-hand side takes;
                                   !! 0 is the consistent mass matrix [nondim].
@@ -771,7 +776,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_phi_x_FV = -1, id_phi_y_FV = -1, &
              id_dg_art_visc_coef_u = -1, id_dg_art_visc_coef_v = -1, &
              id_dg_art_visc_nu_u = -1, id_dg_art_visc_nu_v = -1, &
-             id_dg_art_visc_cell_scale = -1, id_dg_band_kappa = -1, &
+             id_dg_art_visc_cell_scale = -1, id_dg_band_kappa = -1, id_dg_band_w = -1, &
              id_dg_slow_idle_face_u = -1, id_dg_slow_idle_face_v = -1, &
              id_h_jump_face_u = -1, id_h_jump_face_v = -1, &
              id_s_jump_face_u = -1, id_s_jump_face_v = -1, &
@@ -2075,6 +2080,11 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
            'weight included; zero outside the band', 'm2 yr-1', &
            conversion=365.0*86400.0*US%L_T_to_m_s*US%L_to_m)
       endif
+      if (CS%dg_band_width >= 0) allocate(CS%dg_band_w(G%isd:G%ied,G%jsd:G%jed), source=0.0)
+      if (CS%dg_band_width >= 0) &
+        CS%id_dg_band_w = register_diag_field('ice_shelf_model', 'dg_band_w', CS%diag%axesT1, Time, &
+           'DG(1) shared band weight of DG1_BAND_WIDTH: 1 in the band, falling to 0 across '//&
+           'DG1_BAND_RAMP', 'nondim')
       ! alpha decides how fast TRANSPORT clears the tilt mode: the decay factor f(alpha) peaks at
       ! alpha = 2*sqrt(3)-1 and break-even against no viscosity at all is alpha = 5.5.  This is
       ! the one route by which DG1_ART_VISC_TAU_FLOOR reaches the tilt relaxation.
@@ -2788,6 +2798,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_art_visc_nu_v, CS%dg_art_visc_nu_v, CS%diag)
     if (CS%id_dg_band_kappa > 0) &
         call post_data(CS%id_dg_band_kappa, CS%dg_band_kappa, CS%diag)
+    if (CS%id_dg_band_w > 0) &
+        call post_data(CS%id_dg_band_w, CS%dg_band_w, CS%diag)
     if (CS%id_dg_art_visc_cell_scale > 0 .and. associated(CS%dg_art_visc_cell_scale)) &
         call post_data(CS%id_dg_art_visc_cell_scale, CS%dg_art_visc_cell_scale, CS%diag)
     if (CS%id_dg_slow_idle_face_u > 0 .and. associated(CS%dg_slow_idle_face_u)) &
@@ -9867,6 +9879,7 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_art_visc_nu_v)) deallocate(CS%dg_art_visc_nu_v)
   if (associated(CS%dg_art_visc_cell_scale)) deallocate(CS%dg_art_visc_cell_scale)
   if (associated(CS%dg_band_kappa)) deallocate(CS%dg_band_kappa)
+  if (associated(CS%dg_band_w)) deallocate(CS%dg_band_w)
   if (associated(CS%dg_slow_idle_face_u)) deallocate(CS%dg_slow_idle_face_u)
   if (associated(CS%dg_slow_idle_face_v)) deallocate(CS%dg_slow_idle_face_v)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
@@ -11837,9 +11850,31 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "flow angle and not below.", &
                  units="nondim", default=3.0, &
                  do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_diff_time <= 0.0))
-  if (CS%dg_band_diff_time > 0.0) then
+  call get_param(param_file, mdl, "DG1_BAND_WIDTH", CS%dg_band_width, &
+                 "If zero or positive, the band diffusion of DG1_BAND_DIFF_TIME takes a band weight w "//&
+                 "near the grounding line that later options share.  w comes from the "//&
+                 "distance d in cells of a wholly grounded cell to the nearest ice cell that is not "//&
+                 "wholly grounded (crossed, floating or a partly filled front cell), d = min(cheb - 1 + "//&
+                 "f) with cheb the chessboard distance and f that cell's grounded fraction, so d moves "//&
+                 "smoothly as the grounding line moves through a cell.  w = 1 for d <= DG1_BAND_WIDTH "//&
+                 "and falls linearly to 0 across DG1_BAND_RAMP; cells that are not wholly grounded have "//&
+                 "w = 1.  It replaces DG1_BAND_DIFF_WIDTH.  Negative "//&
+                 "turns it off.", &
+                 units="nondim", default=-1, do_not_log=.not.CS%use_DG_thickness)
+  call get_param(param_file, mdl, "DG1_BAND_RAMP", CS%dg_band_ramp, &
+                 "The width in cells of the ramp of DG1_BAND_WIDTH over which the band weight falls "//&
+                 "from 1 to 0.", &
+                 units="nondim", default=2.0, &
+                 do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_width < 0))
+  if (CS%dg_band_width >= 0) then
+    if (CS%dg_band_ramp <= 0.0) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
+        "DG1_BAND_RAMP must be positive.")
+  endif
+  if ((CS%dg_band_diff_time > 0.0) .and. (CS%dg_band_width < 0)) then
     if (CS%dg_band_diff_width < 0) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
         "DG1_BAND_DIFF_WIDTH must not be negative.")
+  endif
+  if (CS%dg_band_diff_time > 0.0) then
     if (CS%dg_band_diff_penalty < 3.0) call MOM_error(WARNING, "MOM_ice_shelf_dynamics: "//&
         "DG1_BAND_DIFF_PENALTY below 3 can make the band diffusion unstable at oblique flow.")
   endif
@@ -12493,6 +12528,7 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
   rhs_vol(:,:,:,:) = 0.0 ; rhs_x(:,:,:,:) = 0.0 ; rhs_y(:,:,:,:) = 0.0
   rx_m(:,:,:,:) = 0.0 ; rx_p(:,:,:,:) = 0.0 ; ry_m(:,:,:,:) = 0.0 ; ry_p(:,:,:,:) = 0.0
   nb = max(CS%dg_band_diff_width, 0)
+  if (CS%dg_band_width >= 0) nb = 0
   if ((isc - isd < nb + 1) .or. (jsc - jsd < nb + 1)) call MOM_error(FATAL, &
     "dg1_band_diffusion: DG1_BAND_DIFF_WIDTH must be at most the halo width minus 1.")
   rr = CS%density_ice / CS%density_ocean_avg
@@ -12518,6 +12554,10 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
   do j = jsc, jec ; do i = isc, iec
     if (state(i,j) < 0) cycle
     if ((state(i,j) == 0) .and. (.not.CS%dg_band_diff_crossed)) cycle
+    if (CS%dg_band_width >= 0) then
+      wgt(i,j) = CS%dg_band_w(i,j)
+      cycle
+    endif
     dmin = nb + 2
     do n = -(nb+1), nb+1 ; do m = -(nb+1), nb+1
       if ((state(i+m,j+n) == 0) .or. (state(i+m,j+n) == -1)) dmin = min(dmin, max(abs(m), abs(n)))
@@ -12707,6 +12747,66 @@ subroutine dg1_av_ground_band_weight(CS, G, hmask, wgt)
   enddo ; enddo
   call pass_var(wgt, G%domain)
 end subroutine dg1_av_ground_band_weight
+
+!> DG1_BAND_WIDTH: the shared band weight w of each cell, valid in the halo.  The distance d of a
+!! cell to the grounding line, in cells, is the smallest cheb(i,k) - 1 + f_k over the ice cells k that
+!! are not wholly grounded, with cheb the chessboard distance and f_k the grounded fraction of k (0 for
+!! a partly filled front cell).  Repeated sweeps D(i) = min(D(i), D(k) + 1) over the 8 neighbours,
+!! from D(k) = f_k - 1, find it: every sweep adds 1 along a shortest chessboard path, so the result
+!! does not depend on the order of the sweeps and a quarter turn leaves it exact.  Then
+!! w = min(1, max(0, (N + R - d)/R)), and w = 1 in the cells that are not wholly grounded.
+subroutine dg1_band_weight(CS, G, hmask)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS  !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(inout) :: G   !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
+
+  real, parameter :: f_eps = 1.0e-6 ! Grounded-fraction tolerance for a pure flotation state [nondim]
+  real, parameter :: d_far = 1.0e30 ! Distance of a cell with no such ice cell in reach [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: dd, dn ! Distance before and after a sweep [nondim]
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: src ! An ice cell that is not wholly grounded
+  real :: dmin   ! Smallest neighbour distance [nondim]
+  real :: d_end  ! Distance at which the weight reaches 0, N + R [nondim]
+  integer :: i, j, k, it, n_it, n_sw, n_halo
+
+  src(:,:) = .false. ; dd(:,:) = d_far
+  do j = G%jsd, G%jed ; do i = G%isd, G%ied
+    if (hmask(i,j) == 3.0) then
+      src(i,j) = .true. ; dd(i,j) = -1.0
+    elseif (hmask(i,j) == 1.0) then
+      if (CS%ground_frac(i,j) < 1.0 - f_eps) then
+        src(i,j) = .true. ; dd(i,j) = min(max(CS%ground_frac(i,j), 0.0), 1.0) - 1.0
+      endif
+    endif
+  enddo ; enddo
+  d_end = real(CS%dg_band_width) + CS%dg_band_ramp
+  ! Beyond N + R the weight is 0, so the sweeps can stop there.
+  n_it = ceiling(d_end) + 1
+  n_halo = min(G%isc - G%isd, G%jsc - G%jsd)
+  it = 0
+  do while (it < n_it)
+    ! Up to n_halo sweeps between halo updates, sweep k over a region k cells inside the data domain,
+    ! which still covers the computational domain after the last of them.
+    n_sw = min(n_halo, n_it - it)
+    do k = 1, n_sw
+      dn(:,:) = dd(:,:)
+      do j = G%jsd+k, G%jed-k ; do i = G%isd+k, G%ied-k
+        dmin = min(min(min(dd(i-1,j-1), dd(i+1,j+1)), min(dd(i+1,j-1), dd(i-1,j+1))), &
+                   min(min(dd(i-1,j), dd(i+1,j)), min(dd(i,j-1), dd(i,j+1))))
+        dn(i,j) = min(dd(i,j), dmin + 1.0)
+      enddo ; enddo
+      dd(:,:) = dn(:,:)
+    enddo
+    it = it + n_sw
+    call pass_var(dd, G%domain)
+  enddo
+  do j = G%jsd, G%jed ; do i = G%isd, G%ied
+    if (src(i,j)) then
+      CS%dg_band_w(i,j) = 1.0
+    else
+      CS%dg_band_w(i,j) = min(1.0, max(0.0, (d_end - dd(i,j)) / CS%dg_band_ramp))
+    endif
+  enddo ; enddo
+end subroutine dg1_band_weight
 
 !> DG(1) right-hand side M dh/dt = int grad(N).(u h) dA - int N (u.n) h_upwind ds + art visc,
 !! with 2x2 Gauss points in the cell and 2 per face. Specified-flux faces split their flux
@@ -14546,6 +14646,8 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   ! that step's grounding-line motion.
   if (CS%dg_tilt_relax .and. (CS%dg_tilt_relax_ground_mig_len > 0.0)) &
     call dg1_ground_migration_update(CS, G, time_step)
+  ! The grounded fraction and the mask hold through both stages, so the band weight is set once.
+  if (CS%dg_band_width >= 0) call dg1_band_weight(CS, G, hmask)
 
   ! Dirichlet thickness BC.  A boundary cell keeps the nodal thicknesses it was given, so that it
   ! can carry a profile along the inflow face; the stage update below already steps only hmask == 1
