@@ -653,6 +653,8 @@ type, public :: ice_shelf_dyn_CS ; private
   integer :: dg_band_width        !< Shared band: the full band N in cells from the grounding line, or
                                   !! negative for none.
   real :: dg_band_ramp            !< Shared band: the ramp R in cells over which the weight falls to 0 [nondim].
+  logical :: dg_band_ramp_lump    !< Shared band: the artificial viscosity of a cell with weight w takes the mass
+                                  !! matrix lumped by the fraction 1 - w.
   real, pointer, dimension(:,:) :: dg_band_w => NULL() !< Shared band: the weight w of each cell from
                                   !! its distance to the grounding line, valid in the halo [nondim].
   logical :: dg_grounded_limiter  !< If true, a vertex-based limiter of the surface acts in wholly grounded
@@ -11892,6 +11894,11 @@ subroutine read_DG_params(param_file, mdl, CS, US)
     if (CS%dg_band_ramp <= 0.0) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
         "DG1_BAND_RAMP must be positive.")
   endif
+  call get_param(param_file, mdl, "DG1_BAND_RAMP_LUMP", CS%dg_band_ramp_lump, &
+                 "If true, the artificial-viscosity part of the right-hand side of a cell with band weight "//&
+                 "w below 1 takes the inverse mass matrix blended toward the lumped one by 1 - w, so that "//&
+                 "near the outer edge of the band a face flux moves only the corners on that face.", &
+                 default=.false., do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_width < 0))
   call get_param(param_file, mdl, "DG1_GROUNDED_LIMITER", CS%dg_grounded_limiter, &
                  "If true, a vertex-based limiter (Kuzmin 2010) of the surface acts on wholly grounded "//&
                  "DG(1) cells with a band weight of DG1_BAND_WIDTH below 1, after each stage.  Each "//&
@@ -12220,9 +12227,26 @@ subroutine dg1_split_mass_inverse(CS, i, j, rhs, rhs_v, dh, dh_v)
   real, dimension(2,2) :: r_t  ! The rest of the right-hand side [Z L2 T-1 ~> m3 s-1]
   real, dimension(2,2) :: dh_t ! Its corner rates [Z T-1 ~> m s-1]
 
+  real :: th_r ! DG1_BAND_RAMP_LUMP fraction 1 - w [nondim]
+  integer :: a, b
+
   r_t(:,:) = rhs(:,:) - rhs_v(:,:)
   call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), r_t, dh_t)
-  call apply_nodal_DG_mass_inverse(CS%Minv_av_nodal(i,j,:,:,:,:), rhs_v, dh_v)
+  if (CS%dg_art_visc_lump_frac > 0.0) then
+    call apply_nodal_DG_mass_inverse(CS%Minv_av_nodal(i,j,:,:,:,:), rhs_v, dh_v)
+  else
+    call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), rhs_v, dh_v)
+  endif
+  if (CS%dg_band_ramp_lump .and. (CS%dg_band_width >= 0)) then
+    th_r = 1.0 - CS%dg_band_w(i,j)
+    if (th_r > 0.0) then
+      ! The lumped inverse divides each corner by the integral of its basis function.
+      do b = 1, 2 ; do a = 1, 2
+        if (CS%cell_mean_w(i,j,a,b) > 0.0) &
+          dh_v(a,b) = ((1.0 - th_r) * dh_v(a,b)) + (th_r * (rhs_v(a,b) / CS%cell_mean_w(i,j,a,b)))
+      enddo ; enddo
+    endif
+  endif
   dh(:,:) = dh_t(:,:) + dh_v(:,:)
 end subroutine dg1_split_mass_inverse
 
@@ -14963,7 +14987,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   call project_h_source_rate_to_nodes(CS, ISS, G, S_node)
   bud_on = associated(CS%dg_bud)
   if (bud_on) bud_on = any(CS%id_dg_bud(:) > 0)
-  lump_on = (CS%dg_art_visc_lump_frac > 0.0)
+  lump_on = (CS%dg_art_visc_lump_frac > 0.0) .or. (CS%dg_band_ramp_lump .and. (CS%dg_band_width >= 0))
   need_v = bud_on .or. lump_on
 
   if (CS%debug) then
