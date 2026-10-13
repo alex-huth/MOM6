@@ -11851,14 +11851,16 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  units="nondim", default=3.0, &
                  do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_diff_time <= 0.0))
   call get_param(param_file, mdl, "DG1_BAND_WIDTH", CS%dg_band_width, &
-                 "If zero or positive, the band diffusion of DG1_BAND_DIFF_TIME takes a band weight w "//&
-                 "near the grounding line that later options share.  w comes from the "//&
+                 "If zero or positive, one band weight w near the grounding line is shared by the DG(1) "//&
+                 "artificial viscosity and the band diffusion of DG1_BAND_DIFF_TIME.  A face between two "//&
+                 "wholly grounded cells takes the artificial viscosity times the larger w of the two, so "//&
+                 "the viscosity is off beyond the ramp.  w comes from the "//&
                  "distance d in cells of a wholly grounded cell to the nearest ice cell that is not "//&
                  "wholly grounded (crossed, floating or a partly filled front cell), d = min(cheb - 1 + "//&
                  "f) with cheb the chessboard distance and f that cell's grounded fraction, so d moves "//&
                  "smoothly as the grounding line moves through a cell.  w = 1 for d <= DG1_BAND_WIDTH "//&
                  "and falls linearly to 0 across DG1_BAND_RAMP; cells that are not wholly grounded have "//&
-                 "w = 1.  It replaces DG1_BAND_DIFF_WIDTH.  Negative "//&
+                 "w = 1.  It replaces DG1_ART_VISC_GROUND_BAND and DG1_BAND_DIFF_WIDTH.  Negative "//&
                  "turns it off.", &
                  units="nondim", default=-1, do_not_log=.not.CS%use_DG_thickness)
   call get_param(param_file, mdl, "DG1_BAND_RAMP", CS%dg_band_ramp, &
@@ -12845,8 +12847,9 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: rhoi_rhow_wb       ! Ice/ocean density ratio for the well-balanced jump [nondim]
   real :: advect_inv_L       ! 1/DG1_ART_VISC_ADVECT_L_REF, or 0 [L-1 ~> m-1]
   real :: inv_tau_floor      ! 1/DG1_ART_VISC_TAU_FLOOR, or 0 [T-1 ~> s-1]
-  real, dimension(SZDI_(G),SZDJ_(G)) :: avg_w ! DG1_ART_VISC_GROUND_BAND cell weight [nondim]
-  real :: wf                 ! DG1_ART_VISC_GROUND_BAND face weight [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: avg_w ! DG1_BAND_WIDTH or DG1_ART_VISC_GROUND_BAND cell weight [nondim]
+  real :: wf                 ! DG1_BAND_WIDTH or DG1_ART_VISC_GROUND_BAND face weight [nondim]
+  logical :: band_on         ! A band weight scales the viscosity of the faces
   logical :: advect_grid_inv ! If true, scale the advective term by dx_perp/L_ref.
   real :: eps_e_face         ! Effective strain rate at the face midpoint [T-1 ~> s-1]
   logical :: valid_A_visc, valid_B_visc ! Side A/B is hmask 1 or 3.
@@ -12904,7 +12907,12 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   inv_tau_floor = 0.0
   if (CS%dg_art_visc_tau_floor > 0.0) inv_tau_floor = 1.0 / CS%dg_art_visc_tau_floor
 
-  if (CS%dg_art_visc_ground_band >= 0) call dg1_av_ground_band_weight(CS, G, hmask, avg_w)
+  band_on = (CS%dg_band_width >= 0) .or. (CS%dg_art_visc_ground_band >= 0)
+  if (CS%dg_band_width >= 0) then
+    avg_w(:,:) = CS%dg_band_w(:,:)
+  elseif (CS%dg_art_visc_ground_band >= 0) then
+    call dg1_av_ground_band_weight(CS, G, hmask, avg_w)
+  endif
 
   ! Cell-mean surfaces for DG1_ART_VISC_KINK_ALLOW, each corner on its own flotation branch.
   if (CS%dg_art_visc_floor_target) &
@@ -13042,7 +13050,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     if (.not. (valid_A_visc .and. valid_B_visc)) cycle
     if (.not. (hmask(i,j) == 1.0 .or. hmask(i+1,j) == 1.0)) cycle
     wf = 1.0
-    if (CS%dg_art_visc_ground_band >= 0) wf = max(avg_w(i,j), avg_w(i+1,j))
+    if (band_on) wf = max(avg_w(i,j), avg_w(i+1,j))
     if (wf <= 0.0) cycle
     active_E(i,j) = .true.
 
@@ -13165,7 +13173,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     if (.not. (valid_A_visc .and. valid_B_visc)) cycle
     if (.not. (hmask(i,j) == 1.0 .or. hmask(i,j+1) == 1.0)) cycle
     wf = 1.0
-    if (CS%dg_art_visc_ground_band >= 0) wf = max(avg_w(i,j), avg_w(i,j+1))
+    if (band_on) wf = max(avg_w(i,j), avg_w(i,j+1))
     if (wf <= 0.0) cycle
     active_N(i,j) = .true.
 
