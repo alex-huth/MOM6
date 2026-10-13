@@ -642,6 +642,9 @@ type, public :: ice_shelf_dyn_CS ; private
   integer :: dg_band_diff_width   !< Band diffusion: the band's width in cells (chessboard distance).
   real :: dg_band_diff_u_iso      !< Band diffusion: speed below which the diffusion becomes isotropic
                                   !! [L T-1 ~> m s-1].
+  real :: dg_band_diff_iso_courant !< Band diffusion: if positive, the fraction of the decay rate below which
+                                  !! the flow's cell-crossing rate makes the diffusion isotropic; it replaces
+                                  !! DG1_BAND_DIFF_U_ISO [nondim].
   real :: dg_band_diff_penalty    !< Band diffusion: interior-penalty constant C, sigma = C kappa_nn/dx [nondim].
   logical :: dg_band_diff_crossed !< Band diffusion: if true, cells the grounding line crosses are in the band
                                   !! as well as wholly grounded cells.
@@ -11811,6 +11814,14 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "|u|^2 n n^T)/(|u|^2 + u_iso^2), which is crosswind for |u| >> u_iso and isotropic at rest.", &
                  units="m s-1", default=3.17e-8, scale=US%m_s_to_L_T, &
                  do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_diff_time <= 0.0))
+  call get_param(param_file, mdl, "DG1_BAND_DIFF_ISO_COURANT", CS%dg_band_diff_iso_courant, &
+                 "If positive, DG1_BAND_DIFF_TIME becomes isotropic where the rate at which the flow "//&
+                 "crosses a cell, |(u/dx, v/dy)|, is small against this fraction c of the decay rate 1/T: "//&
+                 "K = a I + (1 - a) n n^T with a = c^2/(c^2 + (T |(u/dx, v/dy)|)^2), n the crosswind unit "//&
+                 "vector of the physical velocity.  It replaces DG1_BAND_DIFF_U_ISO, a fixed speed, by a "//&
+                 "form that does not depend on the resolution.  Zero or less keeps DG1_BAND_DIFF_U_ISO.", &
+                 units="nondim", default=0.0, &
+                 do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_diff_time <= 0.0))
   call get_param(param_file, mdl, "DG1_BAND_DIFF_CROSSED", CS%dg_band_diff_crossed, &
                  "If true, cells the grounding line crosses are in the band of DG1_BAND_DIFF_TIME as "//&
                  "well as wholly grounded cells.  If false, only faces between two wholly grounded "//&
@@ -12452,6 +12463,10 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
   real :: inv_T       ! Decay rate of the crosswind mode, capped at 0.5/dt [T-1 ~> s-1]
   real :: uc, vc      ! Cell-mean velocity [L T-1 ~> m s-1]
   real :: u2, v2, ui2, den ! Squared speeds [L2 T-2 ~> m2 s-2]
+  real :: s2          ! Squared speed [L2 T-2 ~> m2 s-2]
+  real :: cr2         ! Squared cell-crossing rate times T squared [nondim]
+  real :: iso_c2      ! DG1_BAND_DIFF_ISO_COURANT squared, or 0 [nondim]
+  real :: a_iso       ! Isotropic share of K [nondim]
   real :: Kxx_c, Kyy_c, Kxy_c ! Components of K [nondim]
   real :: kap         ! Cell diffusivity [L2 T-1 ~> m2 s-1]
   real :: xi_q, eta_q ! Quadrature point in the cell [nondim]
@@ -12483,6 +12498,8 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
   rr = CS%density_ice / CS%density_ocean_avg
   inv_T = min(1.0 / CS%dg_band_diff_time, 0.5 / dt)
   ui2 = CS%dg_band_diff_u_iso * CS%dg_band_diff_u_iso
+  iso_c2 = 0.0
+  if (CS%dg_band_diff_iso_courant > 0.0) iso_c2 = CS%dg_band_diff_iso_courant**2
 
   do j = jsd, jed ; do i = isd, ied
     state(i,j) = -2
@@ -12520,11 +12537,24 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
     uc = 0.25*((CS%u_shelf(i-1,j-1) + CS%u_shelf(i,j)) + (CS%u_shelf(i,j-1) + CS%u_shelf(i-1,j)))
     vc = 0.25*((CS%v_shelf(i-1,j-1) + CS%v_shelf(i,j)) + (CS%v_shelf(i,j-1) + CS%v_shelf(i-1,j)))
     u2 = uc*uc ; v2 = vc*vc
-    den = (u2 + v2) + ui2
-    if (den > 0.0) then
-      Kxx_c = (ui2 + v2) / den ; Kyy_c = (ui2 + u2) / den ; Kxy_c = -(uc*vc) / den
+    if (iso_c2 > 0.0) then
+      ! The isotropic share from the cell-crossing rate; the crosswind direction stays physical.
+      cr2 = ((uc*G%IdxT(i,j))**2 + (vc*G%IdyT(i,j))**2) * (CS%dg_band_diff_time**2)
+      a_iso = iso_c2 / (iso_c2 + cr2)
+      s2 = u2 + v2
+      if (s2 > 0.0) then
+        Kxx_c = a_iso + ((1.0 - a_iso) * (v2 / s2)) ; Kyy_c = a_iso + ((1.0 - a_iso) * (u2 / s2))
+        Kxy_c = -((1.0 - a_iso) * ((uc*vc) / s2))
+      else
+        Kxx_c = 1.0 ; Kyy_c = 1.0 ; Kxy_c = 0.0
+      endif
     else
-      Kxx_c = 1.0 ; Kyy_c = 1.0 ; Kxy_c = 0.0
+      den = (u2 + v2) + ui2
+      if (den > 0.0) then
+        Kxx_c = (ui2 + v2) / den ; Kyy_c = (ui2 + u2) / den ; Kxy_c = -(uc*vc) / den
+      else
+        Kxx_c = 1.0 ; Kyy_c = 1.0 ; Kxy_c = 0.0
+      endif
     endif
     kap = (wgt(i,j) * inv_T) * (((Kxx_c*(G%dxT(i,j)*G%dxT(i,j))) + (Kyy_c*(G%dyT(i,j)*G%dyT(i,j)))) / &
                                 (12.0 * (Kxx_c + Kyy_c)))
