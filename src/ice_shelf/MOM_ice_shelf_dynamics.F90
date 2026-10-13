@@ -655,6 +655,11 @@ type, public :: ice_shelf_dyn_CS ; private
   real :: dg_band_ramp            !< Shared band: the ramp R in cells over which the weight falls to 0 [nondim].
   real, pointer, dimension(:,:) :: dg_band_w => NULL() !< Shared band: the weight w of each cell from
                                   !! its distance to the grounding line, valid in the halo [nondim].
+  logical :: dg_grounded_limiter  !< If true, a vertex-based limiter of the surface acts in wholly grounded
+                                  !! cells with band weight below 1.
+  real :: dg_lim_d0               !< Grounded limiter: smallest node excess it acts on [Z ~> m].
+  real, pointer, dimension(:,:,:) :: dg_lim_phi => NULL() !< Grounded limiter: the smallest tilt (1) and
+                                  !! twist (2) factors of each cell over the stages of the last step [nondim].
   real :: dg_art_visc_lump_frac  !< Artificial viscosity: the lumped fraction theta of the mass matrix whose
                                   !! inverse the artificial-viscosity part of the right-hand side takes;
                                   !! 0 is the consistent mass matrix [nondim].
@@ -777,6 +782,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_dg_art_visc_coef_u = -1, id_dg_art_visc_coef_v = -1, &
              id_dg_art_visc_nu_u = -1, id_dg_art_visc_nu_v = -1, &
              id_dg_art_visc_cell_scale = -1, id_dg_band_kappa = -1, id_dg_band_w = -1, &
+             id_dg_lim_phi_t = -1, id_dg_lim_phi_w = -1, &
              id_dg_slow_idle_face_u = -1, id_dg_slow_idle_face_v = -1, &
              id_h_jump_face_u = -1, id_h_jump_face_v = -1, &
              id_s_jump_face_u = -1, id_s_jump_face_v = -1, &
@@ -2085,6 +2091,15 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         CS%id_dg_band_w = register_diag_field('ice_shelf_model', 'dg_band_w', CS%diag%axesT1, Time, &
            'DG(1) shared band weight of DG1_BAND_WIDTH: 1 in the band, falling to 0 across '//&
            'DG1_BAND_RAMP', 'nondim')
+      if (CS%dg_grounded_limiter) then
+        allocate(CS%dg_lim_phi(G%isd:G%ied,G%jsd:G%jed,2), source=1.0)
+        CS%id_dg_lim_phi_t = register_diag_field('ice_shelf_model', 'dg_lim_phi_t', CS%diag%axesT1, Time, &
+           'DG(1) grounded limiter: smallest factor on the tilts over the stages of the last step, '//&
+           'band weight included; 1 where it does not act', 'nondim')
+        CS%id_dg_lim_phi_w = register_diag_field('ice_shelf_model', 'dg_lim_phi_w', CS%diag%axesT1, Time, &
+           'DG(1) grounded limiter: smallest factor on the twist over the stages of the last step, '//&
+           'band weight included; 1 where it does not act', 'nondim')
+      endif
       ! alpha decides how fast TRANSPORT clears the tilt mode: the decay factor f(alpha) peaks at
       ! alpha = 2*sqrt(3)-1 and break-even against no viscosity at all is alpha = 5.5.  This is
       ! the one route by which DG1_ART_VISC_TAU_FLOOR reaches the tilt relaxation.
@@ -2800,6 +2815,10 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_band_kappa, CS%dg_band_kappa, CS%diag)
     if (CS%id_dg_band_w > 0) &
         call post_data(CS%id_dg_band_w, CS%dg_band_w, CS%diag)
+    if (CS%id_dg_lim_phi_t > 0) &
+        call post_data(CS%id_dg_lim_phi_t, CS%dg_lim_phi(:,:,1), CS%diag)
+    if (CS%id_dg_lim_phi_w > 0) &
+        call post_data(CS%id_dg_lim_phi_w, CS%dg_lim_phi(:,:,2), CS%diag)
     if (CS%id_dg_art_visc_cell_scale > 0 .and. associated(CS%dg_art_visc_cell_scale)) &
         call post_data(CS%id_dg_art_visc_cell_scale, CS%dg_art_visc_cell_scale, CS%diag)
     if (CS%id_dg_slow_idle_face_u > 0 .and. associated(CS%dg_slow_idle_face_u)) &
@@ -9880,6 +9899,7 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_art_visc_cell_scale)) deallocate(CS%dg_art_visc_cell_scale)
   if (associated(CS%dg_band_kappa)) deallocate(CS%dg_band_kappa)
   if (associated(CS%dg_band_w)) deallocate(CS%dg_band_w)
+  if (associated(CS%dg_lim_phi)) deallocate(CS%dg_lim_phi)
   if (associated(CS%dg_slow_idle_face_u)) deallocate(CS%dg_slow_idle_face_u)
   if (associated(CS%dg_slow_idle_face_v)) deallocate(CS%dg_slow_idle_face_v)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
@@ -11852,9 +11872,9 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_diff_time <= 0.0))
   call get_param(param_file, mdl, "DG1_BAND_WIDTH", CS%dg_band_width, &
                  "If zero or positive, one band weight w near the grounding line is shared by the DG(1) "//&
-                 "artificial viscosity and the band diffusion of DG1_BAND_DIFF_TIME.  A face between two "//&
-                 "wholly grounded cells takes the artificial viscosity times the larger w of the two, so "//&
-                 "the viscosity is off beyond the ramp.  w comes from the "//&
+                 "artificial viscosity, the band diffusion of DG1_BAND_DIFF_TIME and DG1_GROUNDED_LIMITER.  "//&
+                 "A face between two wholly grounded cells takes the artificial viscosity times the larger "//&
+                 "w of the two, so the viscosity is off beyond the ramp.  w comes from the "//&
                  "distance d in cells of a wholly grounded cell to the nearest ice cell that is not "//&
                  "wholly grounded (crossed, floating or a partly filled front cell), d = min(cheb - 1 + "//&
                  "f) with cheb the chessboard distance and f that cell's grounded fraction, so d moves "//&
@@ -11872,6 +11892,20 @@ subroutine read_DG_params(param_file, mdl, CS, US)
     if (CS%dg_band_ramp <= 0.0) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
         "DG1_BAND_RAMP must be positive.")
   endif
+  call get_param(param_file, mdl, "DG1_GROUNDED_LIMITER", CS%dg_grounded_limiter, &
+                 "If true, a vertex-based limiter (Kuzmin 2010) of the surface acts on wholly grounded "//&
+                 "DG(1) cells with a band weight of DG1_BAND_WIDTH below 1, after each stage.  Each "//&
+                 "corner surface is bounded by the cell-mean surfaces of the four cells that share the "//&
+                 "corner (an ice-free cell at its bed or at sea level); the twist and then both tilts are "//&
+                 "scaled down until the corners lie in their bounds, which leaves the cell mean "//&
+                 "unchanged.  A cell whose mean is a smooth extremum (a divide or a dome, by the MOOD "//&
+                 "curvature test) is left alone.  The correction fades in over the first excess above "//&
+                 "a tolerance and is scaled by 1 - w, so it hands over smoothly to the band.  It needs "//&
+                 "DG1_BAND_WIDTH.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
+  if (CS%dg_grounded_limiter .and. (CS%dg_band_width < 0)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics: DG1_GROUNDED_LIMITER needs DG1_BAND_WIDTH >= 0.")
+  CS%dg_lim_d0 = 0.5*US%m_to_Z
   if ((CS%dg_band_diff_time > 0.0) .and. (CS%dg_band_width < 0)) then
     if (CS%dg_band_diff_width < 0) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
         "DG1_BAND_DIFF_WIDTH must not be negative.")
@@ -12809,6 +12843,263 @@ subroutine dg1_band_weight(CS, G, hmask)
     endif
   enddo ; enddo
 end subroutine dg1_band_weight
+
+!> DG1_GROUNDED_LIMITER: a vertex-based limiter (Kuzmin 2010) of the surface, applied to CS%h_nodal in
+!! the wholly grounded cells with a band weight w below 1.  The bounds of a corner are the smallest and
+!! largest cell-mean surfaces of the four cells that share it: an ice cell gives its mean, an ice-free
+!! cell its physical surface (the bed on land, sea level over the ocean), and a cell beyond a domain
+!! edge that is not reentrant the linear extrapolation of the two cells inside, which leaves a divide
+!! at a wall its slope.  A cell is changed only where a corner lies more than delta outside its
+!! bounds, delta = max(dg_lim_d0, lim_eps (s_max - s_min)), and not where its mean is a smooth
+!! extremum of the cell means by the MOOD curvature test (Diot et al. 2012).  The twist is scaled by
+!! the largest factor in [0, 1] that brings every corner into its bounds; if there is none, the twist
+!! is removed and both tilts are scaled by one Barth-Jespersen factor.  The factors fade in over an
+!! excess between delta and 2 delta and are scaled by 1 - w.  The tilt and twist patterns have zero
+!! cell mean, so the cell mean of the surface, and of the thickness while every corner stays on the
+!! grounded branch, is unchanged; a cell whose corners would leave that branch is not changed.  The
+!! halo of h_nodal must be valid on entry; only the computational domain is changed.
+subroutine dg1_grounded_limiter(CS, G, hmask)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS  !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(inout) :: G   !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
+
+  real, parameter :: f_eps = 1.0e-6      ! Grounded-fraction tolerance for a pure flotation state [nondim]
+  real, parameter :: lim_eps = 0.02      ! Excess tolerance as a fraction of a corner's bound range [nondim]
+  real, parameter :: ratio_smooth = 0.5  ! Smallest ratio of the curvatures of a smooth extremum [nondim]
+  real, parameter :: pi_lim = 3.14159265358979323846 ! Pi for the fade-in [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: sbar  ! Cell-mean surface of a cell, see above [Z ~> m]
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: have ! sbar is set
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: in_dom ! The cell lies inside the domain
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: nmin, nmax ! Corner bounds [Z ~> m]
+  real, dimension(2,2) :: s_c    ! Corner surfaces of a cell [Z ~> m]
+  real, dimension(2,2) :: lin_c  ! Tilt part of s_c - sbar [Z ~> m]
+  real, dimension(2,2) :: tw_c   ! Twist part of s_c - sbar [Z ~> m]
+  real, dimension(2,2) :: lo_c, hi_c ! Corner bounds of a cell [Z ~> m]
+  real, dimension(2,2) :: wn     ! Corner weights over the cell area [nondim]
+  real :: rr        ! Ice/ocean density ratio [nondim]
+  real :: dmean     ! Mean bed depth of an ice-free cell [Z ~> m]
+  real :: area      ! Sum of the corner weights [L2 ~> m2]
+  real :: tw        ! Twist amplitude [Z ~> m]
+  real :: wT        ! Weighted cell mean of the twist pattern [nondim]
+  real :: e_max     ! Largest corner excess [Z ~> m]
+  real :: r_max     ! Largest corner bound range [Z ~> m]
+  real :: delta     ! Excess tolerance [Z ~> m]
+  real :: lo, hi    ! Room below and above a corner [Z ~> m]
+  real :: p_lo, p_hi ! Feasible interval of the twist factor [nondim]
+  real :: phi_t, phi_w ! Tilt and twist factors [nondim]
+  real :: xf, g_f   ! Fade-in position and weight [nondim]
+  real :: wb        ! Band weight [nondim]
+  real :: dh        ! Change of a corner [Z ~> m]
+  real :: cm, c0, cp ! Second differences of sbar at the cell before, the cell and the cell after [Z ~> m]
+  real :: s_lo, s_hi ! Smallest and largest mean in the 3 x 3 block [Z ~> m]
+  logical :: feas   ! The twist factor has a feasible value
+  logical :: smooth ! Every axis along which the cell mean is an extremum passes the curvature test
+  logical :: ok_br  ! Every corner stays on the grounded branch
+  logical :: north_open ! The north edge is a fold, so its halo lies inside the domain
+  integer :: i, j, a, b, m, n, k, ig, jg, isc, iec, jsc, jec, isd, ied, jsd, jed
+
+  isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
+  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+  rr = CS%density_ice / CS%density_ocean_avg
+  north_open = (G%Domain%Y_FLAGS == FOLD_NORTH_EDGE)
+
+  ! Cell-mean surfaces inside the domain.
+  do j = jsd, jed ; do i = isd, ied
+    ig = i + G%idg_offset ; jg = j + G%jdg_offset
+    in_dom(i,j) = .true.
+    if ((.not.CS%reentrant_x) .and. ((ig < G%isg) .or. (ig > G%ieg))) in_dom(i,j) = .false.
+    if ((.not.CS%reentrant_y) .and. (jg < G%jsg)) in_dom(i,j) = .false.
+    if ((.not.CS%reentrant_y) .and. (.not.north_open) .and. (jg > G%jeg)) in_dom(i,j) = .false.
+    have(i,j) = .false. ; sbar(i,j) = 0.0
+    if ((.not.in_dom(i,j)) .or. (i == isd) .or. (j == jsd)) cycle
+    if ((hmask(i,j) == 1.0) .or. (hmask(i,j) == 3.0)) then
+      do b = 1, 2 ; do a = 1, 2
+        s_c(a,b) = max(CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b), (1.0 - rr) * CS%h_nodal(i,j,a,b))
+      enddo ; enddo
+      sbar(i,j) = nodal_cell_mean(s_c, CS%cell_mean_w(i,j,:,:))
+    else
+      dmean = 0.25*((CS%bed_node(i-1,j-1) + CS%bed_node(i,j)) + (CS%bed_node(i,j-1) + CS%bed_node(i-1,j)))
+      sbar(i,j) = max(-dmean, 0.0)
+    endif
+    have(i,j) = .true.
+  enddo ; enddo
+
+  ! Cells beyond a domain edge: the linear extrapolation along the axis normal to the edge, or along
+  ! the diagonal beyond a corner of the domain.  k is the distance to the first cell inside.
+  do j = jsd+1, jed-1 ; do i = isd+1, ied-1
+    if (in_dom(i,j)) cycle
+    do k = 1, 2
+      if (have(i,j)) exit
+      if (i+k+1 <= ied) then ; if (in_dom(i+k,j) .and. have(i+k,j) .and. have(i+k+1,j) .and. &
+                                   (.not.in_dom(i+k-1,j))) then
+        sbar(i,j) = sbar(i+k,j) + real(k)*(sbar(i+k,j) - sbar(i+k+1,j)) ; have(i,j) = .true. ; cycle
+      endif ; endif
+      if (i-k-1 >= isd) then ; if (in_dom(i-k,j) .and. have(i-k,j) .and. have(i-k-1,j) .and. &
+                                   (.not.in_dom(i-k+1,j))) then
+        sbar(i,j) = sbar(i-k,j) + real(k)*(sbar(i-k,j) - sbar(i-k-1,j)) ; have(i,j) = .true. ; cycle
+      endif ; endif
+      if (j+k+1 <= jed) then ; if (in_dom(i,j+k) .and. have(i,j+k) .and. have(i,j+k+1) .and. &
+                                   (.not.in_dom(i,j+k-1))) then
+        sbar(i,j) = sbar(i,j+k) + real(k)*(sbar(i,j+k) - sbar(i,j+k+1)) ; have(i,j) = .true. ; cycle
+      endif ; endif
+      if (j-k-1 >= jsd) then ; if (in_dom(i,j-k) .and. have(i,j-k) .and. have(i,j-k-1) .and. &
+                                   (.not.in_dom(i,j-k+1))) then
+        sbar(i,j) = sbar(i,j-k) + real(k)*(sbar(i,j-k) - sbar(i,j-k-1)) ; have(i,j) = .true. ; cycle
+      endif ; endif
+    enddo
+    if (have(i,j)) cycle
+    do n = -1, 1, 2 ; do m = -1, 1, 2
+      if (have(i,j)) cycle
+      if ((i+2*m < isd) .or. (i+2*m > ied) .or. (j+2*n < jsd) .or. (j+2*n > jed)) cycle
+      if (in_dom(i+m,j+n) .and. have(i+m,j+n) .and. have(i+2*m,j+2*n) .and. &
+          (.not.in_dom(i+m,j)) .and. (.not.in_dom(i,j+n))) then
+        sbar(i,j) = sbar(i+m,j+n) + (sbar(i+m,j+n) - sbar(i+2*m,j+2*n)) ; have(i,j) = .true.
+      endif
+    enddo ; enddo
+  enddo ; enddo
+
+  ! Corner bounds; corner (I,J) is shared by cells i = I, I+1 and j = J, J+1.
+  nmin(:,:) = 0.0 ; nmax(:,:) = 0.0
+  do J = jsc-1, jec ; do I = isc-1, iec
+    nmin(I,J) = huge(1.0) ; nmax(I,J) = -huge(1.0)
+    do n = 0, 1 ; do m = 0, 1
+      if (.not.have(I+m,J+n)) cycle
+      nmin(I,J) = min(nmin(I,J), sbar(I+m,J+n)) ; nmax(I,J) = max(nmax(I,J), sbar(I+m,J+n))
+    enddo ; enddo
+  enddo ; enddo
+
+  do j = jsc, jec ; do i = isc, iec
+    CS%dg_lim_phi(i,j,:) = min(CS%dg_lim_phi(i,j,:), 1.0)
+    if (hmask(i,j) /= 1.0) cycle
+    if (CS%ground_frac(i,j) < 1.0 - f_eps) cycle
+    wb = CS%dg_band_w(i,j)
+    if (wb >= 1.0) cycle
+    ok_br = .true.
+    do b = 1, 2 ; do a = 1, 2
+      if (rr * CS%h_nodal(i,j,a,b) < CS%bed_node(i-2+a,j-2+b)) ok_br = .false.
+      s_c(a,b) = CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b)
+      lo_c(a,b) = nmin(i-2+a,j-2+b) ; hi_c(a,b) = nmax(i-2+a,j-2+b)
+    enddo ; enddo
+    if (.not.ok_br) cycle
+    e_max = 0.0 ; r_max = 0.0
+    do b = 1, 2 ; do a = 1, 2
+      e_max = max(e_max, max(s_c(a,b) - hi_c(a,b), lo_c(a,b) - s_c(a,b)))
+      r_max = max(r_max, hi_c(a,b) - lo_c(a,b))
+    enddo ; enddo
+    delta = max(CS%dg_lim_d0, lim_eps * r_max)
+    if (e_max <= delta) cycle
+
+    ! The MOOD smooth-extremum test on the cell means.
+    s_lo = sbar(i,j) ; s_hi = sbar(i,j)
+    do n = -1, 1 ; do m = -1, 1
+      if (.not.have(i+m,j+n)) cycle
+      s_lo = min(s_lo, sbar(i+m,j+n)) ; s_hi = max(s_hi, sbar(i+m,j+n))
+    enddo ; enddo
+    if ((sbar(i,j) >= s_hi) .or. (sbar(i,j) <= s_lo)) then
+      smooth = .true.
+      if (have(i-2,j) .and. have(i-1,j) .and. have(i+1,j) .and. have(i+2,j)) then
+        if (((sbar(i,j) >= sbar(i-1,j)) .and. (sbar(i,j) >= sbar(i+1,j))) .or. &
+            ((sbar(i,j) <= sbar(i-1,j)) .and. (sbar(i,j) <= sbar(i+1,j)))) then
+          cm = (sbar(i-2,j) + sbar(i,j)) - 2.0*sbar(i-1,j)
+          c0 = (sbar(i-1,j) + sbar(i+1,j)) - 2.0*sbar(i,j)
+          cp = (sbar(i,j) + sbar(i+2,j)) - 2.0*sbar(i+1,j)
+          smooth = smooth .and. dg1_lim_smooth3(cm, c0, cp, ratio_smooth)
+        endif
+      else
+        smooth = .false.
+      endif
+      if (have(i,j-2) .and. have(i,j-1) .and. have(i,j+1) .and. have(i,j+2)) then
+        if (((sbar(i,j) >= sbar(i,j-1)) .and. (sbar(i,j) >= sbar(i,j+1))) .or. &
+            ((sbar(i,j) <= sbar(i,j-1)) .and. (sbar(i,j) <= sbar(i,j+1)))) then
+          cm = (sbar(i,j-2) + sbar(i,j)) - 2.0*sbar(i,j-1)
+          c0 = (sbar(i,j-1) + sbar(i,j+1)) - 2.0*sbar(i,j)
+          cp = (sbar(i,j) + sbar(i,j+2)) - 2.0*sbar(i,j+1)
+          smooth = smooth .and. dg1_lim_smooth3(cm, c0, cp, ratio_smooth)
+        endif
+      else
+        smooth = .false.
+      endif
+      if (smooth) cycle
+    endif
+
+    ! Split s_c - sbar into its tilt and twist parts, each of zero weighted mean.
+    area = ((CS%cell_mean_w(i,j,1,1) + CS%cell_mean_w(i,j,2,2)) + &
+            (CS%cell_mean_w(i,j,1,2) + CS%cell_mean_w(i,j,2,1)))
+    if (area <= 0.0) cycle
+    do b = 1, 2 ; do a = 1, 2
+      wn(a,b) = CS%cell_mean_w(i,j,a,b) / area
+    enddo ; enddo
+    tw = 0.25*((s_c(1,1) + s_c(2,2)) - (s_c(2,1) + s_c(1,2)))
+    wT = (wn(1,1) + wn(2,2)) - (wn(2,1) + wn(1,2))
+    tw_c(1,1) = tw*(1.0 - wT) ; tw_c(2,2) = tw*(1.0 - wT)
+    tw_c(2,1) = tw*(-1.0 - wT) ; tw_c(1,2) = tw*(-1.0 - wT)
+    do b = 1, 2 ; do a = 1, 2
+      lin_c(a,b) = (s_c(a,b) - sbar(i,j)) - tw_c(a,b)
+    enddo ; enddo
+
+    ! The twist factor: the largest value in [0, 1] that brings every corner into its bounds.
+    p_lo = 0.0 ; p_hi = 1.0 ; feas = .true.
+    do b = 1, 2 ; do a = 1, 2
+      lo = lo_c(a,b) - (sbar(i,j) + lin_c(a,b)) ; hi = hi_c(a,b) - (sbar(i,j) + lin_c(a,b))
+      if (tw_c(a,b) > 0.0) then
+        p_lo = max(p_lo, lo / tw_c(a,b)) ; p_hi = min(p_hi, hi / tw_c(a,b))
+      elseif (tw_c(a,b) < 0.0) then
+        p_lo = max(p_lo, hi / tw_c(a,b)) ; p_hi = min(p_hi, lo / tw_c(a,b))
+      elseif ((lo > 0.0) .or. (hi < 0.0)) then
+        feas = .false.
+      endif
+    enddo ; enddo
+    if (feas .and. (p_lo <= p_hi)) then
+      phi_w = p_hi ; phi_t = 1.0
+    else
+      ! No twist brings the corners in, so the twist goes and one factor scales both tilts.
+      phi_w = 0.0 ; phi_t = 1.0
+      do b = 1, 2 ; do a = 1, 2
+        if (lin_c(a,b) > 0.0) then
+          phi_t = min(phi_t, (hi_c(a,b) - sbar(i,j)) / lin_c(a,b))
+        elseif (lin_c(a,b) < 0.0) then
+          phi_t = min(phi_t, (lo_c(a,b) - sbar(i,j)) / lin_c(a,b))
+        endif
+      enddo ; enddo
+      phi_t = max(phi_t, 0.0)
+    endif
+
+    ! Fade-in between delta and 2 delta, then the band weight.
+    xf = min(1.0, max(0.0, e_max / delta - 1.0))
+    g_f = 0.5*(1.0 + cos(pi_lim*xf))
+    phi_w = g_f + (1.0 - g_f)*phi_w ; phi_t = g_f + (1.0 - g_f)*phi_t
+    phi_w = 1.0 - (1.0 - wb)*(1.0 - phi_w) ; phi_t = 1.0 - (1.0 - wb)*(1.0 - phi_t)
+
+    ok_br = .true.
+    do b = 1, 2 ; do a = 1, 2
+      dh = ((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b))
+      if (rr * (CS%h_nodal(i,j,a,b) + dh) < CS%bed_node(i-2+a,j-2+b)) ok_br = .false.
+    enddo ; enddo
+    if (.not.ok_br) cycle
+    do b = 1, 2 ; do a = 1, 2
+      CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + (((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b)))
+    enddo ; enddo
+    CS%dg_lim_phi(i,j,1) = min(CS%dg_lim_phi(i,j,1), phi_t)
+    CS%dg_lim_phi(i,j,2) = min(CS%dg_lim_phi(i,j,2), phi_w)
+  enddo ; enddo
+end subroutine dg1_grounded_limiter
+
+!> The MOOD curvature test of a smooth extremum along one axis: the second differences of the cell
+!! means at the cell and its two neighbours have one sign, and the smallest is at least ratio times the
+!! largest in size.
+pure logical function dg1_lim_smooth3(cm, c0, cp, ratio)
+  real, intent(in) :: cm    !< Second difference at the cell before [Z ~> m]
+  real, intent(in) :: c0    !< Second difference at the cell [Z ~> m]
+  real, intent(in) :: cp    !< Second difference at the cell after [Z ~> m]
+  real, intent(in) :: ratio !< Smallest ratio of the curvatures [nondim]
+  real :: a_lo, a_hi ! Smallest and largest size [Z ~> m]
+
+  dg1_lim_smooth3 = .false.
+  if (.not.(((cm > 0.0) .and. (c0 > 0.0) .and. (cp > 0.0)) .or. &
+            ((cm < 0.0) .and. (c0 < 0.0) .and. (cp < 0.0)))) return
+  a_lo = min(min(abs(cm), abs(cp)), abs(c0)) ; a_hi = max(max(abs(cm), abs(cp)), abs(c0))
+  dg1_lim_smooth3 = (a_lo >= ratio * a_hi)
+end function dg1_lim_smooth3
 
 !> DG(1) right-hand side M dh/dt = int grad(N).(u h) dA - int N (u.n) h_upwind ds + art visc,
 !! with 2x2 Gauss points in the cell and 2 per face. Specified-flux faces split their flux
@@ -14656,6 +14947,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
     call dg1_ground_migration_update(CS, G, time_step)
   ! The grounded fraction and the mask hold through both stages, so the band weight is set once.
   if (CS%dg_band_width >= 0) call dg1_band_weight(CS, G, hmask)
+  if (CS%dg_grounded_limiter) CS%dg_lim_phi(:,:,:) = 1.0
 
   ! Dirichlet thickness BC.  A boundary cell keeps the nodal thicknesses it was given, so that it
   ! can carry a profile along the inflow face; the stage update below already steps only hmask == 1
@@ -14778,8 +15070,9 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
     endif
   enddo ; enddo
   call pass_corner_field(CS%h_nodal, G)
+  if (CS%dg_grounded_limiter) call dg1_grounded_limiter(CS, G, hmask)
 
-  ! Stage 2: positivity limit, spatial operator, M^-1, SSP-RK2 combination.
+  ! Stage 2: grounded limiter, positivity limit, spatial operator, M^-1, SSP-RK2 combination.
   if (bud_on) h_pre(:,:,:,:) = CS%h_nodal(:,:,:,:)
   call nodal_positivity_limit(CS, G, ISS)
   if (bud_on) then
@@ -14838,6 +15131,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
     endif
   enddo ; enddo
   call pass_corner_field(CS%h_nodal, G)
+  if (CS%dg_grounded_limiter) call dg1_grounded_limiter(CS, G, hmask)
 
   ! Keep the consumed source for diagnostics and reset the buffers.
   CS%h_source_rate_last(:,:) = CS%h_source_rate(:,:)
