@@ -667,6 +667,10 @@ type, public :: ice_shelf_dyn_CS ; private
   real :: dg_band_ramp            !< Shared band: the ramp R in cells over which the weight falls to 0 [nondim].
   logical :: dg_band_ramp_lump    !< Shared band: the artificial viscosity of a cell with weight w takes the mass
                                   !! matrix lumped by the fraction 1 - w.
+  logical :: dg_band_float        !< Shared band: floating ice takes its own band weight from its distance to
+                                  !! the ice that is not wholly floating, as grounded ice does, instead of w = 1.
+  integer :: dg_band_width_float  !< Shared band: the full band N in cells on the floating side.
+  real :: dg_band_ramp_float      !< Shared band: the ramp R in cells on the floating side [nondim].
   real, pointer, dimension(:,:) :: dg_band_w => NULL() !< Shared band: the weight w of each cell from
                                   !! its distance to the grounding line, valid in the halo [nondim].
   logical :: dg_grounded_limiter  !< If true, a vertex-based limiter of the surface acts in wholly grounded
@@ -12025,6 +12029,34 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "w below 1 takes the inverse mass matrix blended toward the lumped one by 1 - w, so that "//&
                  "near the outer edge of the band a face flux moves only the corners on that face.", &
                  default=.false., do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_width < 0))
+  call get_param(param_file, mdl, "DG1_BAND_FLOAT", CS%dg_band_float, &
+                 "If true, wholly floating cells and partly filled front cells take a band weight of "//&
+                 "DG1_BAND_WIDTH from their distance to the ice that is not wholly floating, as wholly "//&
+                 "grounded cells do from the ice that is not wholly grounded: d = min(cheb - 1 + 1 - f) "//&
+                 "over the grounded and crossed cells, with f the grounded fraction, and the width and "//&
+                 "ramp of DG1_BAND_WIDTH_FLOAT and DG1_BAND_RAMP_FLOAT.  So the artificial viscosity "//&
+                 "is off on floating ice beyond the floating band, the band diffusion of "//&
+                 "DG1_BAND_DIFF_TIME acts in the floating band (on the thickness, and never across a "//&
+                 "face between a wholly grounded and a wholly floating cell), and DG1_GROUNDED_LIMITER "//&
+                 "acts on floating cells with w below 1.  If false, every cell that is not wholly "//&
+                 "grounded has w = 1.", &
+                 default=.false., do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_width < 0))
+  CS%dg_band_width_float = CS%dg_band_width ; CS%dg_band_ramp_float = CS%dg_band_ramp
+  if (CS%dg_band_width >= 0) then
+    call get_param(param_file, mdl, "DG1_BAND_WIDTH_FLOAT", CS%dg_band_width_float, &
+                   "The full band N in cells of DG1_BAND_FLOAT on the floating side.", &
+                   units="nondim", default=CS%dg_band_width, &
+                   do_not_log=(.not.CS%use_DG_thickness) .or. (.not.CS%dg_band_float))
+    call get_param(param_file, mdl, "DG1_BAND_RAMP_FLOAT", CS%dg_band_ramp_float, &
+                   "The ramp R in cells of DG1_BAND_FLOAT on the floating side.", &
+                   units="nondim", default=CS%dg_band_ramp, &
+                   do_not_log=(.not.CS%use_DG_thickness) .or. (.not.CS%dg_band_float))
+    if (CS%dg_band_float .and. ((CS%dg_band_width_float < 0) .or. (CS%dg_band_ramp_float <= 0.0))) &
+      call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG1_BAND_WIDTH_FLOAT must not be negative "//&
+                            "and DG1_BAND_RAMP_FLOAT must be positive.")
+  endif
+  if (CS%dg_band_float .and. (CS%dg_band_width < 0)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics: DG1_BAND_FLOAT needs DG1_BAND_WIDTH >= 0.")
   call get_param(param_file, mdl, "DG1_GROUNDED_LIMITER", CS%dg_grounded_limiter, &
                  "If true, a vertex-based limiter (Kuzmin 2010) of the surface acts on wholly grounded "//&
                  "DG(1) cells with a band weight of DG1_BAND_WIDTH below 1, after each stage.  Each "//&
@@ -12033,8 +12065,9 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "scaled down until the corners lie in their bounds, which leaves the cell mean "//&
                  "unchanged.  A cell whose mean is a smooth extremum (a divide or a dome, by the MOOD "//&
                  "curvature test) is left alone.  The correction fades in over the first excess above "//&
-                 "a tolerance and is scaled by 1 - w, so it hands over smoothly to the band.  It needs "//&
-                 "DG1_BAND_WIDTH.", &
+                 "a tolerance and is scaled by 1 - w, so it hands over smoothly to the band.  With "//&
+                 "DG1_BAND_FLOAT it also acts on wholly floating cells, whose surface is (1 - rho_i/"//&
+                 "rho_w) h, and leaves a cell alone if a corner would ground.  It needs DG1_BAND_WIDTH.", &
                  default=.false., do_not_log=.not.CS%use_DG_thickness)
   if (CS%dg_grounded_limiter .and. (CS%dg_band_width < 0)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics: DG1_GROUNDED_LIMITER needs DG1_BAND_WIDTH >= 0.")
@@ -12725,7 +12758,11 @@ end subroutine dg1_q1_eval
 !! the two sides, and sigma = C {kappa n.K.n}/dx_perp.  K = (u_iso^2 I + |u|^2 n n^T)/(|u|^2 + u_iso^2)
 !! with n the crosswind unit vector of the cell-mean velocity, and kappa = w (Kxx dx^2 + Kyy dy^2) /
 !! (12 (Kxx + Kyy) T), which makes a continuous crosswind alternation of the tilts decay in T; w is the band
-!! weight.  The volume, x-face and y-face parts are returned apart, to be summed with the faces paired.
+!! weight.  With DG1_BAND_FLOAT, wholly floating cells of the floating band take part as well, with s
+!! replaced by the thickness h there (s = (1 - rho_i/rho_w) h would make the mode decay ten times slower),
+!! and no face between a wholly grounded and a wholly floating cell is diffused, so that no mass crosses
+!! the grounding line.  The volume, x-face and y-face parts are returned apart, to be summed with the faces
+!! paired.
 subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_y, uh_ice, vh_ice)
   type(ice_shelf_dyn_CS), intent(in) :: CS  !< Ice shelf dynamics control structure
   type(ocean_grid_type),  intent(in) :: G   !< The grid structure
@@ -12809,7 +12846,8 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
   ! The band weight on the computational domain, then on the halo cells the faces reach.
   wgt(:,:) = 0.0 ; kxx(:,:) = 0.0 ; kyy(:,:) = 0.0 ; kxy(:,:) = 0.0 ; s_c(:,:,:,:) = 0.0
   do j = jsc, jec ; do i = isc, iec
-    if (state(i,j) < 0) cycle
+    if (state(i,j) == -2) cycle
+    if ((state(i,j) == -1) .and. (.not.CS%dg_band_float)) cycle
     if ((state(i,j) == 0) .and. (.not.CS%dg_band_diff_crossed)) cycle
     if (CS%dg_band_width >= 0) then
       wgt(i,j) = CS%dg_band_w(i,j)
@@ -12829,7 +12867,7 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
 
   ! The tensor and corner surfaces of the band cells the faces of the computational domain reach.
   do j = jsc-1, jec+1 ; do i = isc-1, iec+1
-    if ((state(i,j) < 0) .or. (wgt(i,j) <= 0.0)) cycle
+    if ((state(i,j) == -2) .or. (wgt(i,j) <= 0.0)) cycle
     ! Opposite corners paired, as in dg1_eps_face_u.
     uc = 0.25*((CS%u_shelf(i-1,j-1) + CS%u_shelf(i,j)) + (CS%u_shelf(i,j-1) + CS%u_shelf(i-1,j)))
     vc = 0.25*((CS%v_shelf(i-1,j-1) + CS%v_shelf(i,j)) + (CS%v_shelf(i,j-1) + CS%v_shelf(i-1,j)))
@@ -12857,9 +12895,15 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
                                 (12.0 * (Kxx_c + Kyy_c)))
     kxx(i,j) = kap*Kxx_c ; kyy(i,j) = kap*Kyy_c ; kxy(i,j) = kap*Kxy_c
     if (associated(CS%dg_band_kappa)) CS%dg_band_kappa(i,j) = kap
-    do b = 1, 2 ; do a = 1, 2
-      s_c(i,j,a,b) = max(h_nodal_in(i,j,a,b) - CS%bed_node(i-2+a,j-2+b), (1.0 - rr) * h_nodal_in(i,j,a,b))
-    enddo ; enddo
+    if (state(i,j) == -1) then
+      do b = 1, 2 ; do a = 1, 2
+        s_c(i,j,a,b) = h_nodal_in(i,j,a,b)
+      enddo ; enddo
+    else
+      do b = 1, 2 ; do a = 1, 2
+        s_c(i,j,a,b) = max(h_nodal_in(i,j,a,b) - CS%bed_node(i-2+a,j-2+b), (1.0 - rr) * h_nodal_in(i,j,a,b))
+      enddo ; enddo
+    endif
   enddo ; enddo
   if (associated(CS%dg_band_kappa)) then
     do j = jsc, jec ; do i = isc, iec
@@ -12890,6 +12934,7 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
   ! x faces between cells A = (i,j) and B = (i+1,j); n = +x.
   do j = jsc, jec ; do i = isc-1, iec
     if ((wgt(i,j) <= 0.0) .or. (wgt(i+1,j) <= 0.0)) cycle
+    if (state(i,j) * state(i+1,j) == -1) cycle
     if (CS%u_face_mask(i,j) == 4.0) cycle
     sig = (CS%dg_band_diff_penalty * (0.5*(kxx(i,j) + kxx(i+1,j)))) / G%dxCu(i,j)
     wq = gw * G%dyCu(i,j)
@@ -12926,6 +12971,7 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
   ! component first, so that a quarter turn carries one loop onto the other.
   do j = jsc-1, jec ; do i = isc, iec
     if ((wgt(i,j) <= 0.0) .or. (wgt(i,j+1) <= 0.0)) cycle
+    if (state(i,j) * state(i,j+1) == -1) cycle
     if (CS%v_face_mask(i,j) == 4.0) cycle
     sig = (CS%dg_band_diff_penalty * (0.5*(kyy(i,j) + kyy(i,j+1)))) / G%dyCv(i,j)
     wq = gw * G%dxCv(i,j)
@@ -13011,7 +13057,10 @@ end subroutine dg1_av_ground_band_weight
 !! a partly filled front cell).  Repeated sweeps D(i) = min(D(i), D(k) + 1) over the 8 neighbours,
 !! from D(k) = f_k - 1, find it: every sweep adds 1 along a shortest chessboard path, so the result
 !! does not depend on the order of the sweeps and a quarter turn leaves it exact.  Then
-!! w = min(1, max(0, (N + R - d)/R)), and w = 1 in the cells that are not wholly grounded.
+!! w = min(1, max(0, (N + R - d)/R)), and w = 1 in the cells that are not wholly grounded.  With
+!! DG1_BAND_FLOAT, a wholly floating cell or a partly filled front cell takes w in the same way from its
+!! distance cheb - 1 + (1 - f_k) to the grounded and crossed cells k, with the floating N and R, so that
+!! only the crossed cells keep w = 1 at any distance.
 subroutine dg1_band_weight(CS, G, hmask)
   type(ice_shelf_dyn_CS), intent(inout) :: CS  !< Ice shelf dynamics control structure
   type(ocean_grid_type),  intent(inout) :: G   !< The grid structure
@@ -13019,25 +13068,61 @@ subroutine dg1_band_weight(CS, G, hmask)
 
   real, parameter :: f_eps = 1.0e-6 ! Grounded-fraction tolerance for a pure flotation state [nondim]
   real, parameter :: d_far = 1.0e30 ! Distance of a cell with no such ice cell in reach [nondim]
-  real, dimension(SZDI_(G),SZDJ_(G)) :: dd, dn ! Distance before and after a sweep [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: dd   ! Distance to the ice that is not wholly grounded [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: ddf  ! Distance to the ice that is not wholly floating [nondim]
   logical, dimension(SZDI_(G),SZDJ_(G)) :: src ! An ice cell that is not wholly grounded
-  real :: dmin   ! Smallest neighbour distance [nondim]
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: flt ! A wholly floating cell or a partly filled front cell
   real :: d_end  ! Distance at which the weight reaches 0, N + R [nondim]
-  integer :: i, j, k, it, n_it, n_sw, n_halo
+  real :: d_endf ! Distance at which the floating weight reaches 0 [nondim]
+  integer :: i, j
 
-  src(:,:) = .false. ; dd(:,:) = d_far
+  src(:,:) = .false. ; flt(:,:) = .false. ; dd(:,:) = d_far ; ddf(:,:) = d_far
   do j = G%jsd, G%jed ; do i = G%isd, G%ied
     if (hmask(i,j) == 3.0) then
-      src(i,j) = .true. ; dd(i,j) = -1.0
+      src(i,j) = .true. ; dd(i,j) = -1.0 ; flt(i,j) = .true.
     elseif (hmask(i,j) == 1.0) then
       if (CS%ground_frac(i,j) < 1.0 - f_eps) then
         src(i,j) = .true. ; dd(i,j) = min(max(CS%ground_frac(i,j), 0.0), 1.0) - 1.0
       endif
+      if (CS%ground_frac(i,j) > f_eps) then
+        ddf(i,j) = -min(max(CS%ground_frac(i,j), 0.0), 1.0)
+      else
+        flt(i,j) = .true.
+      endif
     endif
   enddo ; enddo
-  d_end = real(CS%dg_band_width) + CS%dg_band_ramp
   ! Beyond N + R the weight is 0, so the sweeps can stop there.
-  n_it = ceiling(d_end) + 1
+  d_end = real(CS%dg_band_width) + CS%dg_band_ramp
+  call dg1_band_distance(G, dd, ceiling(d_end) + 1)
+  d_endf = 0.0
+  if (CS%dg_band_float) then
+    d_endf = real(CS%dg_band_width_float) + CS%dg_band_ramp_float
+    call dg1_band_distance(G, ddf, ceiling(d_endf) + 1)
+  endif
+  do j = G%jsd, G%jed ; do i = G%isd, G%ied
+    if (CS%dg_band_float .and. flt(i,j)) then
+      CS%dg_band_w(i,j) = min(1.0, max(0.0, (d_endf - ddf(i,j)) / CS%dg_band_ramp_float))
+    elseif (src(i,j)) then
+      CS%dg_band_w(i,j) = 1.0
+    else
+      CS%dg_band_w(i,j) = min(1.0, max(0.0, (d_end - dd(i,j)) / CS%dg_band_ramp))
+    endif
+  enddo ; enddo
+end subroutine dg1_band_weight
+
+!> The distance sweeps of dg1_band_weight: n_it sweeps D(i) = min(D(i), D(k) + 1) over the 8
+!! neighbours k of each cell, with a halo update after every n_halo of them, so that dd is valid in the
+!! halo on return.
+subroutine dg1_band_distance(G, dd, n_it)
+  type(ocean_grid_type), intent(inout) :: G   !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(inout) :: dd !< Distance in cells, with the sources
+                                                          !! set and every other cell far on entry [nondim]
+  integer, intent(in) :: n_it !< The number of sweeps
+
+  real, dimension(SZDI_(G),SZDJ_(G)) :: dn ! Distance after a sweep [nondim]
+  real :: dmin   ! Smallest neighbour distance [nondim]
+  integer :: i, j, k, it, n_sw, n_halo
+
   n_halo = min(G%isc - G%isd, G%jsc - G%jsd)
   it = 0
   do while (it < n_it)
@@ -13056,14 +13141,7 @@ subroutine dg1_band_weight(CS, G, hmask)
     it = it + n_sw
     call pass_var(dd, G%domain)
   enddo
-  do j = G%jsd, G%jed ; do i = G%isd, G%ied
-    if (src(i,j)) then
-      CS%dg_band_w(i,j) = 1.0
-    else
-      CS%dg_band_w(i,j) = min(1.0, max(0.0, (d_end - dd(i,j)) / CS%dg_band_ramp))
-    endif
-  enddo ; enddo
-end subroutine dg1_band_weight
+end subroutine dg1_band_distance
 
 !> DG1_GROUNDED_LIMITER: a vertex-based limiter (Kuzmin 2010) of the surface, applied to CS%h_nodal in
 !! the wholly grounded cells with a band weight w below 1.  The bounds of a corner are the smallest and
@@ -13077,8 +13155,11 @@ end subroutine dg1_band_weight
 !! is removed and both tilts are scaled by one Barth-Jespersen factor.  The factors fade in over an
 !! excess between delta and 2 delta and are scaled by 1 - w.  The tilt and twist patterns have zero
 !! cell mean, so the cell mean of the surface, and of the thickness while every corner stays on the
-!! grounded branch, is unchanged; a cell whose corners would leave that branch is not changed.  The
-!! halo of h_nodal must be valid on entry; only the computational domain is changed.
+!! grounded branch, is unchanged; a cell whose corners would leave that branch is not changed.  With
+!! DG1_BAND_FLOAT the same acts on wholly floating cells, whose corner surfaces are (1 - rho_i/rho_w) h, so
+!! the corner thickness changes by the surface change over 1 - rho_i/rho_w, and a cell is not changed if
+!! a corner would ground.  The halo of h_nodal must be valid on entry; only the computational domain is
+!! changed.
 subroutine dg1_grounded_limiter(CS, G, hmask)
   type(ice_shelf_dyn_CS), intent(inout) :: CS  !< Ice shelf dynamics control structure
   type(ocean_grid_type),  intent(inout) :: G   !< The grid structure
@@ -13115,7 +13196,8 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   real :: s_lo, s_hi ! Smallest and largest mean in the 3 x 3 block [Z ~> m]
   logical :: feas   ! The twist factor has a feasible value
   logical :: smooth ! Every axis along which the cell mean is an extremum passes the curvature test
-  logical :: ok_br  ! Every corner stays on the grounded branch
+  logical :: ok_br  ! Every corner stays on the grounded branch, or on the floating branch in a floating cell
+  logical :: flt_c  ! The cell is wholly floating
   logical :: north_open ! The north edge is a fold, so its halo lies inside the domain
   integer :: i, j, a, b, m, n, k, ig, jg, isc, iec, jsc, jec, isd, ied, jsd, jed
 
@@ -13192,13 +13274,23 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   do j = jsc, jec ; do i = isc, iec
     CS%dg_lim_phi(i,j,:) = min(CS%dg_lim_phi(i,j,:), 1.0)
     if (hmask(i,j) /= 1.0) cycle
-    if (CS%ground_frac(i,j) < 1.0 - f_eps) cycle
+    flt_c = .false.
+    if (CS%ground_frac(i,j) < 1.0 - f_eps) then
+      if (.not.CS%dg_band_float) cycle
+      if (CS%ground_frac(i,j) > f_eps) cycle
+      flt_c = .true.
+    endif
     wb = CS%dg_band_w(i,j)
     if (wb >= 1.0) cycle
     ok_br = .true.
     do b = 1, 2 ; do a = 1, 2
-      if (rr * CS%h_nodal(i,j,a,b) < CS%bed_node(i-2+a,j-2+b)) ok_br = .false.
-      s_c(a,b) = CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b)
+      if (flt_c) then
+        if (rr * CS%h_nodal(i,j,a,b) > CS%bed_node(i-2+a,j-2+b)) ok_br = .false.
+        s_c(a,b) = (1.0 - rr) * CS%h_nodal(i,j,a,b)
+      else
+        if (rr * CS%h_nodal(i,j,a,b) < CS%bed_node(i-2+a,j-2+b)) ok_br = .false.
+        s_c(a,b) = CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b)
+      endif
       lo_c(a,b) = nmin(i-2+a,j-2+b) ; hi_c(a,b) = nmax(i-2+a,j-2+b)
     enddo ; enddo
     if (.not.ok_br) cycle
@@ -13292,14 +13384,26 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
     phi_w = 1.0 - (1.0 - wb)*(1.0 - phi_w) ; phi_t = 1.0 - (1.0 - wb)*(1.0 - phi_t)
 
     ok_br = .true.
-    do b = 1, 2 ; do a = 1, 2
-      dh = ((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b))
-      if (rr * (CS%h_nodal(i,j,a,b) + dh) < CS%bed_node(i-2+a,j-2+b)) ok_br = .false.
-    enddo ; enddo
-    if (.not.ok_br) cycle
-    do b = 1, 2 ; do a = 1, 2
-      CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + (((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b)))
-    enddo ; enddo
+    if (flt_c) then
+      do b = 1, 2 ; do a = 1, 2
+        dh = (((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b))) / (1.0 - rr)
+        if (rr * (CS%h_nodal(i,j,a,b) + dh) > CS%bed_node(i-2+a,j-2+b)) ok_br = .false.
+      enddo ; enddo
+      if (.not.ok_br) cycle
+      do b = 1, 2 ; do a = 1, 2
+        CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + &
+            ((((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b))) / (1.0 - rr))
+      enddo ; enddo
+    else
+      do b = 1, 2 ; do a = 1, 2
+        dh = ((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b))
+        if (rr * (CS%h_nodal(i,j,a,b) + dh) < CS%bed_node(i-2+a,j-2+b)) ok_br = .false.
+      enddo ; enddo
+      if (.not.ok_br) cycle
+      do b = 1, 2 ; do a = 1, 2
+        CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + (((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b)))
+      enddo ; enddo
+    endif
     CS%dg_lim_phi(i,j,1) = min(CS%dg_lim_phi(i,j,1), phi_t)
     CS%dg_lim_phi(i,j,2) = min(CS%dg_lim_phi(i,j,2), phi_w)
   enddo ; enddo
