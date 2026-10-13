@@ -495,6 +495,11 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! rate not applied in the last step, positive [Z T-1 ~> m s-1].
   real, pointer, dimension(:,:) :: dg_src_cut_bmb => NULL() !< DG1_SOURCE_POSITIVE: the basal melt rate
                                   !! not applied in the last step, positive [Z T-1 ~> m s-1].
+  logical :: dg_outflow_limit     !< If true, the outflow of a DG(1) cell in one stage cannot exceed its
+                                  !! ice (DG1_OUTFLOW_LIMIT).
+  real, pointer, dimension(:,:) :: dg_outflow_ratio => NULL() !< The ice of a cell over the ice its
+                                  !! outflow takes in a stage, at most 1, smallest over the stages of
+                                  !! the last step [nondim].
   ! DG(1) tilt/twist mode damper (dg_nodal_mode_damp_rate)
   ! DG(1) artificial viscosity (DG1_nodal_spatial_operator)
   real :: dg_art_visc_advect_coef !< Artificial viscosity: coefficient on |u_face| in u_eff [nondim].
@@ -792,7 +797,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_dg_art_visc_nu_u = -1, id_dg_art_visc_nu_v = -1, &
              id_dg_art_visc_cell_scale = -1, id_dg_band_kappa = -1, id_dg_band_w = -1, &
              id_dg_lim_phi_t = -1, id_dg_lim_phi_w = -1, &
-             id_dg_src_cut_smb = -1, id_dg_src_cut_bmb = -1, &
+             id_dg_src_cut_smb = -1, id_dg_src_cut_bmb = -1, id_dg_outflow_ratio = -1, &
              id_dg_slow_idle_face_u = -1, id_dg_slow_idle_face_v = -1, &
              id_h_jump_face_u = -1, id_h_jump_face_v = -1, &
              id_s_jump_face_u = -1, id_s_jump_face_v = -1, &
@@ -2120,6 +2125,12 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
            Time, 'DG(1) basal melt rate that DG1_SOURCE_POSITIVE did not apply in the last step '//&
            'because the cell held no ice for it', 'm s-1', conversion=US%Z_to_m*US%s_to_T)
       endif
+      if (CS%dg_source_positive .or. CS%dg_outflow_limit) then
+        allocate(CS%dg_outflow_ratio(G%isd:G%ied,G%jsd:G%jed), source=1.0)
+        CS%id_dg_outflow_ratio = register_diag_field('ice_shelf_model', 'dg_outflow_ratio', CS%diag%axesT1, &
+           Time, 'DG(1) ice of a cell over the ice its outflow takes in one stage, at most 1, smallest over '//&
+           'the stages of the last step; below 1 DG1_OUTFLOW_LIMIT scales the outflow down', 'nondim')
+      endif
       ! alpha decides how fast TRANSPORT clears the tilt mode: the decay factor f(alpha) peaks at
       ! alpha = 2*sqrt(3)-1 and break-even against no viscosity at all is alpha = 5.5.  This is
       ! the one route by which DG1_ART_VISC_TAU_FLOOR reaches the tilt relaxation.
@@ -2843,6 +2854,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_src_cut_smb, CS%dg_src_cut_smb, CS%diag)
     if (CS%id_dg_src_cut_bmb > 0) &
         call post_data(CS%id_dg_src_cut_bmb, CS%dg_src_cut_bmb, CS%diag)
+    if (CS%id_dg_outflow_ratio > 0) &
+        call post_data(CS%id_dg_outflow_ratio, CS%dg_outflow_ratio, CS%diag)
     if (CS%id_dg_art_visc_cell_scale > 0 .and. associated(CS%dg_art_visc_cell_scale)) &
         call post_data(CS%id_dg_art_visc_cell_scale, CS%dg_art_visc_cell_scale, CS%diag)
     if (CS%id_dg_slow_idle_face_u > 0 .and. associated(CS%dg_slow_idle_face_u)) &
@@ -9926,6 +9939,7 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_lim_phi)) deallocate(CS%dg_lim_phi)
   if (associated(CS%dg_src_cut_smb)) deallocate(CS%dg_src_cut_smb)
   if (associated(CS%dg_src_cut_bmb)) deallocate(CS%dg_src_cut_bmb)
+  if (associated(CS%dg_outflow_ratio)) deallocate(CS%dg_outflow_ratio)
   if (associated(CS%dg_slow_idle_face_u)) deallocate(CS%dg_slow_idle_face_u)
   if (associated(CS%dg_slow_idle_face_v)) deallocate(CS%dg_slow_idle_face_v)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
@@ -11551,6 +11565,13 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  default=.false., do_not_log=.not.CS%use_DG_thickness)
   call get_param(param_file, mdl, "FULLY_MELT_ICE_SHEET_CELLS", CS%dg_fully_melt, &
                  default=.false., do_not_log=.true.)
+  call get_param(param_file, mdl, "DG1_OUTFLOW_LIMIT", CS%dg_outflow_limit, &
+                 "If true, the outflow of a DG(1) cell in one SSP-RK stage cannot exceed the ice it "//&
+                 "holds at the start of the stage.  Where it would, every face through which ice leaves "//&
+                 "the cell takes the same factor, and the face flux, with its artificial viscosity and "//&
+                 "band diffusion, is reduced on both sides, so mass is conserved.  Only the cell means "//&
+                 "change; the positivity limit then acts on the corners as before.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
 
 
   call get_param(param_file, mdl, "DG1_ART_VISC_ADVECT_COEF", CS%dg_art_visc_advect_coef, &
@@ -13375,9 +13396,32 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_advx, rhs_advy, rhs_viscx, rhs_viscy
   ! DG1_BAND_DIFF_TIME: volume, x-face and y-face parts [Z L2 T-1 ~> m3 s-1]
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: rhs_bdv, rhs_bdx, rhs_bdy
+  ! DG1_OUTFLOW_LIMIT and its diagnostic: the face fluxes by part, eastward and northward.
+  logical :: lim_on          ! The face fluxes are kept for the outflow ratio
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: fa_x, fv_x, bd_u ! Advective, art-visc and band-diffusion
+                             ! volume fluxes through u-faces [Z L2 T-1 ~> m3 s-1]
+  real, dimension(SZDI_(G),SZDJB_(G)) :: fa_y, fv_y, bd_v ! The same through v-faces [Z L2 T-1 ~> m3 s-1]
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: fx, dfx ! Total u-face volume flux and its reduction
+                             ! [Z L2 T-1 ~> m3 s-1]
+  real, dimension(SZDI_(G),SZDJB_(G)) :: fy, dfy ! The same on v-faces [Z L2 T-1 ~> m3 s-1]
+  logical, dimension(SZDIB_(G),SZDJ_(G)) :: fix_x ! The u-face flux is specified, so it is not scaled
+  logical, dimension(SZDI_(G),SZDJB_(G)) :: fix_y ! The v-face flux is specified, so it is not scaled
+  real, dimension(SZDI_(G),SZDJ_(G)) :: ratio ! Ice of a cell over the ice its outflow takes [nondim]
+  real :: o_W, o_E, o_S, o_N ! Volume fluxes out through the four faces of a cell [Z L2 T-1 ~> m3 s-1]
+  real :: x_W, x_E, x_S, x_N ! The specified parts of those [Z L2 T-1 ~> m3 s-1]
+  real :: out_s, out_f       ! A cell's scalable and specified outflow [Z L2 T-1 ~> m3 s-1]
+  real :: vol, avail         ! A cell's ice volume, and the part its scalable outflow may take [Z L2 ~> m3]
+  real :: area               ! A cell's DG area [L2 ~> m2]
+  real :: corr               ! The change of a cell's net inflow [Z L2 T-1 ~> m3 s-1]
+  real :: r_f                ! The factor on a face flux [nondim]
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   rhoi_rhow_wb = CS%density_ice / CS%density_ocean_avg
+  lim_on = CS%dg_outflow_limit .or. CS%dg_source_positive
+  if (lim_on) then
+    fa_x(:,:) = 0.0 ; fv_x(:,:) = 0.0 ; bd_u(:,:) = 0.0 ; fix_x(:,:) = .false.
+    fa_y(:,:) = 0.0 ; fv_y(:,:) = 0.0 ; bd_v(:,:) = 0.0 ; fix_y(:,:) = .false.
+  endif
 
   rhs(:,:,:,:) = 0.0
   rhs_vol(:,:,:,:) = 0.0
@@ -13469,6 +13513,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     if (CS%u_face_mask(i,j) == 4.0) then
       face_flux_total = G%dyCu(i,j) * CS%u_flux_bdry_val(i,j)
       uh_ice(i,j) = uh_ice(i,j) + face_flux_total
+      if (lim_on) then ; fa_x(i,j) = face_flux_total ; fix_x(i,j) = .true. ; endif
       if (i >= isc .and. hmask(i,j) == 1.0) then
         rhs_advx(i,j,2,1) = rhs_advx(i,j,2,1) - (0.5*face_flux_total)
         rhs_advx(i,j,2,2) = rhs_advx(i,j,2,2) - (0.5*face_flux_total)
@@ -13504,6 +13549,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         h_upwind = max(h_upwind, 0.0)
         flux_qp = gw * u_at_qp * h_upwind * G%dyCu(i,j)
         uh_ice(i,j) = uh_ice(i,j) + flux_qp
+        if (lim_on) fa_x(i,j) = fa_x(i,j) + flux_qp
         if (i >= isc .and. hmask(i,j) == 1.0) then
           rhs_advx(i,j,2,1) = rhs_advx(i,j,2,1) - (flux_qp * t_co)
           rhs_advx(i,j,2,2) = rhs_advx(i,j,2,2) - (flux_qp * t_face)
@@ -13612,6 +13658,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     if (CS%v_face_mask(i,j) == 4.0) then
       face_flux_total = G%dxCv(i,j) * CS%v_flux_bdry_val(i,j)
       vh_ice(i,j) = vh_ice(i,j) + face_flux_total
+      if (lim_on) then ; fa_y(i,j) = face_flux_total ; fix_y(i,j) = .true. ; endif
       if (j >= jsc .and. hmask(i,j) == 1.0) then
         rhs_advy(i,j,1,2) = rhs_advy(i,j,1,2) - (0.5*face_flux_total)
         rhs_advy(i,j,2,2) = rhs_advy(i,j,2,2) - (0.5*face_flux_total)
@@ -13644,6 +13691,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         h_upwind = max(h_upwind, 0.0)
         flux_qp = gw * v_at_qp * h_upwind * G%dxCv(i,j)
         vh_ice(i,j) = vh_ice(i,j) + flux_qp
+        if (lim_on) fa_y(i,j) = fa_y(i,j) + flux_qp
         if (j >= jsc .and. hmask(i,j) == 1.0) then
           rhs_advy(i,j,1,2) = rhs_advy(i,j,1,2) - (flux_qp * t_co)
           rhs_advy(i,j,2,2) = rhs_advy(i,j,2,2) - (flux_qp * t_face)
@@ -13765,6 +13813,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
       t_co = 1.0 - t_face
       visc_flux_qp = gw * coef_face * ueff_E(i,j,gp) * dheq_E(i,j,gp) * G%dyCu(i,j)
+      if (lim_on) fv_x(i,j) = fv_x(i,j) + visc_flux_qp
       if (i >= isc .and. hmask(i,j) == 1.0) then
         rhs_viscx(i,j,2,1) = rhs_viscx(i,j,2,1) + (visc_flux_qp * t_co)
         rhs_viscx(i,j,2,2) = rhs_viscx(i,j,2,2) + (visc_flux_qp * t_face)
@@ -13788,6 +13837,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       if (gp == 1) then ; t_face = gp1 ; else ; t_face = gp2 ; endif
       t_co = 1.0 - t_face
       visc_flux_qp = gw * coef_face * ueff_N(i,j,gp) * dheq_N(i,j,gp) * G%dxCv(i,j)
+      if (lim_on) fv_y(i,j) = fv_y(i,j) + visc_flux_qp
       if (j >= jsc .and. hmask(i,j) == 1.0) then
         rhs_viscy(i,j,1,2) = rhs_viscy(i,j,1,2) + (visc_flux_qp * t_co)
         rhs_viscy(i,j,2,2) = rhs_viscy(i,j,2,2) + (visc_flux_qp * t_face)
@@ -13810,7 +13860,18 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   enddo ; enddo
   ! The band diffusion is a separate term, so with it off the sum above is unchanged.
   if (CS%dg_band_diff_time > 0.0) then
-    call dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_bdv, rhs_bdx, rhs_bdy, uh_ice, vh_ice)
+    if (lim_on) then
+      ! Kept apart for the outflow ratio; each face's flux is added once, as the routine does.
+      call dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_bdv, rhs_bdx, rhs_bdy, bd_u, bd_v)
+      do j = jsc, jec ; do i = isc-1, iec
+        uh_ice(i,j) = uh_ice(i,j) + bd_u(i,j)
+      enddo ; enddo
+      do j = jsc-1, jec ; do i = isc, iec
+        vh_ice(i,j) = vh_ice(i,j) + bd_v(i,j)
+      enddo ; enddo
+    else
+      call dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_bdv, rhs_bdx, rhs_bdy, uh_ice, vh_ice)
+    endif
     do j = jsc, jec ; do i = isc, iec
       if (hmask(i,j) /= 1.0) cycle
       do b = 1, 2 ; do a = 1, 2
@@ -13818,6 +13879,81 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       enddo ; enddo
     enddo ; enddo
   endif
+
+  ! DG1_OUTFLOW_LIMIT.  A cell whose outflow over the stage would take more than the ice it holds
+  ! has every outgoing face flux scaled by one factor.  A face takes the factor of the cell the ice
+  ! leaves, and its reduction enters both cells as a uniform change of the corners, so mass is
+  ! conserved and only the means change: M times a uniform rate c is c*w, and w/area per unit volume.
+  if (lim_on) then
+    do j = jsc, jec ; do i = isc-1, iec
+      fx(i,j) = (fa_x(i,j) - fv_x(i,j)) + bd_u(i,j)
+    enddo ; enddo
+    do j = jsc-1, jec ; do i = isc, iec
+      fy(i,j) = (fa_y(i,j) - fv_y(i,j)) + bd_v(i,j)
+    enddo ; enddo
+    ratio(:,:) = 1.0
+    do j = jsc, jec ; do i = isc, iec
+      if (hmask(i,j) /= 1.0) cycle
+      o_W = max(-fx(i-1,j), 0.0) ; o_E = max(fx(i,j), 0.0)
+      o_S = max(-fy(i,j-1), 0.0) ; o_N = max(fy(i,j), 0.0)
+      x_W = 0.0 ; if (fix_x(i-1,j)) then ; x_W = o_W ; o_W = 0.0 ; endif
+      x_E = 0.0 ; if (fix_x(i,j))   then ; x_E = o_E ; o_E = 0.0 ; endif
+      x_S = 0.0 ; if (fix_y(i,j-1)) then ; x_S = o_S ; o_S = 0.0 ; endif
+      x_N = 0.0 ; if (fix_y(i,j))   then ; x_N = o_N ; o_N = 0.0 ; endif
+      out_s = (o_W + o_E) + (o_S + o_N)
+      out_f = (x_W + x_E) + (x_S + x_N)
+      vol = ((CS%cell_mean_w(i,j,1,1)*h_nodal_in(i,j,1,1)) + (CS%cell_mean_w(i,j,2,2)*h_nodal_in(i,j,2,2))) + &
+            ((CS%cell_mean_w(i,j,2,1)*h_nodal_in(i,j,2,1)) + (CS%cell_mean_w(i,j,1,2)*h_nodal_in(i,j,1,2)))
+      avail = max(vol - dt*out_f, 0.0)
+      if (dt*out_s > avail) ratio(i,j) = avail / (dt*out_s)
+    enddo ; enddo
+    call pass_var(ratio, G%domain)
+    if (associated(CS%dg_outflow_ratio)) then
+      do j = jsc, jec ; do i = isc, iec
+        CS%dg_outflow_ratio(i,j) = min(CS%dg_outflow_ratio(i,j), ratio(i,j))
+      enddo ; enddo
+    endif
+    if (CS%dg_outflow_limit) then
+      dfx(:,:) = 0.0 ; dfy(:,:) = 0.0
+      do j = jsc, jec ; do i = isc-1, iec
+        if (fix_x(i,j)) cycle
+        r_f = 1.0
+        if (fx(i,j) > 0.0) then
+          if (hmask(i,j) == 1.0) r_f = ratio(i,j)
+        elseif (fx(i,j) < 0.0) then
+          if (hmask(i+1,j) == 1.0) r_f = ratio(i+1,j)
+        endif
+        if (r_f < 1.0) then
+          dfx(i,j) = (r_f - 1.0) * fx(i,j)
+          uh_ice(i,j) = uh_ice(i,j) + dfx(i,j)
+        endif
+      enddo ; enddo
+      do j = jsc-1, jec ; do i = isc, iec
+        if (fix_y(i,j)) cycle
+        r_f = 1.0
+        if (fy(i,j) > 0.0) then
+          if (hmask(i,j) == 1.0) r_f = ratio(i,j)
+        elseif (fy(i,j) < 0.0) then
+          if (hmask(i,j+1) == 1.0) r_f = ratio(i,j+1)
+        endif
+        if (r_f < 1.0) then
+          dfy(i,j) = (r_f - 1.0) * fy(i,j)
+          vh_ice(i,j) = vh_ice(i,j) + dfy(i,j)
+        endif
+      enddo ; enddo
+      do j = jsc, jec ; do i = isc, iec
+        if (hmask(i,j) /= 1.0) cycle
+        corr = (dfx(i-1,j) - dfx(i,j)) + (dfy(i,j-1) - dfy(i,j))
+        if (corr == 0.0) cycle
+        area = (CS%cell_mean_w(i,j,1,1) + CS%cell_mean_w(i,j,2,2)) + &
+               (CS%cell_mean_w(i,j,2,1) + CS%cell_mean_w(i,j,1,2))
+        do b = 1, 2 ; do a = 1, 2
+          rhs(i,j,a,b) = rhs(i,j,a,b) + (CS%cell_mean_w(i,j,a,b) * (corr / area))
+        enddo ; enddo
+      enddo ; enddo
+    endif
+  endif
+
   if (present(rhs_visc)) then
     rhs_visc(:,:,:,:) = 0.0
     do j = jsc, jec ; do i = isc, iec
@@ -15165,6 +15301,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
 
   ! A nodal source S enters as M*S, so after M^-1 it is added to dh/dt directly.
   cap_on = CS%dg_source_positive
+  if (associated(CS%dg_outflow_ratio)) CS%dg_outflow_ratio(:,:) = 1.0
   if (cap_on) then
     call project_h_source_rate_to_nodes(CS, ISS, G, S_node, dt=time_step, S_bmb_out=S_bmb, S_smb_out=S_smb)
     CS%dg_src_cut_smb(:,:) = 0.0 ; CS%dg_src_cut_bmb(:,:) = 0.0
