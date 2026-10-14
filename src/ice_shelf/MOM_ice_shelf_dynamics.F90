@@ -2106,8 +2106,9 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       if (CS%dg_band_diff_time > 0.0) then
         allocate(CS%dg_band_kappa(G%isd:G%ied,G%jsd:G%jed), source=0.0)
         CS%id_dg_band_kappa = register_diag_field('ice_shelf_model', 'dg_band_kappa', &
-           CS%diag%axesT1, Time, 'DG(1) band diffusivity of DG1_BAND_DIFF_TIME in each cell, its band '//&
-           'weight included; zero outside the band', 'm2 yr-1', &
+           CS%diag%axesT1, Time, 'DG(1) band diffusivity of DG1_BAND_DIFF_TIME in each cell (the trace of '//&
+           'the diffusivity tensor over the trace of K), its band weight included; zero outside the band', &
+           'm2 yr-1', &
            conversion=365.0*86400.0*US%L_T_to_m_s*US%L_to_m)
       endif
       if (CS%dg_band_width >= 0) allocate(CS%dg_band_w(G%isd:G%ied,G%jsd:G%jed), source=0.0)
@@ -11964,13 +11965,16 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "If positive, grounded DG(1) cells near the grounding line (the band of "//&
                  "DG1_BAND_DIFF_WIDTH) diffuse the surface across the flow: the thickness equation gains "//&
                  "div(kappa K grad s), with K = n n^T for the crosswind unit vector n of the cell-mean "//&
-                 "velocity, discretized by the symmetric interior penalty method.  kappa = "//&
-                 "(Kxx dx^2 + Kyy dy^2)/(12 (Kxx + Kyy) DG1_BAND_DIFF_TIME), which makes a crosswind "//&
-                 "alternation of the tilts decay in this time.  Unlike the jump-only artificial "//&
+                 "velocity, discretized by the symmetric interior penalty method.  The diffusivity "//&
+                 "tensor is kappa K = D K D/(12 DG1_BAND_DIFF_TIME), D = diag(dx, dy), which makes a "//&
+                 "two-cell crosswind alternation of the tilts decay in this time along each cell axis, "//&
+                 "whatever the aspect of the cell.  Unlike the jump-only artificial "//&
                  "viscosity, the operator is a consistent diffusion, which has no alternating null "//&
                  "vector; it moves the cell means with the tilts, so it smooths real crosswind "//&
                  "structure in the band as well.  Mass is conserved and the flux enters uh_ice and "//&
-                 "vh_ice.  The rate is capped at 0.5/dt for SSP-RK2.  Zero or less turns it off.", &
+                 "vh_ice.  The rate 1/T is capped at min(0.5, 2/C)/dt, C = DG1_BAND_DIFF_PENALTY, since "//&
+                 "the fastest rate of the operator is about C/T on cells of any aspect.  Zero or less "//&
+                 "turns it off.", &
                  units="s", default=0.0, scale=US%s_to_T, do_not_log=.not.CS%use_DG_thickness)
   call get_param(param_file, mdl, "DG1_BAND_DIFF_WIDTH", CS%dg_band_diff_width, &
                  "The band of DG1_BAND_DIFF_TIME: grounded and crossed ice cells within this many cells "//&
@@ -12785,9 +12789,11 @@ end subroutine dg1_q1_eval
 !!              + sum over faces of int ( {kappa K grad s}.n [phi] + {kappa K grad phi}.n [s] - sigma [s][phi] ) dl,
 !! where [v] = v_A - v_B across a face whose normal n points from cell A to cell B, {v} is the average of
 !! the two sides, and sigma = C {kappa n.K.n}/dx_perp.  K = (u_iso^2 I + |u|^2 n n^T)/(|u|^2 + u_iso^2)
-!! with n the crosswind unit vector of the cell-mean velocity, and kappa = w (Kxx dx^2 + Kyy dy^2) /
-!! (12 (Kxx + Kyy) T), which makes a continuous crosswind alternation of the tilts decay in T; w is the band
-!! weight.  With DG1_BAND_FLOAT, wholly floating cells of the floating band take part as well, with s
+!! with n the crosswind unit vector of the cell-mean velocity, and kappa K = w D K D / (12 T), D = diag(dx, dy),
+!! which makes a continuous two-cell alternation of the tilts decay in T along each cell axis, whatever the
+!! aspect of the cell; w is the band weight.  (A scalar kappa from the larger side diffused the short side of a
+!! stretched cell aspect^2 times too fast, which made the operator stiff and, at C = 3, unstable.)
+!! With DG1_BAND_FLOAT, wholly floating cells of the floating band take part as well, with s
 !! replaced by the thickness h there (s = (1 - rho_i/rho_w) h would make the mode decay ten times slower),
 !! and no face between a wholly grounded and a wholly floating cell is diffused, so that no mass crosses
 !! the grounding line; a face between a wholly floating cell and any other cell is not diffused either,
@@ -12824,7 +12830,7 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
   real, dimension(2,2) :: NvB, dNxB, dNyB ! Side-B basis values and derivatives [nondim]
   real :: rr          ! Ice/ocean density ratio [nondim]
   real :: f           ! Grounded fraction clipped to [0,1] [nondim]
-  real :: inv_T       ! Decay rate of the crosswind mode, capped at 0.5/dt [T-1 ~> s-1]
+  real :: inv_T       ! Decay rate of the crosswind mode, capped at min(0.5, 2/C)/dt [T-1 ~> s-1]
   real :: uc, vc      ! Cell-mean velocity [L T-1 ~> m s-1]
   real :: u2, v2, ui2, den ! Squared speeds [L2 T-2 ~> m2 s-2]
   real :: s2          ! Squared speed [L2 T-2 ~> m2 s-2]
@@ -12833,7 +12839,7 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
   real :: iso_c2      ! DG1_BAND_DIFF_ISO_COURANT squared, or 0 [nondim]
   real :: a_iso       ! Isotropic share of K [nondim]
   real :: Kxx_c, Kyy_c, Kxy_c ! Components of K [nondim]
-  real :: kap         ! Cell diffusivity [L2 T-1 ~> m2 s-1]
+  real :: kap         ! The cell's rate w/(12 T) that scales D K D [T-1 ~> s-1]
   real :: xi_q, eta_q ! Quadrature point in the cell [nondim]
   real :: a_qp, d_qp  ! Cell lengths along x and y through the QP [L ~> m]
   real :: s_v, s_xi, s_eta    ! Side-A (or cell) surface and its xi- and eta-derivatives [Z ~> m]
@@ -12867,7 +12873,9 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
   if ((isc - isd < nb + 1) .or. (jsc - jsd < nb + 1)) call MOM_error(FATAL, &
     "dg1_band_diffusion: DG1_BAND_DIFF_WIDTH must be at most the halo width minus 1.")
   rr = CS%density_ice / CS%density_ocean_avg
-  inv_T = min(1.0 / CS%dg_band_diff_time, 0.5 / dt)
+  ! The fastest rate of the operator is about C times 1/T on cells of any aspect, so 1/T <= 2/(C dt) keeps
+  ! it below 2/dt for SSP-RK; 0.5/dt bounds the mode itself.
+  inv_T = min(1.0 / CS%dg_band_diff_time, min(0.5, 2.0 / max(CS%dg_band_diff_penalty, 1.0)) / dt)
   ui2 = CS%dg_band_diff_u_iso * CS%dg_band_diff_u_iso
   iso_c2 = 0.0
   if (CS%dg_band_diff_iso_courant > 0.0) iso_c2 = CS%dg_band_diff_iso_courant**2
@@ -12932,8 +12940,7 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
         Kxx_c = 1.0 ; Kyy_c = 1.0 ; Kxy_c = 0.0
       endif
     endif
-    kap = (wgt(i,j) * inv_T) * (((Kxx_c*(G%dxT(i,j)*G%dxT(i,j))) + (Kyy_c*(G%dyT(i,j)*G%dyT(i,j)))) / &
-                                (12.0 * (Kxx_c + Kyy_c)))
+    kap = (wgt(i,j) * inv_T) / 12.0
     ! Tilt-only, floating cells diffuse the surface too, with kappa / (1 - rho_i/rho_w), so that their
     ! thickness decays as fast as before while a face to any other cell sees one variable on both sides.
     if (CS%dg_band_diff_tilt_only .and. (state(i,j) == -1)) kap = kap / (1.0 - rr)
@@ -12943,8 +12950,10 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
       cr_rate = CS%dg_band_diff_speed_courant * sqrt((uc*G%IdxT(i,j))**2 + (vc*G%IdyT(i,j))**2)
       if (cr_rate < inv_T) kap = kap * (cr_rate / inv_T)
     endif
-    kxx(i,j) = kap*Kxx_c ; kyy(i,j) = kap*Kyy_c ; kxy(i,j) = kap*Kxy_c
-    if (associated(CS%dg_band_kappa)) CS%dg_band_kappa(i,j) = kap
+    ! kappa K = kap D K D: each axis scaled by its own cell length.
+    kxx(i,j) = kap*(Kxx_c*(G%dxT(i,j)*G%dxT(i,j))) ; kyy(i,j) = kap*(Kyy_c*(G%dyT(i,j)*G%dyT(i,j)))
+    kxy(i,j) = kap*(Kxy_c*(G%dxT(i,j)*G%dyT(i,j)))
+    if (associated(CS%dg_band_kappa)) CS%dg_band_kappa(i,j) = (kxx(i,j) + kyy(i,j)) / (Kxx_c + Kyy_c)
     if ((state(i,j) == -1) .and. (.not.CS%dg_band_diff_tilt_only)) then
       do b = 1, 2 ; do a = 1, 2
         s_c(i,j,a,b) = h_nodal_in(i,j,a,b)
