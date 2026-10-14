@@ -681,6 +681,10 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: dg_grounded_limiter  !< If true, a vertex-based limiter of the surface acts in wholly grounded
                                   !! cells with band weight below 1.
   real :: dg_lim_d0               !< Grounded limiter: smallest node excess it acts on [Z ~> m].
+  logical :: dg_lim_face          !< If true, the grounded limiter first bounds the face-midpoint surface of
+                                  !! each axis by the means of the two cells that share the face.
+  real :: dg_lim_face_curv        !< Grounded limiter face bounds: the allowance per unit second difference
+                                  !! of the cell means along the axis [nondim].
   real, pointer, dimension(:,:,:) :: dg_lim_phi => NULL() !< Grounded limiter: the smallest tilt (1) and
                                   !! twist (2) factors of each cell over the stages of the last step [nondim].
   real :: dg_art_visc_lump_frac  !< Artificial viscosity: the lumped fraction theta of the mass matrix whose
@@ -12112,6 +12116,26 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   if (CS%dg_grounded_limiter .and. (CS%dg_band_width < 0)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics: DG1_GROUNDED_LIMITER needs DG1_BAND_WIDTH >= 0.")
   CS%dg_lim_d0 = 0.5*US%m_to_Z
+  call get_param(param_file, mdl, "DG1_LIMITER_FACE_BOUNDS", CS%dg_lim_face, &
+                 "If true, DG1_GROUNDED_LIMITER first bounds the tilts along each axis by the faces "//&
+                 "(Cockburn and Shu 1998): the surface at the middle of a face must lie between the "//&
+                 "cell-mean surfaces of the two cells that share it and the surface of the other cell "//&
+                 "at that face, to within an allowance of max(0.5 m, DG1_LIMITER_FACE_CURV |c|), c the "//&
+                 "second difference of the cell means along the axis (the TVB idea of Shu 1987, so a "//&
+                 "smooth extremum keeps its tilt).  A face that is continuous is thus never cut, and a "//&
+                 "face to an ice-free cell sets no bound.  "//&
+                 "Each tilt is scaled down until both of its faces lie in their bounds; the cell mean "//&
+                 "and the twist are unchanged, and the vertex bounds then act as before.  The corner "//&
+                 "bounds include the cells along the flow, so a cross-flow staircase (one tilt in "//&
+                 "every cell over flat means, with a jump back at each face) stays inside them; the "//&
+                 "face bounds remove it.  The factors are scaled by 1 - w, as the vertex factors are.", &
+                 default=.false., do_not_log=.not.CS%dg_grounded_limiter)
+  call get_param(param_file, mdl, "DG1_LIMITER_FACE_CURV", CS%dg_lim_face_curv, &
+                 "The allowance of DG1_LIMITER_FACE_BOUNDS per unit second difference of the cell-mean "//&
+                 "surface along the axis.", &
+                 units="nondim", default=0.5, do_not_log=.not.CS%dg_lim_face)
+  if (CS%dg_lim_face .and. (.not.CS%dg_grounded_limiter)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics: DG1_LIMITER_FACE_BOUNDS needs DG1_GROUNDED_LIMITER.")
   if ((CS%dg_band_diff_time > 0.0) .and. (CS%dg_band_width < 0)) then
     if (CS%dg_band_diff_width < 0) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
         "DG1_BAND_DIFF_WIDTH must not be negative.")
@@ -13260,8 +13284,11 @@ end subroutine dg1_band_distance
 !! grounded branch, is unchanged; a cell whose corners would leave that branch is not changed.  With
 !! DG1_BAND_FLOAT the same acts on wholly floating cells, whose corner surfaces are (1 - rho_i/rho_w) h, so
 !! the corner thickness changes by the surface change over 1 - rho_i/rho_w, and a cell is not changed if
-!! a corner would ground.  The halo of h_nodal must be valid on entry; only the computational domain is
-!! changed.
+!! a corner would ground.  With DG1_LIMITER_FACE_BOUNDS a face pass acts first on each tilt: the surface
+!! at the middle of each face must lie between the cell means on its two sides and the surface of the
+!! other cell at that face (on entry), widened by an allowance that grows with the second difference of
+!! the means along the axis; a face to an ice-free cell sets no bound.  The halo of h_nodal must be valid
+!! on entry; only the computational domain is changed.
 subroutine dg1_grounded_limiter(CS, G, hmask)
   type(ice_shelf_dyn_CS), intent(inout) :: CS  !< Ice shelf dynamics control structure
   type(ocean_grid_type),  intent(inout) :: G   !< The grid structure
@@ -13300,6 +13327,18 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   logical :: smooth ! Every axis along which the cell mean is an extremum passes the curvature test
   logical :: ok_br  ! Every corner stays on the grounded branch, or on the floating branch in a floating cell
   logical :: flt_c  ! The cell is wholly floating
+  real, dimension(2,2) :: ds_f   ! Change of the corner surfaces by the face bounds [Z ~> m]
+  real :: t_x, t_y  ! Tilts of the cell along x and y, from the west to the east corners [Z ~> m]
+  real :: m_x, m_y  ! Weighted cell means of the corner patterns (a - 3/2) and (b - 3/2) [nondim]
+  real :: al_x, al_y ! Allowances of the face bounds along x and y [Z ~> m]
+  real :: phi_x, phi_y ! Face-bound factors on the tilts along x and y [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G),4) :: trc ! Surface at the middle of the west, east, south and north
+                                 ! faces of each ice cell on entry [Z ~> m]
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: f_ice ! The cell is an ice cell inside the domain, so trc is set
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: f_use ! The cell bounds the face it shares: an ice cell, or a
+                                 ! cell beyond a domain edge that is not reentrant
+  real, dimension(2,2) :: s_n    ! Corner surfaces of a cell for trc [Z ~> m]
+  real :: lo_m, hi_m, lo_p, hi_p ! Face bounds on the minus and plus faces of an axis [Z ~> m]
   logical :: north_open ! The north edge is a fold, so its halo lies inside the domain
   integer :: i, j, a, b, m, n, k, ig, jg, isc, iec, jsc, jec, isd, ied, jsd, jed
 
@@ -13363,6 +13402,25 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
     enddo ; enddo
   enddo ; enddo
 
+  ! DG1_LIMITER_FACE_BOUNDS: the face-midpoint surfaces of every ice cell on entry, so that the bounds
+  ! do not depend on the order in which the loop below changes the cells.
+  if (CS%dg_lim_face) then
+    trc(:,:,:) = 0.0 ; f_ice(:,:) = .false. ; f_use(:,:) = .false.
+    do j = jsd+1, jed ; do i = isd+1, ied
+      if (.not.in_dom(i,j)) then
+        f_use(i,j) = have(i,j)
+        cycle
+      endif
+      if ((hmask(i,j) /= 1.0) .and. (hmask(i,j) /= 3.0)) cycle
+      do b = 1, 2 ; do a = 1, 2
+        s_n(a,b) = max(CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b), (1.0 - rr) * CS%h_nodal(i,j,a,b))
+      enddo ; enddo
+      trc(i,j,1) = 0.5*(s_n(1,1) + s_n(1,2)) ; trc(i,j,2) = 0.5*(s_n(2,1) + s_n(2,2))
+      trc(i,j,3) = 0.5*(s_n(1,1) + s_n(2,1)) ; trc(i,j,4) = 0.5*(s_n(1,2) + s_n(2,2))
+      f_ice(i,j) = .true. ; f_use(i,j) = .true.
+    enddo ; enddo
+  endif
+
   ! Corner bounds; corner (I,J) is shared by cells i = I, I+1 and j = J, J+1.
   nmin(:,:) = 0.0 ; nmax(:,:) = 0.0
   do J = jsc-1, jec ; do I = isc-1, iec
@@ -13396,6 +13454,67 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
       lo_c(a,b) = nmin(i-2+a,j-2+b) ; hi_c(a,b) = nmax(i-2+a,j-2+b)
     enddo ; enddo
     if (.not.ok_br) cycle
+
+    ! DG1_LIMITER_FACE_BOUNDS: the face pass on the tilts.  s_c - sbar = t_x p_x + t_y p_y + tw_c, with
+    ! p_x = (a - 3/2) - m_x and p_y = (b - 3/2) - m_y of zero weighted mean, so scaling a tilt keeps the
+    ! mean and the twist.  Both factors come from the corners on entry, so the order of the axes does
+    ! not matter.
+    if (CS%dg_lim_face) then
+      area = ((CS%cell_mean_w(i,j,1,1) + CS%cell_mean_w(i,j,2,2)) + &
+              (CS%cell_mean_w(i,j,1,2) + CS%cell_mean_w(i,j,2,1)))
+      if (area > 0.0) then
+        do b = 1, 2 ; do a = 1, 2
+          wn(a,b) = CS%cell_mean_w(i,j,a,b) / area
+        enddo ; enddo
+        m_x = 0.5*((wn(2,1) + wn(2,2)) - (wn(1,1) + wn(1,2)))
+        m_y = 0.5*((wn(1,2) + wn(2,2)) - (wn(1,1) + wn(2,1)))
+        t_x = 0.5*((s_c(2,1) - s_c(1,1)) + (s_c(2,2) - s_c(1,2)))
+        t_y = 0.5*((s_c(1,2) - s_c(1,1)) + (s_c(2,2) - s_c(2,1)))
+        al_x = CS%dg_lim_d0 ; al_y = CS%dg_lim_d0
+        if (f_use(i-1,j) .and. f_use(i+1,j)) &
+          al_x = max(al_x, CS%dg_lim_face_curv * abs((sbar(i-1,j) + sbar(i+1,j)) - 2.0*sbar(i,j)))
+        if (f_use(i,j-1) .and. f_use(i,j+1)) &
+          al_y = max(al_y, CS%dg_lim_face_curv * abs((sbar(i,j-1) + sbar(i,j+1)) - 2.0*sbar(i,j)))
+        ! Each face is bounded by the two cell means and, from an ice cell, by that cell's own surface at the
+        ! face, so a face that is continuous now is never cut.  A face to an ice-free cell sets no bound.
+        call dg1_lim_face_bounds(sbar(i,j), al_x, f_use(i-1,j), f_ice(i-1,j), sbar(i-1,j), trc(i-1,j,2), lo_m, hi_m)
+        call dg1_lim_face_bounds(sbar(i,j), al_x, f_use(i+1,j), f_ice(i+1,j), sbar(i+1,j), trc(i+1,j,1), lo_p, hi_p)
+        phi_x = dg1_lim_face_factor(0.5*(s_c(1,1) + s_c(1,2)), t_x*(-0.5 - m_x), f_use(i-1,j), lo_m, hi_m, &
+                                    0.5*(s_c(2,1) + s_c(2,2)), t_x*(0.5 - m_x), f_use(i+1,j), lo_p, hi_p)
+        call dg1_lim_face_bounds(sbar(i,j), al_y, f_use(i,j-1), f_ice(i,j-1), sbar(i,j-1), trc(i,j-1,4), lo_m, hi_m)
+        call dg1_lim_face_bounds(sbar(i,j), al_y, f_use(i,j+1), f_ice(i,j+1), sbar(i,j+1), trc(i,j+1,3), lo_p, hi_p)
+        phi_y = dg1_lim_face_factor(0.5*(s_c(1,1) + s_c(2,1)), t_y*(-0.5 - m_y), f_use(i,j-1), lo_m, hi_m, &
+                                    0.5*(s_c(1,2) + s_c(2,2)), t_y*(0.5 - m_y), f_use(i,j+1), lo_p, hi_p)
+        phi_x = 1.0 - (1.0 - wb)*(1.0 - phi_x) ; phi_y = 1.0 - (1.0 - wb)*(1.0 - phi_y)
+        if ((phi_x < 1.0) .or. (phi_y < 1.0)) then
+          do b = 1, 2 ; do a = 1, 2
+            ds_f(a,b) = ((phi_x - 1.0) * (t_x * ((real(a) - 1.5) - m_x))) + &
+                        ((phi_y - 1.0) * (t_y * ((real(b) - 1.5) - m_y)))
+          enddo ; enddo
+          ! As below, the face pass leaves the cell alone if a corner would change branch.
+          ok_br = .true.
+          do b = 1, 2 ; do a = 1, 2
+            if (flt_c) then
+              if (rr * (CS%h_nodal(i,j,a,b) + ds_f(a,b) / (1.0 - rr)) > CS%bed_node(i-2+a,j-2+b)) ok_br = .false.
+            else
+              if (rr * (CS%h_nodal(i,j,a,b) + ds_f(a,b)) < CS%bed_node(i-2+a,j-2+b)) ok_br = .false.
+            endif
+          enddo ; enddo
+          if (ok_br) then
+            do b = 1, 2 ; do a = 1, 2
+              if (flt_c) then
+                CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + ds_f(a,b) / (1.0 - rr)
+              else
+                CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + ds_f(a,b)
+              endif
+              s_c(a,b) = s_c(a,b) + ds_f(a,b)
+            enddo ; enddo
+            CS%dg_lim_phi(i,j,1) = min(CS%dg_lim_phi(i,j,1), min(phi_x, phi_y))
+          endif
+        endif
+      endif
+    endif
+
     e_max = 0.0 ; r_max = 0.0
     do b = 1, 2 ; do a = 1, 2
       e_max = max(e_max, max(s_c(a,b) - hi_c(a,b), lo_c(a,b) - s_c(a,b)))
@@ -13527,6 +13646,72 @@ pure logical function dg1_lim_smooth3(cm, c0, cp, ratio)
   a_lo = min(min(abs(cm), abs(cp)), abs(c0)) ; a_hi = max(max(abs(cm), abs(cp)), abs(c0))
   dg1_lim_smooth3 = (a_lo >= ratio * a_hi)
 end function dg1_lim_smooth3
+
+!> DG1_LIMITER_FACE_BOUNDS: the bounds of one face, the smallest and largest of the cell mean, the mean
+!! across the face and, if the cell across is an ice cell, its own surface at the face, widened by the
+!! allowance.  The values are not used if the face sets no bound.
+pure subroutine dg1_lim_face_bounds(sb, al, use_nb, ice_nb, sb_nb, tr_nb, lo, hi)
+  real,    intent(in)  :: sb     !< Cell-mean surface of the cell [Z ~> m]
+  real,    intent(in)  :: al     !< Allowance of the bounds [Z ~> m]
+  logical, intent(in)  :: use_nb !< The cell across the face sets a bound
+  logical, intent(in)  :: ice_nb !< The cell across the face is an ice cell, so tr_nb is set
+  real,    intent(in)  :: sb_nb  !< Cell-mean surface across the face [Z ~> m]
+  real,    intent(in)  :: tr_nb  !< Surface of the cell across at the middle of the face [Z ~> m]
+  real,    intent(out) :: lo     !< Lower bound [Z ~> m]
+  real,    intent(out) :: hi     !< Upper bound [Z ~> m]
+
+  lo = 0.0 ; hi = 0.0
+  if (.not.use_nb) return
+  lo = min(sb, sb_nb) ; hi = max(sb, sb_nb)
+  if (ice_nb) then
+    lo = min(lo, tr_nb) ; hi = max(hi, tr_nb)
+  endif
+  lo = lo - al ; hi = hi + al
+end subroutine dg1_lim_face_bounds
+
+!> DG1_LIMITER_FACE_BOUNDS along one axis: the largest factor phi in [0, 1] on the tilt that keeps the
+!! surface at the middle of both faces, t + (phi - 1) k, in the bounds of the face.  A face that sets no
+!! bound is skipped.  The result is 1 where the faces are in their bounds now, and also where no factor
+!! brings both in.
+pure real function dg1_lim_face_factor(t_m, k_m, use_m, lo_m, hi_m, t_p, k_p, use_p, lo_p, hi_p)
+  real,    intent(in) :: t_m   !< Surface at the middle of the face on the minus side [Z ~> m]
+  real,    intent(in) :: k_m   !< Change of t_m per unit change of the factor [Z ~> m]
+  logical, intent(in) :: use_m !< The minus face sets a bound
+  real,    intent(in) :: lo_m  !< Lower bound of the minus face [Z ~> m]
+  real,    intent(in) :: hi_m  !< Upper bound of the minus face [Z ~> m]
+  real,    intent(in) :: t_p   !< Surface at the middle of the face on the plus side [Z ~> m]
+  real,    intent(in) :: k_p   !< Change of t_p per unit change of the factor [Z ~> m]
+  logical, intent(in) :: use_p !< The plus face sets a bound
+  real,    intent(in) :: lo_p  !< Lower bound of the plus face [Z ~> m]
+  real,    intent(in) :: hi_p  !< Upper bound of the plus face [Z ~> m]
+  real :: q_lo, q_hi ! Feasible interval of the factor minus 1 [nondim]
+  logical :: feas    ! The interval is not empty
+
+  q_lo = -1.0 ; q_hi = 0.0 ; feas = .true.
+  if (use_m) call dg1_lim_face_room(t_m, k_m, lo_m, hi_m, q_lo, q_hi, feas)
+  if (use_p) call dg1_lim_face_room(t_p, k_p, lo_p, hi_p, q_lo, q_hi, feas)
+  dg1_lim_face_factor = 1.0
+  if (feas .and. (q_lo <= q_hi)) dg1_lim_face_factor = 1.0 + q_hi
+end function dg1_lim_face_factor
+
+!> Narrow the feasible interval of dg1_lim_face_factor to the factors that keep one face in [lo, hi].
+pure subroutine dg1_lim_face_room(t, k, lo, hi, q_lo, q_hi, feas)
+  real,    intent(in)    :: t    !< Surface at the middle of the face [Z ~> m]
+  real,    intent(in)    :: k    !< Its change per unit change of the factor [Z ~> m]
+  real,    intent(in)    :: lo   !< Lower bound [Z ~> m]
+  real,    intent(in)    :: hi   !< Upper bound [Z ~> m]
+  real,    intent(inout) :: q_lo !< Lowest feasible factor minus 1 [nondim]
+  real,    intent(inout) :: q_hi !< Highest feasible factor minus 1 [nondim]
+  logical, intent(inout) :: feas !< False once no factor keeps a face in its bounds
+
+  if (k > 0.0) then
+    q_lo = max(q_lo, (lo - t) / k) ; q_hi = min(q_hi, (hi - t) / k)
+  elseif (k < 0.0) then
+    q_lo = max(q_lo, (hi - t) / k) ; q_hi = min(q_hi, (lo - t) / k)
+  elseif ((t < lo) .or. (t > hi)) then
+    feas = .false.
+  endif
+end subroutine dg1_lim_face_room
 
 !> DG(1) right-hand side M dh/dt = int grad(N).(u h) dA - int N (u.n) h_upwind ds + art visc,
 !! with 2x2 Gauss points in the cell and 2 per face. Specified-flux faces split their flux
