@@ -11344,6 +11344,7 @@ subroutine project_h_source_rate_to_nodes(CS, ISS, G, S_node, dt, S_bmb_out, S_s
   real, dimension(SZDI_(G),SZDJ_(G)) :: src_smb ! Surface part of the source rate [Z T-1 ~> m s-1]
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: S_smb ! Surface part of the nodal source [Z T-1 ~> m s-1]
   logical, dimension(SZDI_(G),SZDJ_(G)) :: part ! The cell takes part in the corner averages
+  real, dimension(SZDI_(G),SZDJ_(G)) :: partr   ! part as 1 or 0, for the halo update [nondim]
   real :: abl_s, abl_b ! Largest surface and basal ablation of the cells around a cell [Z T-1 ~> m s-1]
   real :: Hbar         ! A cell's mean thickness [Z ~> m]
   logical :: part_on   ! The cells that cannot supply the shared ablation take their own rate
@@ -11361,8 +11362,10 @@ subroutine project_h_source_rate_to_nodes(CS, ISS, G, S_node, dt, S_bmb_out, S_s
     call pass_var(CS%h_source_rate_bmb, G%domain)
     ! Over one step a cell can be given at most the largest surface and the largest basal
     ! ablation of the cells that share its corners, so a cell whose mean covers both may share.
-    part(:,:) = .true.
-    do j = G%jsd+1, G%jed-1 ; do i = G%isd+1, G%ied-1
+    ! Each cell is judged where it is owned and the result shared through the halo, since the
+    ! halo of CS%h_nodal is not current here; otherwise the answers depend on the layout.
+    partr(:,:) = 1.0
+    do j = G%jsc, G%jec ; do i = G%isc, G%iec
       if (ISS%hmask(i,j) /= 1.0) cycle
       abl_s = 0.0 ; abl_b = 0.0
       do jj = j-1, j+1 ; do ii = i-1, i+1
@@ -11371,7 +11374,11 @@ subroutine project_h_source_rate_to_nodes(CS, ISS, G, S_node, dt, S_bmb_out, S_s
         abl_b = max(abl_b, -CS%h_source_rate_bmb(ii,jj))
       enddo ; enddo
       Hbar = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
-      part(i,j) = (Hbar >= dt * (abl_s + abl_b))
+      if (Hbar < dt * (abl_s + abl_b)) partr(i,j) = 0.0
+    enddo ; enddo
+    call pass_var(partr, G%domain)
+    do j = G%jsd, G%jed ; do i = G%isd, G%ied
+      part(i,j) = (partr(i,j) > 0.5)
     enddo ; enddo
   endif
 
