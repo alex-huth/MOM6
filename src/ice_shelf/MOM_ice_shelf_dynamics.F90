@@ -654,6 +654,9 @@ type, public :: ice_shelf_dyn_CS ; private
   integer :: dg_band_diff_width   !< Band diffusion: the band's width in cells (chessboard distance).
   real :: dg_band_diff_u_iso      !< Band diffusion: speed below which the diffusion becomes isotropic
                                   !! [L T-1 ~> m s-1].
+  real :: dg_band_diff_speed_courant !< Band diffusion: if positive, the decay rate of a floating or crossed
+                                  !! cell is at most this factor times the rate at which the flow crosses
+                                  !! the cell [nondim].
   real :: dg_band_diff_iso_courant !< Band diffusion: if positive, the fraction of the decay rate below which
                                   !! the flow's cell-crossing rate makes the diffusion isotropic; it replaces
                                   !! DG1_BAND_DIFF_U_ISO [nondim].
@@ -11989,6 +11992,15 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "form that does not depend on the resolution.  Zero or less keeps DG1_BAND_DIFF_U_ISO.", &
                  units="nondim", default=0.0, &
                  do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_diff_time <= 0.0))
+  call get_param(param_file, mdl, "DG1_BAND_DIFF_SPEED_COURANT", CS%dg_band_diff_speed_courant, &
+                 "If positive, the decay rate of DG1_BAND_DIFF_TIME in a floating or crossed cell is at "//&
+                 "most this factor c times the rate at which the flow crosses the cell, min(1/T, c |(u/dx, "//&
+                 "v/dy)|), so that in slow ice the diffusion there is no faster than the flow renews the "//&
+                 "cell.  With a fixed T the diffusion a parcel meets while it crosses a cell grows as 1/|u|; "//&
+                 "in slow ice next to a grounding line it becomes a real change of the floating ice that "//&
+                 "moves the line.  Wholly grounded cells keep 1/T.  Zero or less keeps 1/T everywhere.", &
+                 units="nondim", default=0.0, &
+                 do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_diff_time <= 0.0))
   call get_param(param_file, mdl, "DG1_BAND_DIFF_CROSSED", CS%dg_band_diff_crossed, &
                  "If true, cells the grounding line crosses are in the band of DG1_BAND_DIFF_TIME as "//&
                  "well as wholly grounded cells.  If false, only faces between two wholly grounded "//&
@@ -12817,6 +12829,7 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
   real :: u2, v2, ui2, den ! Squared speeds [L2 T-2 ~> m2 s-2]
   real :: s2          ! Squared speed [L2 T-2 ~> m2 s-2]
   real :: cr2         ! Squared cell-crossing rate times T squared [nondim]
+  real :: cr_rate     ! DG1_BAND_DIFF_SPEED_COURANT times the cell-crossing rate [T-1 ~> s-1]
   real :: iso_c2      ! DG1_BAND_DIFF_ISO_COURANT squared, or 0 [nondim]
   real :: a_iso       ! Isotropic share of K [nondim]
   real :: Kxx_c, Kyy_c, Kxy_c ! Components of K [nondim]
@@ -12924,6 +12937,12 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
     ! Tilt-only, floating cells diffuse the surface too, with kappa / (1 - rho_i/rho_w), so that their
     ! thickness decays as fast as before while a face to any other cell sees one variable on both sides.
     if (CS%dg_band_diff_tilt_only .and. (state(i,j) == -1)) kap = kap / (1.0 - rr)
+    ! DG1_BAND_DIFF_SPEED_COURANT: in a cell that is not wholly grounded the rate is at most c times the
+    ! cell-crossing rate.  Wholly grounded cells keep 1/T: their diffusion moves no ice across the line.
+    if ((CS%dg_band_diff_speed_courant > 0.0) .and. (state(i,j) /= 1)) then
+      cr_rate = CS%dg_band_diff_speed_courant * sqrt((uc*G%IdxT(i,j))**2 + (vc*G%IdyT(i,j))**2)
+      if (cr_rate < inv_T) kap = kap * (cr_rate / inv_T)
+    endif
     kxx(i,j) = kap*Kxx_c ; kyy(i,j) = kap*Kyy_c ; kxy(i,j) = kap*Kxy_c
     if (associated(CS%dg_band_kappa)) CS%dg_band_kappa(i,j) = kap
     if ((state(i,j) == -1) .and. (.not.CS%dg_band_diff_tilt_only)) then
