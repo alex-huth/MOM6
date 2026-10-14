@@ -685,6 +685,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! each axis by the means of the two cells that share the face.
   real :: dg_lim_face_curv        !< Grounded limiter face bounds: the allowance per unit second difference
                                   !! of the cell means along the axis [nondim].
+  logical :: dg_lim_no_band       !< If true, the grounded limiter acts at full strength in every wholly grounded
+                                  !! (and, with DG1_BAND_FLOAT, wholly floating) cell, whatever its band weight.
   real, pointer, dimension(:,:,:) :: dg_lim_phi => NULL() !< Grounded limiter: the smallest tilt (1) and
                                   !! twist (2) factors of each cell over the stages of the last step [nondim].
   real :: dg_art_visc_lump_frac  !< Artificial viscosity: the lumped fraction theta of the mass matrix whose
@@ -12136,6 +12138,15 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  units="nondim", default=0.5, do_not_log=.not.CS%dg_lim_face)
   if (CS%dg_lim_face .and. (.not.CS%dg_grounded_limiter)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics: DG1_LIMITER_FACE_BOUNDS needs DG1_GROUNDED_LIMITER.")
+  call get_param(param_file, mdl, "DG1_LIMITER_NO_BAND", CS%dg_lim_no_band, &
+                 "If true, DG1_GROUNDED_LIMITER acts at full strength in every wholly grounded cell, and "//&
+                 "with DG1_BAND_FLOAT in every wholly floating cell, whatever its band weight w; only the "//&
+                 "crossed cells and the partly filled front cells are left out.  A band of width 0 still "//&
+                 "gives w = 1 in a cell that touches a cell of the other kind, so this is the way to test "//&
+                 "the limiter with no treatment of the grounding line.", &
+                 default=.false., do_not_log=.not.CS%dg_grounded_limiter)
+  if (CS%dg_lim_no_band .and. (.not.CS%dg_grounded_limiter)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics: DG1_LIMITER_NO_BAND needs DG1_GROUNDED_LIMITER.")
   if ((CS%dg_band_diff_time > 0.0) .and. (CS%dg_band_width < 0)) then
     if (CS%dg_band_diff_width < 0) call MOM_error(FATAL, "MOM_ice_shelf_dynamics: "//&
         "DG1_BAND_DIFF_WIDTH must not be negative.")
@@ -13287,8 +13298,8 @@ end subroutine dg1_band_distance
 !! a corner would ground.  With DG1_LIMITER_FACE_BOUNDS a face pass acts first on each tilt: the surface
 !! at the middle of each face must lie between the cell means on its two sides and the surface of the
 !! other cell at that face (on entry), widened by an allowance that grows with the second difference of
-!! the means along the axis; a face to an ice-free cell sets no bound.  The halo of h_nodal must be valid
-!! on entry; only the computational domain is changed.
+!! the means along the axis; a face to an ice-free cell sets no bound.  With DG1_LIMITER_NO_BAND w is taken
+!! as 0.  The halo of h_nodal must be valid on entry; only the computational domain is changed.
 subroutine dg1_grounded_limiter(CS, G, hmask)
   type(ice_shelf_dyn_CS), intent(inout) :: CS  !< Ice shelf dynamics control structure
   type(ocean_grid_type),  intent(inout) :: G   !< The grid structure
@@ -13441,6 +13452,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
       flt_c = .true.
     endif
     wb = CS%dg_band_w(i,j)
+    if (CS%dg_lim_no_band) wb = 0.0
     if (wb >= 1.0) cycle
     ok_br = .true.
     do b = 1, 2 ; do a = 1, 2
