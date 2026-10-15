@@ -665,8 +665,6 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! as well as wholly grounded cells.
   logical :: dg_band_diff_tilt_only !< Band diffusion: if true, the cell-mean part of its tendency is removed
                                   !! in every cell, so it changes only the tilts and the twist and moves no mass.
-  real :: dg_band_diff_ramp_iso   !< Band diffusion: the isotropic share a (1 - w) of the tensor in wholly
-                                  !! grounded cells of the ramp, 0 < w < 1, is set by this a [nondim].
   real, pointer, dimension(:,:) :: dg_band_kappa => NULL() !< Band diffusivity of each cell, weight
                                   !! included, from the last call [L2 T-1 ~> m2 s-1].
   integer :: dg_band_width        !< Shared band: the full band N in cells from the grounding line, or
@@ -12105,31 +12103,6 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   endif
   if (CS%dg_band_float .and. (CS%dg_band_width < 0)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics: DG1_BAND_FLOAT needs DG1_BAND_WIDTH >= 0.")
-  call get_param(param_file, mdl, "DG1_BAND_DIFF_RAMP_ISO", CS%dg_band_diff_ramp_iso, &
-                 "The isotropic share a of the band diffusion of DG1_BAND_DIFF_TIME in the wholly "//&
-                 "grounded cells of the ramp of DG1_BAND_WIDTH (0 < w < 1): K = b I + (1 - b) K with "//&
-                 "b = a (1 - w), so the crosswind rate stays and the along-flow diffusivity, which also "//&
-                 "carries the factor w of the band, goes as a w (1 - w) and vanishes at both ends of the "//&
-                 "ramp.  A share that stayed a up to the band would leave a face with no along-flow flux "//&
-                 "there, and with the means fixed the tilt next to such a face flattens and starts an "//&
-                 "alternation of its own.  Where the artificial viscosity "//&
-                 "holds the faces continuous, the cell means fix the face values along a flow line up "//&
-                 "to one alternating pattern, which the jump-only viscosity does not see and the "//&
-                 "crosswind diffusion does not reach; it enters at the inland end of the band from the "//&
-                 "jumps of the interior.  Along-flow diffusion of the tilts in the ramp sets it to the "//&
-                 "smoothest field there, at least DG1_BAND_WIDTH cells from the line.  The band (w = 1), "//&
-                 "the crossed and the floating cells keep their tensor.  It needs DG1_BAND_DIFF_TILT_ONLY, "//&
-                 "so that it moves no mass.  0 turns it off.", &
-                 units="nondim", default=0.0, &
-                 do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_diff_time <= 0.0) .or. &
-                            (CS%dg_band_width < 0))
-  if ((CS%dg_band_diff_ramp_iso < 0.0) .or. (CS%dg_band_diff_ramp_iso > 1.0)) call MOM_error(FATAL, &
-      "MOM_ice_shelf_dynamics: DG1_BAND_DIFF_RAMP_ISO must be in [0, 1].")
-  if (CS%dg_band_diff_ramp_iso > 0.0) then
-    if ((CS%dg_band_diff_time <= 0.0) .or. (CS%dg_band_width < 0) .or. (.not.CS%dg_band_diff_tilt_only)) &
-      call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG1_BAND_DIFF_RAMP_ISO needs DG1_BAND_DIFF_TIME > 0, "//&
-                            "DG1_BAND_WIDTH >= 0 and DG1_BAND_DIFF_TILT_ONLY.")
-  endif
   call get_param(param_file, mdl, "DG1_GROUNDED_LIMITER", CS%dg_grounded_limiter, &
                  "If true, a vertex-based limiter (Kuzmin 2010) of the surface acts on wholly grounded "//&
                  "DG(1) cells with a band weight of DG1_BAND_WIDTH below 1, after each stage.  Each "//&
@@ -12872,8 +12845,7 @@ end subroutine dg1_q1_eval
 !! the surface with kappa / (1 - rho_i/rho_w), and each face takes the weighted interior penalty of a jumping
 !! coefficient (Ern, Stephansen and Zunino 2009): the side fluxes are weighted by the other side's kappa n.K.n
 !! and the penalty takes the harmonic mean of the two.  The volume, x-face and y-face parts are returned apart,
-!! to be summed with the faces paired.  With DG1_BAND_DIFF_RAMP_ISO the tensor of the wholly grounded cells
-!! with 0 < w < 1 is blended toward the identity by a (1 - w).
+!! to be summed with the faces paired.
 subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_y, uh_ice, vh_ice)
   type(ice_shelf_dyn_CS), intent(in) :: CS  !< Ice shelf dynamics control structure
   type(ocean_grid_type),  intent(in) :: G   !< The grid structure
@@ -13009,13 +12981,6 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
       else
         Kxx_c = 1.0 ; Kyy_c = 1.0 ; Kxy_c = 0.0
       endif
-    endif
-    ! DG1_BAND_DIFF_RAMP_ISO: blend toward isotropic in the wholly grounded cells of the ramp, by a share
-    ! a (1 - w) that vanishes at the band, so the along-flow diffusivity w (1 - w) has no edge there.
-    if ((CS%dg_band_diff_ramp_iso > 0.0) .and. (state(i,j) == 1) .and. (wgt(i,j) < 1.0)) then
-      a_iso = CS%dg_band_diff_ramp_iso * (1.0 - wgt(i,j))
-      Kxx_c = a_iso + ((1.0 - a_iso) * Kxx_c) ; Kyy_c = a_iso + ((1.0 - a_iso) * Kyy_c)
-      Kxy_c = (1.0 - a_iso) * Kxy_c
     endif
     kap = (wgt(i,j) * inv_T) / 12.0
     ! Tilt-only, floating cells diffuse the surface too, with kappa / (1 - rho_i/rho_w), so that their
