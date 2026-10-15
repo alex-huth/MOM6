@@ -402,6 +402,21 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: gl_band        !< If true, widen gl_sub_float_nbr to every fully grounded cell with a
                             !! neighbour whose ground_frac < 1, and raise the SEP2 rules to a 6-pt
                             !! triangle rule and 3x3 Gauss on quad pieces.
+  logical :: fric_precompute !< If true (BASAL_FRICTION_PRECOMPUTE), evaluate the basal friction once
+                            !! per nonlinear iteration: quadrature-point coefficients for regular cells
+                            !! and a corner friction matrix for grounding-line cells, applied by CG_action
+                            !! in every linear-solver iteration.
+  real, pointer, dimension(:,:,:) :: fric_qp_on => NULL()   !< 1 where a regular-cell quadrature point
+                            !! carries basal friction, else 0, per (qp,i,j) [nondim]
+  real, pointer, dimension(:,:,:) :: fric_qp_coef => NULL() !< Stored Picard friction coefficient per
+                            !! (qp,i,j), ground-fraction scaled [R L2 Z T-1 ~> kg s-1]
+  real, pointer, dimension(:,:,:) :: fric_qp_newt => NULL() !< Stored Newton drag coefficient per
+                            !! (qp,i,j), ground-fraction scaled [R Z T ~> kg m-2 s]
+  real, pointer, dimension(:,:,:) :: fric_qp_u => NULL()    !< Frozen u^k at each quadrature point [L T-1 ~> m s-1]
+  real, pointer, dimension(:,:,:) :: fric_qp_v => NULL()    !< Frozen v^k at each quadrature point [L T-1 ~> m s-1]
+  real, pointer, dimension(:,:,:,:,:) :: gl_fric_K => NULL() !< Grounding-line cell friction matrix
+                            !! K(c,n,blk,i,j) over corners c,n (SW,SE,NW,NE); blk 1 is the Picard
+                            !! block, 2-4 the Newton uu, uv and vv blocks [R L3 Z T-1 L-1 ~> kg s-1]
   real, pointer, dimension(:,:) :: gl_sub_nbr => NULL() !< 1 where a fully grounded cell uses the
                             !! grounding-line sub-element quadrature because of its neighbours
                             !! (set_gl_subgrid_neighbors), 0 elsewhere [nondim]
@@ -1241,6 +1256,14 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "discontinuous between cells: with the DG(1) thickness, or at a bed step with the "//&
                  "cell-constant bed of the non-DG path. ground_frac itself is unchanged.", &
                  default=.true., do_not_log=.not.CS%GL_regularize)
+    call get_param(param_file, mdl, "BASAL_FRICTION_PRECOMPUTE", CS%fric_precompute, &
+                 "If true, evaluate the basal friction once per nonlinear iteration instead of "//&
+                 "in every linear-solver iteration, since the frozen velocity it depends on does "//&
+                 "not change within a linear solve. Regular cells store their quadrature-point "//&
+                 "coefficients, and each grounding-line cell stores its sub-element friction as a "//&
+                 "corner matrix, so the linear-solver cost of the GROUNDING_LINE_SUBGRID_SCHEME "//&
+                 "quadrature no longer depends on its number of points. Answers change at roundoff "//&
+                 "in grounding-line cells.", default=.false.)
     call get_param(param_file, mdl, "GROUNDING_LINE_SUBGRID_BAND", CS%gl_band, &
                  "If true, every fully grounded ice cell that shares an edge or a corner with an "//&
                  "ice cell with ground_frac < 1 integrates its basal friction and its DG driving "//&
@@ -1721,6 +1744,14 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     endif
 
     allocate(CS%Phi(1:8,1:4,isd:ied,jsd:jed), source=0.0)
+    if (CS%fric_precompute) then
+      allocate(CS%fric_qp_on(4,isd:ied,jsd:jed), source=0.0)
+      allocate(CS%fric_qp_coef(4,isd:ied,jsd:jed), source=0.0)
+      allocate(CS%fric_qp_newt(4,isd:ied,jsd:jed), source=0.0)
+      allocate(CS%fric_qp_u(4,isd:ied,jsd:jed), source=0.0)
+      allocate(CS%fric_qp_v(4,isd:ied,jsd:jed), source=0.0)
+      allocate(CS%gl_fric_K(4,4,4,isd:ied,jsd:jed), source=0.0)
+    endif
     allocate(CS%Jac(1:4,isd:ied,jsd:jed), source=0.0)
     do j=G%jsd,G%jed ; do i=G%isd,G%ied
       call bilinear_shape_fn_grid(G, i, j, CS%Phi(:,:,i,j), CS%Jac(:,i,j))
@@ -3766,14 +3797,21 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
   RHSu(:,:) = taudx(:,:) ; RHSv(:,:) = taudy(:,:)
   call pass_vector(RHSu, RHSv, G%domain, TO_ALL, BGRID_NE, complete=.false.)
 
+  ! The basal friction depends on the frozen iterate, which every inner solver takes from u_shlf and
+  ! keeps for the whole linear solve, so it is evaluated once here and applied from storage.
+  if (CS%fric_precompute) &
+    call build_basal_friction_cache(CS, G, US, u_shlf, v_shlf, Phisub, hmask, H_node, CS%bed_elev, &
+                                    rhoi_rhow, isc-1, iec+1, jsc-1, jec+1, h_shelf=ISS%h_shelf)
+
   call matrix_diagonal(CS, G, US, H_node, CS%ice_visc, u_shlf, v_shlf, &
-                       hmask, rhoi_rhow, Phi, Phisub, DIAGu, DIAGv, h_shelf=ISS%h_shelf)
+                       hmask, rhoi_rhow, Phi, Phisub, DIAGu, DIAGv, h_shelf=ISS%h_shelf, &
+                       use_fric_cache=CS%fric_precompute)
   call pass_vector(DIAGu, DIAGv, G%domain, TO_ALL, BGRID_NE, complete=.false.)
 
   call CG_action(CS, Au, Av, u_shlf, v_shlf, Phi, Phisub, CS%umask, CS%vmask, hmask, &
                  H_node, CS%ice_visc, CS%bed_elev, u_shlf, v_shlf, &
                  G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, use_newton_in=.false., &
-                 h_shelf=ISS%h_shelf)
+                 h_shelf=ISS%h_shelf, use_fric_cache=CS%fric_precompute)
   call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE, complete=.true.)
 
   ! Precompute reciprocal diagonal
@@ -3978,7 +4016,7 @@ subroutine ice_shelf_solve_inner_CG(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, A
 
     call CG_action(CS, Au, Av, Du, Dv, Phi, Phisub, CS%umask, CS%vmask, hmask, &
                    H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
-                   G, US, is, ie, js, je, rhoi_rhow, h_shelf=h_shelf)
+                   G, US, is, ie, js, je, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute)
 
     sum_vec(:,:) = 0.0
 
@@ -4210,7 +4248,7 @@ subroutine ice_shelf_solve_inner_MINRES(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, A
     Qu(:,:) = 0 ; Qv(:,:) = 0
     call CG_action(CS, Qu, Qv, Z_curr_u, Z_curr_v, Phi, Phisub, CS%umask, CS%vmask, hmask, &
                    H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
-                   G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf)
+                   G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute)
     ! --- STEP 2: alpha = q dot z_curr ---
     sum_vec_3d(:,:) = 0.0
     do J=Jscq_sv,Jecq ; do I=Iscq_sv,Iecq
@@ -4410,7 +4448,7 @@ subroutine ice_shelf_solve_inner_CR(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, A
   Au(:,:) = 0 ; Av(:,:) = 0
   call CG_action(CS, Au, Av, Zu, Zv, Phi, Phisub, CS%umask, CS%vmask, hmask, &
                  H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
-                 G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf)
+                 G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute)
   call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
 
   ! q_0 = A * p_0
@@ -4488,7 +4526,7 @@ subroutine ice_shelf_solve_inner_CR(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, A
     Au(:,:) = 0 ; Av(:,:) = 0
     call CG_action(CS, Au, Av, Zu, Zv, Phi, Phisub, CS%umask, CS%vmask, hmask, &
                    H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
-                   G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf)
+                   G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute)
     call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
 
     ! --- STEP 4: beta and convergence check ---
@@ -5794,7 +5832,7 @@ end subroutine calc_shelf_driving_stress_vertex
 
 subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, hmask, H_node, &
                      ice_visc, bathyT, u_curr, v_curr, G, US, is, ie, js, je, dens_ratio, &
-                     use_newton_in, h_shelf)
+                     use_newton_in, h_shelf, use_fric_cache)
 
   type(ice_shelf_dyn_CS), intent(in)    :: CS !< A pointer to the ice shelf control structure
   type(ocean_grid_type), intent(in) :: G  !< The grid structure used by the ice shelf.
@@ -5847,6 +5885,9 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   logical, optional,     intent(in)    :: use_newton_in !< If present, overrides CS%doing_newton for Newton correction
   real, dimension(SZDI_(G),SZDJ_(G)), &
                          optional, intent(in) :: h_shelf !< Cell-averaged ice thickness for DG mode [Z ~> m]
+  logical, optional,     intent(in)    :: use_fric_cache !< If true, apply the basal friction stored by
+                                               !! build_basal_friction_cache for this u_curr instead of
+                                               !! evaluating it. Only valid inside a linear solve.
 
 ! the linear action of the matrix on (u,v) with bilinear finite elements
 ! as of now everything is passed in so no grid pointers or anything of the sort have to be dereferenced,
@@ -5871,10 +5912,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   real :: uq, vq  ! Interpolated direction-vector δu at quadrature point [L T-1 ~> m s-1]
   real :: strx_n, stry_n, strsh_n, dstrain_n  ! Newton viscosity correction variables [T-1 ~> s-1], [T-2 ~> s-2]
   real :: u_curr_qp, v_curr_qp  ! Current iterate u^k at quadrature point [L T-1 ~> m s-1]
-  real :: unorm2_qp  ! Regularized squared speed of u^k at quadrature point [L2 T-2 ~> m2 s-2]
   real :: basal_coef_qp  ! Picard basal friction coefficient at quadrature point [R L2 Z T-1 ~> kg s-1]
-  real :: gl_w_qp        ! Quadrant-GLP grounded weight at the quadrature point, bilinear-interpolated
-                         ! from CS%f_ground_node; used only when CS%gl_quad_friction [nondim]
   real :: drag_newt_qp   ! Newton basal drag coefficient at quadrature point [R Z T-1 ~> kg m-2 s-1]
   real :: inner_dot_qp   ! u^k_qp · δu_qp inner product for Newton basal drag [L2 T-2 ~> m2 s-2]
   real :: bcoef_loc, dnewt_loc ! Local (nodal-diagonal) basal Picard drag [R L2 Z T-1 ~> kg s-1] and
@@ -5885,14 +5923,12 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   real :: min_trac_e     ! min_basal_traction * areaT for current element [R L2 Z T-1 ~> kg s-1]
   real :: fB_e           ! Pre-computed Coulomb fB for element; 0 for Weertman [(T L-1)^CF_PostPeak]
   real :: jac_wt  ! Per-quadrature-point metric correction |J_q|/areaT [nondim]
-  real :: h_gp           ! DG-evaluated ice thickness at Gauss point [Z ~> m]
-  real :: bed_gp         ! Bilinear bed elevation at Gauss point [Z ~> m]
-  real :: fB_local       ! Coulomb fB at quadrature point (DG mode) [(T L-1)^CF_PostPeak]
   real :: rho_oi_ratio   ! density_ocean / density_ice [nondim]
   real :: rho_ice_g_LtoZ ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
   logical :: do_DG       ! Local flag for DG basal friction mode
   logical :: fv_sub_fric ! Local flag for I2N_FRICTION (corner H and fls fields)
   logical :: grounded_qp ! Whether this quadrature point is grounded (for DG per-qp check)
+  logical :: use_cache   ! Whether to apply the stored basal friction (use_fric_cache)
   integer :: iq, jq, iphi, jphi, i, j, ilq, jlq, Itgt, Jtgt, qp, qpv
   logical :: visc_qp4
   logical :: use_newton  ! Whether to apply Newton tangent stiffness corrections
@@ -5918,6 +5954,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
 
   do_DG = CS%use_DG_thickness .and. present(h_shelf)
   fv_sub_fric = CS%i2n_friction
+  use_cache = .false. ; if (present(use_fric_cache)) use_cache = use_fric_cache
   if (do_DG) then
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
     rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
@@ -5985,77 +6022,21 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
         ! Basal friction and Newton Jacobian evaluated at this quadrature point (fully grounded cells only).
         ! Evaluating at quadrature points rather than cell-averaged ensures the Newton correction is the
         ! exact Jacobian of the Picard residual, enabling quadratic convergence for all friction exponents.
-        if (CS%gl_quad_friction) then
-          ! Quadrant GLP: the element friction path handles every cell with any grounded area,
-          ! and the per-quadrature-point weight gl_w_qp (below) carries the sub-cell structure.
-          grounded_qp = CS%f_ground_cell(i,j) > 0.0
+        if (use_cache) then
+          ! Stored once per nonlinear iteration by build_basal_friction_cache.
+          grounded_qp = (CS%fric_qp_on(qp,i,j) > 0.0)
+          if (grounded_qp) then
+            basal_coef_qp = CS%fric_qp_coef(qp,i,j) ; drag_newt_qp = CS%fric_qp_newt(qp,i,j)
+            u_curr_qp = CS%fric_qp_u(qp,i,j) ; v_curr_qp = CS%fric_qp_v(qp,i,j)
+          endif
         else
-          grounded_qp = merge((CS%ground_frac(i,j) >= 1.0) .and. .not.gl_subgrid_cell(CS, i, j), &
-                              CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
+          call basal_friction_qp(CS, G, US, i, j, iq, jq, xquad, u_curr, v_curr, do_DG, dens_ratio, &
+                                 rho_oi_ratio, rho_ice_g_LtoZ, coef_prefactor_e, min_trac_e, fB_e, &
+                                 eps_vel2_e, use_newton, grounded_qp, basal_coef_qp, drag_newt_qp, &
+                                 u_curr_qp, v_curr_qp)
         endif
-        if (grounded_qp) then
-          ! DG: h_gp is only used for flotation and the effective pressure.
-          if (do_DG) then
-            h_gp = ((CS%h_nodal(i,j,1,1) * (xquad(3-iq) * xquad(3-jq))) + &
-                    (CS%h_nodal(i,j,2,2) * (xquad(iq)   * xquad(jq))))  + &
-                   ((CS%h_nodal(i,j,2,1) * (xquad(iq)   * xquad(3-jq))) + &
-                    (CS%h_nodal(i,j,1,2) * (xquad(3-iq) * xquad(jq))))
-            h_gp = max(h_gp, CS%min_h_shelf)
-            bed_gp = ((CS%bed_node(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
-                      (CS%bed_node(I,J)     * (xquad(iq)   * xquad(jq))))  + &
-                     ((CS%bed_node(I,J-1)   * (xquad(iq)   * xquad(3-jq))) + &
-                      (CS%bed_node(I-1,J)   * (xquad(3-iq) * xquad(jq))))
-            ! Under quadrant GLP the smooth nodal weight gl_w_qp sets the grounded contribution,
-            ! so the binary per-quadrature-point test must not gate the friction; it still selects
-            ! a physical (grounded-only) effective pressure for the Coulomb law.
-            if (.not. CS%gl_quad_friction) grounded_qp = (dens_ratio * h_gp - bed_gp > 0)
-            if ((dens_ratio * h_gp - bed_gp > 0) .and. CS%CoulombFriction) then
-              fB_local = compute_fB_local(h_gp, bed_gp, rho_oi_ratio, rho_ice_g_LtoZ, &
-                  CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
-                  CS%CF_PostPeak, CS%n_basal_fric)
-            else
-              fB_local = 0.0
-            endif
-          else
-            fB_local = fB_e
-          endif
-        endif
-
-        if (grounded_qp) then
-          u_curr_qp = ((u_curr(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
-                       (u_curr(I,J) * (xquad(iq) * xquad(jq)))) + &
-                      ((u_curr(I,J-1) * (xquad(iq) * xquad(3-jq))) + &
-                       (u_curr(I-1,J) * (xquad(3-iq) * xquad(jq))))
-          v_curr_qp = ((v_curr(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
-                       (v_curr(I,J) * (xquad(iq) * xquad(jq)))) + &
-                      ((v_curr(I,J-1) * (xquad(iq) * xquad(3-jq))) + &
-                       (v_curr(I-1,J) * (xquad(3-iq) * xquad(jq))))
-          unorm2_qp = ((u_curr_qp**2) + (v_curr_qp**2)) + eps_vel2_e
-          call compute_basal_coef(unorm2_qp, coef_prefactor_e, min_trac_e, fB_local, &
-              CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, use_newton, &
-              basal_coef_qp, drag_newt_qp)
-          ! Quadrant-GLP grounded weight at this quadrature point: bilinear interpolation of the
-          ! nodal grounded fraction (same corner basis as h_gp above). Harmless when the toggle is
-          ! off (f_ground_node is zero and the merge below discards it).
-          gl_w_qp = ((CS%f_ground_node(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
-                     (CS%f_ground_node(I,J)     * (xquad(iq)   * xquad(jq))))  + &
-                    ((CS%f_ground_node(I,J-1)   * (xquad(iq)   * xquad(3-jq))) + &
-                     (CS%f_ground_node(I-1,J)   * (xquad(3-iq) * xquad(jq))))
-          ! Apply ground fraction scaling (replaces external scaling of basal_traction).
-          ! Under GL_regularize, GL cells (0 < ground_frac < 1) get sub-grid-aware basal
-          ! handling via the GL branch below, so the cell-level scaling must collapse to 1.0
-          ! there to avoid double-counting (matches pre-refactor behavior when ground_frac
-          ! was forced to 1.0 in GL cells). Under quadrant GLP the nodal weight gl_w_qp is used
-          ! at every grounded cell instead.
-          basal_coef_qp = basal_coef_qp * &
-              merge(gl_w_qp, merge(1.0, CS%ground_frac(i,j), CS%GL_regularize), CS%gl_quad_friction)
-          if (use_newton) then
-            drag_newt_qp = drag_newt_qp * &
-                merge(gl_w_qp, merge(1.0, CS%ground_frac(i,j), CS%GL_regularize), CS%gl_quad_friction)
-            ! Inner product u^k_qp . delta_u_qp for the Newton correction.
-            inner_dot_qp = (u_curr_qp * uq) + (v_curr_qp * vq)
-          endif
-        endif
+        ! Inner product u^k_qp . delta_u_qp for the Newton correction.
+        if (grounded_qp .and. use_newton) inner_dot_qp = (u_curr_qp * uq) + (v_curr_qp * vq)
 
         ! Ratio |J_q|/areaT corrects the uniform-area weight baked into ice_visc for
         ! non-rectangular elements where opposite cell edges have unequal lengths.
@@ -6122,7 +6103,11 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
         ! Subgrid grounding-line: evaluate basal friction at each grounded sub-quadrature point.
         ! Picard and Newton Jacobian are both computed inside CG_action_subgrid_basal.
         Hcell(:,:) = H_node(I-1:I,J-1:J)
-        if (CS%use_sep2) then
+        if (use_cache) then
+          ! The sub-element friction of this cell, stored as a corner matrix for this u_curr.
+          call apply_gl_fric_matrix(CS%gl_fric_K(:,:,:,i,j), u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), &
+                                    use_newton, Usub, Vsub)
+        elseif (CS%use_sep2) then
           if (fv_sub_fric) then
             call CG_action_sep2_basal(CS, G, US, Hcell, &
                 u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
@@ -6206,13 +6191,128 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
 
 end subroutine CG_action
 
+!> Basal friction coefficients at one 2x2 quadrature point of a regular (not sub-element) cell: the
+!! grounded test, the Picard coefficient and, if use_newton, the Newton drag coefficient, both scaled by
+!! the cell's grounded weight. Shared by CG_action and build_basal_friction_cache so the two agree.
+subroutine basal_friction_qp(CS, G, US, i, j, iq, jq, xquad, u_curr, v_curr, do_DG, dens_ratio, &
+                             rho_oi_ratio, rho_ice_g_LtoZ, coef_prefactor_e, min_trac_e, fB_e, &
+                             eps_vel2_e, use_newton, grounded_qp, basal_coef_qp, drag_newt_qp, &
+                             u_curr_qp, v_curr_qp)
+  type(ice_shelf_dyn_CS), intent(in) :: CS  !< The ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in) :: G   !< The grid structure used by the ice shelf
+  type(unit_scale_type),  intent(in) :: US  !< A structure containing unit conversion factors
+  integer,                intent(in) :: i   !< The i-index of the cell
+  integer,                intent(in) :: j   !< The j-index of the cell
+  integer,                intent(in) :: iq  !< The x-index of the quadrature point
+  integer,                intent(in) :: jq  !< The y-index of the quadrature point
+  real, dimension(2),     intent(in) :: xquad !< The 2-pt Gauss abscissae on [0,1] [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in) :: u_curr !< Frozen u^k at the corners [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in) :: v_curr !< Frozen v^k at the corners [L T-1 ~> m s-1]
+  logical,                intent(in) :: do_DG  !< If true, use the DG nodal thickness and bed
+  real,                   intent(in) :: dens_ratio !< Ice density / water density [nondim]
+  real,                   intent(in) :: rho_oi_ratio !< density_ocean / density_ice [nondim]
+  real,                   intent(in) :: rho_ice_g_LtoZ !< US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
+  real,                   intent(in) :: coef_prefactor_e !< area * C_basal_friction * L_T_to_m_s
+                                               !! [R L2 Z T-1 ~> kg s-1]
+  real,                   intent(in) :: min_trac_e !< min_basal_traction * areaT [R L2 Z T-1 ~> kg s-1]
+  real,                   intent(in) :: fB_e   !< Element Coulomb fB; 0 for Weertman [(T L-1)^CF_PostPeak]
+  real,                   intent(in) :: eps_vel2_e !< Velocity regularization squared [L2 T-2 ~> m2 s-2]
+  logical,                intent(in) :: use_newton !< If true, also return the Newton drag coefficient
+  logical,                intent(out) :: grounded_qp !< True if this quadrature point carries friction
+  real,                   intent(out) :: basal_coef_qp !< Picard coefficient [R L2 Z T-1 ~> kg s-1]
+  real,                   intent(out) :: drag_newt_qp  !< Newton drag coefficient [R Z T ~> kg m-2 s]
+  real,                   intent(out) :: u_curr_qp !< u^k at the quadrature point [L T-1 ~> m s-1]
+  real,                   intent(out) :: v_curr_qp !< v^k at the quadrature point [L T-1 ~> m s-1]
+
+  real :: h_gp      ! DG-evaluated ice thickness at the Gauss point [Z ~> m]
+  real :: bed_gp    ! Bilinear bed elevation at the Gauss point [Z ~> m]
+  real :: fB_local  ! Coulomb fB at the quadrature point [(T L-1)^CF_PostPeak]
+  real :: unorm2_qp ! Regularized squared speed of u^k [L2 T-2 ~> m2 s-2]
+  real :: gl_w_qp   ! Quadrant-GLP grounded weight at the quadrature point [nondim]
+
+  basal_coef_qp = 0.0 ; drag_newt_qp = 0.0 ; u_curr_qp = 0.0 ; v_curr_qp = 0.0
+
+  if (CS%gl_quad_friction) then
+    ! Quadrant GLP: the element friction path handles every cell with any grounded area,
+    ! and the per-quadrature-point weight gl_w_qp (below) carries the sub-cell structure.
+    grounded_qp = CS%f_ground_cell(i,j) > 0.0
+  else
+    grounded_qp = merge((CS%ground_frac(i,j) >= 1.0) .and. .not.gl_subgrid_cell(CS, i, j), &
+                        CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
+  endif
+  if (grounded_qp) then
+    ! DG: h_gp is only used for flotation and the effective pressure.
+    if (do_DG) then
+      h_gp = ((CS%h_nodal(i,j,1,1) * (xquad(3-iq) * xquad(3-jq))) + &
+              (CS%h_nodal(i,j,2,2) * (xquad(iq)   * xquad(jq))))  + &
+             ((CS%h_nodal(i,j,2,1) * (xquad(iq)   * xquad(3-jq))) + &
+              (CS%h_nodal(i,j,1,2) * (xquad(3-iq) * xquad(jq))))
+      h_gp = max(h_gp, CS%min_h_shelf)
+      bed_gp = ((CS%bed_node(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
+                (CS%bed_node(I,J)     * (xquad(iq)   * xquad(jq))))  + &
+               ((CS%bed_node(I,J-1)   * (xquad(iq)   * xquad(3-jq))) + &
+                (CS%bed_node(I-1,J)   * (xquad(3-iq) * xquad(jq))))
+      ! Under quadrant GLP the smooth nodal weight gl_w_qp sets the grounded contribution,
+      ! so the binary per-quadrature-point test must not gate the friction; it still selects
+      ! a physical (grounded-only) effective pressure for the Coulomb law.
+      if (.not. CS%gl_quad_friction) grounded_qp = (dens_ratio * h_gp - bed_gp > 0)
+      if ((dens_ratio * h_gp - bed_gp > 0) .and. CS%CoulombFriction) then
+        fB_local = compute_fB_local(h_gp, bed_gp, rho_oi_ratio, rho_ice_g_LtoZ, &
+            CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
+            CS%CF_PostPeak, CS%n_basal_fric)
+      else
+        fB_local = 0.0
+      endif
+    else
+      fB_local = fB_e
+    endif
+  endif
+
+  if (grounded_qp) then
+    u_curr_qp = ((u_curr(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
+                 (u_curr(I,J) * (xquad(iq) * xquad(jq)))) + &
+                ((u_curr(I,J-1) * (xquad(iq) * xquad(3-jq))) + &
+                 (u_curr(I-1,J) * (xquad(3-iq) * xquad(jq))))
+    v_curr_qp = ((v_curr(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
+                 (v_curr(I,J) * (xquad(iq) * xquad(jq)))) + &
+                ((v_curr(I,J-1) * (xquad(iq) * xquad(3-jq))) + &
+                 (v_curr(I-1,J) * (xquad(3-iq) * xquad(jq))))
+    unorm2_qp = ((u_curr_qp**2) + (v_curr_qp**2)) + eps_vel2_e
+    call compute_basal_coef(unorm2_qp, coef_prefactor_e, min_trac_e, fB_local, &
+        CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, use_newton, &
+        basal_coef_qp, drag_newt_qp)
+    ! Quadrant-GLP grounded weight at this quadrature point: bilinear interpolation of the
+    ! nodal grounded fraction (same corner basis as h_gp above). Harmless when the toggle is
+    ! off (f_ground_node is zero and the merge below discards it).
+    gl_w_qp = ((CS%f_ground_node(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
+               (CS%f_ground_node(I,J)     * (xquad(iq)   * xquad(jq))))  + &
+              ((CS%f_ground_node(I,J-1)   * (xquad(iq)   * xquad(3-jq))) + &
+               (CS%f_ground_node(I-1,J)   * (xquad(3-iq) * xquad(jq))))
+    ! Apply ground fraction scaling (replaces external scaling of basal_traction).
+    ! Under GL_regularize, GL cells (0 < ground_frac < 1) get sub-grid-aware basal
+    ! handling via the GL branch below, so the cell-level scaling must collapse to 1.0
+    ! there to avoid double-counting (matches pre-refactor behavior when ground_frac
+    ! was forced to 1.0 in GL cells). Under quadrant GLP the nodal weight gl_w_qp is used
+    ! at every grounded cell instead.
+    basal_coef_qp = basal_coef_qp * &
+        merge(gl_w_qp, merge(1.0, CS%ground_frac(i,j), CS%GL_regularize), CS%gl_quad_friction)
+    if (use_newton) then
+      drag_newt_qp = drag_newt_qp * &
+          merge(gl_w_qp, merge(1.0, CS%ground_frac(i,j), CS%GL_regularize), CS%gl_quad_friction)
+    endif
+  endif
+
+end subroutine basal_friction_qp
+
 !> Compute subgrid grounding-line basal traction nodal contributions for a CG action.
 !! Evaluates basal friction (Picard and Newton Jacobian) at each grounded sub-quadrature point.
 !! The sub-qp flotation test accounts for partial grounding; no external ground_frac scaling needed.
 subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta, V_delta, &
                                    bathyT, dens_ratio, i_elem, j_elem, fB_e, use_newton, Ucontr, Vcontr, &
                                    dxCv_S, dxCv_N, dyCu_W, dyCu_E, IareaT, &
-                                   use_DG, h_nodal_cell, bed_corners, fls_cell)
+                                   use_DG, h_nodal_cell, bed_corners, fls_cell, Kmat)
   type(ice_shelf_dyn_CS), intent(in) :: CS      !< Ice shelf control structure
   type(ocean_grid_type),  intent(in) :: G       !< The grid structure
   type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
@@ -6245,6 +6345,10 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
                                               !! sub-point flotation test and the effective pressure
                                               !! are taken from this field and h_nodal_cell supplies
                                               !! the matching corner thickness [Z ~> m]
+  real, dimension(4,4,4), optional, intent(out) :: Kmat !< If present, the corner friction matrix
+                                              !! K(c,n,blk) is returned instead of Ucontr and Vcontr:
+                                              !! corners SW,SE,NW,NE; blk 1 Picard, 2-4 Newton uu, uv,
+                                              !! vv. Call with use_newton = .true. [R L2 Z T-1 ~> kg s-1]
 
   real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: Ucontr_sub, Vcontr_sub
   real, dimension(2,2,2,2) :: U_qp_nd, V_qp_nd  ! Per-qp nodal contributions (qx,qy,m,n)
@@ -6276,7 +6380,17 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
   logical :: do_fvsub    ! Local flag for the FV sub-element mode (fls_cell supplied)
   real :: fls_loc        ! Flotation deficit r*h - bed at sub-qp [Z ~> m]
   real :: rho_ocean_g_LtoZ ! US%L_to_Z * density_ocean_avg * g_Earth [R L Z-1 T-2]
-  integer :: nsub, i, j, qx, qy, m, n
+  real, dimension(2,2,10,4) :: KQ ! Per-qp matrix contributions (qx,qy,pair,blk) [R L2 Z T-1 ~> kg s-1]
+  real, allocatable, dimension(:,:,:,:) :: Ksub ! Per-sub-cell matrix sums (i,j,pair,blk) [R L2 Z T-1 ~> kg s-1]
+  real :: Kp               ! One reduced matrix entry [R L2 Z T-1 ~> kg s-1]
+  real :: wcn              ! Weight times the two corner basis values [nondim]
+  integer, dimension(4), parameter :: mc = (/ 1, 2, 1, 2 /) ! x-index of corner c (SW,SE,NW,NE)
+  integer, dimension(4), parameter :: nc = (/ 1, 1, 2, 2 /) ! y-index of corner c
+  logical :: build_K       ! True if Kmat is to be returned
+  integer :: nsub, i, j, qx, qy, m, n, c, cn, blk, ip
+  ! The friction matrix is symmetric in its two corners, so only the 10 pairs c <= n are formed.
+  integer, dimension(10), parameter :: pc = (/ 1, 1, 2, 1, 2, 3, 1, 2, 3, 4 /) ! First corner of pair
+  integer, dimension(10), parameter :: pn = (/ 1, 2, 2, 3, 3, 3, 4, 4, 4, 4 /) ! Second corner of pair
 
   nsub    = size(Phisub, 3)
   subarea = 1.0 / real(nsub)**2
@@ -6297,9 +6411,14 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
   endif
 
   Ucontr_sub(:,:,:,:) = 0.0 ; Vcontr_sub(:,:,:,:) = 0.0
+  build_K = present(Kmat)
+  if (build_K) then
+    allocate(Ksub(nsub,nsub,10,4), source=0.0)
+  endif
 
   do j=1,nsub ; do i=1,nsub
     U_qp_nd(:,:,:,:) = 0.0 ; V_qp_nd(:,:,:,:) = 0.0
+    if (build_K) KQ(:,:,:,:) = 0.0
     do qy=1,2 ; do qx=1,2
       if (do_fvsub) then
         ! FV sub-element mode: thickness and flotation deficit share one interpolant (the same
@@ -6338,10 +6457,14 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
                        ((Phisub(qx,qy,i,j,1,2)*U_curr(1,2))  + (Phisub(qx,qy,i,j,2,1)*U_curr(2,1))))
         v_curr_loc  = (((Phisub(qx,qy,i,j,1,1)*V_curr(1,1))  + (Phisub(qx,qy,i,j,2,2)*V_curr(2,2)))  + &
                        ((Phisub(qx,qy,i,j,1,2)*V_curr(1,2))  + (Phisub(qx,qy,i,j,2,1)*V_curr(2,1))))
-        u_delta_loc = (((Phisub(qx,qy,i,j,1,1)*U_delta(1,1)) + (Phisub(qx,qy,i,j,2,2)*U_delta(2,2))) + &
-                       ((Phisub(qx,qy,i,j,1,2)*U_delta(1,2)) + (Phisub(qx,qy,i,j,2,1)*U_delta(2,1))))
-        v_delta_loc = (((Phisub(qx,qy,i,j,1,1)*V_delta(1,1)) + (Phisub(qx,qy,i,j,2,2)*V_delta(2,2))) + &
-                       ((Phisub(qx,qy,i,j,1,2)*V_delta(1,2)) + (Phisub(qx,qy,i,j,2,1)*V_delta(2,1))))
+        if (.not. build_K) then
+          u_delta_loc = (((Phisub(qx,qy,i,j,1,1)*U_delta(1,1)) + (Phisub(qx,qy,i,j,2,2)*U_delta(2,2))) + &
+                         ((Phisub(qx,qy,i,j,1,2)*U_delta(1,2)) + (Phisub(qx,qy,i,j,2,1)*U_delta(2,1))))
+          v_delta_loc = (((Phisub(qx,qy,i,j,1,1)*V_delta(1,1)) + (Phisub(qx,qy,i,j,2,2)*V_delta(2,2))) + &
+                         ((Phisub(qx,qy,i,j,1,2)*V_delta(1,2)) + (Phisub(qx,qy,i,j,2,1)*V_delta(2,1))))
+        else
+          u_delta_loc = 0.0 ; v_delta_loc = 0.0
+        endif
 
         unorm2_loc = ((u_curr_loc**2) + (v_curr_loc**2)) + eps_vel2
 
@@ -6374,7 +6497,19 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
             (dyCu_E * (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)))      !  + x  * dyCu_E
         jac_sub_wt = 0.25 * subarea * (a * d) * IareaT
 
-        do n=1,2 ; do m=1,2
+        if (build_K) then
+          ! K(c,n) = sum_q w_q phi_c phi_n {coef, drag u u, drag u v, drag v v}. phi_c*phi_n is formed
+          ! first so the entry does not depend on which corner is c, and the uv block from the product
+          ! u*v, so that a quarter turn maps each entry exactly onto its image.
+          do ip=1,10
+            c = pc(ip) ; cn = pn(ip)
+            wcn = jac_sub_wt * (Phisub(qx,qy,i,j,mc(c),nc(c)) * Phisub(qx,qy,i,j,mc(cn),nc(cn)))
+            KQ(qx,qy,ip,1) = wcn * basal_coef_loc
+            KQ(qx,qy,ip,2) = wcn * (drag_newt_loc * (u_curr_loc * u_curr_loc))
+            KQ(qx,qy,ip,3) = wcn * (drag_newt_loc * (u_curr_loc * v_curr_loc))
+            KQ(qx,qy,ip,4) = wcn * (drag_newt_loc * (v_curr_loc * v_curr_loc))
+          enddo
+        else ; do n=1,2 ; do m=1,2
           phi_mn  = Phisub(qx,qy,i,j,m,n)
           contrib = jac_sub_wt * phi_mn
           ! Picard: friction matrix applied to search direction δu
@@ -6385,9 +6520,13 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
             U_qp_nd(qx,qy,m,n) = U_qp_nd(qx,qy,m,n) + (contrib * (drag_newt_loc * u_curr_loc * inner_dot_loc))
             V_qp_nd(qx,qy,m,n) = V_qp_nd(qx,qy,m,n) + (contrib * (drag_newt_loc * v_curr_loc * inner_dot_loc))
           endif
-        enddo ; enddo
+        enddo ; enddo ; endif
       endif
     enddo ; enddo
+
+    if (build_K) then
+      Ksub(i,j,:,:) = (KQ(1,1,:,:) + KQ(2,2,:,:)) + (KQ(1,2,:,:) + KQ(2,1,:,:))
+    endif
 
     do n=1,2 ; do m=1,2
       Ucontr_sub(i,j,m,n) = (U_qp_nd(1,1,m,n) + U_qp_nd(2,2,m,n)) + &
@@ -6397,12 +6536,174 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
     enddo ; enddo
   enddo ; enddo
 
+  if (build_K) then
+    do blk=1,4 ; do ip=1,10
+      call sum_square_matrix(Kp, Ksub(:,:,ip,blk), nsub)
+      Kmat(pc(ip),pn(ip),blk) = Kp ; Kmat(pn(ip),pc(ip),blk) = Kp
+    enddo ; enddo
+    deallocate(Ksub)
+    Ucontr(:,:) = 0.0 ; Vcontr(:,:) = 0.0
+    return
+  endif
+
   do n=1,2 ; do m=1,2
     call sum_square_matrix(Ucontr(m,n), Ucontr_sub(:,:,m,n), nsub)
     call sum_square_matrix(Vcontr(m,n), Vcontr_sub(:,:,m,n), nsub)
   enddo ; enddo
 
 end subroutine CG_action_subgrid_basal
+
+!> Apply a grounding-line cell's stored friction matrix (build_basal_friction_cache) to the search
+!! direction at its corners. Each row is a sum over the four corners, taken in opposite-corner pairs
+!! with rounded products (dg_sum4_rounded) so that the result is rotation invariant with FMA.
+subroutine apply_gl_fric_matrix(K, du, dv, use_newton, Ucontr, Vcontr)
+  real, dimension(4,4,4), intent(in)  :: K      !< Corner friction matrix K(c,n,blk) [R L2 Z T-1 ~> kg s-1]
+  real, dimension(2,2),   intent(in)  :: du     !< u search direction at the corners [L T-1 ~> m s-1]
+  real, dimension(2,2),   intent(in)  :: dv     !< v search direction at the corners [L T-1 ~> m s-1]
+  logical,                intent(in)  :: use_newton !< If true, add the Newton blocks
+  real, dimension(2,2),   intent(out) :: Ucontr !< Nodal u-contributions [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(2,2),   intent(out) :: Vcontr !< Nodal v-contributions [R L3 Z T-2 ~> kg m s-2]
+
+  real, dimension(4) :: u, v ! Search direction flattened SW,SE,NW,NE [L T-1 ~> m s-1]
+  real, dimension(4) :: su, sv ! Row sums [R L3 Z T-2 ~> kg m s-2]
+  real :: nuu, nuv, nvu, nvv   ! Newton block row sums [R L3 Z T-2 ~> kg m s-2]
+  integer :: c
+
+  u(1) = du(1,1) ; u(2) = du(2,1) ; u(3) = du(1,2) ; u(4) = du(2,2)
+  v(1) = dv(1,1) ; v(2) = dv(2,1) ; v(3) = dv(1,2) ; v(4) = dv(2,2)
+  do c=1,4
+    su(c) = dg_sum4_rounded(K(c,1,1)*u(1), K(c,4,1)*u(4), K(c,2,1)*u(2), K(c,3,1)*u(3))
+    sv(c) = dg_sum4_rounded(K(c,1,1)*v(1), K(c,4,1)*v(4), K(c,2,1)*v(2), K(c,3,1)*v(3))
+    if (use_newton) then
+      nuu = dg_sum4_rounded(K(c,1,2)*u(1), K(c,4,2)*u(4), K(c,2,2)*u(2), K(c,3,2)*u(3))
+      nuv = dg_sum4_rounded(K(c,1,3)*v(1), K(c,4,3)*v(4), K(c,2,3)*v(2), K(c,3,3)*v(3))
+      nvu = dg_sum4_rounded(K(c,1,3)*u(1), K(c,4,3)*u(4), K(c,2,3)*u(2), K(c,3,3)*u(3))
+      nvv = dg_sum4_rounded(K(c,1,4)*v(1), K(c,4,4)*v(4), K(c,2,4)*v(2), K(c,3,4)*v(3))
+      su(c) = su(c) + (nuu + nuv)
+      sv(c) = sv(c) + (nvu + nvv)
+    endif
+  enddo
+  Ucontr(1,1) = su(1) ; Ucontr(2,1) = su(2) ; Ucontr(1,2) = su(3) ; Ucontr(2,2) = su(4)
+  Vcontr(1,1) = sv(1) ; Vcontr(2,1) = sv(2) ; Vcontr(1,2) = sv(3) ; Vcontr(2,2) = sv(4)
+
+end subroutine apply_gl_fric_matrix
+
+!> Evaluate the basal friction once for the frozen iterate (u_curr, v_curr) of a linear solve, for
+!! CG_action to apply with use_fric_cache. Regular cells store the coefficients at their 2x2
+!! quadrature points (the same values CG_action would compute), and each cell on the grounding-line
+!! sub-element path stores its friction as the corner matrix K(c,n,blk), so a linear-solver
+!! iteration costs the same whatever the number of sub-element quadrature points. The Newton parts
+!! are always stored; CG_action adds them only when it applies Newton.
+subroutine build_basal_friction_cache(CS, G, US, u_curr, v_curr, Phisub, hmask, H_node, bathyT, &
+                                      dens_ratio, is, ie, js, je, h_shelf)
+  type(ice_shelf_dyn_CS), intent(in) :: CS !< The ice shelf dynamics control structure; only the
+                                           !! targets of its friction-cache pointers are written
+  type(ocean_grid_type),  intent(in) :: G  !< The grid structure used by the ice shelf
+  type(unit_scale_type),  intent(in) :: US !< A structure containing unit conversion factors
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in) :: u_curr !< Frozen iterate u^k at the corners [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in) :: v_curr !< Frozen iterate v^k at the corners [L T-1 ~> m s-1]
+  real, dimension(:,:,:,:,:,:), intent(in) :: Phisub !< Sub-grid quadrature weights [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(in) :: hmask !< A mask of the ice-covered tracer points
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in) :: H_node !< The ice thickness at the corners [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(in) :: bathyT !< The ocean bathymetry depth at tracer points [Z ~> m]
+  real,                   intent(in) :: dens_ratio !< Ice density / water density [nondim]
+  integer,                intent(in) :: is !< The starting i-index to work on
+  integer,                intent(in) :: ie !< The ending i-index to work on
+  integer,                intent(in) :: js !< The starting j-index to work on
+  integer,                intent(in) :: je !< The ending j-index to work on
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                optional, intent(in) :: h_shelf !< Cell-averaged ice thickness for DG mode [Z ~> m]
+
+  real, dimension(2) :: xquad   ! The 2-pt Gauss abscissae on [0,1] [nondim]
+  real, dimension(2,2) :: Hcell ! Ice thickness at the cell corners [Z ~> m]
+  real, dimension(2,2) :: zero2 ! A zero search direction for the matrix builds [L T-1 ~> m s-1]
+  real, dimension(2,2) :: Usub, Vsub ! Unused vector outputs of the matrix builds [R L3 Z T-2 ~> kg m s-2]
+  real :: coef_prefactor_e ! area * C_basal_friction * L_T_to_m_s [R L2 Z T-1 ~> kg s-1]
+  real :: eps_vel2_e       ! Velocity regularization squared [L2 T-2 ~> m2 s-2]
+  real :: min_trac_e       ! min_basal_traction * areaT [R L2 Z T-1 ~> kg s-1]
+  real :: fB_e             ! Element Coulomb fB; 0 for Weertman [(T L-1)^CF_PostPeak]
+  real :: rho_oi_ratio     ! density_ocean / density_ice [nondim]
+  real :: rho_ice_g_LtoZ   ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
+  real :: bc, dn           ! Picard [R L2 Z T-1 ~> kg s-1] and Newton [R Z T ~> kg m-2 s] coefficients
+  real :: uq, vq           ! u^k and v^k at a quadrature point [L T-1 ~> m s-1]
+  logical :: do_DG, fv_sub_fric, grounded_qp
+  integer :: i, j, iq, jq, qp
+
+  xquad(1) = .5 * (1-sqrt(1./3)) ; xquad(2) = .5 * (1+sqrt(1./3))
+  zero2(:,:) = 0.0
+  do_DG = CS%use_DG_thickness .and. present(h_shelf)
+  fv_sub_fric = CS%i2n_friction
+  rho_oi_ratio = 0.0 ; rho_ice_g_LtoZ = 0.0
+  if (do_DG) then
+    rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
+    rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
+  endif
+
+  do j=js,je ; do i=is,ie ; if (hmask(i,j) == 1 .or. hmask(i,j) == 3) then
+    coef_prefactor_e = CS%coef_prefactor(i,j)
+    eps_vel2_e = CS%eps_glen_min**2 * ((G%dxT(i,j)**2) + (G%dyT(i,j)**2))
+    min_trac_e = CS%min_basal_traction * G%areaT(i,j)
+    fB_e = CS%fB_elem(i,j)
+
+    do iq=1,2 ; do jq=1,2
+      qp = 2*(jq-1)+iq
+      call basal_friction_qp(CS, G, US, i, j, iq, jq, xquad, u_curr, v_curr, do_DG, dens_ratio, &
+                             rho_oi_ratio, rho_ice_g_LtoZ, coef_prefactor_e, min_trac_e, fB_e, &
+                             eps_vel2_e, .true., grounded_qp, bc, dn, uq, vq)
+      CS%fric_qp_on(qp,i,j) = merge(1.0, 0.0, grounded_qp)
+      CS%fric_qp_coef(qp,i,j) = bc ; CS%fric_qp_newt(qp,i,j) = dn
+      CS%fric_qp_u(qp,i,j) = uq ; CS%fric_qp_v(qp,i,j) = vq
+    enddo ; enddo
+
+    if (CS%GL_regularize .and. .not. CS%gl_quad_friction .and. .not. CS%local_basal_friction .and. &
+        gl_subgrid_cell(CS, i, j)) then
+      Hcell(:,:) = H_node(I-1:I,J-1:J)
+      if (CS%use_sep2) then
+        if (fv_sub_fric) then
+          call CG_action_sep2_basal(CS, G, US, Hcell, u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+              zero2, zero2, bathyT(i,j), dens_ratio, i, j, fB_e, .true., Usub, Vsub, &
+              G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
+              h_nodal_cell=CS%H_corner(I-1:I,J-1:J), fls_cell=CS%fls_corner(I-1:I,J-1:J), &
+              Kmat=CS%gl_fric_K(:,:,:,i,j))
+        elseif (do_DG) then
+          call CG_action_sep2_basal(CS, G, US, Hcell, u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+              zero2, zero2, bathyT(i,j), dens_ratio, i, j, fB_e, .true., Usub, Vsub, &
+              G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
+              use_DG=.true., h_nodal_cell=CS%h_nodal(i,j,:,:), bed_corners=CS%bed_node(I-1:I,J-1:J), &
+              Kmat=CS%gl_fric_K(:,:,:,i,j))
+        else
+          call CG_action_sep2_basal(CS, G, US, Hcell, u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+              zero2, zero2, bathyT(i,j), dens_ratio, i, j, fB_e, .true., Usub, Vsub, &
+              G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
+              Kmat=CS%gl_fric_K(:,:,:,i,j))
+        endif
+      elseif (fv_sub_fric) then
+        call CG_action_subgrid_basal(CS, G, US, Phisub, Hcell, u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+            zero2, zero2, bathyT(i,j), dens_ratio, i, j, fB_e, .true., Usub, Vsub, &
+            G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
+            h_nodal_cell=CS%H_corner(I-1:I,J-1:J), fls_cell=CS%fls_corner(I-1:I,J-1:J), &
+            Kmat=CS%gl_fric_K(:,:,:,i,j))
+      elseif (do_DG) then
+        call CG_action_subgrid_basal(CS, G, US, Phisub, Hcell, u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+            zero2, zero2, bathyT(i,j), dens_ratio, i, j, fB_e, .true., Usub, Vsub, &
+            G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
+            use_DG=.true., h_nodal_cell=CS%h_nodal(i,j,:,:), bed_corners=CS%bed_node(I-1:I,J-1:J), &
+            Kmat=CS%gl_fric_K(:,:,:,i,j))
+      else
+        call CG_action_subgrid_basal(CS, G, US, Phisub, Hcell, u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+            zero2, zero2, bathyT(i,j), dens_ratio, i, j, fB_e, .true., Usub, Vsub, &
+            G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
+            Kmat=CS%gl_fric_K(:,:,:,i,j))
+      endif
+    endif
+  endif ; enddo ; enddo
+
+end subroutine build_basal_friction_cache
 
 !> Compute the Picard basal friction coefficient and Newton drag coefficient at a
 !! single quadrature point. Encapsulates the 3-path dispatch (linear Weertman / nonlinear
@@ -6593,7 +6894,8 @@ end subroutine sum_square_matrix
 
 !> returns the diagonal entries of the matrix for a Jacobi preconditioning
 subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
-                           hmask, dens_ratio, Phi, Phisub, u_diagonal, v_diagonal, h_shelf)
+                           hmask, dens_ratio, Phi, Phisub, u_diagonal, v_diagonal, h_shelf, &
+                           use_fric_cache)
 
   type(ice_shelf_dyn_CS), intent(in)    :: CS !< A pointer to the ice shelf control structure
   type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
@@ -6628,6 +6930,9 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
                                             !! matrix from the left-hand side of the solver [R L2 Z T-1 ~> kg s-1]
   real, dimension(SZDI_(G),SZDJ_(G)), &
                          optional, intent(in) :: h_shelf !< Cell-averaged ice thickness for DG mode [Z ~> m]
+  logical, optional,      intent(in)    :: use_fric_cache !< If true, take the grounding-line friction
+                                               !! diagonal from the matrices stored by
+                                               !! build_basal_friction_cache for this u_curr
 
 
 ! returns the diagonal entries of the matrix for a Jacobi preconditioning
@@ -6654,6 +6959,8 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
   real :: rho_ice_g_LtoZ ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
   logical :: do_DG       ! Local flag for DG basal friction mode
   logical :: fv_sub_fric ! Local flag for I2N_FRICTION (corner H and fls fields)
+  logical :: use_cache   ! Whether to read the stored grounding-line friction (use_fric_cache)
+  integer :: m, n, kc    ! Corner indices within a cell and their flattened SW,SE,NW,NE index
   logical :: grounded_qp ! Whether this quadrature point is grounded
   real :: bcoef_loc, dnewt_loc ! Local (nodal-diagonal) basal Picard drag [R L2 Z T-1 ~> kg s-1] and
                          ! Newton tangent factor [R Z T ~> kg m-2 s] at a node (CISM_FRICTION='local')
@@ -6679,6 +6986,7 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
   do_newton_visc = CS%doing_newton .and. trim(CS%ice_viscosity_compute) == "MODEL"
 
   do_DG = CS%use_DG_thickness .and. present(h_shelf)
+  use_cache = .false. ; if (present(use_fric_cache)) use_cache = use_fric_cache
   fv_sub_fric = CS%i2n_friction
   if (do_DG) then
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
@@ -6864,7 +7172,18 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
       ! Returns separate u_diag_sub and v_diag_sub (differ in Newton term: u^2 vs v^2).
       ! The sub-qp flotation test handles grounding fraction; no external ground_frac scaling needed.
       Hcell(:,:) = H_node(I-1:I,J-1:J)
-      if (CS%use_sep2) then
+      if (use_cache) then
+        ! Diagonal of the stored corner matrix: Picard block plus, under Newton, the uu or vv block.
+        do n=1,2 ; do m=1,2
+          kc = m + 2*(n-1)
+          u_diag_sub(m,n) = CS%gl_fric_K(kc,kc,1,i,j)
+          v_diag_sub(m,n) = CS%gl_fric_K(kc,kc,1,i,j)
+          if (CS%doing_newton) then
+            u_diag_sub(m,n) = u_diag_sub(m,n) + CS%gl_fric_K(kc,kc,2,i,j)
+            v_diag_sub(m,n) = v_diag_sub(m,n) + CS%gl_fric_K(kc,kc,4,i,j)
+          endif
+        enddo ; enddo
+      elseif (CS%use_sep2) then
         if (fv_sub_fric) then
           call CG_diagonal_sep2_basal(CS, G, US, Hcell, &
               u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
@@ -7389,7 +7708,7 @@ end subroutine sep2_fan_gradient
 subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, &
                                 bathyT, dens_ratio, i_elem, j_elem, fB_e, use_newton, &
                                 Ucontr, Vcontr, dxCv_S, dxCv_N, dyCu_W, dyCu_E, IareaT, &
-                                use_DG, h_nodal_cell, bed_corners, fls_cell)
+                                use_DG, h_nodal_cell, bed_corners, fls_cell, Kmat)
   type(ice_shelf_dyn_CS), intent(in) :: CS      !< Ice shelf control structure
   type(ocean_grid_type),  intent(in) :: G       !< The grid structure
   type(unit_scale_type),  intent(in) :: US      !< Unit conversion factors
@@ -7419,6 +7738,10 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
                                               !! partition and the effective pressure are both taken
                                               !! from this field and h_nodal_cell supplies the
                                               !! matching corner thickness [Z ~> m]
+  real, dimension(4,4,4), optional, intent(out) :: Kmat !< If present, the corner friction matrix
+                                              !! K(c,n,blk) is returned instead of Ucontr and Vcontr:
+                                              !! corners SW,SE,NW,NE; blk 1 Picard, 2-4 Newton uu, uv,
+                                              !! vv. Call with use_newton = .true. [R L2 Z T-1 ~> kg s-1]
 
   real, dimension(4)     :: hc, bedc  ! Corner thickness and bed, flattened SW,SE,NW,NE [Z ~> m]
   real, dimension(4)     :: uc, vc    ! Corner frozen velocities [L T-1 ~> m s-1]
@@ -7453,7 +7776,15 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
   real :: fls_loc           ! Flotation deficit at the QP [Z ~> m]
   logical :: do_DG          ! Local flag for DG mode
   logical :: do_fvsub       ! Local flag for the FV sub-element mode (fls_cell supplied)
-  integer :: t, k, c
+  real, dimension(10,4,SEP2_MAXQP) :: valK ! Per-QP matrix contributions (pair,blk,k) [R L2 Z T-1 ~> kg s-1]
+  real, dimension(10,4,4) :: pK   ! Per-triangle matrix sums (pair,blk,t) [R L2 Z T-1 ~> kg s-1]
+  real :: Kp                ! One reduced matrix entry [R L2 Z T-1 ~> kg s-1]
+  real :: wcn               ! Weight times the two corner basis values [nondim]
+  logical :: build_K        ! True if Kmat is to be returned
+  integer :: t, k, c, blk, ip
+  ! The friction matrix is symmetric in its two corners, so only the 10 pairs c <= n are formed.
+  integer, dimension(10), parameter :: pc = (/ 1, 1, 2, 1, 2, 3, 1, 2, 3, 4 /) ! First corner of pair
+  integer, dimension(10), parameter :: pn = (/ 1, 2, 2, 3, 3, 3, 4, 4, 4, 4 /) ! Second corner of pair
 
   coef_prefactor = CS%coef_prefactor(i_elem,j_elem)
   min_trac_area  = CS%min_basal_traction * G%areaT(i_elem,j_elem)
@@ -7496,9 +7827,11 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
     fls(:) = (dens_ratio * hc(:)) - bedc(:)
   endif
   call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
+  build_K = present(Kmat)
 
   do t=1,4
     valu(:,1:nqp(t)) = 0.0 ; valv(:,1:nqp(t)) = 0.0
+    if (build_K) valK(:,:,1:nqp(t)) = 0.0
     do k=1,nqp(t)
       if (.not. qpg(k,t)) cycle ! floating piece: no basal traction
       b1 = beta(1,k,t) ; b2 = beta(2,k,t) ; b3 = beta(3,k,t) ; b4 = beta(4,k,t)
@@ -7547,6 +7880,18 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
           basal_coef_loc, drag_newt_loc)
       inner_dot_loc = (u_curr_loc * u_delta_loc) + (v_curr_loc * v_delta_loc)
 
+      if (build_K) then
+        ! See CG_action_subgrid_basal for the product order.
+        do ip=1,10
+          wcn = jac * (beta(pc(ip),k,t) * beta(pn(ip),k,t))
+          valK(ip,1,k) = wcn * basal_coef_loc
+          valK(ip,2,k) = wcn * (drag_newt_loc * (u_curr_loc * u_curr_loc))
+          valK(ip,3,k) = wcn * (drag_newt_loc * (u_curr_loc * v_curr_loc))
+          valK(ip,4,k) = wcn * (drag_newt_loc * (v_curr_loc * v_curr_loc))
+        enddo
+        cycle
+      endif
+
       do c=1,4
         contrib = jac * beta(c,k,t)
         valu(c,k) = contrib * (basal_coef_loc * u_delta_loc)
@@ -7559,11 +7904,28 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
     enddo
 
     ! Orbit-grouped QP sums (sep2_qp_sum), invariant under the reflections that permute the QPs.
-    do c=1,4
-      pu(c,t) = sep2_qp_sum(valu(c,1:nqp(t)), nqp(t))
-      pv(c,t) = sep2_qp_sum(valv(c,1:nqp(t)), nqp(t))
-    enddo
+    if (build_K) then
+      do blk=1,4 ; do ip=1,10
+        pK(ip,blk,t) = sep2_qp_sum(valK(ip,blk,1:nqp(t)), nqp(t))
+      enddo ; enddo
+    else
+      do c=1,4
+        pu(c,t) = sep2_qp_sum(valu(c,1:nqp(t)), nqp(t))
+        pv(c,t) = sep2_qp_sum(valv(c,1:nqp(t)), nqp(t))
+      enddo
+    endif
   enddo
+
+  if (build_K) then
+    ! Opposite-pair triangle grouping (S+N)+(E+W): a rotation or reflection only swaps terms within
+    ! or between the pairs, whichever corner of the entry is c, so the mirrored entry is exact.
+    do blk=1,4 ; do ip=1,10
+      Kp = (pK(ip,blk,1) + pK(ip,blk,3)) + (pK(ip,blk,2) + pK(ip,blk,4))
+      Kmat(pc(ip),pn(ip),blk) = Kp ; Kmat(pn(ip),pc(ip),blk) = Kp
+    enddo ; enddo
+    Ucontr(:,:) = 0.0 ; Vcontr(:,:) = 0.0
+    return
+  endif
 
   ! Role-grouped cross-triangle reduction: each corner takes each of the roles
   ! (A, B, farA, farB) exactly once over the 4 triangles (S=1, E=2, N=3, W=4).
@@ -9942,6 +10304,12 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%h_source_rate_bmb)) deallocate(CS%h_source_rate_bmb)
   if (associated(CS%xi_basal)) deallocate(CS%xi_basal)
   if (associated(CS%gl_sub_nbr)) deallocate(CS%gl_sub_nbr)
+  if (associated(CS%fric_qp_on)) deallocate(CS%fric_qp_on)
+  if (associated(CS%fric_qp_coef)) deallocate(CS%fric_qp_coef)
+  if (associated(CS%fric_qp_newt)) deallocate(CS%fric_qp_newt)
+  if (associated(CS%fric_qp_u)) deallocate(CS%fric_qp_u)
+  if (associated(CS%fric_qp_v)) deallocate(CS%fric_qp_v)
+  if (associated(CS%gl_fric_K)) deallocate(CS%gl_fric_K)
   if (associated(CS%h_source_rate_last)) deallocate(CS%h_source_rate_last)
   if (associated(CS%phi_x_FV)) deallocate(CS%phi_x_FV)
   if (associated(CS%phi_y_FV)) deallocate(CS%phi_y_FV)
