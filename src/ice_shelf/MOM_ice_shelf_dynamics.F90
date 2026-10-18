@@ -672,6 +672,13 @@ type, public :: ice_shelf_dyn_CS ; private
   real :: dg_band_diff_speed_courant !< Band diffusion: if positive, the decay rate of a floating or crossed
                                   !! cell is at most this factor times the rate at which the flow crosses
                                   !! the cell [nondim].
+  logical :: dg_band_diff_speed_courant_all !< Band diffusion: if true, the cap of DG1_BAND_DIFF_SPEED_COURANT
+                                  !! acts in wholly grounded cells as well.
+  real :: dg_band_diff_slow_time  !< Band diffusion: if positive, the decay time below which the crosswind
+                                  !! rate does not fall in slow ice, and the time of the along-flow floor of
+                                  !! DG1_BAND_DIFF_SLOW_ALONG [T ~> s].
+  logical :: dg_band_diff_slow_along !< Band diffusion: if true, an along-flow diffusion makes up the upwind
+                                  !! decay of the along-flow tilt mode to 1/DG1_BAND_DIFF_SLOW_TIME.
   real :: dg_band_diff_iso_courant !< Band diffusion: if positive, the fraction of the decay rate below which
                                   !! the flow's cell-crossing rate makes the diffusion isotropic; it replaces
                                   !! DG1_BAND_DIFF_U_ISO [nondim].
@@ -702,8 +709,22 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! of the cell means along the axis [nondim].
   logical :: dg_lim_no_band       !< If true, the grounded limiter acts at full strength in every wholly grounded
                                   !! (and, with DG1_BAND_FLOAT, wholly floating) cell, whatever its band weight.
+  logical :: dg_lim_crossed       !< If true, the grounded limiter also acts on the thickness of every cell the
+                                  !! grounding line crosses, with corner bounds mapped from the surface.
+  logical :: dg_lim_edge_mirror   !< If true, the face pass of the grounded limiter takes the cell means beyond a
+                                  !! domain edge that is not reentrant as the mirror image of the cells inside.
+  logical :: dg_lim_crossed_straddle !< If true, dg_lim_crossed also treats the two cells of a face the
+                                  !! grounding line lies on: a grounded and a floating corner at one node, neither
+                                  !! cell crossed.
+  logical :: dg_lim_crossed_sweep !< If true, dg_lim_crossed ends with the troubled-cell sweep of the tilts.
+  logical :: dg_lim_crossed_float !< If true, with dg_lim_crossed and dg_lim_face, a floating corner of a crossed
+                                  !! cell on a face with a wholly floating cell is bounded in thickness by that cell.
+  logical :: dg_lim_float_d0_thick !< If true, the grounded limiter takes dg_lim_d0 as a thickness on wholly
+                                  !! floating cells, so their surface floor is (1 - rho_i/rho_w) dg_lim_d0.
   real, pointer, dimension(:,:,:) :: dg_lim_phi => NULL() !< Grounded limiter: the smallest tilt (1) and
                                   !! twist (2) factors of each cell over the stages of the last step [nondim].
+  logical :: dg_art_visc_node_weight !< Artificial viscosity: the band weight of a face QP is interpolated along
+                                  !! the face from the node weights, each the largest weight of the 4 cells there.
   real :: dg_art_visc_lump_frac  !< Artificial viscosity: the lumped fraction theta of the mass matrix whose
                                   !! inverse the artificial-viscosity part of the right-hand side takes;
                                   !! 0 is the consistent mass matrix [nondim].
@@ -12383,9 +12404,34 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "v/dy)|), so that in slow ice the diffusion there is no faster than the flow renews the "//&
                  "cell.  With a fixed T the diffusion a parcel meets while it crosses a cell grows as 1/|u|; "//&
                  "in slow ice next to a grounding line it becomes a real change of the floating ice that "//&
-                 "moves the line.  Wholly grounded cells keep 1/T.  Zero or less keeps 1/T everywhere.", &
+                 "moves the line.  Wholly grounded cells keep 1/T unless DG1_BAND_DIFF_SPEED_COURANT_ALL.  "//&
+                 "Zero or less keeps 1/T everywhere.", &
                  units="nondim", default=0.0, &
                  do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_diff_time <= 0.0))
+  call get_param(param_file, mdl, "DG1_BAND_DIFF_SPEED_COURANT_ALL", CS%dg_band_diff_speed_courant_all, &
+                 "If true, the cap of DG1_BAND_DIFF_SPEED_COURANT acts in wholly grounded cells as "//&
+                 "well, so that one rate law holds in every band cell and the rate has no step where "//&
+                 "a cell becomes wholly grounded.", &
+                 default=.false., do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_diff_time <= 0.0))
+  call get_param(param_file, mdl, "DG1_BAND_DIFF_SLOW_TIME", CS%dg_band_diff_slow_time, &
+                 "If positive, the crosswind decay rate of DG1_BAND_DIFF_TIME is min(1/T, max(c |(u/dx, "//&
+                 "v/dy)|, 1/T_slow)), with c = DG1_BAND_DIFF_SPEED_COURANT and T_slow this time, so that "//&
+                 "the rate follows the cell-crossing rate in moving ice but does not fall below 1/T_slow "//&
+                 "in slow ice, where sources such as the continuity of the artificial viscosity do not "//&
+                 "scale with the speed.  Without the cap of DG1_BAND_DIFF_SPEED_COURANT in a cell the "//&
+                 "rate there stays 1/T.  1/T stays an upper cap; a very short DG1_BAND_DIFF_TIME leaves "//&
+                 "only the stability cap min(0.5, 2/C)/dt.  Zero or less keeps the law of "//&
+                 "DG1_BAND_DIFF_SPEED_COURANT.", &
+                 units="s", default=0.0, scale=US%s_to_T, &
+                 do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_diff_time <= 0.0))
+  call get_param(param_file, mdl, "DG1_BAND_DIFF_SLOW_ALONG", CS%dg_band_diff_slow_along, &
+                 "If true and DG1_BAND_DIFF_SLOW_TIME is positive, the band diffusion also acts along "//&
+                 "the flow at the rate max(0, 1/T_slow - |(u/dx, v/dy)|), at most 1/T.  Upwind advection "//&
+                 "damps the two-cell along-flow alternation of the DG(1) tilts at the cell-crossing rate "//&
+                 "|u|/dx, so the sum of the two is about 1/T_slow where the ice is slow and the along-flow "//&
+                 "diffusion is off where upwind is faster.", &
+                 default=.false., do_not_log=(.not.CS%use_DG_thickness) .or. (CS%dg_band_diff_time <= 0.0) &
+                 .or. (CS%dg_band_diff_slow_time <= 0.0))
   call get_param(param_file, mdl, "DG1_BAND_DIFF_CROSSED", CS%dg_band_diff_crossed, &
                  "If true, cells the grounding line crosses are in the band of DG1_BAND_DIFF_TIME as "//&
                  "well as wholly grounded cells.  If false, only faces between two wholly grounded "//&
@@ -12513,6 +12559,63 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "gives w = 1 in a cell that touches a cell of the other kind, so this is the way to test "//&
                  "the limiter with no treatment of the grounding line.", &
                  default=.false., do_not_log=.not.CS%dg_grounded_limiter)
+  call get_param(param_file, mdl, "DG1_LIMITER_CROSSED", CS%dg_lim_crossed, &
+                 "If true, DG1_GROUNDED_LIMITER also acts at full strength, whatever its band weight, in "//&
+                 "every cell the grounding line crosses.  The vertex bounds of each corner surface, widened "//&
+                 "to hold the surface the corner has when the cell thickness is flat, are mapped to bounds "//&
+                 "on the corner thickness through the corner surface max(h - D, (1 - rho_i/rho_w) h), which "//&
+                 "increases with h.  The twist and then the tilts of the thickness are scaled as in the "//&
+                 "vertex pass, so the cell mean of the thickness is unchanged and a corner may cross "//&
+                 "flotation.  With DG1_LIMITER_FACE_BOUNDS the thickness tilts first take the face pass: "//&
+                 "the change of each tilt nearest to 0 that holds the surface at the middle of both faces "//&
+                 "of the axis in the face bounds, found exactly on the pieces between flotation points.  "//&
+                 "Where both faces of the axis set a bound, the tilt may become steeper or change sign "//&
+                 "(the bounds of the two faces limit it): where the bed depth changes steeply across the "//&
+                 "cell, a flatter thickness raises the surface of a grounded corner on the high bed and "//&
+                 "lowers that of a floating corner on the deep bed, so a tilt that is too shallow is out "//&
+                 "of both bounds and only a steeper one brings it in.  No corner thickness goes below 0.  "//&
+                 "Where only one face sets a bound, the tilt may only become flatter.  In these cells the "//&
+                 "vertex pass acts on the twist only; the tilts are left to the face pass.", &
+                 default=.false., do_not_log=.not.CS%dg_grounded_limiter)
+  call get_param(param_file, mdl, "DG1_LIMITER_EDGE_MIRROR", CS%dg_lim_edge_mirror, &
+                 "If true, the face pass of DG1_GROUNDED_LIMITER (DG1_LIMITER_FACE_BOUNDS) takes the "//&
+                 "cell-mean surface of a cell beyond a domain edge that is not reentrant as the mirror image "//&
+                 "of the cells inside, as at a free-slip wall or a divide, in place of the linear "//&
+                 "extrapolation of the two cells inside.  The corner bounds and the smooth-extremum test "//&
+                 "keep the extrapolation: under the mirror image every wall cell is an extremum across the "//&
+                 "wall, and the corner bounds have no allowance for its curvature.", &
+                 default=.false., do_not_log=.not.CS%dg_grounded_limiter)
+  call get_param(param_file, mdl, "DG1_LIMITER_FLOAT_D0_THICKNESS", CS%dg_lim_float_d0_thick, &
+                 "If true, the fixed 0.5 m allowance of DG1_GROUNDED_LIMITER (the floor of the face "//&
+                 "allowance and of the corner tolerance) is a thickness on wholly floating cells, so the "//&
+                 "surface allowance there is (1 - rho_i/rho_w) 0.5 m.  The limiter bounds the surface, "//&
+                 "and on floating ice 1 m of surface is 1/(1 - rho_i/rho_w), about 9, m of thickness, so "//&
+                 "with a surface allowance a floating cell keeps corner and face excesses about 9 times "//&
+                 "larger in thickness and in base than a grounded cell.", &
+                 default=.false., do_not_log=.not.CS%dg_grounded_limiter)
+  call get_param(param_file, mdl, "DG1_LIMITER_CROSSED_FLOAT_BOUND", CS%dg_lim_crossed_float, &
+                 "If true, with DG1_LIMITER_CROSSED and DG1_LIMITER_FACE_BOUNDS, each corner of a crossed "//&
+                 "cell that floats and lies on a face shared with a wholly floating ice cell F is held in "//&
+                 "[min(hF, hFn) - a, max(hF, hFn) + a] in thickness, with hF the mean thickness of F, hFn "//&
+                 "the corner of F at the same node and a = max(0.5 m, DG1_LIMITER_FACE_CURV |c|), c the "//&
+                 "second difference of the mean thickness along the axis centred on F.  The thickness is "//&
+                 "smooth across the grounding line (only the surface kinks), so a floating corner of a "//&
+                 "crossed cell should neither dip below nor stand above the shelf beside it; the surface "//&
+                 "bounds of the face pass allow both by the allowance of the whole surface kink.  A grounded "//&
+                 "corner is not bounded here: on which side of flotation it lies is for a term that moves "//&
+                 "mass to settle.  The bound acts through the thickness tilt of the axis, as the face pass.", &
+                 default=.false., do_not_log=.not.CS%dg_lim_crossed)
+  call get_param(param_file, mdl, "DG1_LIMITER_CROSSED_STRADDLE", CS%dg_lim_crossed_straddle, &
+                 "If true, DG1_LIMITER_CROSSED also treats, in place of the main passes, the two cells of a "//&
+                 "face the grounding line lies on: at a node of the face one of the two corners is grounded "//&
+                 "and the other floats, and neither cell is crossed.", &
+                 default=.false., do_not_log=.not.CS%dg_lim_crossed)
+  call get_param(param_file, mdl, "DG1_LIMITER_CROSSED_SWEEP", CS%dg_lim_crossed_sweep, &
+                 "If true, DG1_LIMITER_CROSSED ends with a sweep over its cells: each tilt shifts, inside the "//&
+                 "interval of the face pass, to bring the thickness at the middle of each face nearest, in "//&
+                 "least squares, to that of the neighbour (the mean of the two where the neighbour is treated "//&
+                 "too).  Needs DG1_LIMITER_FACE_BOUNDS.", &
+                 default=.false., do_not_log=.not.CS%dg_lim_crossed)
   if (CS%dg_lim_no_band .and. (.not.CS%dg_grounded_limiter)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics: DG1_LIMITER_NO_BAND needs DG1_GROUNDED_LIMITER.")
   if ((CS%dg_band_diff_time > 0.0) .and. (CS%dg_band_width < 0)) then
@@ -12537,6 +12640,16 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "mass matrix.", &
                  units="nondim", default=0.0, &
                  do_not_log=.not.CS%use_DG_thickness)
+  call get_param(param_file, mdl, "DG1_ART_VISC_NODE_WEIGHT", CS%dg_art_visc_node_weight, &
+                 "If true, the band weight of the DG(1) artificial viscosity (DG1_BAND_WIDTH or "//&
+                 "DG1_ART_VISC_GROUND_BAND) is set at the nodes, each the largest weight of the 4 cells "//&
+                 "around it, and at each quadrature point of a face it is the linear interpolation of the "//&
+                 "weights of the two end nodes.  With the weight of a face, the larger weight of its two "//&
+                 "cells, a node shared with one cell of weight 1 has the faces of that cell at full "//&
+                 "strength and the other two faces off, so the corner of the diagonal cell is tied to "//&
+                 "nothing while the other three follow that cell.  With node weights every face at such a "//&
+                 "node acts near it.  A face whose two end nodes have weight 1 is unchanged.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
   if (CS%use_DG_thickness .and. ((CS%dg_art_visc_lump_frac < 0.0) .or. (CS%dg_art_visc_lump_frac > 1.0))) &
     call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: DG1_ART_VISC_LUMP_FRAC must be in [0, 1].")
   if (CS%use_DG_thickness .and. (CS%dg_art_visc_r_hi <= 0.0)) call MOM_error(FATAL, &
@@ -13213,7 +13326,8 @@ end subroutine dg1_q1_eval
 !! the surface with kappa / (1 - rho_i/rho_w), and each face takes the weighted interior penalty of a jumping
 !! coefficient (Ern, Stephansen and Zunino 2009): the side fluxes are weighted by the other side's kappa n.K.n
 !! and the penalty takes the harmonic mean of the two.  The volume, x-face and y-face parts are returned apart,
-!! to be summed with the faces paired.
+!! to be summed with the faces paired.  DG1_BAND_DIFF_SLOW_TIME sets the crosswind rate from the
+!! cell-crossing rate with a floor in slow ice, and DG1_BAND_DIFF_SLOW_ALONG adds an along-flow part.
 subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_y, uh_ice, vh_ice)
   type(ice_shelf_dyn_CS), intent(in) :: CS  !< Ice shelf dynamics control structure
   type(ocean_grid_type),  intent(in) :: G   !< The grid structure
@@ -13249,6 +13363,10 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
   real :: iso_c2      ! DG1_BAND_DIFF_ISO_COURANT squared, or 0 [nondim]
   real :: a_iso       ! Isotropic share of K [nondim]
   real :: Kxx_c, Kyy_c, Kxy_c ! Components of K [nondim]
+  real :: Kxx_a, Kyy_a, Kxy_a ! Components of the along-flow tensor (1 - a_iso) t t^T [nondim]
+  real :: inv_Ts      ! The floor rate 1/DG1_BAND_DIFF_SLOW_TIME, or 0 [T-1 ~> s-1]
+  real :: cr          ! The cell-crossing rate |(u/dx, v/dy)| [T-1 ~> s-1]
+  real :: f_x, f_a    ! The crosswind and along-flow rates over inv_T [nondim]
   real :: kap         ! The cell's rate w/(12 T) that scales D K D [T-1 ~> s-1]
   real :: xi_q, eta_q ! Quadrature point in the cell [nondim]
   real :: a_qp, d_qp  ! Cell lengths along x and y through the QP [L ~> m]
@@ -13289,6 +13407,8 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
   ui2 = CS%dg_band_diff_u_iso * CS%dg_band_diff_u_iso
   iso_c2 = 0.0
   if (CS%dg_band_diff_iso_courant > 0.0) iso_c2 = CS%dg_band_diff_iso_courant**2
+  inv_Ts = 0.0
+  if (CS%dg_band_diff_slow_time > 0.0) inv_Ts = 1.0 / CS%dg_band_diff_slow_time
 
   do j = jsd, jed ; do i = isd, ied
     state(i,j) = -2
@@ -13356,14 +13476,43 @@ subroutine dg1_band_diffusion(CS, G, hmask, h_nodal_in, dt, rhs_vol, rhs_x, rhs_
     if (CS%dg_band_diff_tilt_only .and. (state(i,j) == -1)) kap = kap / (1.0 - rr)
     ! DG1_BAND_DIFF_SPEED_COURANT: in a cell that is not wholly grounded the rate is at most c times the
     ! cell-crossing rate.  Wholly grounded cells keep 1/T: their diffusion moves no ice across the line.
-    if ((CS%dg_band_diff_speed_courant > 0.0) .and. (state(i,j) /= 1)) then
-      cr_rate = CS%dg_band_diff_speed_courant * sqrt((uc*G%IdxT(i,j))**2 + (vc*G%IdyT(i,j))**2)
-      if (cr_rate < inv_T) kap = kap * (cr_rate / inv_T)
+    ! With DG1_BAND_DIFF_SPEED_COURANT_ALL, wholly grounded cells take the cap as well.
+    if (inv_Ts > 0.0) then
+      ! DG1_BAND_DIFF_SLOW_TIME: the crosswind rate min(1/T, max(c cr, 1/T_slow)), and with
+      ! DG1_BAND_DIFF_SLOW_ALONG an along-flow rate min(1/T, max(0, 1/T_slow - cr)) on (1 - a_iso) t t^T.
+      cr = sqrt((uc*G%IdxT(i,j))**2 + (vc*G%IdyT(i,j))**2)
+      f_x = 1.0
+      if ((CS%dg_band_diff_speed_courant > 0.0) .and. &
+          ((state(i,j) /= 1) .or. CS%dg_band_diff_speed_courant_all)) &
+        f_x = min(inv_T, max(CS%dg_band_diff_speed_courant * cr, inv_Ts)) / inv_T
+      f_a = 0.0
+      if (CS%dg_band_diff_slow_along) f_a = min(inv_T, max(inv_Ts - cr, 0.0)) / inv_T
+      Kxx_a = 0.0 ; Kyy_a = 0.0 ; Kxy_a = 0.0
+      if (iso_c2 > 0.0) then
+        if (s2 > 0.0) then
+          Kxx_a = (1.0 - a_iso) * (u2 / s2) ; Kyy_a = (1.0 - a_iso) * (v2 / s2)
+          Kxy_a = (1.0 - a_iso) * ((uc*vc) / s2)
+        endif
+      elseif (den > 0.0) then
+        Kxx_a = u2 / den ; Kyy_a = v2 / den ; Kxy_a = (uc*vc) / den
+      endif
+      kxx(i,j) = kap*(((f_x*Kxx_c) + (f_a*Kxx_a))*(G%dxT(i,j)*G%dxT(i,j)))
+      kyy(i,j) = kap*(((f_x*Kyy_c) + (f_a*Kyy_a))*(G%dyT(i,j)*G%dyT(i,j)))
+      kxy(i,j) = kap*(((f_x*Kxy_c) + (f_a*Kxy_a))*(G%dxT(i,j)*G%dyT(i,j)))
+      ! The diagnostic reports the crosswind part.
+      if (associated(CS%dg_band_kappa)) CS%dg_band_kappa(i,j) = (kap*f_x) * &
+          (((Kxx_c*(G%dxT(i,j)*G%dxT(i,j))) + (Kyy_c*(G%dyT(i,j)*G%dyT(i,j)))) / (Kxx_c + Kyy_c))
+    else
+      if ((CS%dg_band_diff_speed_courant > 0.0) .and. &
+          ((state(i,j) /= 1) .or. CS%dg_band_diff_speed_courant_all)) then
+        cr_rate = CS%dg_band_diff_speed_courant * sqrt((uc*G%IdxT(i,j))**2 + (vc*G%IdyT(i,j))**2)
+        if (cr_rate < inv_T) kap = kap * (cr_rate / inv_T)
+      endif
+      ! kappa K = kap D K D: each axis scaled by its own cell length.
+      kxx(i,j) = kap*(Kxx_c*(G%dxT(i,j)*G%dxT(i,j))) ; kyy(i,j) = kap*(Kyy_c*(G%dyT(i,j)*G%dyT(i,j)))
+      kxy(i,j) = kap*(Kxy_c*(G%dxT(i,j)*G%dyT(i,j)))
+      if (associated(CS%dg_band_kappa)) CS%dg_band_kappa(i,j) = (kxx(i,j) + kyy(i,j)) / (Kxx_c + Kyy_c)
     endif
-    ! kappa K = kap D K D: each axis scaled by its own cell length.
-    kxx(i,j) = kap*(Kxx_c*(G%dxT(i,j)*G%dxT(i,j))) ; kyy(i,j) = kap*(Kyy_c*(G%dyT(i,j)*G%dyT(i,j)))
-    kxy(i,j) = kap*(Kxy_c*(G%dxT(i,j)*G%dyT(i,j)))
-    if (associated(CS%dg_band_kappa)) CS%dg_band_kappa(i,j) = (kxx(i,j) + kyy(i,j)) / (Kxx_c + Kyy_c)
     if ((state(i,j) == -1) .and. (.not.CS%dg_band_diff_tilt_only)) then
       do b = 1, 2 ; do a = 1, 2
         s_c(i,j,a,b) = h_nodal_in(i,j,a,b)
@@ -13667,7 +13816,10 @@ end subroutine dg1_band_distance
 !! at the middle of each face must lie between the cell means on its two sides and the surface of the
 !! other cell at that face (on entry), widened by an allowance that grows with the second difference of
 !! the means along the axis; a face to an ice-free cell sets no bound.  With DG1_LIMITER_NO_BAND w is taken
-!! as 0.  The halo of h_nodal must be valid on entry; only the computational domain is changed.
+!! as 0.  With DG1_LIMITER_CROSSED a last vertex pass acts on the thickness of the crossed cells, with the
+!! surface bounds mapped to thickness bounds; with DG1_LIMITER_EDGE_MIRROR the cells beyond a closed domain
+!! edge mirror the cells inside.  The halo of h_nodal must be valid on entry; only the computational domain
+!! is changed.
 subroutine dg1_grounded_limiter(CS, G, hmask)
   type(ice_shelf_dyn_CS), intent(inout) :: CS  !< Ice shelf dynamics control structure
   type(ocean_grid_type),  intent(inout) :: G   !< The grid structure
@@ -13678,6 +13830,8 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   real, parameter :: ratio_smooth = 0.5  ! Smallest ratio of the curvatures of a smooth extremum [nondim]
   real, parameter :: pi_lim = 3.14159265358979323846 ! Pi for the fade-in [nondim]
   real, dimension(SZDI_(G),SZDJ_(G)) :: sbar  ! Cell-mean surface of a cell, see above [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: sbar_f ! sbar as the face pass reads it: beyond a domain edge the
+                                              ! mirror image or the extrapolation, see below [Z ~> m]
   logical, dimension(SZDI_(G),SZDJ_(G)) :: have ! sbar is set
   logical, dimension(SZDI_(G),SZDJ_(G)) :: in_dom ! The cell lies inside the domain
   real, dimension(SZDIB_(G),SZDJB_(G)) :: nmin, nmax ! Corner bounds [Z ~> m]
@@ -13694,6 +13848,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   real :: e_max     ! Largest corner excess [Z ~> m]
   real :: r_max     ! Largest corner bound range [Z ~> m]
   real :: delta     ! Excess tolerance [Z ~> m]
+  real :: d0_c      ! Floor of the face allowance and of the excess tolerance of this cell [Z ~> m]
   real :: lo, hi    ! Room below and above a corner [Z ~> m]
   real :: p_lo, p_hi ! Feasible interval of the twist factor [nondim]
   real :: phi_t, phi_w ! Tilt and twist factors [nondim]
@@ -13719,6 +13874,26 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   real, dimension(2,2) :: s_n    ! Corner surfaces of a cell for trc [Z ~> m]
   real :: lo_m, hi_m, lo_p, hi_p ! Face bounds on the minus and plus faces of an axis [Z ~> m]
   logical :: north_open ! The north edge is a fold, so its halo lies inside the domain
+  real :: hb        ! Cell-mean thickness of a crossed cell [Z ~> m]
+  real :: d_c       ! Bed depth at a corner, positive down [Z ~> m]
+  real :: s_f       ! Corner surface of the flat thickness hb [Z ~> m]
+  real, dimension(2,2) :: d_n ! Bed depths at the corners of a crossed cell, positive down [Z ~> m]
+  real :: qa_x, qb_x, qa_y, qb_y ! DG1_LIMITER_CROSSED_FLOAT_BOUND tilt shift intervals of the two axes [Z ~> m]
+  real :: pl_x, ph_x, pl_y, ph_y ! DG1_LIMITER_CROSSED tilt shifts allowed along x and y [Z ~> m]
+  real :: p_x, p_y       ! DG1_LIMITER_CROSSED tilt shifts along x and y [Z ~> m]
+  real :: fl_x, fh_x, fl_y, fh_y ! Feasible tilt shifts of the face pass along x and y [Z ~> m]
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: trb ! DG1_LIMITER_CROSSED: the cell is troubled, crossed by the grounding
+                                 ! line or on a face whose two corners lie on the two sides of flotation at a node
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: crs ! The ice cell is crossed by the grounding line
+  real, dimension(SZDI_(G),SZDJ_(G),2) :: sw_lo, sw_hi ! Shifts of the x and y tilts the sweep may take [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G),2) :: sw_p ! Shifts of the x and y tilts chosen by the sweep [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: h_c ! Corner thicknesses before the troubled-cell passes [Z ~> m]
+  real :: k_m, k_p   ! Change of the minus and plus face thicknesses per unit shift [nondim]
+  real :: hf_m, hf_p ! Thicknesses at the middle of the minus and plus faces [Z ~> m]
+  real :: tg_m, tg_p ! Target thicknesses at the middle of the minus and plus faces [Z ~> m]
+  logical :: str     ! A face has a grounded and a floating corner at one of its nodes
+  real :: hb_f   ! Mean thickness of a wholly floating neighbour [Z ~> m]
+  real :: al_f   ! Allowance of the floating-corner bound [Z ~> m]
   integer :: i, j, a, b, m, n, k, ig, jg, isc, iec, jsc, jec, isd, ied, jsd, jed
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
@@ -13748,26 +13923,37 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   enddo ; enddo
 
   ! Cells beyond a domain edge: the linear extrapolation along the axis normal to the edge, or along
-  ! the diagonal beyond a corner of the domain.  k is the distance to the first cell inside.
+  ! the diagonal beyond a corner of the domain.  k is the distance to the first cell inside.  With
+  ! DG1_LIMITER_EDGE_MIRROR the face pass takes the mirror image instead: the cell k - 1 cells inside the first
+  ! one.  Both are found (sbar the extrapolation, sbar_f the mirror image), from cells inside the domain only.
+  sbar_f(:,:) = sbar(:,:)
   do j = jsd+1, jed-1 ; do i = isd+1, ied-1
     if (in_dom(i,j)) cycle
     do k = 1, 2
       if (have(i,j)) exit
       if (i+k+1 <= ied) then ; if (in_dom(i+k,j) .and. have(i+k,j) .and. have(i+k+1,j) .and. &
                                    (.not.in_dom(i+k-1,j))) then
-        sbar(i,j) = sbar(i+k,j) + real(k)*(sbar(i+k,j) - sbar(i+k+1,j)) ; have(i,j) = .true. ; cycle
+        sbar(i,j) = sbar(i+k,j) + real(k)*(sbar(i+k,j) - sbar(i+k+1,j))
+        sbar_f(i,j) = sbar(i+2*k-1,j)
+        have(i,j) = .true. ; cycle
       endif ; endif
       if (i-k-1 >= isd) then ; if (in_dom(i-k,j) .and. have(i-k,j) .and. have(i-k-1,j) .and. &
                                    (.not.in_dom(i-k+1,j))) then
-        sbar(i,j) = sbar(i-k,j) + real(k)*(sbar(i-k,j) - sbar(i-k-1,j)) ; have(i,j) = .true. ; cycle
+        sbar(i,j) = sbar(i-k,j) + real(k)*(sbar(i-k,j) - sbar(i-k-1,j))
+        sbar_f(i,j) = sbar(i-2*k+1,j)
+        have(i,j) = .true. ; cycle
       endif ; endif
       if (j+k+1 <= jed) then ; if (in_dom(i,j+k) .and. have(i,j+k) .and. have(i,j+k+1) .and. &
                                    (.not.in_dom(i,j+k-1))) then
-        sbar(i,j) = sbar(i,j+k) + real(k)*(sbar(i,j+k) - sbar(i,j+k+1)) ; have(i,j) = .true. ; cycle
+        sbar(i,j) = sbar(i,j+k) + real(k)*(sbar(i,j+k) - sbar(i,j+k+1))
+        sbar_f(i,j) = sbar(i,j+2*k-1)
+        have(i,j) = .true. ; cycle
       endif ; endif
       if (j-k-1 >= jsd) then ; if (in_dom(i,j-k) .and. have(i,j-k) .and. have(i,j-k-1) .and. &
                                    (.not.in_dom(i,j-k+1))) then
-        sbar(i,j) = sbar(i,j-k) + real(k)*(sbar(i,j-k) - sbar(i,j-k-1)) ; have(i,j) = .true. ; cycle
+        sbar(i,j) = sbar(i,j-k) + real(k)*(sbar(i,j-k) - sbar(i,j-k-1))
+        sbar_f(i,j) = sbar(i,j-2*k+1)
+        have(i,j) = .true. ; cycle
       endif ; endif
     enddo
     if (have(i,j)) cycle
@@ -13776,10 +13962,13 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
       if ((i+2*m < isd) .or. (i+2*m > ied) .or. (j+2*n < jsd) .or. (j+2*n > jed)) cycle
       if (in_dom(i+m,j+n) .and. have(i+m,j+n) .and. have(i+2*m,j+2*n) .and. &
           (.not.in_dom(i+m,j)) .and. (.not.in_dom(i,j+n))) then
-        sbar(i,j) = sbar(i+m,j+n) + (sbar(i+m,j+n) - sbar(i+2*m,j+2*n)) ; have(i,j) = .true.
+        sbar(i,j) = sbar(i+m,j+n) + (sbar(i+m,j+n) - sbar(i+2*m,j+2*n))
+        sbar_f(i,j) = sbar(i+m,j+n)
+        have(i,j) = .true.
       endif
     enddo ; enddo
   enddo ; enddo
+  if (.not.CS%dg_lim_edge_mirror) sbar_f(:,:) = sbar(:,:)
 
   ! DG1_LIMITER_FACE_BOUNDS: the face-midpoint surfaces of every ice cell on entry, so that the bounds
   ! do not depend on the order in which the loop below changes the cells.
@@ -13800,6 +13989,42 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
     enddo ; enddo
   endif
 
+  ! DG1_LIMITER_CROSSED: the troubled cells, on entry.  A cell is troubled if the grounding line crosses it, or,
+  ! with DG1_LIMITER_CROSSED_STRADDLE, if it shares a face with an ice cell, neither of the two crossed, and at a
+  ! node of that face one of the two corners is grounded and the other floats: the grounding line then lies on
+  ! the face.  Cells beyond a domain
+  ! edge that is not reentrant hold no ice state and are never troubled.
+  trb(:,:) = .false. ; crs(:,:) = .false.
+  if (CS%dg_lim_crossed) then
+    do j = jsd, jed ; do i = isd, ied
+      if ((hmask(i,j) /= 1.0) .or. (.not.in_dom(i,j))) cycle
+      crs(i,j) = (CS%ground_frac(i,j) > f_eps) .and. (CS%ground_frac(i,j) < 1.0 - f_eps)
+      trb(i,j) = crs(i,j)
+    enddo ; enddo
+  endif
+  if (CS%dg_lim_crossed .and. CS%dg_lim_crossed_straddle) then
+    do j = jsd, jed ; do i = isd, ied-1
+      if ((hmask(i,j) /= 1.0) .or. (hmask(i+1,j) /= 1.0) .or. crs(i,j) .or. crs(i+1,j)) cycle
+      if ((.not.in_dom(i,j)) .or. (.not.in_dom(i+1,j))) cycle
+      str = .false.
+      do b = 1, 2
+        if ((rr * CS%h_nodal(i,j,2,b) >= CS%bed_node(i,j-2+b)) .neqv. &
+            (rr * CS%h_nodal(i+1,j,1,b) >= CS%bed_node(i,j-2+b))) str = .true.
+      enddo
+      if (str) then ; trb(i,j) = .true. ; trb(i+1,j) = .true. ; endif
+    enddo ; enddo
+    do j = jsd, jed-1 ; do i = isd, ied
+      if ((hmask(i,j) /= 1.0) .or. (hmask(i,j+1) /= 1.0) .or. crs(i,j) .or. crs(i,j+1)) cycle
+      if ((.not.in_dom(i,j)) .or. (.not.in_dom(i,j+1))) cycle
+      str = .false.
+      do a = 1, 2
+        if ((rr * CS%h_nodal(i,j,a,2) >= CS%bed_node(i-2+a,j)) .neqv. &
+            (rr * CS%h_nodal(i,j+1,a,1) >= CS%bed_node(i-2+a,j))) str = .true.
+      enddo
+      if (str) then ; trb(i,j) = .true. ; trb(i,j+1) = .true. ; endif
+    enddo ; enddo
+  endif
+
   ! Corner bounds; corner (I,J) is shared by cells i = I, I+1 and j = J, J+1.
   nmin(:,:) = 0.0 ; nmax(:,:) = 0.0
   do J = jsc-1, jec ; do I = isc-1, iec
@@ -13813,12 +14038,15 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   do j = jsc, jec ; do i = isc, iec
     CS%dg_lim_phi(i,j,:) = min(CS%dg_lim_phi(i,j,:), 1.0)
     if (hmask(i,j) /= 1.0) cycle
+    if (trb(i,j)) cycle   ! DG1_LIMITER_CROSSED limits it below
     flt_c = .false.
     if (CS%ground_frac(i,j) < 1.0 - f_eps) then
       if (.not.CS%dg_band_float) cycle
       if (CS%ground_frac(i,j) > f_eps) cycle
       flt_c = .true.
     endif
+    d0_c = CS%dg_lim_d0
+    if (flt_c .and. CS%dg_lim_float_d0_thick) d0_c = (1.0 - rr) * CS%dg_lim_d0
     wb = CS%dg_band_w(i,j)
     if (CS%dg_lim_no_band) wb = 0.0
     if (wb >= 1.0) cycle
@@ -13850,19 +14078,19 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         m_y = 0.5*((wn(1,2) + wn(2,2)) - (wn(1,1) + wn(2,1)))
         t_x = 0.5*((s_c(2,1) - s_c(1,1)) + (s_c(2,2) - s_c(1,2)))
         t_y = 0.5*((s_c(1,2) - s_c(1,1)) + (s_c(2,2) - s_c(2,1)))
-        al_x = CS%dg_lim_d0 ; al_y = CS%dg_lim_d0
+        al_x = d0_c ; al_y = d0_c
         if (f_use(i-1,j) .and. f_use(i+1,j)) &
-          al_x = max(al_x, CS%dg_lim_face_curv * abs((sbar(i-1,j) + sbar(i+1,j)) - 2.0*sbar(i,j)))
+          al_x = max(al_x, CS%dg_lim_face_curv * abs((sbar_f(i-1,j) + sbar_f(i+1,j)) - 2.0*sbar_f(i,j)))
         if (f_use(i,j-1) .and. f_use(i,j+1)) &
-          al_y = max(al_y, CS%dg_lim_face_curv * abs((sbar(i,j-1) + sbar(i,j+1)) - 2.0*sbar(i,j)))
+          al_y = max(al_y, CS%dg_lim_face_curv * abs((sbar_f(i,j-1) + sbar_f(i,j+1)) - 2.0*sbar_f(i,j)))
         ! Each face is bounded by the two cell means and, from an ice cell, by that cell's own surface at the
         ! face, so a face that is continuous now is never cut.  A face to an ice-free cell sets no bound.
-        call dg1_lim_face_bounds(sbar(i,j), al_x, f_use(i-1,j), f_ice(i-1,j), sbar(i-1,j), trc(i-1,j,2), lo_m, hi_m)
-        call dg1_lim_face_bounds(sbar(i,j), al_x, f_use(i+1,j), f_ice(i+1,j), sbar(i+1,j), trc(i+1,j,1), lo_p, hi_p)
+        call dg1_lim_face_bounds(sbar_f(i,j), al_x, f_use(i-1,j), f_ice(i-1,j), sbar_f(i-1,j), trc(i-1,j,2), lo_m, hi_m)
+        call dg1_lim_face_bounds(sbar_f(i,j), al_x, f_use(i+1,j), f_ice(i+1,j), sbar_f(i+1,j), trc(i+1,j,1), lo_p, hi_p)
         phi_x = dg1_lim_face_factor(0.5*(s_c(1,1) + s_c(1,2)), t_x*(-0.5 - m_x), f_use(i-1,j), lo_m, hi_m, &
                                     0.5*(s_c(2,1) + s_c(2,2)), t_x*(0.5 - m_x), f_use(i+1,j), lo_p, hi_p)
-        call dg1_lim_face_bounds(sbar(i,j), al_y, f_use(i,j-1), f_ice(i,j-1), sbar(i,j-1), trc(i,j-1,4), lo_m, hi_m)
-        call dg1_lim_face_bounds(sbar(i,j), al_y, f_use(i,j+1), f_ice(i,j+1), sbar(i,j+1), trc(i,j+1,3), lo_p, hi_p)
+        call dg1_lim_face_bounds(sbar_f(i,j), al_y, f_use(i,j-1), f_ice(i,j-1), sbar_f(i,j-1), trc(i,j-1,4), lo_m, hi_m)
+        call dg1_lim_face_bounds(sbar_f(i,j), al_y, f_use(i,j+1), f_ice(i,j+1), sbar_f(i,j+1), trc(i,j+1,3), lo_p, hi_p)
         phi_y = dg1_lim_face_factor(0.5*(s_c(1,1) + s_c(2,1)), t_y*(-0.5 - m_y), f_use(i,j-1), lo_m, hi_m, &
                                     0.5*(s_c(1,2) + s_c(2,2)), t_y*(0.5 - m_y), f_use(i,j+1), lo_p, hi_p)
         phi_x = 1.0 - (1.0 - wb)*(1.0 - phi_x) ; phi_y = 1.0 - (1.0 - wb)*(1.0 - phi_y)
@@ -13900,7 +14128,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
       e_max = max(e_max, max(s_c(a,b) - hi_c(a,b), lo_c(a,b) - s_c(a,b)))
       r_max = max(r_max, hi_c(a,b) - lo_c(a,b))
     enddo ; enddo
-    delta = max(CS%dg_lim_d0, lim_eps * r_max)
+    delta = max(d0_c, lim_eps * r_max)
     if (e_max <= delta) cycle
 
     ! The MOOD smooth-extremum test on the cell means.
@@ -14008,7 +14236,493 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
     CS%dg_lim_phi(i,j,1) = min(CS%dg_lim_phi(i,j,1), phi_t)
     CS%dg_lim_phi(i,j,2) = min(CS%dg_lim_phi(i,j,2), phi_w)
   enddo ; enddo
+
+  ! DG1_LIMITER_CROSSED: the troubled cells (crossed cells, and the two cells of a face the grounding line lies
+  ! on), on the thickness.  First the face pass on the tilts, then the vertex pass on the twist only: the
+  ! surface bounds of each corner, widened to hold the corner surface of the flat thickness hb, become
+  ! thickness bounds through the corner surface, which increases with h.  The cell mean of h is kept and a
+  ! corner may cross flotation.  The bounds and sbar are from entry, so this pass does not depend on the one
+  ! above.  Last, with DG1_LIMITER_CROSSED_SWEEP, the troubled-cell sweep below.
+  if (CS%dg_lim_crossed) then
+    sw_lo(:,:,:) = 0.0 ; sw_hi(:,:,:) = 0.0
+    ! Neighbours are read from this copy, so that the result does not depend on the order of the loop.
+    h_c(:,:,:,:) = CS%h_nodal(:,:,:,:)
+    do j = jsc, jec ; do i = isc, iec
+      if (.not.trb(i,j)) cycle
+      area = ((CS%cell_mean_w(i,j,1,1) + CS%cell_mean_w(i,j,2,2)) + &
+              (CS%cell_mean_w(i,j,1,2) + CS%cell_mean_w(i,j,2,1)))
+      if (area <= 0.0) cycle
+      hb = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
+
+      ! The face pass on the thickness tilts, with the bounds of the face pass above.  Along each axis the
+      ! two corners of a face move together as the tilt shifts, so the surface at the middle of the face is
+      ! monotone and piecewise linear in the shift, and the shift nearest to 0 that holds both faces of the
+      ! axis in their bounds is found exactly.  Both shifts come from the corners on entry.
+      if (CS%dg_lim_face) then
+        do b = 1, 2 ; do a = 1, 2
+          wn(a,b) = CS%cell_mean_w(i,j,a,b) / area
+          d_n(a,b) = CS%bed_node(i-2+a,j-2+b)
+        enddo ; enddo
+        m_x = 0.5*((wn(2,1) + wn(2,2)) - (wn(1,1) + wn(1,2)))
+        m_y = 0.5*((wn(1,2) + wn(2,2)) - (wn(1,1) + wn(2,1)))
+        t_x = 0.5*((CS%h_nodal(i,j,2,1) - CS%h_nodal(i,j,1,1)) + (CS%h_nodal(i,j,2,2) - CS%h_nodal(i,j,1,2)))
+        t_y = 0.5*((CS%h_nodal(i,j,1,2) - CS%h_nodal(i,j,1,1)) + (CS%h_nodal(i,j,2,2) - CS%h_nodal(i,j,2,1)))
+        al_x = CS%dg_lim_d0 ; al_y = CS%dg_lim_d0
+        if (f_use(i-1,j) .and. f_use(i+1,j)) &
+          al_x = max(al_x, CS%dg_lim_face_curv * abs((sbar_f(i-1,j) + sbar_f(i+1,j)) - 2.0*sbar_f(i,j)))
+        if (f_use(i,j-1) .and. f_use(i,j+1)) &
+          al_y = max(al_y, CS%dg_lim_face_curv * abs((sbar_f(i,j-1) + sbar_f(i,j+1)) - 2.0*sbar_f(i,j)))
+        ! The tilt shifts each axis may take; the corners of the minus and plus faces move by -0.5 - m and
+        ! 0.5 - m per unit shift.
+        call dg1_lim_cshift_range(CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,1,2), -0.5 - m_x, CS%h_nodal(i,j,2,1), &
+                 CS%h_nodal(i,j,2,2), 0.5 - m_x, t_x, (f_use(i-1,j) .and. f_use(i+1,j)), pl_x, ph_x)
+        call dg1_lim_cshift_range(CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,2,1), -0.5 - m_y, CS%h_nodal(i,j,1,2), &
+                 CS%h_nodal(i,j,2,2), 0.5 - m_y, t_y, (f_use(i,j-1) .and. f_use(i,j+1)), pl_y, ph_y)
+        qa_x = pl_x ; qb_x = ph_x ; qa_y = pl_y ; qb_y = ph_y
+        if (CS%dg_lim_crossed_float) then
+          ! Each face to a wholly floating ice cell F: its floating corners are held by F in thickness.
+          if ((hmask(i-1,j) == 1.0) .and. (CS%ground_frac(i-1,j) <= f_eps)) then
+            hb_f = nodal_cell_mean(h_c(i-1,j,:,:), CS%cell_mean_w(i-1,j,:,:))
+            al_f = CS%dg_lim_d0
+            if (hmask(i-2,j) == 1.0) al_f = max(al_f, CS%dg_lim_face_curv * abs((hb + &
+                nodal_cell_mean(h_c(i-2,j,:,:), CS%cell_mean_w(i-2,j,:,:))) - 2.0*hb_f))
+            call dg1_lim_cfloat_corner(CS%h_nodal(i,j,1,1), -0.5 - m_x, d_n(1,1), &
+                     min(hb_f, h_c(i-1,j,2,1)) - al_f, max(hb_f, h_c(i-1,j,2,1)) + al_f, rr, &
+                     pl_x, ph_x, qa_x, qb_x)
+            call dg1_lim_cfloat_corner(CS%h_nodal(i,j,1,2), -0.5 - m_x, d_n(1,2), &
+                     min(hb_f, h_c(i-1,j,2,2)) - al_f, max(hb_f, h_c(i-1,j,2,2)) + al_f, rr, &
+                     pl_x, ph_x, qa_x, qb_x)
+          endif
+          if ((hmask(i+1,j) == 1.0) .and. (CS%ground_frac(i+1,j) <= f_eps)) then
+            hb_f = nodal_cell_mean(h_c(i+1,j,:,:), CS%cell_mean_w(i+1,j,:,:))
+            al_f = CS%dg_lim_d0
+            if (hmask(i+2,j) == 1.0) al_f = max(al_f, CS%dg_lim_face_curv * abs((hb + &
+                nodal_cell_mean(h_c(i+2,j,:,:), CS%cell_mean_w(i+2,j,:,:))) - 2.0*hb_f))
+            call dg1_lim_cfloat_corner(CS%h_nodal(i,j,2,1), 0.5 - m_x, d_n(2,1), &
+                     min(hb_f, h_c(i+1,j,1,1)) - al_f, max(hb_f, h_c(i+1,j,1,1)) + al_f, rr, &
+                     pl_x, ph_x, qa_x, qb_x)
+            call dg1_lim_cfloat_corner(CS%h_nodal(i,j,2,2), 0.5 - m_x, d_n(2,2), &
+                     min(hb_f, h_c(i+1,j,1,2)) - al_f, max(hb_f, h_c(i+1,j,1,2)) + al_f, rr, &
+                     pl_x, ph_x, qa_x, qb_x)
+          endif
+          if ((hmask(i,j-1) == 1.0) .and. (CS%ground_frac(i,j-1) <= f_eps)) then
+            hb_f = nodal_cell_mean(h_c(i,j-1,:,:), CS%cell_mean_w(i,j-1,:,:))
+            al_f = CS%dg_lim_d0
+            if (hmask(i,j-2) == 1.0) al_f = max(al_f, CS%dg_lim_face_curv * abs((hb + &
+                nodal_cell_mean(h_c(i,j-2,:,:), CS%cell_mean_w(i,j-2,:,:))) - 2.0*hb_f))
+            call dg1_lim_cfloat_corner(CS%h_nodal(i,j,1,1), -0.5 - m_y, d_n(1,1), &
+                     min(hb_f, h_c(i,j-1,1,2)) - al_f, max(hb_f, h_c(i,j-1,1,2)) + al_f, rr, &
+                     pl_y, ph_y, qa_y, qb_y)
+            call dg1_lim_cfloat_corner(CS%h_nodal(i,j,2,1), -0.5 - m_y, d_n(2,1), &
+                     min(hb_f, h_c(i,j-1,2,2)) - al_f, max(hb_f, h_c(i,j-1,2,2)) + al_f, rr, &
+                     pl_y, ph_y, qa_y, qb_y)
+          endif
+          if ((hmask(i,j+1) == 1.0) .and. (CS%ground_frac(i,j+1) <= f_eps)) then
+            hb_f = nodal_cell_mean(h_c(i,j+1,:,:), CS%cell_mean_w(i,j+1,:,:))
+            al_f = CS%dg_lim_d0
+            if (hmask(i,j+2) == 1.0) al_f = max(al_f, CS%dg_lim_face_curv * abs((hb + &
+                nodal_cell_mean(h_c(i,j+2,:,:), CS%cell_mean_w(i,j+2,:,:))) - 2.0*hb_f))
+            call dg1_lim_cfloat_corner(CS%h_nodal(i,j,1,2), 0.5 - m_y, d_n(1,2), &
+                     min(hb_f, h_c(i,j+1,1,1)) - al_f, max(hb_f, h_c(i,j+1,1,1)) + al_f, rr, &
+                     pl_y, ph_y, qa_y, qb_y)
+            call dg1_lim_cfloat_corner(CS%h_nodal(i,j,2,2), 0.5 - m_y, d_n(2,2), &
+                     min(hb_f, h_c(i,j+1,2,1)) - al_f, max(hb_f, h_c(i,j+1,2,1)) + al_f, rr, &
+                     pl_y, ph_y, qa_y, qb_y)
+          endif
+        endif
+        call dg1_lim_face_bounds(sbar_f(i,j), al_x, f_use(i-1,j), f_ice(i-1,j), sbar_f(i-1,j), trc(i-1,j,2), lo_m, hi_m)
+        call dg1_lim_face_bounds(sbar_f(i,j), al_x, f_use(i+1,j), f_ice(i+1,j), sbar_f(i+1,j), trc(i+1,j,1), lo_p, hi_p)
+        if (CS%dg_lim_crossed_float) then
+          call dg1_lim_crossed_face_shift(CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,1,2), d_n(1,1), d_n(1,2), &
+                      -0.5 - m_x, f_use(i-1,j), lo_m, hi_m, &
+                      CS%h_nodal(i,j,2,1), CS%h_nodal(i,j,2,2), d_n(2,1), d_n(2,2), &
+                      0.5 - m_x, f_use(i+1,j), lo_p, hi_p, rr, pl_x, ph_x, &
+                      p_x, fl_x, fh_x, qa_x, qb_x)
+        else
+          call dg1_lim_crossed_face_shift(CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,1,2), d_n(1,1), d_n(1,2), &
+                      -0.5 - m_x, f_use(i-1,j), lo_m, hi_m, &
+                      CS%h_nodal(i,j,2,1), CS%h_nodal(i,j,2,2), d_n(2,1), d_n(2,2), &
+                      0.5 - m_x, f_use(i+1,j), lo_p, hi_p, rr, pl_x, ph_x, &
+                      p_x, fl_x, fh_x)
+        endif
+        call dg1_lim_face_bounds(sbar_f(i,j), al_y, f_use(i,j-1), f_ice(i,j-1), sbar_f(i,j-1), trc(i,j-1,4), lo_m, hi_m)
+        call dg1_lim_face_bounds(sbar_f(i,j), al_y, f_use(i,j+1), f_ice(i,j+1), sbar_f(i,j+1), trc(i,j+1,3), lo_p, hi_p)
+        if (CS%dg_lim_crossed_float) then
+          call dg1_lim_crossed_face_shift(CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,2,1), d_n(1,1), d_n(2,1), &
+                      -0.5 - m_y, f_use(i,j-1), lo_m, hi_m, &
+                      CS%h_nodal(i,j,1,2), CS%h_nodal(i,j,2,2), d_n(1,2), d_n(2,2), &
+                      0.5 - m_y, f_use(i,j+1), lo_p, hi_p, rr, pl_y, ph_y, &
+                      p_y, fl_y, fh_y, qa_y, qb_y)
+        else
+          call dg1_lim_crossed_face_shift(CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,2,1), d_n(1,1), d_n(2,1), &
+                      -0.5 - m_y, f_use(i,j-1), lo_m, hi_m, &
+                      CS%h_nodal(i,j,1,2), CS%h_nodal(i,j,2,2), d_n(1,2), d_n(2,2), &
+                      0.5 - m_y, f_use(i,j+1), lo_p, hi_p, rr, pl_y, ph_y, &
+                      p_y, fl_y, fh_y)
+        endif
+        ! The shifts the sweep may still take, from the state after this pass.
+        sw_lo(i,j,1) = fl_x - p_x ; sw_hi(i,j,1) = fh_x - p_x
+        sw_lo(i,j,2) = fl_y - p_y ; sw_hi(i,j,2) = fh_y - p_y
+        if ((p_x /= 0.0) .or. (p_y /= 0.0)) then
+          do b = 1, 2 ; do a = 1, 2
+            CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + &
+                ((p_x * ((real(a) - 1.5) - m_x)) + (p_y * ((real(b) - 1.5) - m_y)))
+          enddo ; enddo
+          ! The diagnostic keeps the smallest equivalent factor on the tilt; a tilt of 0 that is set counts as 0.
+          phi_x = 1.0 ; phi_y = 1.0
+          if (p_x /= 0.0) then ; phi_x = 0.0 ; if (t_x /= 0.0) phi_x = 1.0 + p_x / t_x ; endif
+          if (p_y /= 0.0) then ; phi_y = 0.0 ; if (t_y /= 0.0) phi_y = 1.0 + p_y / t_y ; endif
+          CS%dg_lim_phi(i,j,1) = min(CS%dg_lim_phi(i,j,1), min(phi_x, phi_y))
+        endif
+      endif
+
+      e_max = 0.0 ; r_max = 0.0
+      do b = 1, 2 ; do a = 1, 2
+        d_c = CS%bed_node(i-2+a,j-2+b)
+        s_c(a,b) = max(CS%h_nodal(i,j,a,b) - d_c, (1.0 - rr) * CS%h_nodal(i,j,a,b))
+        s_f = max(hb - d_c, (1.0 - rr) * hb)
+        lo = min(nmin(i-2+a,j-2+b), s_f) ; hi = max(nmax(i-2+a,j-2+b), s_f)
+        e_max = max(e_max, max(s_c(a,b) - hi, lo - s_c(a,b)))
+        r_max = max(r_max, hi - lo)
+        lo_c(a,b) = max(dg1_lim_h_from_s(lo, d_c, rr), 0.0) ; hi_c(a,b) = dg1_lim_h_from_s(hi, d_c, rr)
+      enddo ; enddo
+      delta = max(CS%dg_lim_d0, lim_eps * r_max)
+      if (e_max <= delta) cycle
+      if (dg1_lim_smooth_ext(sbar(i-2:i+2,j-2:j+2), have(i-2:i+2,j-2:j+2), ratio_smooth)) cycle
+
+      ! Split h - hb into its tilt and twist parts, each of zero weighted mean.
+      do b = 1, 2 ; do a = 1, 2
+        wn(a,b) = CS%cell_mean_w(i,j,a,b) / area
+      enddo ; enddo
+      tw = 0.25*((CS%h_nodal(i,j,1,1) + CS%h_nodal(i,j,2,2)) - (CS%h_nodal(i,j,2,1) + CS%h_nodal(i,j,1,2)))
+      wT = (wn(1,1) + wn(2,2)) - (wn(2,1) + wn(1,2))
+      tw_c(1,1) = tw*(1.0 - wT) ; tw_c(2,2) = tw*(1.0 - wT)
+      tw_c(2,1) = tw*(-1.0 - wT) ; tw_c(1,2) = tw*(-1.0 - wT)
+      do b = 1, 2 ; do a = 1, 2
+        lin_c(a,b) = (CS%h_nodal(i,j,a,b) - hb) - tw_c(a,b)
+      enddo ; enddo
+
+      ! The twist factor against the thickness bounds; the tilts are left to the face pass and the sweep.
+      p_lo = 0.0 ; p_hi = 1.0 ; feas = .true.
+      do b = 1, 2 ; do a = 1, 2
+        lo = lo_c(a,b) - (hb + lin_c(a,b)) ; hi = hi_c(a,b) - (hb + lin_c(a,b))
+        if (tw_c(a,b) > 0.0) then
+          p_lo = max(p_lo, lo / tw_c(a,b)) ; p_hi = min(p_hi, hi / tw_c(a,b))
+        elseif (tw_c(a,b) < 0.0) then
+          p_lo = max(p_lo, hi / tw_c(a,b)) ; p_hi = min(p_hi, lo / tw_c(a,b))
+        elseif ((lo > 0.0) .or. (hi < 0.0)) then
+          feas = .false.
+        endif
+      enddo ; enddo
+      phi_t = 1.0 ; phi_w = 0.0
+      if (feas .and. (p_lo <= p_hi)) phi_w = p_hi
+
+      ! Fade-in between delta and 2 delta; no band weight.
+      xf = min(1.0, max(0.0, e_max / delta - 1.0))
+      g_f = 0.5*(1.0 + cos(pi_lim*xf))
+      phi_w = g_f + (1.0 - g_f)*phi_w ; phi_t = g_f + (1.0 - g_f)*phi_t
+      do b = 1, 2 ; do a = 1, 2
+        CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + (((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b)))
+      enddo ; enddo
+      CS%dg_lim_phi(i,j,1) = min(CS%dg_lim_phi(i,j,1), phi_t)
+      CS%dg_lim_phi(i,j,2) = min(CS%dg_lim_phi(i,j,2), phi_w)
+    enddo ; enddo
+
+    ! The troubled-cell sweep, last, on the limited state.  Along each axis whose two faces are shared with ice
+    ! cells inside the domain, the tilt shifts to bring the thickness at the middle of each face nearest, in least
+    ! squares, to its target: the neighbour's thickness there, or the mean of the two where the neighbour is
+    ! troubled too.  The shift stays in the interval of the face pass, so its bounds still hold, and the mean is
+    ! kept.  All shifts are found from the same state before any is applied.
+    if (CS%dg_lim_face .and. CS%dg_lim_crossed_sweep) then
+      call pass_corner_field(CS%h_nodal, G)
+      sw_p(:,:,:) = 0.0
+      do j = jsc, jec ; do i = isc, iec
+        if (.not.trb(i,j)) cycle
+        area = ((CS%cell_mean_w(i,j,1,1) + CS%cell_mean_w(i,j,2,2)) + &
+                (CS%cell_mean_w(i,j,1,2) + CS%cell_mean_w(i,j,2,1)))
+        if (area <= 0.0) cycle
+        do b = 1, 2 ; do a = 1, 2
+          wn(a,b) = CS%cell_mean_w(i,j,a,b) / area
+        enddo ; enddo
+        m_x = 0.5*((wn(2,1) + wn(2,2)) - (wn(1,1) + wn(1,2)))
+        m_y = 0.5*((wn(1,2) + wn(2,2)) - (wn(1,1) + wn(2,1)))
+        if (f_ice(i-1,j) .and. f_ice(i+1,j)) then
+          k_m = -0.5 - m_x ; k_p = 0.5 - m_x
+          hf_m = 0.5*(CS%h_nodal(i,j,1,1) + CS%h_nodal(i,j,1,2))
+          hf_p = 0.5*(CS%h_nodal(i,j,2,1) + CS%h_nodal(i,j,2,2))
+          tg_m = 0.5*(CS%h_nodal(i-1,j,2,1) + CS%h_nodal(i-1,j,2,2))
+          tg_p = 0.5*(CS%h_nodal(i+1,j,1,1) + CS%h_nodal(i+1,j,1,2))
+          if (trb(i-1,j)) tg_m = 0.5*(tg_m + hf_m)
+          if (trb(i+1,j)) tg_p = 0.5*(tg_p + hf_p)
+          sw_p(i,j,1) = min(max(((k_m*(tg_m - hf_m)) + (k_p*(tg_p - hf_p))) / ((k_m*k_m) + (k_p*k_p)), &
+                                sw_lo(i,j,1)), sw_hi(i,j,1))
+        endif
+        if (f_ice(i,j-1) .and. f_ice(i,j+1)) then
+          k_m = -0.5 - m_y ; k_p = 0.5 - m_y
+          hf_m = 0.5*(CS%h_nodal(i,j,1,1) + CS%h_nodal(i,j,2,1))
+          hf_p = 0.5*(CS%h_nodal(i,j,1,2) + CS%h_nodal(i,j,2,2))
+          tg_m = 0.5*(CS%h_nodal(i,j-1,1,2) + CS%h_nodal(i,j-1,2,2))
+          tg_p = 0.5*(CS%h_nodal(i,j+1,1,1) + CS%h_nodal(i,j+1,2,1))
+          if (trb(i,j-1)) tg_m = 0.5*(tg_m + hf_m)
+          if (trb(i,j+1)) tg_p = 0.5*(tg_p + hf_p)
+          sw_p(i,j,2) = min(max(((k_m*(tg_m - hf_m)) + (k_p*(tg_p - hf_p))) / ((k_m*k_m) + (k_p*k_p)), &
+                                sw_lo(i,j,2)), sw_hi(i,j,2))
+        endif
+      enddo ; enddo
+      do j = jsc, jec ; do i = isc, iec
+        if ((sw_p(i,j,1) == 0.0) .and. (sw_p(i,j,2) == 0.0)) cycle
+        area = ((CS%cell_mean_w(i,j,1,1) + CS%cell_mean_w(i,j,2,2)) + &
+                (CS%cell_mean_w(i,j,1,2) + CS%cell_mean_w(i,j,2,1)))
+        do b = 1, 2 ; do a = 1, 2
+          wn(a,b) = CS%cell_mean_w(i,j,a,b) / area
+        enddo ; enddo
+        m_x = 0.5*((wn(2,1) + wn(2,2)) - (wn(1,1) + wn(1,2)))
+        m_y = 0.5*((wn(1,2) + wn(2,2)) - (wn(1,1) + wn(2,1)))
+        do b = 1, 2 ; do a = 1, 2
+          CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + &
+              ((sw_p(i,j,1) * ((real(a) - 1.5) - m_x)) + (sw_p(i,j,2) * ((real(b) - 1.5) - m_y)))
+        enddo ; enddo
+      enddo ; enddo
+    endif
+  endif
 end subroutine dg1_grounded_limiter
+
+!> DG1_LIMITER_CROSSED: the corner thickness whose corner surface max(h - D, (1 - rr) h) is s.  The corner
+!! surface increases with h, so this is its inverse: the grounded branch above the flotation surface
+!! (1 - rr) D / rr, the floating branch below it, and the grounded branch everywhere where the bed is at
+!! or above sea level.
+pure real function dg1_lim_h_from_s(s, d, rr)
+  real, intent(in) :: s  !< Corner surface [Z ~> m]
+  real, intent(in) :: d  !< Bed depth at the corner, positive down [Z ~> m]
+  real, intent(in) :: rr !< Ice to ocean density ratio [nondim]
+
+  if (d <= 0.0) then
+    dg1_lim_h_from_s = s + d
+  elseif (s >= (1.0 - rr) * (d / rr)) then
+    dg1_lim_h_from_s = s + d
+  else
+    dg1_lim_h_from_s = s / (1.0 - rr)
+  endif
+end function dg1_lim_h_from_s
+
+!> DG1_LIMITER_CROSSED, face pass along one axis of a crossed cell: the shift p of the thickness tilt of the axis,
+!! in [p_min, p_max] and nearest to 0, that keeps the surface at the middle of both faces of the axis in the bounds
+!! of the face.  A corner of a face has the thickness h + p k, with the same k for both corners of the face.  A
+!! face that sets no bound is skipped.  The shift is 0 where both faces are in their bounds now, and also where
+!! no shift brings both in; the feasible interval is returned for the troubled-cell sweep.
+pure subroutine dg1_lim_crossed_face_shift(hm1, hm2, dm1, dm2, km, use_m, lo_m, hi_m, &
+                                           hp1, hp2, dp1, dp2, kp, use_p, lo_p, hi_p, rr, p_min, p_max, &
+                                           p, f_lo, f_hi, qa, qb)
+  real,    intent(in) :: hm1, hm2 !< Corner thicknesses of the minus face [Z ~> m]
+  real,    intent(in) :: dm1, dm2 !< Bed depths at those corners, positive down [Z ~> m]
+  real,    intent(in) :: km       !< Change of those corner thicknesses per unit shift [nondim]
+  logical, intent(in) :: use_m    !< The minus face sets a bound
+  real,    intent(in) :: lo_m     !< Lower bound of the minus face [Z ~> m]
+  real,    intent(in) :: hi_m     !< Upper bound of the minus face [Z ~> m]
+  real,    intent(in) :: hp1, hp2 !< Corner thicknesses of the plus face [Z ~> m]
+  real,    intent(in) :: dp1, dp2 !< Bed depths at those corners, positive down [Z ~> m]
+  real,    intent(in) :: kp       !< Change of those corner thicknesses per unit shift [nondim]
+  logical, intent(in) :: use_p    !< The plus face sets a bound
+  real,    intent(in) :: lo_p     !< Lower bound of the plus face [Z ~> m]
+  real,    intent(in) :: hi_p     !< Upper bound of the plus face [Z ~> m]
+  real,    intent(in) :: rr       !< Ice to ocean density ratio [nondim]
+  real,    intent(in) :: p_min    !< Smallest shift allowed, at most 0 [Z ~> m]
+  real,    intent(in) :: p_max    !< Largest shift allowed, at least 0 [Z ~> m]
+  real,    intent(out) :: p       !< The shift [Z ~> m]
+  real,    intent(out) :: f_lo    !< Smallest shift that holds both faces, or p where none does [Z ~> m]
+  real,    intent(out) :: f_hi    !< Largest shift that holds both faces, or p where none does [Z ~> m]
+  real, optional, intent(in) :: qa !< Smallest shift allowed by DG1_LIMITER_CROSSED_FLOAT_BOUND [Z ~> m]
+  real, optional, intent(in) :: qb !< Largest shift allowed by DG1_LIMITER_CROSSED_FLOAT_BOUND [Z ~> m]
+
+  real :: pa_m, pb_m, pa_p, pb_p ! Feasible intervals of the shift for the two faces [Z ~> m]
+  real :: p_lo, p_hi             ! The feasible interval of the shift for both faces [Z ~> m]
+  logical :: ok_m, ok_p          ! The intervals are not empty
+
+  pa_m = p_min ; pb_m = p_max ; ok_m = .true.
+  pa_p = p_min ; pb_p = p_max ; ok_p = .true.
+  if (use_m) call dg1_lim_cface_interval(hm1, hm2, dm1, dm2, km, lo_m, hi_m, rr, p_min, p_max, pa_m, pb_m, ok_m)
+  if (use_p) call dg1_lim_cface_interval(hp1, hp2, dp1, dp2, kp, lo_p, hi_p, rr, p_min, p_max, pa_p, pb_p, ok_p)
+  p = 0.0 ; f_lo = 0.0 ; f_hi = 0.0
+  if (.not.(ok_m .and. ok_p)) return
+  p_lo = max(pa_m, pa_p) ; p_hi = min(pb_m, pb_p)
+  if (present(qa) .and. present(qb)) then
+    p_lo = max(p_lo, qa) ; p_hi = min(p_hi, qb)
+  endif
+  if (p_lo > p_hi) return
+  p = min(max(0.0, p_lo), p_hi) ; f_lo = p_lo ; f_hi = p_hi
+end subroutine dg1_lim_crossed_face_shift
+
+!> DG1_LIMITER_CROSSED: the shifts [p_min, p_max] of the thickness tilt of one axis that the face pass may take.
+!! Where both faces of the axis set a bound, every shift that keeps the four corner thicknesses at or above 0;
+!! the bounds of the two faces then limit the shift, as the surface of one face rises with it and that of the
+!! other falls.  Otherwise only a flatter tilt: the shifts between 0 and -t.
+pure subroutine dg1_lim_cshift_range(hm1, hm2, km, hp1, hp2, kp, t, both, p_min, p_max)
+  real,    intent(in)  :: hm1, hm2 !< Corner thicknesses of the minus face [Z ~> m]
+  real,    intent(in)  :: km       !< Change of those corner thicknesses per unit shift, below 0 [nondim]
+  real,    intent(in)  :: hp1, hp2 !< Corner thicknesses of the plus face [Z ~> m]
+  real,    intent(in)  :: kp       !< Change of those corner thicknesses per unit shift, above 0 [nondim]
+  real,    intent(in)  :: t        !< The thickness tilt of the axis [Z ~> m]
+  logical, intent(in)  :: both     !< Both faces of the axis set a bound
+  real,    intent(out) :: p_min    !< Smallest shift allowed [Z ~> m]
+  real,    intent(out) :: p_max    !< Largest shift allowed [Z ~> m]
+
+  if (both .and. (km < 0.0) .and. (kp > 0.0)) then
+    p_max = max(0.0, min(-hm1 / km, -hm2 / km))
+    p_min = min(0.0, max(-hp1 / kp, -hp2 / kp))
+  else
+    p_min = min(0.0, -t) ; p_max = max(0.0, -t)
+  endif
+end subroutine dg1_lim_cshift_range
+
+!> DG1_LIMITER_CROSSED_FLOAT_BOUND: narrow [qa, qb] to the shifts p in [p_min, p_max] for which the corner
+!! thickness h1 + p k lies in [lo, hi], if the corner floats now.  A corner that no shift in [p_min, p_max] brings
+!! into the bounds leaves [qa, qb] as it is, as the face pass does with a face.
+pure subroutine dg1_lim_cfloat_corner(h1, k, dep, lo, hi, rr, p_min, p_max, qa, qb)
+  real, intent(in)    :: h1    !< Corner thickness now [Z ~> m]
+  real, intent(in)    :: k     !< Change of the corner thickness per unit shift [nondim]
+  real, intent(in)    :: dep   !< Bed depth at the corner, positive down [Z ~> m]
+  real, intent(in)    :: lo    !< Lower bound on the corner thickness [Z ~> m]
+  real, intent(in)    :: hi    !< Upper bound on the corner thickness [Z ~> m]
+  real, intent(in)    :: rr    !< Ice to ocean density ratio [nondim]
+  real, intent(in)    :: p_min !< Smallest shift allowed [Z ~> m]
+  real, intent(in)    :: p_max !< Largest shift allowed [Z ~> m]
+  real, intent(inout) :: qa    !< Smallest allowed shift [Z ~> m]
+  real, intent(inout) :: qb    !< Largest allowed shift [Z ~> m]
+  real :: p_lo, p_hi ! The shifts at which the corner meets its bounds [Z ~> m]
+
+  if (rr * h1 >= dep) return   ! grounded corner
+  if (k == 0.0) return
+  if (k > 0.0) then
+    p_lo = (lo - h1) / k ; p_hi = (hi - h1) / k
+  else
+    p_lo = (hi - h1) / k ; p_hi = (lo - h1) / k
+  endif
+  p_lo = max(p_lo, p_min) ; p_hi = min(p_hi, p_max)
+  if (p_lo > p_hi) return
+  qa = max(qa, p_lo) ; qb = min(qb, p_hi)
+end subroutine dg1_lim_cfloat_corner
+
+!> DG1_LIMITER_CROSSED: the interval [p_a, p_b] in [p_min, p_max] of the shift p for which the face-midpoint
+!! surface g(p) = (s(h1 + p k, d1) + s(h2 + p k, d2)) / 2, s(h, d) = max(h - d, (1 - rr) h), lies in [lo, hi].
+!! g is monotone and linear between the shifts at which a corner reaches flotation, so the ends are found exactly
+!! on those pieces.
+pure subroutine dg1_lim_cface_interval(h1, h2, d1, d2, k, lo, hi, rr, p_min, p_max, p_a, p_b, ok)
+  real,    intent(in)  :: h1, h2 !< Corner thicknesses now [Z ~> m]
+  real,    intent(in)  :: d1, d2 !< Bed depths at the corners, positive down [Z ~> m]
+  real,    intent(in)  :: k      !< Change of both corner thicknesses per unit shift [nondim]
+  real,    intent(in)  :: lo     !< Lower bound on g [Z ~> m]
+  real,    intent(in)  :: hi     !< Upper bound on g [Z ~> m]
+  real,    intent(in)  :: rr     !< Ice to ocean density ratio [nondim]
+  real,    intent(in)  :: p_min  !< Smallest shift allowed [Z ~> m]
+  real,    intent(in)  :: p_max  !< Largest shift allowed [Z ~> m]
+  real,    intent(out) :: p_a    !< Smallest feasible shift [Z ~> m]
+  real,    intent(out) :: p_b    !< Largest feasible shift [Z ~> m]
+  logical, intent(out) :: ok     !< The interval is not empty
+
+  real, dimension(4) :: pt  ! Ends and break points of the pieces of g, ascending [Z ~> m]
+  real, dimension(4) :: gv  ! g at those points [Z ~> m]
+  real :: pb                ! A break point [Z ~> m]
+  real :: tmp               ! Swap space [Z ~> m]
+  real :: kk                ! |k| [nondim]
+  real :: q_min, q_max      ! The range of q = sign(k) p [Z ~> m]
+  real :: q_a, q_b          ! The feasible interval of q [Z ~> m]
+  integer :: np, m, n
+
+  p_a = p_min ; p_b = p_max
+  if (k == 0.0) then
+    gv(1) = 0.5*(max(h1 - d1, (1.0 - rr)*h1) + max(h2 - d2, (1.0 - rr)*h2))
+    ok = (gv(1) >= lo) .and. (gv(1) <= hi)
+    return
+  endif
+  ! Work in q = sign(k) p, in which g increases with slope |k|, so that a face and its mirror image (the same
+  ! corners with k and p of the other sign) take the same arithmetic.
+  if (k < 0.0) then
+    kk = -k ; q_min = -p_max ; q_max = -p_min
+  else
+    kk = k ; q_min = p_min ; q_max = p_max
+  endif
+  q_a = q_min ; q_b = q_max
+  np = 2 ; pt(1) = q_min ; pt(2) = q_max
+  if (d1 > 0.0) then
+    pb = ((d1 / rr) - h1) / kk
+    if ((pb > q_min) .and. (pb < q_max)) then ; np = np + 1 ; pt(np) = pb ; endif
+  endif
+  if (d2 > 0.0) then
+    pb = ((d2 / rr) - h2) / kk
+    if ((pb > q_min) .and. (pb < q_max)) then ; np = np + 1 ; pt(np) = pb ; endif
+  endif
+  do m = 2, np ; do n = np, m, -1
+    if (pt(n) < pt(n-1)) then ; tmp = pt(n) ; pt(n) = pt(n-1) ; pt(n-1) = tmp ; endif
+  enddo ; enddo
+  do n = 1, np
+    gv(n) = 0.5*(max((h1 + pt(n)*kk) - d1, (1.0 - rr)*(h1 + pt(n)*kk)) + &
+                 max((h2 + pt(n)*kk) - d2, (1.0 - rr)*(h2 + pt(n)*kk)))
+  enddo
+  if (lo > gv(np)) then ; ok = .false. ; return ; endif
+  if (hi < gv(1)) then ; ok = .false. ; return ; endif
+  if (lo > gv(1)) q_a = cface_inverse(lo)
+  if (hi < gv(np)) q_b = cface_inverse(hi)
+  ok = (q_a <= q_b)
+  if (k < 0.0) then
+    p_a = -q_b ; p_b = -q_a
+  else
+    p_a = q_a ; p_b = q_b
+  endif
+
+contains
+  !> The q at which g equals v, by linear interpolation on the piece of g that holds v.
+  pure real function cface_inverse(v)
+    real, intent(in) :: v !< A value of g between gv(1) and gv(np) [Z ~> m]
+    integer :: q
+    cface_inverse = pt(np)
+    do q = 1, np-1
+      if (((v - gv(q)) * (v - gv(q+1))) <= 0.0) then
+        if (gv(q+1) /= gv(q)) then
+          cface_inverse = pt(q) + (pt(q+1) - pt(q)) * ((v - gv(q)) / (gv(q+1) - gv(q)))
+        else
+          cface_inverse = pt(q)
+        endif
+        return
+      endif
+    enddo
+  end function cface_inverse
+end subroutine dg1_lim_cface_interval
+
+!> DG1_LIMITER_CROSSED: the MOOD smooth-extremum test of dg1_grounded_limiter on a 5 x 5 block of cell means
+!! centred on the cell: true if the mean is an extremum of its 3 x 3 block and, along every axis on which it
+!! is an extremum of its two neighbours, the curvature test passes.
+pure logical function dg1_lim_smooth_ext(sb, hv, ratio)
+  real,    dimension(5,5), intent(in) :: sb    !< Cell-mean surfaces, centre at (3,3) [Z ~> m]
+  logical, dimension(5,5), intent(in) :: hv    !< The mean is set
+  real,                    intent(in) :: ratio !< Smallest ratio of the curvatures of a smooth extremum [nondim]
+
+  real :: s_lo, s_hi ! Smallest and largest mean in the 3 x 3 block [Z ~> m]
+  real :: cm, c0, cp ! Second differences at the cell before, the cell and the cell after [Z ~> m]
+  integer :: m, n
+
+  dg1_lim_smooth_ext = .false.
+  s_lo = sb(3,3) ; s_hi = sb(3,3)
+  do n = 2, 4 ; do m = 2, 4
+    if (.not.hv(m,n)) cycle
+    s_lo = min(s_lo, sb(m,n)) ; s_hi = max(s_hi, sb(m,n))
+  enddo ; enddo
+  if ((sb(3,3) < s_hi) .and. (sb(3,3) > s_lo)) return
+  if (.not.(hv(1,3) .and. hv(2,3) .and. hv(4,3) .and. hv(5,3))) return
+  if (.not.(hv(3,1) .and. hv(3,2) .and. hv(3,4) .and. hv(3,5))) return
+  dg1_lim_smooth_ext = .true.
+  if (((sb(3,3) >= sb(2,3)) .and. (sb(3,3) >= sb(4,3))) .or. ((sb(3,3) <= sb(2,3)) .and. (sb(3,3) <= sb(4,3)))) then
+    cm = (sb(1,3) + sb(3,3)) - 2.0*sb(2,3)
+    c0 = (sb(2,3) + sb(4,3)) - 2.0*sb(3,3)
+    cp = (sb(3,3) + sb(5,3)) - 2.0*sb(4,3)
+    dg1_lim_smooth_ext = dg1_lim_smooth_ext .and. dg1_lim_smooth3(cm, c0, cp, ratio)
+  endif
+  if (((sb(3,3) >= sb(3,2)) .and. (sb(3,3) >= sb(3,4))) .or. ((sb(3,3) <= sb(3,2)) .and. (sb(3,3) <= sb(3,4)))) then
+    cm = (sb(3,1) + sb(3,3)) - 2.0*sb(3,2)
+    c0 = (sb(3,2) + sb(3,4)) - 2.0*sb(3,3)
+    cp = (sb(3,3) + sb(3,5)) - 2.0*sb(3,4)
+    dg1_lim_smooth_ext = dg1_lim_smooth_ext .and. dg1_lim_smooth3(cm, c0, cp, ratio)
+  endif
+end function dg1_lim_smooth_ext
 
 !> The MOOD curvature test of a smooth extremum along one axis: the second differences of the cell
 !! means at the cell and its two neighbours have one sign, and the smallest is at least ratio times the
@@ -14132,6 +14846,9 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: inv_tau_floor      ! 1/DG1_ART_VISC_TAU_FLOOR, or 0 [T-1 ~> s-1]
   real, dimension(SZDI_(G),SZDJ_(G)) :: avg_w ! DG1_BAND_WIDTH or DG1_ART_VISC_GROUND_BAND cell weight [nondim]
   real :: wf                 ! DG1_BAND_WIDTH or DG1_ART_VISC_GROUND_BAND face weight [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: w_node ! DG1_ART_VISC_NODE_WEIGHT node weight [nondim]
+  real, dimension(2) :: wq   ! DG1_ART_VISC_NODE_WEIGHT weight at the two face QPs [nondim]
+  logical :: node_w          ! DG1_ART_VISC_NODE_WEIGHT is on with a band
   logical :: band_on         ! A band weight scales the viscosity of the faces
   logical :: advect_grid_inv ! If true, scale the advective term by dx_perp/L_ref.
   real :: eps_e_face         ! Effective strain rate at the face midpoint [T-1 ~> s-1]
@@ -14218,6 +14935,14 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     avg_w(:,:) = CS%dg_band_w(:,:)
   elseif (CS%dg_art_visc_ground_band >= 0) then
     call dg1_av_ground_band_weight(CS, G, hmask, avg_w)
+  endif
+  ! DG1_ART_VISC_NODE_WEIGHT: node (I,J) is shared by cells i = I, I+1 and j = J, J+1.
+  node_w = band_on .and. CS%dg_art_visc_node_weight
+  if (node_w) then
+    w_node(:,:) = 0.0
+    do J = jsc-1, jec ; do I = isc-1, iec
+      w_node(I,J) = max(max(avg_w(I,J), avg_w(I+1,J+1)), max(avg_w(I+1,J), avg_w(I,J+1)))
+    enddo ; enddo
   endif
 
   ! Cell-mean surfaces for DG1_ART_VISC_KINK_ALLOW, each corner on its own flotation branch.
@@ -14359,6 +15084,11 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     if (.not. (hmask(i,j) == 1.0 .or. hmask(i+1,j) == 1.0)) cycle
     wf = 1.0
     if (band_on) wf = max(avg_w(i,j), avg_w(i+1,j))
+    if (node_w) then  ! QP 1 near the south node (i,j-1), QP 2 near the north node (i,j)
+      wq(1) = ((1.0-gp1)*w_node(i,j-1)) + (gp1*w_node(i,j))
+      wq(2) = ((1.0-gp2)*w_node(i,j-1)) + (gp2*w_node(i,j))
+      wf = max(wq(1), wq(2))
+    endif
     if (wf <= 0.0) cycle
     active_E(i,j) = .true.
 
@@ -14416,7 +15146,10 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
                rhoi_rhow_wb, advect_grid_inv, advect_inv_L, inv_tau_floor, &
                ueff_E(i,j,:), dheq_E(i,j,:), cK_E(i,j), rate_E(i,j), idle_face, ds_allow)
     endif
-    if (wf < 1.0) then
+    if (node_w) then  ! The weight of each QP scales its u_eff; the cap takes the larger one.
+      ueff_E(i,j,1) = wq(1) * ueff_E(i,j,1) ; ueff_E(i,j,2) = wq(2) * ueff_E(i,j,2)
+      rate_E(i,j) = wf * rate_E(i,j)
+    elseif (wf < 1.0) then
       cK_E(i,j) = wf * cK_E(i,j) ; rate_E(i,j) = wf * rate_E(i,j)
     endif
     if (associated(CS%dg_slow_idle_face_u)) then
@@ -14484,6 +15217,11 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     if (.not. (hmask(i,j) == 1.0 .or. hmask(i,j+1) == 1.0)) cycle
     wf = 1.0
     if (band_on) wf = max(avg_w(i,j), avg_w(i,j+1))
+    if (node_w) then  ! QP 1 near the west node (i-1,j), QP 2 near the east node (i,j)
+      wq(1) = ((1.0-gp1)*w_node(i-1,j)) + (gp1*w_node(i,j))
+      wq(2) = ((1.0-gp2)*w_node(i-1,j)) + (gp2*w_node(i,j))
+      wf = max(wq(1), wq(2))
+    endif
     if (wf <= 0.0) cycle
     active_N(i,j) = .true.
 
@@ -14541,7 +15279,10 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
                rhoi_rhow_wb, advect_grid_inv, advect_inv_L, inv_tau_floor, &
                ueff_N(i,j,:), dheq_N(i,j,:), cK_N(i,j), rate_N(i,j), idle_face, ds_allow)
     endif
-    if (wf < 1.0) then
+    if (node_w) then
+      ueff_N(i,j,1) = wq(1) * ueff_N(i,j,1) ; ueff_N(i,j,2) = wq(2) * ueff_N(i,j,2)
+      rate_N(i,j) = wf * rate_N(i,j)
+    elseif (wf < 1.0) then
       cK_N(i,j) = wf * cK_N(i,j) ; rate_N(i,j) = wf * rate_N(i,j)
     endif
     if (associated(CS%dg_slow_idle_face_v)) then
