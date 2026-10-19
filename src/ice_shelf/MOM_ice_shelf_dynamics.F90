@@ -48,6 +48,19 @@ integer, parameter :: INNER_CG = 1       !< Conjugate gradient (default)
 integer, parameter :: INNER_MINRES = 2   !< MINRES
 integer, parameter :: INNER_CR = 3       !< Conjugate residual
 
+! Sentinel stored in the Coulomb fB fields when the effective pressure is zero. The sliding law
+! tau_b = C |u|^m / (1 + fB |u|^q)^m gives exactly zero drag as N -> 0, but it encodes that limit as
+! fB -> infinity, which is not representable. Any negative fB therefore means "no Coulomb drag here",
+! and compute_basal_coef takes that branch instead of evaluating the divergent expression. With a
+! positive CF_MinN the effective pressure is floored before fB is formed and the sentinel is never
+! produced.
+real, parameter :: FB_NO_COULOMB_DRAG = -1.0 !< fB value meaning zero effective pressure [(s m-1)^CF_PostPeak]
+
+! CISM-style grounding-line treatment modes (CISM_FRICTION, CISM_TAUD)
+integer, parameter :: CISM_OFF = 0       !< No CISM-style treatment of this term
+integer, parameter :: CISM_LOCAL = 1     !< Quadrant grounded fraction with the local/lumped nodal assembly
+integer, parameter :: CISM_INTEGRATE = 2 !< Quadrant grounded fraction with the consistent element assembly
+
 ! A note on unit descriptions in comments: MOM6 uses units that can be rescaled for dimensional
 ! consistency testing. These are noted in comments with units like Z, H, L, and T, along with
 ! their mks counterparts with notation like "a velocity [Z T-1 ~> m s-1]".  If the units
@@ -131,6 +144,26 @@ type, public :: ice_shelf_dyn_CS ; private
   real, pointer, dimension(:,:) :: fB_elem => NULL()        !< Pre-computed element-level Coulomb fB parameter
                                !! [(s m-1)^CF_PostPeak]; 0 for Weertman.
                                !! Updated each outer iteration by calc_shelf_basal_prefactors.
+  real, pointer, dimension(:,:) :: coef_prefactor_node => NULL() !< Pre-computed area_node*C_node*L_T_to_m_s at
+                               !! B-grid nodes for the local (CISM_FRICTION='local') diagonal drag,
+                               !! C_node an area-weighted 4-cell average and area_node the nodal
+                               !! control volume [R L2 Z T-1 ~> kg s-1].
+  real, pointer, dimension(:,:) :: fB_node => NULL()        !< Pre-computed nodal Coulomb fB parameter at B-grid
+                               !! nodes for CISM_FRICTION='local' [(s m-1)^CF_PostPeak]; 0 for Weertman.
+  real, pointer, dimension(:,:) :: area_node => NULL()      !< Nodal control-volume area for the local
+                               !! (CISM_FRICTION='local') drag: the sum of the lumped corner areas
+                               !! (0.25*areaT each) of the in-domain cells around a node with any ice,
+                               !! the CISM convention of dx*dy at every active vertex. It halves at
+                               !! domain-edge nodes, so the local taud and friction share one control
+                               !! volume and the wall-node force balance stays symmetric [L2 ~> m2].
+  real, pointer, dimension(:,:) :: f_ground_node => NULL() !< Analytic grounded ice fraction at B-grid
+                               !! nodes (vertices) from the quadrant grounding-line parameterization
+                               !! (Leguy et al. 2021). Multiplies basal friction when CISM_FRICTION
+                               !! is set. 1 = fully grounded, 0 = fully floating [nondim].
+  real, pointer, dimension(:,:) :: f_ground_cell => NULL() !< Analytic grounded ice fraction at cell
+                               !! centers from the same quadrant parameterization (shares the per-cell
+                               !! quadrant areas with f_ground_node, so the two grids carry mutually
+                               !! consistent grounded areas) [nondim].
   real :: alpha_coulomb = 1.0  !< Coulomb prefactor (CF_PostPeak-1)^(CF_PostPeak-1)/CF_PostPeak^CF_PostPeak [nondim]
   real :: coulomb_pp_n         !< CF_PostPeak/n_basal_fric [nondim]
   real, pointer, dimension(:,:) :: OD_rt => NULL()         !< A running total for calculating OD_av [Z ~> m].
@@ -201,6 +234,27 @@ type, public :: ice_shelf_dyn_CS ; private
   real :: min_h_shelf !< The minimum ice thickness used during ice dynamics [Z ~> m].
   real :: min_basal_traction !< The minimum basal traction for grounded ice (Pa m-1 s) [R Z T-1 ~> kg m-2 s-1]
   real :: max_surface_slope !< The maximum allowed ice-sheet surface slope (to ignore, set to zero) [nondim]
+  integer :: cism_friction = CISM_OFF !< CISM-style grounding-line treatment of the basal friction,
+                            !! set by CISM_FRICTION; drives gl_quad_friction and local_basal_friction.
+  integer :: cism_taud = CISM_OFF !< CISM-style grounding-line treatment of the driving stress,
+                            !! set by CISM_TAUD; drives fv_taud_vertex_grad and local_fv_taud_vertex.
+  logical :: gl_quad_friction = .false. !< If true, scale basal friction by an analytic nodal grounded
+                            !! fraction (CS%f_ground_node) computed by the quadrant grounding-line
+                            !! parameterization of Leguy et al. (2021), replacing the geometric
+                            !! sub-cell (Phisub) friction integration in grounding-line cells.
+  logical :: local_basal_friction = .false. !< If true, assemble basal drag with a local/nodal diagonal
+                            !! (CISM HO_ASSEMBLE_BETA_LOCAL): drag at a node = beta(node)*area_node*u(node),
+                            !! beta from a nodal C, nodal velocity, and the nodal grounded fraction
+                            !! f_ground_node, with no element integration or neighbor coupling.
+  logical :: fv_taud_vertex_grad = .false. !< If true, the driving stress evaluates the surface
+                            !! gradient directly at B-grid nodes from the four surrounding cell
+                            !! centers (Lipscomb et al. 2019 eq. 14, "option 3" margins), instead of
+                            !! the wider cell-centroid centered difference.
+  logical :: local_fv_taud_vertex = .false. !< If true (CISM_TAUD='local'), assemble the nodal driving
+                            !! stress by the local/lumped method (Lipscomb 2019 A4; CISM
+                            !! HO_ASSEMBLE_TAUD_LOCAL): tau_d at a node uses that node's slope alone over
+                            !! its nodal control mass. If false, use the consistent element-quadrature
+                            !! assembly.
   real :: min_ice_visc !< The minimum allowed Glen's law ice viscosity (Pa s), in [R L2 T-1 ~> kg m-1 s-1].
 
   real :: n_glen            !< Nonlinearity exponent in Glen's Law [nondim]
@@ -300,6 +354,7 @@ type, public :: ice_shelf_dyn_CS ; private
   integer :: id_u_shelf = -1, id_v_shelf = -1, id_shelf_speed, id_t_shelf = -1, &
              id_taudx_shelf = -1, id_taudy_shelf = -1, id_taud_shelf = -1, id_bed_elev = -1, &
              id_ground_frac = -1, id_col_thick = -1, id_OD_av = -1, id_float_cond = -1, &
+             id_f_ground_cell = -1, id_f_ground_node = -1, &
              id_u_mask = -1, id_v_mask = -1, id_ufb_mask =-1, id_vfb_mask = -1, id_t_mask = -1, &
              id_sx_shelf = -1, id_sy_shelf = -1, id_surf_slope_mag_shelf, &
              id_duHdx = -1, id_dvHdy = -1, id_fluxdiv = -1, &
@@ -440,6 +495,11 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
              ! Units of [R L Z T-2 (s m-1)^n_sliding ~> Pa (s m-1)^n_sliding]
     allocate(CS%coef_prefactor(isd:ied,jsd:jed), source=0.0)
     allocate(CS%fB_elem(isd:ied,jsd:jed), source=0.0)
+    allocate(CS%coef_prefactor_node(IsdB:IedB,JsdB:JedB), source=0.0)
+    allocate(CS%fB_node(IsdB:IedB,JsdB:JedB), source=0.0)
+    allocate(CS%area_node(IsdB:IedB,JsdB:JedB), source=0.0)
+    allocate(CS%f_ground_node(IsdB:IedB,JsdB:JedB), source=0.0)
+    allocate(CS%f_ground_cell(isd:ied,jsd:jed), source=0.0)
     allocate(CS%OD_av(isd:ied,jsd:jed), source=0.0)
     allocate(CS%ground_frac(isd:ied,jsd:jed), source=0.0)
     allocate(CS%taudx_shelf(IsdB:IedB,JsdB:JedB), source=0.0)
@@ -534,6 +594,8 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   character(len=200) :: IS_energyfile  ! The name of the energy file.
   character(len=32) :: filename_appendix = '' ! FMS appendix to filename for ensemble runs
   character(len=16) :: inner_solver_str ! The type of inner solver to use for the SSA
+  character(len=16) :: cism_friction_str ! CISM-style basal friction mode string
+  character(len=16) :: cism_taud_str     ! CISM-style driving stress mode string
 
   Isdq = G%isdB ; Iedq = G%iedB ; Jsdq = G%jsdB ; Jedq = G%jedB
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -611,6 +673,50 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     call get_param(param_file, mdl, "MAX_SURFACE_SLOPE", CS%max_surface_slope, &
                  "max. allowed ice-sheet surface slope. To ignore, set to zero.", &
                  units="none", default=0., scale=US%m_to_Z/US%m_to_L)
+    call get_param(param_file, mdl, "CISM_FRICTION", cism_friction_str, &
+                 "How the basal friction treats the grounding line, following Leguy, Lipscomb "//&
+                 "& Asay-Davis (2021, The Cryosphere 15:3229-3253) and CISM. 'off' leaves the "//&
+                 "friction to the cell grounded fraction, or to the sub-cell integration when "//&
+                 "GROUNDING_LINE_INTERPOLATE is true. 'local' and 'integrate' both scale the "//&
+                 "friction by the analytic nodal grounded fraction of the quadrant parameterization "//&
+                 "(sec. 2.2), which is the bilinear-flotation area integral and needs no sub-cell "//&
+                 "sampling; they replace the GROUNDING_LINE_INTERPOLATE sub-cell friction. They "//&
+                 "differ in the assembly: 'local' is the nodal diagonal of CISM "//&
+                 "HO_ASSEMBLE_BETA_LOCAL, where the drag at each node is beta(node)*area_node*u(node) "//&
+                 "with no element integration or neighbor coupling, and 'integrate' is the "//&
+                 "consistent element-quadrature mass. 'local' is the CISM-faithful choice and "//&
+                 "co-locates with CISM_TAUD='local'. Both honor MIN_BASAL_TRACTION and "//&
+                 "USE_COULOMB_FRICTION.", default="off")
+    select case (trim(cism_friction_str))
+      case ("off")       ; CS%cism_friction = CISM_OFF
+      case ("local")     ; CS%cism_friction = CISM_LOCAL
+      case ("integrate") ; CS%cism_friction = CISM_INTEGRATE
+      case default ; call MOM_error(FATAL, "MOM_ice_shelf_dynamics: CISM_FRICTION must be "//&
+                 "'off', 'local' or 'integrate', but got '"//trim(cism_friction_str)//"'.")
+    end select
+    CS%gl_quad_friction     = (CS%cism_friction /= CISM_OFF)
+    CS%local_basal_friction = (CS%cism_friction == CISM_LOCAL)
+    call get_param(param_file, mdl, "CISM_TAUD", cism_taud_str, &
+                 "How the driving stress treats the grounding line, following Lipscomb et al. "//&
+                 "(2019, Geosci. Model Dev. 12:387-424) and CISM. 'off' uses the cell-centroid "//&
+                 "centered difference of the surface. 'local' and 'integrate' both evaluate the "//&
+                 "surface gradient directly at B-grid nodes from the four surrounding cell centers "//&
+                 "(eq. 14, with their 'option 3' ice-margin treatment), a compact stencil that is "//&
+                 "less smeared across the grounding line. They differ in the assembly: 'local' is "//&
+                 "the mass-lumped method of A4, where each node's driving stress uses the surface "//&
+                 "slope at that node alone over its nodal control mass (CISM "//&
+                 "HO_ASSEMBLE_TAUD_LOCAL), and 'integrate' is the consistent element-quadrature "//&
+                 "assembly. 'local' is the CISM-faithful choice and co-locates with "//&
+                 "CISM_FRICTION='local'. Honors MAX_SURFACE_SLOPE.", default="off")
+    select case (trim(cism_taud_str))
+      case ("off")       ; CS%cism_taud = CISM_OFF
+      case ("local")     ; CS%cism_taud = CISM_LOCAL
+      case ("integrate") ; CS%cism_taud = CISM_INTEGRATE
+      case default ; call MOM_error(FATAL, "MOM_ice_shelf_dynamics: CISM_TAUD must be "//&
+                 "'off', 'local' or 'integrate', but got '"//trim(cism_taud_str)//"'.")
+    end select
+    CS%fv_taud_vertex_grad  = (CS%cism_taud /= CISM_OFF)
+    CS%local_fv_taud_vertex = (CS%cism_taud == CISM_LOCAL)
     call get_param(param_file, mdl, "MIN_ICE_VISC", CS%min_ice_visc, &
                  "min. allowed Glen's law ice viscosity", &
                  units="Pa s", default=0., scale=US%Pa_to_RL2_T2*US%s_to_T)
@@ -1023,6 +1129,13 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
        'fraction of cell that is grounded', 'none')
     CS%id_float_cond = register_diag_field('ice_shelf_model','float_cond',CS%diag%axesT1, Time, &
        'sub-cell grounding cells', 'none')
+    CS%id_f_ground_cell = register_diag_field('ice_shelf_model','f_ground_cell',CS%diag%axesT1, Time, &
+      'analytic grounded ice fraction at cell centers from the quadrant grounding-line '//&
+      'parameterization (Leguy et al. 2021); nonzero only when CISM_FRICTION is set', 'none')
+    CS%id_f_ground_node = register_diag_field('ice_shelf_model','f_ground_node',CS%diag%axesB1, Time, &
+      'analytic grounded ice fraction at B-grid nodes from the quadrant grounding-line '//&
+      'parameterization (Leguy et al. 2021); multiplies basal friction under '//&
+      'CISM_FRICTION', 'none')
     CS%id_col_thick = register_diag_field('ice_shelf_model','col_thick',CS%diag%axesT1, Time, &
        'ocean column thickness passed to ice model', 'm', conversion=US%Z_to_m)
     CS%id_visc_shelf = register_diag_field('ice_shelf_model','ice_visc',CS%diag%axesT1, Time, &
@@ -1312,6 +1425,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       call post_data(CS%id_surf_slope_mag_shelf, surf_slope, CS%diag)
     endif
     if (CS%id_ground_frac > 0) call post_data(CS%id_ground_frac, CS%ground_frac, CS%diag)
+    if (CS%id_f_ground_cell > 0) call post_data(CS%id_f_ground_cell, CS%f_ground_cell, CS%diag)
+    if (CS%id_f_ground_node > 0) call post_data(CS%id_f_ground_node, CS%f_ground_node, CS%diag)
     if (CS%id_float_cond > 0) call post_data(CS%id_float_cond, CS%float_cond, CS%diag)
     if (CS%id_OD_av >0) call post_data(CS%id_OD_av, CS%OD_av,CS%diag)
     if (CS%id_visc_shelf > 0) then
@@ -1743,8 +1858,13 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
   endif
 
+  ! Analytic quadrant grounding-line fractions for the CISM-style basal friction (Leguy et al.
+  ! 2021). These use the cell-mean h_shelf and bed_elev, so they are independent of GL_couple.
+  if (CS%gl_quad_friction) call compute_gl_quadrant_fractions(CS, ISS, G)
+
   ! Calculate basal drag constants and initial velocity
   call calc_shelf_basal_prefactors(CS, ISS, G, US)
+  if (CS%local_basal_friction) call calc_shelf_basal_prefactors_node(CS, ISS, G, US)
   call calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
   if (CS%doing_newton) then
     ! halo pass for ice_visc, newton_str_sh, newton_visc_factor, newton_str_x
@@ -3510,6 +3630,12 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
 !  is = iscq - 1 ; js = jscq - 1
   i_off = G%idg_offset ; j_off = G%jdg_offset
 
+  ! Compact nodal surface-gradient driving stress (Lipscomb et al. 2019 eq. 14) is a drop-in
+  ! alternative; hand off and return so every caller routes through it.
+  if (CS%fv_taud_vertex_grad) then
+    call calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
+    return
+  endif
 
   rho =  CS%density_ice
   rhow = CS%density_ocean_avg
@@ -3669,6 +3795,373 @@ subroutine calc_shelf_driving_stress(CS, ISS, G, US, taudx, taudy, OD)
   enddo ; enddo
 end subroutine calc_shelf_driving_stress
 
+!> Driving stress with the surface gradient evaluated directly at B-grid
+!! nodes from the four surrounding cell-center surface elevations, following Lipscomb et al. (2019,
+!! Geosci. Model Dev. 12:387-424) eq. 14 and their "option 3" ice-margin treatment. This compact
+!! 4-cell stencil replaces the wider cell-centroid centered difference used by
+!! calc_shelf_driving_stress, and so is less smeared across the grounding line. Per parallel edge,
+!! a gradient is included when both cells are ice-covered, or when an ice-covered cell lies above an
+!! ice-free land neighbor; edges across an ice/ice-free-ocean margin contribute no gradient (the
+!! lateral pressure there is supplied by the Neumann face term, retained verbatim below), and
+!! nunatak edges (ice below ice-free land) likewise contribute nothing. The body force is then
+!! assembled either by mass lumping (CISM_TAUD='local', A4 local method) or by element quadrature
+!! (CISM_TAUD='integrate', A4, eqs A26-A27): the nodal slope is interpolated to each 2x2 Gauss
+!! point with the bilinear basis and distributed to the corner nodes weighted by the basis, the
+!! same consistent integration the basal friction uses in CG_action, so the driving-stress and
+!! friction grounding lines co-locate. The surface field S is built exactly as in
+!! calc_shelf_driving_stress, so this honors
+!! MAX_SURFACE_SLOPE. Selected by CISM_TAUD.
+subroutine calc_shelf_driving_stress_vertex(CS, ISS, G, US, taudx, taudy, OD)
+  type(ice_shelf_dyn_CS), intent(in)   :: CS  !< A pointer to the ice shelf control structure
+  type(ice_shelf_state), intent(in)    :: ISS !< A structure describing the ice-shelf state
+  type(ocean_grid_type), intent(inout) :: G   !< The grid structure used by the ice shelf.
+  type(unit_scale_type), intent(in)    :: US  !< A structure containing unit conversion factors
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                         intent(in)    :: OD  !< ocean floor depth at tracer points [Z ~> m].
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                         intent(inout) :: taudx  !< X-direction driving stress at q-points [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                         intent(inout) :: taudy  !< Y-direction driving stress at q-points [R L3 Z T-2 ~> kg m s-2]
+
+  real, dimension(SZDI_(G),SZDJ_(G))   :: S     ! surface elevation [Z ~> m].
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: sx_n, sy_n ! Nodal surface slopes [Z L-1 ~> nondim]
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: ice_cell  ! True at ice-covered cells (grounded or floating)
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: land_cell ! True at ice-free cells at/above sea level (bed_elev<=0)
+  real    :: rho, rhow  ! Ice and ocean densities [R ~> kg m-3]
+  real    :: grav      ! The gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
+  real    :: num_x, num_y ! Sum of the valid parallel-edge surface differences at a node [Z ~> m]
+  real    :: den_x, den_y ! Sum of the valid parallel-edge lengths at a node [L ~> m]
+  real    :: g_x1, g_x2   ! Per-edge x-direction surface slopes at a node; 0 on a dropped edge [Z L-1 ~> nondim]
+  real    :: g_y1, g_y2   ! Per-edge y-direction surface slopes at a node; 0 on a dropped edge [Z L-1 ~> nondim]
+  integer :: ndom_x, ndom_y ! Number of in-domain parallel edges at a node, the gradient divisor
+  integer :: nok_x, nok_y   ! Number of those edges that also carry ice and so contribute
+  real    :: smag      ! Surface slope magnitude at a node [Z L-1 ~> nondim]
+  real    :: scale     ! Scaling factor enforcing MAX_SURFACE_SLOPE [nondim]
+  real    :: neumann_val ! Lateral-pressure boundary term [R Z L2 T-2 ~> kg s-2]
+  real    :: xquad(2)  ! 2-point Gauss-Legendre quadrature locations on [0,1] [nondim]
+  real    :: He        ! Cell-mean ice thickness used in the driving-stress integral [Z ~> m]
+  real    :: wq        ! Per-quadrature-point area weight, 1/4 |J_q| (= 1/4 areaT for rectangular cells) [L2 ~> m2]
+  real    :: dsdx_qp, dsdy_qp ! Surface slope interpolated to a quadrature point [Z L-1 ~> nondim]
+  real    :: phim(2,2) ! Bilinear nodal basis values of the 4 cell corners at a quadrature point [nondim]
+  real    :: hA        ! h-weighted node control mass for the lumped assembly, sum of the metric
+                       ! lumped corner masses (1/4 |J_q|-integrated basis) over the ice-covered
+                       ! cells around the node [Z L2 ~> m3]
+  real    :: hA_sw, hA_se, hA_nw, hA_ne ! Per-cell metric-lumped corner-mass weights at the four cells
+                       ! around a node, summed in diagonal pairs for rotation invariance [Z L2 ~> m3]
+  real    :: txqp(2,2,4), tyqp(2,2,4) ! Per-quadrature-point nodal driving-stress contributions within
+                       ! one element, pair-summed over quadrature points [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(SZDIB_(G),SZDJB_(G),4) :: taudx_b, taudy_b ! Per-element corner contributions to the
+                       ! nodal driving stress, diagonal-pair-summed for rotation invariance [R L3 Z T-2 ~> kg m s-2]
+  integer :: i, j, isc, iec, jsc, jec, isd, ied, jsd, jed
+  integer :: iq, jq, iphi, jphi, ilq, jlq, qp
+  integer :: i_off, j_off, gisc, gjsc, giec, gjec
+
+  isc = G%isc ; jsc = G%jsc ; iec = G%iec ; jec = G%jec
+  isd = G%isd ; jsd = G%jsd ; ied = G%ied ; jed = G%jed
+  i_off = G%idg_offset ; j_off = G%jdg_offset
+  gisc = 1 ; gjsc = 1 ; giec = G%domain%niglobal ; gjec = G%domain%njglobal
+
+  rho = CS%density_ice ; rhow = CS%density_ocean_avg ; grav = CS%g_Earth
+  xquad(1) = .5*(1. - sqrt(1./3.)) ; xquad(2) = .5*(1. + sqrt(1./3.))
+
+  ! Surface elevation S -- identical to calc_shelf_driving_stress.
+  if (CS%GL_couple) then
+    do j=jsc-2,jec+2 ; do i=isc-2,iec+2
+      S(i,j) = -CS%bed_elev(i,j) + (OD(i,j) + max(ISS%h_shelf(i,j),CS%min_h_shelf))
+    enddo ; enddo
+  else
+    do j=jsc-2,jec+2 ; do i=isc-2,iec+2
+      if (CS%rhoi_rhow * max(ISS%h_shelf(i,j),CS%min_h_shelf) - CS%bed_elev(i,j) <= 0) then
+        S(i,j) = (1 - CS%rhoi_rhow)*max(ISS%h_shelf(i,j),CS%min_h_shelf)
+      else
+        S(i,j) = max(ISS%h_shelf(i,j),CS%min_h_shelf)-CS%bed_elev(i,j)
+      endif
+    enddo ; enddo
+  endif
+  call pass_var(S, G%domain)
+
+  ! Cell classification for the option-3 margin rule: ice-covered (hmask 1 or 3), ice-free land
+  ! (no ice and bed at/above sea level, bed_elev<=0), else ice-free ocean.
+  do j=jsd,jed ; do i=isd,ied
+    ice_cell(i,j)  = (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3)
+    land_cell(i,j) = (.not. ice_cell(i,j)) .and. (CS%bed_elev(i,j) <= 0.0)
+  enddo ; enddo
+
+  ! Nodal surface gradient (generalized Lipscomb 2019 eq. 14), built per parallel edge so margin
+  ! edges can be dropped (option 3). Node (I,J) is the NE corner of cell (i,j); its four cells are
+  ! (i,j),(i+1,j),(i,j+1),(i+1,j+1) (uppercase I,J equal lowercase i,j in Fortran). Computed over a
+  ! node range wide enough to cover every corner of the element-integration loop below.
+  !
+  ! When both parallel edges are usable, they are combined as a ratio of summed surface differences
+  ! over summed edge lengths -- num/den -- which is the isoparametric bilinear gradient CG_action
+  ! forms for nodal fields (metric-interpolated numerator over metric-interpolated denominator), not
+  ! an average of the two per-edge ratios. The two are bitwise identical on a uniform grid but differ
+  ! where the parallel edges have unequal length (e.g. lat/lon, where dxCu varies with latitude), so
+  ! this matches CG_action's metric treatment.
+  !
+  ! When an edge is dropped, the two reasons are treated differently, following CISM
+  ! (glissade_surface_elevation_gradient with ho_gradient = HO_GRADIENT_CENTERED, which forms
+  ! 0.5*(ds_dx_edge(i,j) + ds_dx_edge(i,j+1)) with a masked edge left at zero):
+  !
+  ! (a) The neighbor cell is genuinely ice-free (the option-3 margin rule). CISM leaves that edge's
+  !     gradient at zero but still divides by two, so the nodal slope is HALVED. The surviving edge
+  !     therefore carries a fixed 1/2 weight here, not a renormalized full weight.
+  ! (b) The edge crosses a non-reentrant domain wall. CISM has no such case: its halo BC is periodic
+  !     (parallel_halo), so the across-wall cells hold ice and both edges are valid. The faithful
+  !     analogue is a mirror BC, under which the out-of-domain edge gradient equals the in-domain one
+  !     and 0.5*(g+g) = g -- i.e. renormalize over the in-domain edges. Halving here instead would
+  !     cut the wall-node driving stress in half while its friction and viscous terms keep their
+  !     (half) control volume, breaking the meridional symmetry of channel configs (MISMIP3D).
+  !
+  ! So the divisor is the number of IN-DOMAIN parallel edges, while only the ice-usable ones
+  ! contribute. With no ice-free cells anywhere (e.g. MISMIP3D, fixed front, hmask=1 everywhere)
+  ! case (a) never arises and this reduces exactly to the renormalized num/den form.
+  sx_n(:,:) = 0.0 ; sy_n(:,:) = 0.0
+  do j=jsc-2,jec+1 ; do i=isc-2,iec+1
+    ! x-slope: south edge (i,j)->(i+1,j) and north edge (i,j+1)->(i+1,j+1)
+    num_x = 0.0 ; den_x = 0.0 ; g_x1 = 0.0 ; g_x2 = 0.0 ; ndom_x = 0 ; nok_x = 0
+    if (edge_in_domain(i,j,  i+1,j  )) then
+      ndom_x = ndom_x + 1
+      if (edge_ice_ok(i,j,  i+1,j  )) then
+        nok_x = nok_x + 1 ; g_x1 = (S(i+1,j)   - S(i,j)  ) / G%dxCu(I,j)
+        num_x = num_x + (S(i+1,j)   - S(i,j)  ) ; den_x = den_x + G%dxCu(I,j)
+      endif
+    endif
+    if (edge_in_domain(i,j+1,i+1,j+1)) then
+      ndom_x = ndom_x + 1
+      if (edge_ice_ok(i,j+1,i+1,j+1)) then
+        nok_x = nok_x + 1 ; g_x2 = (S(i+1,j+1) - S(i,j+1)) / G%dxCu(I,j+1)
+        num_x = num_x + (S(i+1,j+1) - S(i,j+1)) ; den_x = den_x + G%dxCu(I,j+1)
+      endif
+    endif
+    if (nok_x == ndom_x) then
+      if (den_x > 0.0) sx_n(I,J) = num_x / den_x
+    elseif (nok_x > 0) then
+      sx_n(I,J) = (g_x1 + g_x2) / real(ndom_x)
+    endif
+
+    ! y-slope: west edge (i,j)->(i,j+1) and east edge (i+1,j)->(i+1,j+1)
+    num_y = 0.0 ; den_y = 0.0 ; g_y1 = 0.0 ; g_y2 = 0.0 ; ndom_y = 0 ; nok_y = 0
+    if (edge_in_domain(i,j,  i,  j+1)) then
+      ndom_y = ndom_y + 1
+      if (edge_ice_ok(i,j,  i,  j+1)) then
+        nok_y = nok_y + 1 ; g_y1 = (S(i,j+1)   - S(i,j)  ) / G%dyCv(i,J)
+        num_y = num_y + (S(i,j+1)   - S(i,j)  ) ; den_y = den_y + G%dyCv(i,J)
+      endif
+    endif
+    if (edge_in_domain(i+1,j,i+1,j+1)) then
+      ndom_y = ndom_y + 1
+      if (edge_ice_ok(i+1,j,i+1,j+1)) then
+        nok_y = nok_y + 1 ; g_y2 = (S(i+1,j+1) - S(i+1,j)) / G%dyCv(i+1,J)
+        num_y = num_y + (S(i+1,j+1) - S(i+1,j)) ; den_y = den_y + G%dyCv(i+1,J)
+      endif
+    endif
+    if (nok_y == ndom_y) then
+      if (den_y > 0.0) sy_n(I,J) = num_y / den_y
+    elseif (nok_y > 0) then
+      sy_n(I,J) = (g_y1 + g_y2) / real(ndom_y)
+    endif
+
+    ! Cap the surface slope magnitude (MAX_SURFACE_SLOPE), as in calc_shelf_driving_stress.
+    if (CS%max_surface_slope > 0) then
+      smag = sqrt((sx_n(I,J)**2) + (sy_n(I,J)**2))
+      scale = CS%max_surface_slope / max(smag, CS%max_surface_slope)
+      sx_n(I,J) = scale*sx_n(I,J) ; sy_n(I,J) = scale*sy_n(I,J)
+    endif
+  enddo ; enddo
+
+  if (CS%local_fv_taud_vertex) then
+    ! Mass-lumped ("local") assembly: each node's driving stress uses its own slope alone,
+    ! tau_d = -rho g grad(s) * hA, with hA the h-weighted lumped nodal mass over the ice-covered
+    ! cells around the node (Lipscomb 2019 A4 local method; more robust for sharp surfaces).
+    do j=jsc-1,jec ; do i=isc-1,iec
+      ! Metric-exact lumped (row-sum) mass contribution of each of the four cells around node (I,J):
+      ! h * integral of that cell's node-corner bilinear basis against the element Jacobian,
+      ! (h/4) sum_qp phi_corner(qp) Jac(qp) (lumped_corner_mass below; 2-pt Gauss is exact for the
+      ! bilinear-orthogonal map, so this carries the lat/lon metric exactly and reduces to
+      ! 0.25*areaT*h on rectangular cells). The corner passed is the cell's corner that coincides
+      ! with the node: cell (i,j) -> NE, (i+1,j) -> NW, (i,j+1) -> SE, (i+1,j+1) -> SW. Cells are
+      ! summed in diagonal pairs (SW+NE)+(SE+NW) so the lumped mass is bitwise invariant under
+      ! 90 deg rotation, matching CG_action.
+      hA_sw = 0.0 ; if (ice_cell(i,  j  )) hA_sw = lumped_corner_mass(i,  j,   2, 2)
+      hA_se = 0.0 ; if (ice_cell(i+1,j  )) hA_se = lumped_corner_mass(i+1,j,   1, 2)
+      hA_nw = 0.0 ; if (ice_cell(i,  j+1)) hA_nw = lumped_corner_mass(i,  j+1, 2, 1)
+      hA_ne = 0.0 ; if (ice_cell(i+1,j+1)) hA_ne = lumped_corner_mass(i+1,j+1, 1, 1)
+      hA = (hA_sw + hA_ne) + (hA_se + hA_nw)
+      taudx(I,J) = taudx(I,J) - (rho*grav) * (hA * sx_n(I,J))
+      taudy(I,J) = taudy(I,J) - (rho*grav) * (hA * sy_n(I,J))
+    enddo ; enddo
+  else
+    ! Consistent element-quadrature assembly, matching the basal friction integration in CG_action
+    ! (Lipscomb 2019 A4, eqs A26-A27): at each 2x2 Gauss point the nodal slope is interpolated with
+    ! the bilinear basis, multiplied by the cell-mean thickness, and distributed back to the four
+    ! cell-corner nodes weighted by that basis. Matching the friction's quadrature co-locates the
+    ! driving-stress and friction grounding lines. The per-quadrature-point weight 1/4 |J_q| (CS%Jac)
+    ! carries the element metric, exactly as CG_action's jac_wt = |J_q|/areaT does for friction; it
+    ! reduces to 1/4 areaT on rectangular cells where |J_q| == areaT.
+    ! Each element writes its four corner contributions into its own slot of taudx_b/taudy_b; the
+    ! quadrature-point and four-element sums are then accumulated in diagonal pairs (exactly as
+    ! CG_action assembles uret_b) so the load vector is bitwise invariant under 90 deg rotation.
+    taudx_b(:,:,:) = 0.0 ; taudy_b(:,:,:) = 0.0
+    do j=jsc-1,jec+1 ; do i=isc-1,iec+1
+      if (ice_cell(i,j)) then
+        He = max(ISS%h_shelf(i,j), CS%min_h_shelf)
+        do jq=1,2 ; do iq=1,2
+          qp = 2*(jq-1)+iq
+          ! Per-quadrature-point area weight |J_q|/4, the same element-map metric CG_action applies
+          ! to the friction integral (via jac_wt). On non-rectangular (e.g. lat/lon) cells this keeps
+          ! the driving-stress and friction integrals on an identical metric; = 0.25*areaT when |J_q|==areaT.
+          wq = 0.25 * CS%Jac(qp,i,j)
+          ! Bilinear basis of the 4 corners at this quadrature point (same convention as CG_action).
+          do jphi=1,2 ; do iphi=1,2
+            ilq = 1 ; if (iq == iphi) ilq = 2
+            jlq = 1 ; if (jq == jphi) jlq = 2
+            phim(iphi,jphi) = xquad(ilq) * xquad(jlq)
+          enddo ; enddo
+          ! Interpolate the nodal slope to the quadrature point, summing corners in diagonal pairs.
+          dsdx_qp = ((sx_n(i-1,j-1)*phim(1,1) + sx_n(i,j)*phim(2,2)) + &
+                     (sx_n(i,j-1)*phim(2,1) + sx_n(i-1,j)*phim(1,2)))
+          dsdy_qp = ((sy_n(i-1,j-1)*phim(1,1) + sy_n(i,j)*phim(2,2)) + &
+                     (sy_n(i,j-1)*phim(2,1) + sy_n(i-1,j)*phim(1,2)))
+          ! Per-corner contribution -rho g H grad(s) phi_m |J| w_q at this quadrature point.
+          do jphi=1,2 ; do iphi=1,2
+            txqp(iphi,jphi,qp) = -(((rho*grav)*He) * dsdx_qp) * (phim(iphi,jphi)*wq)
+            tyqp(iphi,jphi,qp) = -(((rho*grav)*He) * dsdy_qp) * (phim(iphi,jphi)*wq)
+          enddo ; enddo
+        enddo ; enddo
+        ! Sum the four quadrature points in diagonal pairs (qp 1+4, 2+3) into each corner's element slot.
+        taudx_b(I-1,J-1,4) = (txqp(1,1,1)+txqp(1,1,4)) + (txqp(1,1,2)+txqp(1,1,3))
+        taudx_b(I-1,J  ,2) = (txqp(1,2,1)+txqp(1,2,4)) + (txqp(1,2,2)+txqp(1,2,3))
+        taudx_b(I  ,J-1,3) = (txqp(2,1,1)+txqp(2,1,4)) + (txqp(2,1,2)+txqp(2,1,3))
+        taudx_b(I  ,J  ,1) = (txqp(2,2,1)+txqp(2,2,4)) + (txqp(2,2,2)+txqp(2,2,3))
+        taudy_b(I-1,J-1,4) = (tyqp(1,1,1)+tyqp(1,1,4)) + (tyqp(1,1,2)+tyqp(1,1,3))
+        taudy_b(I-1,J  ,2) = (tyqp(1,2,1)+tyqp(1,2,4)) + (tyqp(1,2,2)+tyqp(1,2,3))
+        taudy_b(I  ,J-1,3) = (tyqp(2,1,1)+tyqp(2,1,4)) + (tyqp(2,1,2)+tyqp(2,1,3))
+        taudy_b(I  ,J  ,1) = (tyqp(2,2,1)+tyqp(2,2,4)) + (tyqp(2,2,2)+tyqp(2,2,3))
+      endif
+    enddo ; enddo
+    ! Assemble the four surrounding-element slots at each node in diagonal pairs (slots 1+4, 2+3).
+    do J=jsc-1,jec ; do I=isc-1,iec
+      taudx(I,J) = taudx(I,J) + ((taudx_b(I,J,1)+taudx_b(I,J,4)) + (taudx_b(I,J,2)+taudx_b(I,J,3)))
+      taudy(I,J) = taudy(I,J) + ((taudy_b(I,J,1)+taudy_b(I,J,4)) + (taudy_b(I,J,2)+taudy_b(I,J,3)))
+    enddo ; enddo
+  endif
+
+  ! Lateral-pressure (Neumann) boundary conditions at calving fronts and stress faces. This block
+  ! is identical to calc_shelf_driving_stress; the front forcing is unchanged by the gradient scheme.
+  do j=jsc-1,jec+1 ; do i=isc-1,iec+1
+    if (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3) then
+      if (CS%ground_frac(i,j) == 1) then
+        neumann_val = ((.5 * grav) * (rho * max(ISS%h_shelf(i,j),CS%min_h_shelf)**2 - &
+                                      rhow * max(0.0, CS%bed_elev(i,j))**2))
+      else
+        neumann_val = (.5 * grav) * ((1-CS%rhoi_rhow) * (rho * max(ISS%h_shelf(i,j),CS%min_h_shelf)**2))
+      endif
+      if ((CS%u_face_mask_bdry(I-1,j) == 2) .OR. &
+        ((ISS%hmask(i-1,j) == 0 .OR. ISS%hmask(i-1,j) == 2) .AND. (CS%reentrant_x .OR. (i+i_off /= gisc)))) then
+        taudx(I-1,J-1) = taudx(I-1,J-1) - .5 * G%dyCu(I-1,j) * neumann_val
+        taudx(I-1,J) = taudx(I-1,J) - .5 * G%dyCu(I-1,j) * neumann_val
+      endif
+      if ((CS%u_face_mask_bdry(I,j) == 2) .OR. &
+        ((ISS%hmask(i+1,j) == 0 .OR. ISS%hmask(i+1,j) == 2) .and. (CS%reentrant_x .OR. (i+i_off /= giec)))) then
+        taudx(I,J-1) = taudx(I,J-1) + .5 * G%dyCu(I,j) * neumann_val
+        taudx(I,J) = taudx(I,J) + .5 * G%dyCu(I,j) * neumann_val
+      endif
+      if ((CS%v_face_mask_bdry(i,J-1) == 2) .OR. &
+        ((ISS%hmask(i,j-1) == 0 .OR. ISS%hmask(i,j-1) == 2) .and. (CS%reentrant_y .OR. (j+j_off /= gjsc)))) then
+        taudy(I-1,J-1) = taudy(I-1,J-1) - .5 * G%dxCv(i,J-1) * neumann_val
+        taudy(I,J-1) = taudy(I,J-1) - .5 * G%dxCv(i,J-1) * neumann_val
+      endif
+      if ((CS%v_face_mask_bdry(i,J) == 2) .OR. &
+        ((ISS%hmask(i,j+1) == 0 .OR. ISS%hmask(i,j+1) == 2) .and. (CS%reentrant_y .OR. (j+j_off /= gjec)))) then
+        taudy(I-1,J) = taudy(I-1,J) + .5 * G%dxCv(i,J) * neumann_val
+        taudy(I,J) = taudy(I,J) + .5 * G%dxCv(i,J) * neumann_val
+      endif
+    endif
+  enddo ; enddo
+
+  ! Surface-slope diagnostic at cell centers: average the four corner-node slopes.
+  if (CS%id_sx_shelf > 0 .or. CS%id_sy_shelf > 0 .or. CS%id_surf_slope_mag_shelf > 0) then
+    do j=jsc,jec ; do i=isc,iec
+      if (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3) then
+        CS%sx_shelf(i,j) = 0.25*((sx_n(I-1,J-1) + sx_n(I,J)) + (sx_n(I,J-1) + sx_n(I-1,J)))
+        CS%sy_shelf(i,j) = 0.25*((sy_n(I-1,J-1) + sy_n(I,J)) + (sy_n(I,J-1) + sy_n(I-1,J)))
+      else
+        CS%sx_shelf(i,j) = 0.0 ; CS%sy_shelf(i,j) = 0.0
+      endif
+    enddo ; enddo
+  endif
+
+contains
+
+  !> Option-3 (Lipscomb 2019) test for whether the edge between cells A=(ia,ja) and B=(ib,jb)
+  !! contributes a surface-slope estimate: yes if both are ice-covered, or if an ice-covered cell
+  !! lies higher in surface elevation than an ice-free land neighbor; no across ice/ice-free-ocean
+  !! margins or where ice lies below ice-free land (a nunatak). An edge is also rejected if either
+  !! cell lies outside a non-reentrant computational boundary, so the nodal gradient never differences
+  !! across a solid wall into the (unphysical) across-wall halo. Without this guard the N/S (and E/W)
+  !! wall nodes pick up a spurious cross-wall slope, breaking the meridional symmetry of channel
+  !! configurations like MISMIP3D, matching the boundary handling in calc_shelf_driving_stress.
+  !> True if both cells of an edge lie inside the global computational domain. An edge that fails
+  !! this test has no CISM counterpart (CISM's halo BC is periodic, so its across-wall cells hold
+  !! ice); it is excluded from both the numerator and the divisor, which is equivalent to a mirror
+  !! boundary condition on the surface slope.
+  logical function edge_in_domain(ia, ja, ib, jb)
+    integer, intent(in) :: ia, ja, ib, jb
+    edge_in_domain = .false.
+    if (.not. CS%reentrant_x) then
+      if ((ia+i_off < gisc) .or. (ia+i_off > giec) .or. &
+          (ib+i_off < gisc) .or. (ib+i_off > giec)) return
+    endif
+    if (.not. CS%reentrant_y) then
+      if ((ja+j_off < gjsc) .or. (ja+j_off > gjec) .or. &
+          (jb+j_off < gjsc) .or. (jb+j_off > gjec)) return
+    endif
+    edge_in_domain = .true.
+  end function edge_in_domain
+
+  !> True if an in-domain edge carries a meaningful surface gradient: ice in both cells, or ice
+  !! standing above an ice-free land cell (CISM HO_GRADIENT_MARGIN_HYBRID). An edge that fails this
+  !! test is the option-3 margin case: it contributes nothing but still counts in the divisor, so
+  !! the surviving parallel edge is halved, as in CISM's centered edge-gradient average.
+  logical function edge_ice_ok(ia, ja, ib, jb)
+    integer, intent(in) :: ia, ja, ib, jb
+    edge_ice_ok = .false.
+    if (ice_cell(ia,ja) .and. ice_cell(ib,jb)) then
+      edge_ice_ok = .true.
+    elseif (ice_cell(ia,ja) .and. land_cell(ib,jb)) then
+      edge_ice_ok = (S(ia,ja) > S(ib,jb))
+    elseif (ice_cell(ib,jb) .and. land_cell(ia,ja)) then
+      edge_ice_ok = (S(ib,jb) > S(ia,ja))
+    endif
+  end function edge_ice_ok
+
+  !> Metric-exact lumped (row-sum) nodal mass contribution of cell (ic,jc) to the node at its
+  !! (icorner,jcorner) corner: h * integral of that corner's bilinear basis against the element
+  !! Jacobian, (h/4) * sum_qp phi_corner(qp) * Jac(qp). Two-point Gauss is exact for this integrand
+  !! on the bilinear locally-orthogonal map (phi*Jac is at most quadratic per direction), so the
+  !! result carries the lat/lon metric exactly, matching the per-quadrature-point |J_q| weighting
+  !! CG_action uses. Reduces to 0.25*areaT*h on rectangular cells where Jac(qp) == areaT.
+  real function lumped_corner_mass(ic, jc, icorner, jcorner)
+    integer, intent(in) :: ic, jc        !< Cell indices of the contributing cell
+    integer, intent(in) :: icorner, jcorner !< The cell corner (1=W/S, 2=E/N) that is the node
+    real :: pj(4)  ! phi_corner(qp) * Jac(qp) at the four quadrature points [L2 ~> m2]
+    integer :: iq2, jq2, qq, il, jl
+    do jq2=1,2 ; do iq2=1,2
+      qq = 2*(jq2-1)+iq2
+      il = 1 ; if (iq2 == icorner) il = 2
+      jl = 1 ; if (jq2 == jcorner) jl = 2
+      pj(qq) = (xquad(il)*xquad(jl)) * CS%Jac(qq,ic,jc)
+    enddo ; enddo
+    ! Gauss weight 1/4 per QP, summed in diagonal pairs (1+4)+(2+3) to match CG_action's
+    ! rotation-invariant quadrature; times the cell-mean thickness.
+    lumped_corner_mass = (0.25 * ((pj(1)+pj(4)) + (pj(2)+pj(3)))) * &
+                         max(ISS%h_shelf(ic,jc), CS%min_h_shelf)
+  end function lumped_corner_mass
+
+end subroutine calc_shelf_driving_stress_vertex
+
+
 subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, hmask, H_node, &
                      ice_visc, float_cond, bathyT, u_curr, v_curr, G, US, is, ie, js, je, dens_ratio, use_newton_in)
 
@@ -3752,13 +4245,18 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   real :: basal_coef_qp  ! Picard basal friction coefficient at quadrature point [R L2 Z T-1 ~> kg s-1]
   real :: drag_newt_qp   ! Newton basal drag coefficient at quadrature point [R Z T-1 ~> kg m-2 s-1]
   real :: inner_dot_qp   ! u^k_qp · δu_qp inner product for Newton basal drag [L2 T-2 ~> m2 s-2]
+  real :: bcoef_loc, dnewt_loc ! Local (nodal-diagonal) basal Picard drag [R L2 Z T-1 ~> kg s-1] and
+                         ! Newton tangent factor [R Z T ~> kg m-2 s] at a node (CISM_FRICTION='local')
+  real :: idot_loc       ! u^k_node · δu_node inner product for the local Newton drag [L2 T-2 ~> m2 s-2]
   real :: coef_prefactor_e  ! Pre-computed area * C_basal_friction * L_T_to_m_s [R L2 Z T-1 ~> kg s-1]
   real :: eps_vel2_e     ! Velocity regularization squared for current element [L2 T-2 ~> m2 s-2]
   real :: min_trac_e     ! min_basal_traction * areaT for current element [R L2 Z T-1 ~> kg s-1]
   real :: fB_e           ! Pre-computed Coulomb fB for element; 0 for Weertman [(s m-1)^CF_PostPeak]
   real :: jac_wt  ! Per-quadrature-point metric correction |J_q|/areaT [nondim]
+  real :: gl_w_qp ! Quadrant-GLP grounded weight at the quadrature point (CISM_FRICTION) [nondim]
   integer :: iq, jq, iphi, jphi, i, j, ilq, jlq, Itgt, Jtgt, qp, qpv
   logical :: visc_qp4
+  logical :: grounded_qp ! Whether this element's quadrature points carry basal friction
   logical :: use_newton  ! Whether to apply Newton tangent stiffness corrections
   logical :: do_newton_visc  ! Whether to apply viscosity-related Newton tangent stiffness corrections
   real, dimension(2) :: xquad  ! Nondimensional quadrature ratios [nondim]
@@ -3842,7 +4340,14 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
         ! Basal friction and Newton Jacobian evaluated at this quadrature point (fully grounded cells only).
         ! Evaluating at quadrature points rather than cell-averaged ensures the Newton correction is the
         ! exact Jacobian of the Picard residual, enabling quadratic convergence for all friction exponents.
-        if (float_cond(i,j) == 0  .and. CS%ground_frac(i,j)>0) then
+        ! Under CISM_FRICTION the element path handles every cell with any grounded area, and the
+        ! per-quadrature-point weight gl_w_qp carries the sub-cell structure.
+        if (CS%gl_quad_friction) then
+          grounded_qp = (CS%f_ground_cell(i,j) > 0.0)
+        else
+          grounded_qp = (float_cond(i,j) == 0 .and. CS%ground_frac(i,j) > 0)
+        endif
+        if (grounded_qp) then
           u_curr_qp = ((u_curr(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
                        (u_curr(I,J) * (xquad(iq) * xquad(jq)))) + &
                       ((u_curr(I,J-1) * (xquad(iq) * xquad(3-jq))) + &
@@ -3855,10 +4360,20 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
           call compute_basal_coef(unorm2_qp, coef_prefactor_e, min_trac_e, fB_e, &
               CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, use_newton, &
               basal_coef_qp, drag_newt_qp)
+          if (CS%gl_quad_friction) then
+            ! Quadrant-GLP grounded weight at this quadrature point: bilinear interpolation of the
+            ! nodal grounded fraction.
+            gl_w_qp = ((CS%f_ground_node(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
+                       (CS%f_ground_node(I,J)     * (xquad(iq)   * xquad(jq))))  + &
+                      ((CS%f_ground_node(I,J-1)   * (xquad(iq)   * xquad(3-jq))) + &
+                       (CS%f_ground_node(I-1,J)   * (xquad(3-iq) * xquad(jq))))
+          else
+            gl_w_qp = CS%ground_frac(i,j)
+          endif
           ! Apply ground fraction scaling (replaces external scaling of basal_traction)
-          basal_coef_qp = basal_coef_qp * CS%ground_frac(i,j)
+          basal_coef_qp = basal_coef_qp * gl_w_qp
           if (use_newton) then
-            drag_newt_qp = drag_newt_qp * CS%ground_frac(i,j)
+            drag_newt_qp = drag_newt_qp * gl_w_qp
             ! Inner product u^k_qp . delta_u_qp for the Newton correction.
             inner_dot_qp = (u_curr_qp * uq) + (v_curr_qp * vq)
           endif
@@ -3888,7 +4403,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
                ((2.*stry_n + strx_n) * Phi(2*(2*(jphi-1)+iphi),qp,i,j)))
           endif
 
-          if (float_cond(i,j) == 0 .and. CS%ground_frac(i,j)>0) then
+          if (grounded_qp .and. .not. CS%local_basal_friction) then
             ilq = 1 ; if (iq == iphi) ilq = 2
             jlq = 1 ; if (jq == jphi) jlq = 2
             ! Picard basal drag: C*|u^k|^(m-1) * δu evaluated at quadrature point, weighted by φ_m
@@ -3924,7 +4439,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
       uret_b(I  ,J  ,1) = 0.25*((uret_qp(2,2,1)+uret_qp(2,2,4))+(uret_qp(2,2,2)+uret_qp(2,2,3)))
       vret_b(I  ,J  ,1) = 0.25*((vret_qp(2,2,1)+vret_qp(2,2,4))+(vret_qp(2,2,2)+vret_qp(2,2,3)))
 
-      if (float_cond(i,j) == 1) then
+      if ((float_cond(i,j) == 1) .and. .not. CS%gl_quad_friction) then
         ! Subgrid grounding-line: evaluate basal friction at each grounded sub-quadrature point.
         ! Picard and Newton Jacobian are both computed inside CG_action_subgrid_basal.
         Hcell(:,:) = H_node(I-1:I,J-1:J)
@@ -3948,6 +4463,23 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
     uret(I,J) = (uret_b(I,J,1)+uret_b(I,J,4)) + (uret_b(I,J,2)+uret_b(I,J,3))
     vret(I,J) = (vret_b(I,J,1)+vret_b(I,J,4)) + (vret_b(I,J,2)+vret_b(I,J,3))
   enddo ; enddo
+
+  ! Local (nodal-diagonal) basal friction (CISM HO_ASSEMBLE_BETA_LOCAL): each node's drag uses only
+  ! its own velocity, beta, and grounded fraction f_ground_node -- no element integration or neighbor
+  ! coupling. Replaces the per-quadrature-point friction gated off above.
+  if (CS%local_basal_friction) then
+    do J=js-1,je ; do I=is-1,ie
+      if (CS%f_ground_node(I,J) > 0.0) then
+        call compute_basal_coef_node(CS, US, I, J, u_curr(I,J), v_curr(I,J), use_newton, &
+                                     bcoef_loc, dnewt_loc)
+        idot_loc = (u_curr(I,J)*u_shlf(I,J)) + (v_curr(I,J)*v_shlf(I,J))
+        if (umask(I,J) == 1) uret(I,J) = uret(I,J) + &
+            ((bcoef_loc * u_shlf(I,J)) + (dnewt_loc * u_curr(I,J) * idot_loc))
+        if (vmask(I,J) == 1) vret(I,J) = vret(I,J) + &
+            ((bcoef_loc * v_shlf(I,J)) + (dnewt_loc * v_curr(I,J) * idot_loc))
+      endif
+    enddo ; enddo
+  endif
 
 end subroutine CG_action
 
@@ -4100,6 +4632,12 @@ subroutine compute_basal_coef(unorm2_qp, coef_prefactor, min_trac_area, fB_e, &
     ! Linear Weertman: coef is independent of |u|; sqrt and Newton correction not needed
     basal_coef = max(coef_prefactor, min_trac_area)
     drag_newt  = 0.0
+  elseif (CoulombFriction .and. (fB_e < 0.0)) then
+    ! Zero effective pressure (FB_NO_COULOMB_DRAG): the Coulomb law gives exactly zero basal drag
+    ! and its Newton tangent vanishes with it, since the drag is identically zero in u. Taking this
+    ! branch avoids forming the divergent fB expression at all. min_trac_area reproduces what the
+    ! Coulomb branch below would do with raw_coef = 0: the floor when one is set, zero otherwise.
+    basal_coef = min_trac_area  ;  drag_newt = 0.0
   elseif (CoulombFriction) then
     ! Schoof/Gagliardini Coulomb friction
     unorm    = L_T_to_m_s * sqrt(unorm2_qp)
@@ -4133,6 +4671,43 @@ subroutine compute_basal_coef(unorm2_qp, coef_prefactor, min_trac_area, fB_e, &
   endif
 
 end subroutine compute_basal_coef
+
+!> Local (nodal) basal drag coefficient and Newton tangent factor at B-grid node (I,J) for
+!! CISM_FRICTION='local' (CISM HO_ASSEMBLE_BETA_LOCAL). beta is built from the pre-computed nodal
+!! prefactor (area_node*C_node) and nodal Coulomb fB, the nodal velocity magnitude, then scaled by the
+!! nodal grounded fraction f_ground_node. The drag is purely diagonal: tau_b at the node = bcoef*u.
+subroutine compute_basal_coef_node(CS, US, I, J, u_c, v_c, use_newton, bcoef, dnewt)
+  type(ice_shelf_dyn_CS), intent(in) :: CS  !< Ice shelf dynamics control structure
+  type(unit_scale_type),  intent(in) :: US  !< Unit conversion factors
+  integer, intent(in) :: I                  !< B-grid node i-index
+  integer, intent(in) :: J                  !< B-grid node j-index
+  real,    intent(in) :: u_c                !< Current nodal zonal velocity [L T-1 ~> m s-1]
+  real,    intent(in) :: v_c                !< Current nodal meridional velocity [L T-1 ~> m s-1]
+  logical, intent(in) :: use_newton         !< If true, evaluate the Newton tangent factor
+  real,    intent(out) :: bcoef             !< Picard diagonal drag at the node [R L2 Z T-1 ~> kg s-1]
+  real,    intent(out) :: dnewt             !< Newton drag tangent factor [R Z T ~> kg m-2 s]; 0 without Newton
+
+  real :: eps2     ! Velocity regularization squared at the node [L2 T-2 ~> m2 s-2]
+  real :: mintrac  ! min_basal_traction * area_node floor at the node [R L2 Z T-1 ~> kg s-1]
+  real :: unorm2   ! Regularized |u|^2 at the node [L2 T-2 ~> m2 s-2]
+
+  ! Scale the regularization and traction floor by the same nodal control volume (CS%area_node) the
+  ! drag prefactor uses, not areaBu, so every term in the local node balance shares one control volume
+  ! and the domain-edge nodes stay consistent with the interior (meridional symmetry).
+  eps2    = CS%eps_glen_min**2 * CS%area_node(I,J)
+  mintrac = CS%min_basal_traction * CS%area_node(I,J)
+  unorm2  = ((u_c**2) + (v_c**2)) + eps2
+  ! CISM HO_BETA_LIMIT_ABSOLUTE (its default): scale by the grounded fraction first, then floor, so
+  ! that a node with any grounded area keeps at least MIN_BASAL_TRACTION. Where the floor binds the
+  ! drag is constant in |u|, so the Newton tangent factor vanishes, as in compute_basal_coef.
+  call compute_basal_coef(unorm2, CS%coef_prefactor_node(I,J), 0.0, CS%fB_node(I,J), &
+      CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, use_newton, bcoef, dnewt)
+  bcoef = bcoef * CS%f_ground_node(I,J)
+  dnewt = dnewt * CS%f_ground_node(I,J)
+  if ((CS%f_ground_node(I,J) > 0.0) .and. (bcoef < mintrac)) then
+    bcoef = mintrac ; dnewt = 0.0
+  endif
+end subroutine compute_basal_coef_node
 
 !! Returns the sum of the elements in a square matrix. This sum is bitwise identical even if the matrices are rotated.
 subroutine sum_square_matrix(sum_out, mat_in, n)
@@ -4228,6 +4803,10 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, u_curr, v_cu
   real :: eps_vel2_e     ! Velocity regularization squared for current element [L2 T-2 ~> m2 s-2]
   real :: min_trac_e     ! min_basal_traction * areaT for current element [R L2 Z T-1 ~> kg s-1]
   real :: fB_e           ! Pre-computed Coulomb fB for element; 0 for Weertman [(s m-1)^CF_PostPeak]
+  real :: gl_w_qp        ! Quadrant-GLP grounded weight at the quadrature point (CISM_FRICTION) [nondim]
+  real :: bcoef_loc, dnewt_loc ! Local (nodal-diagonal) basal Picard drag [R L2 Z T-1 ~> kg s-1] and
+                         ! Newton tangent factor [R Z T ~> kg m-2 s] at a node (CISM_FRICTION='local')
+  logical :: grounded_qp ! Whether this element's quadrature points carry basal friction
   real, dimension(2)   :: xquad
   real, dimension(2,2) :: Hcell, u_diag_sub, v_diag_sub  ! Subgrid diagonal contributions [R L2 Z T-1 ~> kg s-1]
   real, dimension(2,2,4) :: u_diag_qp, v_diag_qp
@@ -4281,8 +4860,14 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, u_curr, v_cu
         strsh_n = CS%newton_str_sh(i,j,qpv)
       endif
 
-      ! Basal friction coefficients at this quadrature point (fully grounded cells only)
-      if (float_cond(i,j) == 0 .and. CS%ground_frac(i,j)>0) then
+      ! Basal friction coefficients at this quadrature point (fully grounded cells only). Mirror the
+      ! CG_action operator, so that under CISM_FRICTION the preconditioner diagonal matches it.
+      if (CS%gl_quad_friction) then
+        grounded_qp = (CS%f_ground_cell(i,j) > 0.0)
+      else
+        grounded_qp = (float_cond(i,j) == 0 .and. CS%ground_frac(i,j) > 0)
+      endif
+      if (grounded_qp) then
         u_curr_qp = ((u_curr(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
                      (u_curr(I,J) * (xquad(iq) * xquad(jq)))) + &
                     ((u_curr(I,J-1) * (xquad(iq) * xquad(3-jq))) + &
@@ -4295,8 +4880,16 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, u_curr, v_cu
         call compute_basal_coef(unorm2_qp, coef_prefactor_e, min_trac_e, fB_e, &
             CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .true., &
             basal_coef_qp, drag_newt_qp)
-        basal_coef_qp = basal_coef_qp * CS%ground_frac(i,j)
-        drag_newt_qp  = drag_newt_qp  * CS%ground_frac(i,j)
+        if (CS%gl_quad_friction) then
+          gl_w_qp = ((CS%f_ground_node(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
+                     (CS%f_ground_node(I,J)     * (xquad(iq)   * xquad(jq))))  + &
+                    ((CS%f_ground_node(I,J-1)   * (xquad(iq)   * xquad(3-jq))) + &
+                     (CS%f_ground_node(I-1,J)   * (xquad(3-iq) * xquad(jq))))
+        else
+          gl_w_qp = CS%ground_frac(i,j)
+        endif
+        basal_coef_qp = basal_coef_qp * gl_w_qp
+        drag_newt_qp  = drag_newt_qp  * gl_w_qp
       endif
 
       do jphi=1,2 ; Jtgt = J-2+jphi ; do iphi=1,2 ; Itgt = I-2+iphi
@@ -4325,7 +4918,7 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, u_curr, v_cu
               jac_wt * CS%newton_visc_factor(i,j,qpv) * dstrain_diag_u**2
           endif
 
-          if (float_cond(i,j) == 0 .and. CS%ground_frac(i,j)>0) then
+          if (grounded_qp .and. .not. CS%local_basal_friction) then
             ! Picard diagonal: basal_coef_qp * phi_m^2; Newton diagonal adds drag_newt_qp * u^k_qp^2 * phi_m^2.
             u_diag_qp(iphi,jphi,qp) = u_diag_qp(iphi,jphi,qp) + jac_wt * basal_coef_qp * phi_m_sq
             if (CS%doing_newton) &
@@ -4352,7 +4945,7 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, u_curr, v_cu
               jac_wt * CS%newton_visc_factor(i,j,qpv) * dstrain_diag_v**2
           endif
 
-          if (float_cond(i,j) == 0 .and. CS%ground_frac(i,j)>0) then
+          if (grounded_qp .and. .not. CS%local_basal_friction) then
             v_diag_qp(iphi,jphi,qp) = v_diag_qp(iphi,jphi,qp) + jac_wt * basal_coef_qp * phi_m_sq
             if (CS%doing_newton) &
               v_diag_qp(iphi,jphi,qp) = v_diag_qp(iphi,jphi,qp) + jac_wt * drag_newt_qp * v_curr_qp**2 * phi_m_sq
@@ -4377,7 +4970,7 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, u_curr, v_cu
     u_diag_b(I  ,J  ,1) = 0.25*((u_diag_qp(2,2,1)+u_diag_qp(2,2,4))+(u_diag_qp(2,2,2)+u_diag_qp(2,2,3)))
     v_diag_b(I  ,J  ,1) = 0.25*((v_diag_qp(2,2,1)+v_diag_qp(2,2,4))+(v_diag_qp(2,2,2)+v_diag_qp(2,2,3)))
 
-    if (float_cond(i,j) == 1) then
+    if ((float_cond(i,j) == 1) .and. .not. CS%gl_quad_friction) then
       ! Subgrid grounding-line: evaluate basal friction diagonal at each grounded sub-quadrature point.
       ! Returns separate u_diag_sub and v_diag_sub (differ in Newton term: u^2 vs v^2).
       ! The sub-qp flotation test handles grounding fraction; no external ground_frac scaling needed.
@@ -4402,6 +4995,19 @@ subroutine matrix_diagonal(CS, G, US, float_cond, H_node, ice_visc, u_curr, v_cu
     u_diagonal(I,J) = (u_diag_b(I,J,1)+u_diag_b(I,J,4)) + (u_diag_b(I,J,2)+u_diag_b(I,J,3))
     v_diagonal(I,J) = (v_diag_b(I,J,1)+v_diag_b(I,J,4)) + (v_diag_b(I,J,2)+v_diag_b(I,J,3))
   enddo ; enddo
+
+  ! Local (nodal-diagonal) basal friction (CISM HO_ASSEMBLE_BETA_LOCAL): the diagonal of the nodal
+  ! drag bcoef*u (+ Newton tangent dnewt*u^2), matching the term added in CG_action.
+  if (CS%local_basal_friction) then
+    do J=jsc-2,jec+1 ; do I=isc-2,iec+1
+      if (CS%f_ground_node(I,J) > 0.0) then
+        call compute_basal_coef_node(CS, US, I, J, u_curr(I,J), v_curr(I,J), CS%doing_newton, &
+                                     bcoef_loc, dnewt_loc)
+        if (CS%umask(I,J) == 1) u_diagonal(I,J) = u_diagonal(I,J) + (bcoef_loc + (dnewt_loc * u_curr(I,J)**2))
+        if (CS%vmask(I,J) == 1) v_diagonal(I,J) = v_diagonal(I,J) + (bcoef_loc + (dnewt_loc * v_curr(I,J)**2))
+      endif
+    enddo ; enddo
+  endif
 
 end subroutine matrix_diagonal
 
@@ -4821,14 +5427,136 @@ subroutine calc_shelf_basal_prefactors(CS, ISS, G, US)
       Hf = max(CS%rhow_rhoi * CS%bed_elev(i,j), 0.0)
       fN = max((US%L_to_Z*(CS%density_ice * CS%g_Earth) * &
                 (max(ISS%h_shelf(i,j), CS%min_h_shelf) - Hf)), CS%CF_MinN)
-      CS%fB_elem(i,j) = CS%alpha_coulomb * &
-          (CS%C_basal_friction(i,j) / (CS%CF_Max * fN))**(CS%coulomb_pp_n)
+      if (fN > 0.0) then
+        CS%fB_elem(i,j) = CS%alpha_coulomb * &
+            (CS%C_basal_friction(i,j) / (CS%CF_Max * fN))**(CS%coulomb_pp_n)
+      else
+        ! Zero effective pressure (only reachable with CF_MinN <= 0, in a floating cell, which
+        ! CISM_FRICTION='integrate' can apply friction to): no Coulomb drag.
+        CS%fB_elem(i,j) = FB_NO_COULOMB_DRAG
+      endif
     else
       CS%fB_elem(i,j) = 0.0
     endif
   enddo ; enddo
 
 end subroutine calc_shelf_basal_prefactors
+
+!> Pre-compute the nodal basal-friction prefactors for CISM_FRICTION='local'. C_basal_friction is a
+!! static bed property defined under grounded, floating, and ice-free cells alike, so the nodal C is
+!! an area-weighted average over all four in-domain cells around the node -- the nodal C does not
+!! change as the (grounded) ice front moves across the node. The Coulomb effective pressure is instead
+!! an ice-state quantity: it is formed and capped to [0, overburden] in each cell and then averaged
+!! over all four in-domain cells (ice-free cells contributing zero), as CISM does. These are
+!! velocity-independent, so they are computed once per solve alongside calc_shelf_basal_prefactors.
+!! Node (I,J) is the NE corner of cell (i,j); its four surrounding cells are
+!! (I,J),(I+1,J),(I,J+1),(I+1,J+1).
+subroutine calc_shelf_basal_prefactors_node(CS, ISS, G, US)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS  !< Ice shelf dynamics control structure
+  type(ice_shelf_state),  intent(in)    :: ISS !< Ice shelf state (hmask, h_shelf)
+  type(ocean_grid_type),  intent(in)    :: G   !< The grid structure
+  type(unit_scale_type),  intent(in)    :: US  !< Unit conversion factors
+
+  real :: rho_ice_g_LtoZ ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2 ~> kg m-3 m s-2]
+  real :: Hf             ! Flotation thickness of one cell [Z ~> m]
+  real :: h_c            ! Ice thickness of one cell [Z ~> m]
+  real :: asum_all       ! Sum of all four in-domain cell areas at the node [L2 ~> m2]
+  real :: asum_ice       ! Sum of the ice-covered cell areas at the node [L2 ~> m2]
+  real :: w              ! Area weight of one cell [L2 ~> m2]
+  real, dimension(4) :: aq ! Per-cell area weight at the node, by corner slot [L2 ~> m2]
+  real, dimension(4) :: cq ! Per-cell area-weighted C_basal_friction
+                           ! [R L Z T-2 (s m-1)^n_basal_fric L2 ~> Pa (s m-1)^n_basal_fric m2]
+  real, dimension(4) :: iq ! Per-cell area weight where ice is present [L2 ~> m2]
+  real, dimension(4) :: nq ! Per-cell area-weighted effective pressure [R Z L T-2 L2 ~> Pa m2]
+  integer :: kq            ! Corner slot index: 1=SW, 2=SE, 3=NW, 4=NE
+  real :: Cw             ! Area-weighted sum of C_basal_friction over all four cells
+                         ! [R L Z T-2 (s m-1)^n_basal_fric L2 ~> Pa (s m-1)^n_basal_fric m2]
+  real :: Nw             ! Area-weighted sum of the cell effective pressures [R Z L T-2 L2 ~> Pa m2]
+  real :: C_n            ! Nodal area-weighted C_basal_friction
+                         ! [R L Z T-2 (s m-1)^n_basal_fric ~> Pa (s m-1)^n_basal_fric]
+  real :: N_n            ! Nodal area-weighted effective pressure [R Z L T-2 ~> Pa]
+  logical :: ice_here    ! True if this cell holds ice
+  integer :: I, J, ii, jj, ic, jc
+  integer :: i_off, j_off, gisc, gjsc, giec, gjec
+
+  rho_ice_g_LtoZ = US%L_to_Z * (CS%density_ice * CS%g_Earth)
+  i_off = G%idg_offset ; j_off = G%jdg_offset
+  gisc = 1 ; gjsc = 1 ; giec = G%domain%niglobal ; gjec = G%domain%njglobal
+
+  do J=G%jsd,G%jed-1 ; do I=G%isd,G%ied-1
+    C_n = 0.0 ; N_n = 0.0
+    aq(:) = 0.0 ; cq(:) = 0.0 ; iq(:) = 0.0 ; nq(:) = 0.0
+    do jj=0,1 ; jc = J+jj ; do ii=0,1 ; ic = I+ii
+      kq = 1 + ii + 2*jj   ! 1=SW, 2=SE, 3=NW, 4=NE
+      ! Skip across-wall halo cells: beyond a non-reentrant wall C_basal_friction is not read from
+      ! file and pass_var does not fill it, so it keeps the (large) allocate default and would poison
+      ! the nodal C average at wall nodes, inflating the wall-node drag and breaking meridional
+      ! symmetry (MISMIP3D y-velocity/y-slope). In-domain ice-free land cells are kept (valid C).
+      if (.not. CS%reentrant_x) then
+        if ((ic+i_off < gisc) .or. (ic+i_off > giec)) cycle
+      endif
+      if (.not. CS%reentrant_y) then
+        if ((jc+j_off < gjsc) .or. (jc+j_off > gjec)) cycle
+      endif
+      w = G%areaT(ic,jc)
+      ice_here = (ISS%hmask(ic,jc) == 1 .or. ISS%hmask(ic,jc) == 3)
+      ! C is a static bed property under floating and ice-free ice alike: average over all in-domain
+      ! cells so the nodal C is fixed by geometry, not by where the ice front happens to be.
+      aq(kq) = w
+      cq(kq) = w*CS%C_basal_friction(ic,jc)
+      if (ice_here) iq(kq) = w
+      ! CISM order of operations (glissade_basal_traction, calc_effective_pressure): form
+      ! N = rho_i*g*(H - H_f) in the cell and cap it to [0, overburden] there, then stagger N itself
+      ! to the node over ALL four in-domain cells. An ice-free cell has no overburden and so
+      ! contributes N = 0, exactly as CISM's glissade_stagger with stagger_margin = 0 does. Including
+      ! the ice-free cells is what makes the nodal N continuous as a cell gains or loses thin ice, and
+      ! capping per cell stops a deeply floating neighbor from pulling the nodal average below zero.
+      if (ice_here) then
+        h_c = max(ISS%h_shelf(ic,jc), CS%min_h_shelf)
+        Hf = max(CS%rhow_rhoi * CS%bed_elev(ic,jc), 0.0)
+        nq(kq) = w*max(min(rho_ice_g_LtoZ * (h_c - Hf), rho_ice_g_LtoZ * h_c), 0.0)
+      endif
+    enddo ; enddo
+    ! Reduce over the four cells by opposite pairs, SW+NE then SE+NW. A quarter turn
+    ! permutes the four cyclically, so this pairing is bit-for-bit rotation-invariant
+    ! while a running accumulation over the loop order is not.
+    asum_all = (aq(1) + aq(4)) + (aq(2) + aq(3))
+    Cw       = (cq(1) + cq(4)) + (cq(2) + cq(3))
+    asum_ice = (iq(1) + iq(4)) + (iq(2) + iq(3))
+    Nw       = (nq(1) + nq(4)) + (nq(2) + nq(3))
+    ! Nodal control volume for the local drag, as lumped corner areas (0.25*areaT per cell) of the
+    ! in-domain cells, which is what CISM adds to the diagonal (dx*dy) at every active vertex. It is
+    ! not areaBu: at a domain-edge node the across-wall halo cells are out of the domain, and
+    ! counting them would give the boundary node a full-strength drag while its driving stress and
+    ! viscous terms are integrated over only the interior (half) control volume, breaking the
+    ! meridional symmetry of channel configs (MISMIP3D).
+    if (asum_ice > 0.0) then
+      CS%area_node(I,J) = 0.25 * asum_all
+    else
+      ! No ice anywhere around the node: it is not an active vertex and carries no drag (CISM vmask).
+      CS%area_node(I,J) = 0.0
+    endif
+    if (CS%area_node(I,J) > 0.0) then
+      C_n = Cw/asum_all
+      CS%coef_prefactor_node(I,J) = (CS%area_node(I,J) * C_n) * US%L_T_to_m_s
+    else
+      CS%coef_prefactor_node(I,J) = 0.0
+    endif
+    CS%fB_node(I,J) = 0.0
+    if (CS%CoulombFriction .and. asum_ice > 0.0) then
+      N_n = Nw/asum_all
+      if (N_n > 0.0) then
+        CS%fB_node(I,J) = CS%alpha_coulomb * (C_n / (CS%CF_Max * N_n))**(CS%coulomb_pp_n)
+      else
+        ! A vanishing effective pressure gives no Coulomb drag at all. Zero the prefactor rather
+        ! than pass an infinite fB through the sliding law; MIN_BASAL_TRACTION is still applied
+        ! downstream, so a partly grounded node keeps its floor under BETA_LIMIT_ABSOLUTE.
+        CS%coef_prefactor_node(I,J) = 0.0
+      endif
+    endif
+  enddo ; enddo
+
+end subroutine calc_shelf_basal_prefactors_node
 
 !> Compute basal traction coefficient beta = taub/|u| [R Z T-1 ~> Pa s m-1]
 !! Basal shear stress = beta * ice speed
@@ -4956,6 +5684,259 @@ subroutine update_OD_ffrac_uncoupled(CS, G, h_shelf)
   enddo
 
 end subroutine update_OD_ffrac_uncoupled
+
+!> Grounded-area fraction of a rectangular region from the flotation function at its four
+!! corners, via the analytic bilinear-flotation area integral of the quadrant grounding-line
+!! parameterization. Ported from CISM's glissade_grounding_line.F90::compute_grounded_fraction
+!! (W. Lipscomb, Los Alamos National Laboratory; CISM is LGPL), the scheme documented in
+!! Leguy, Lipscomb & Asay-Davis (2021, The Cryosphere 15:3229-3253, sec. 2.2; orig. Leguy et al.
+!! 2014). Corners are ordered counter-clockwise from the southwest. The flotation function is
+!! positive where floating and non-positive where grounded, with the grounding line at the
+!! contour f = 0; the routine returns the fraction of the region where f <= 0.
+subroutine gl_quadrant_grounded_frac(f_flot, frac)
+  real, dimension(4), intent(in) :: f_flot !< Flotation function at the 4 CCW corners (>0 floating) [Z ~> m]
+  real,               intent(out) :: frac  !< Grounded area fraction of the region [nondim]
+
+  real :: a, b, c, d           ! Coefficients of the bilinear f(x,y) = a + b*x + c*y + d*x*y on the unit square
+  real :: f1, f2, f3, f4       ! Corner values after rotation to a canonical orientation
+  real :: f_corner             ! Area of a single triangular/curved corner region
+  real :: f_corner1, f_corner2 ! Areas of the two corner regions in the diagonal case
+  real :: f_trapezoid          ! Floating-side trapezoid area in the adjacent case
+  real :: var                  ! Sign selector for the diagonal case
+  logical, dimension(4) :: cfloat, logvar
+  logical :: adjacent          ! True if the two like corners are edge-adjacent (vs diagonal)
+  logical :: rotated           ! True if the diagonal case was rotated 90 degrees before integrating
+  integer :: nc, nfloat
+  real, parameter :: eps06 = 1.0e-6 ! Guards the small-curvature (d->0) branches
+
+  nfloat = 0
+  do nc=1,4
+    cfloat(nc) = (f_flot(nc) > 0.0)
+    if (cfloat(nc)) nfloat = nfloat + 1
+  enddo
+
+  if (nfloat == 0) then
+    frac = 1.0 ; return
+  elseif (nfloat == 4 .or. minval(f_flot) == 0.0) then
+    ! All floating, or grounded only where f == 0 exactly: treat as fully floating.
+    frac = 0.0 ; return
+  endif
+
+  if (nfloat == 1 .or. nfloat == 3) then
+    ! One corner is unlike the other three. Rotate it to the southwest (corner 1).
+    if (nfloat == 1) then
+      logvar(:) = cfloat(:)
+    else
+      logvar(:) = .not. cfloat(:)
+    endif
+    if (logvar(1)) then       ! no rotation
+      f1 = f_flot(1) ; f2 = f_flot(2) ; f3 = f_flot(3) ; f4 = f_flot(4)
+    elseif (logvar(2)) then   ! rotate 90 degrees
+      f4 = f_flot(1) ; f1 = f_flot(2) ; f2 = f_flot(3) ; f3 = f_flot(4)
+    elseif (logvar(3)) then   ! rotate 180 degrees
+      f3 = f_flot(1) ; f4 = f_flot(2) ; f1 = f_flot(3) ; f2 = f_flot(4)
+    else                      ! rotate 270 degrees
+      f2 = f_flot(1) ; f3 = f_flot(2) ; f4 = f_flot(3) ; f1 = f_flot(4)
+    endif
+    a = f1 ; b = f2 - f1 ; c = f4 - f1 ; d = (f1 + f3) - (f2 + f4)
+    ! Area of the corner region (floating if nfloat==1, grounded if nfloat==3):
+    !   d /= 0: [(bc - ad) ln|1 - ad/(bc)| + ad] / d^2 ;  d -> 0: a^2 / (2 b c)
+    if (abs((a*d)/(b*c)) > eps06) then
+      f_corner = ((b*c - a*d) * log(abs(1.0 - (a*d)/(b*c))) + a*d) / (d*d)
+    else
+      f_corner = (a*a) / (2.0*b*c)
+    endif
+    if (nfloat == 1) then  ! f_corner is the floating area
+      frac = 1.0 - f_corner
+    else                   ! f_corner is the grounded area
+      frac = f_corner
+    endif
+
+  else  ! nfloat == 2
+    if (cfloat(1) .and. cfloat(2)) then       ! two floating corners adjacent; no rotation
+      adjacent = .true. ; f1 = f_flot(1) ; f2 = f_flot(2) ; f3 = f_flot(3) ; f4 = f_flot(4)
+    elseif (cfloat(2) .and. cfloat(3)) then   ! rotate 90 degrees
+      adjacent = .true. ; f4 = f_flot(1) ; f1 = f_flot(2) ; f2 = f_flot(3) ; f3 = f_flot(4)
+    elseif (cfloat(3) .and. cfloat(4)) then   ! rotate 180 degrees
+      adjacent = .true. ; f3 = f_flot(1) ; f4 = f_flot(2) ; f1 = f_flot(3) ; f2 = f_flot(4)
+    elseif (cfloat(4) .and. cfloat(1)) then   ! rotate 270 degrees
+      adjacent = .true. ; f2 = f_flot(1) ; f3 = f_flot(2) ; f4 = f_flot(3) ; f1 = f_flot(4)
+    else                                      ! two floating corners diagonally opposite
+      adjacent = .false.
+      var = f_flot(2)*f_flot(4) - f_flot(1)*f_flot(3)
+      if (var >= 0.0) then
+        f1 = f_flot(1) ; f2 = f_flot(2) ; f3 = f_flot(3) ; f4 = f_flot(4) ; rotated = .false.
+      else
+        f4 = f_flot(1) ; f1 = f_flot(2) ; f2 = f_flot(3) ; f3 = f_flot(4) ; rotated = .true.
+      endif
+    endif
+    a = f1 ; b = f2 - f1 ; c = f4 - f1 ; d = (f1 + f3) - (f2 + f4)
+    if (adjacent) then
+      ! Floating-side trapezoid area:
+      !   d /= 0: [(bc - ad) ln(1 + d/c) - bd] / d^2 ;  d -> 0: -(2a + b) / (2c)
+      if (abs(d/c) > eps06) then
+        f_trapezoid = ((b*c - a*d) * log(1.0 + d/c) - b*d) / (d*d)
+      else
+        f_trapezoid = -(2.0*a + b) / (2.0*c)
+      endif
+      frac = 1.0 - f_trapezoid
+    else
+      ! Two opposite corner regions; lower-left integral plus upper-right integral.
+      if (abs(b*c - a*d) > eps06) then
+        f_corner1 = ((b*c - a*d) * log(abs(1.0 - (a*d)/(b*c))) + a*d) / (d*d)
+        f_corner2 = ((b*c - a*d) * log(abs((b*c - a*d)/((b+d)*(c+d)))) + d*((a+b)+(c+d))) / (d*d)
+      else
+        f_corner1 = (a*a) / (b*c)
+        f_corner2 = ((a+b)*(a+c)) / (b*c)
+      endif
+      if (f_flot(1) > 0.0) then  ! southwest corner floating
+        if (rotated) then ; frac = f_corner1 + f_corner2
+        else              ; frac = 1.0 - (f_corner1 + f_corner2) ; endif
+      else                       ! southwest corner grounded
+        if (rotated) then ; frac = 1.0 - (f_corner1 + f_corner2)
+        else              ; frac = f_corner1 + f_corner2 ; endif
+      endif
+    endif
+  endif
+
+  ! Guard against small round-off excursions outside the physical range.
+  frac = min(max(frac, 0.0), 1.0)
+
+end subroutine gl_quadrant_grounded_frac
+
+!> Compute the analytic grounded ice fraction at B-grid nodes (CS%f_ground_node, for basal
+!! friction) and at cell centers (CS%f_ground_cell, to select the cells that carry friction) using
+!! the quadrant grounding-line parameterization of Leguy et al. (2021). Each cell is split into
+!! four quadrants; the grounded area of every quadrant is integrated analytically by
+!! gl_quadrant_grounded_frac and the shared quadrant areas are summed to the surrounding node
+!! (averaged over its 4 quadrants) and to the host cell (averaged over its 4 in-cell quadrants),
+!! so the node and cell grounded areas stay mutually consistent. Cell-mean thickness (h_shelf)
+!! and bed (bed_elev) are used.
+subroutine compute_gl_quadrant_fractions(CS, ISS, G)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS  !< The ice shelf dynamics control structure
+  type(ice_shelf_state),  intent(in)    :: ISS !< A structure describing the ice-shelf state
+  type(ocean_grid_type),  intent(in)    :: G   !< The grid structure used by the ice shelf
+
+  real, dimension(SZDI_(G),SZDJ_(G)) :: f_flot ! Cell-center flotation function (>0 floating) [Z ~> m]
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: ice_cell ! True where ice is present (grounded or floating)
+  real, allocatable, dimension(:,:,:) :: fgq    ! Grounded fraction of the 4 quadrants around each node [nondim]
+  real, dimension(4) :: fv                       ! Flotation at the 4 CCW corners of one quadrant [Z ~> m]
+  real :: f_flot_land_min                        ! Minimum depth below sea level assigned to a land cell
+                                                 ! in the LINEARB flotation function [Z ~> m]
+  real :: f_flot_marine_min                      ! Minimum magnitude of f_flot in a marine cell under
+                                                 ! the LINEARB flotation function [Z ~> m]
+  real :: h_cell                                 ! Ice thickness used in the flotation function [Z ~> m]
+  logical :: filled                              ! True once an ice-free cell has an ice neighbor to copy from
+  logical :: vmask                               ! True if the node has at least one ice-covered neighbor cell
+  integer :: i, j, ii, jj, isd, ied, jsd, jed, isc, iec, jsc, jec
+  integer :: i_in, j_in, i_off, j_off, gisc, gjsc, giec, gjec
+
+  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+  isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
+  ! CISM's f_flotation_land_topg_min and f_flotation_marine_min (glissade_grounding_line).
+  f_flot_land_min   = 50.0 * G%US%m_to_Z
+  f_flot_marine_min = 1.0e-4 * G%US%m_to_Z
+  i_off = G%idg_offset ; j_off = G%jdg_offset
+  gisc = 1 ; gjsc = 1 ; giec = G%domain%niglobal ; gjec = G%domain%njglobal
+
+  ! Cell-center flotation function (Leguy 2021 "linear" form = ocean cavity thickness): f > 0 where
+  ! floating, f <= 0 where grounded, with the grounding line at f = 0. Sign matches the existing
+  ! cell-center flotation test rhoi_rhow*h - bed (grounded when positive). Note CS%bed_elev is the
+  ! depth of the bed below sea level, so it is CISM's -(topg - eus) and a land cell has bed_elev < 0.
+  do j=jsd,jed ; do i=isd,ied
+    ice_cell(i,j) = (ISS%hmask(i,j) == 1 .or. ISS%hmask(i,j) == 3)
+    ! CISM HO_FLOTATION_FUNCTION_LINEARB: evaluate the same expression in every cell, so an ice-free
+    ! cell reports its own bed rather than an extrapolated neighbor value, and no extrapolation pass
+    ! is needed. Cells whose bed stands above sea level are land and are made strongly grounded with
+    ! a floor on the assumed freeboard, and |f| is floored in marine cells for robustness.
+    if (CS%bed_elev(i,j) <= 0.0) then   ! land: the bed stands at or above sea level
+      f_flot(i,j) = min(CS%bed_elev(i,j), -f_flot_land_min)
+    else
+      h_cell = 0.0
+      if (ice_cell(i,j)) h_cell = max(ISS%h_shelf(i,j), CS%min_h_shelf)
+      f_flot(i,j) = CS%bed_elev(i,j) - CS%rhoi_rhow * h_cell
+      if (abs(f_flot(i,j)) < f_flot_marine_min) &
+        f_flot(i,j) = sign(f_flot_marine_min, f_flot(i,j))
+    endif
+  enddo ; enddo
+
+  ! Under LINEARB the halo across a solid (non-reentrant) wall would otherwise be read as real ocean:
+  ! it holds bed_elev = 0 there (no neighbor PE fills it), which the expression above turns into a
+  ! barely floating marine cell and which would then unground the wall nodes. Fill those cells by
+  ! zero-gradient extension of the nearest in-domain cell, so a wall bounding grounded ice stays
+  ! grounded and one bounding a shelf stays floating.
+  do j=jsd,jed ; do i=isd,ied
+    i_in = i ; j_in = j
+    if (.not. CS%reentrant_x) i_in = min(max(i+i_off, gisc), giec) - i_off
+    if (.not. CS%reentrant_y) j_in = min(max(j+j_off, gjsc), gjec) - j_off
+    if ((i_in /= i) .or. (j_in /= j)) then
+      if ((i_in >= isd) .and. (i_in <= ied) .and. (j_in >= jsd) .and. (j_in <= jed)) &
+        f_flot(i,j) = f_flot(i_in,j_in)
+    endif
+  enddo ; enddo
+
+  call pass_var(f_flot, G%Domain)
+
+  allocate(fgq(4,isd:ied,jsd:jed), source=0.0)
+  CS%f_ground_node(:,:) = 0.0
+  CS%f_ground_cell(:,:) = 0.0
+
+  ! Per-node quadrant fractions. Node (I,J) is the NE corner of cell (i,j); the four cells around
+  ! it are (i,j), (i+1,j), (i+1,j+1), (i,j+1) (the CISM vertex convention). Each quadrant's corner
+  ! values are the cell-center field interpolated to {cell center, two edge midpoints,
+  ! node}. Only nodes with at least one ice-covered neighbor (vmask) are computed; nodes surrounded
+  ! entirely by ice-free ocean stay floating (f_ground_node = 0), matching CISM's vmask gate.
+  do j=jsd,jed-1 ; do i=isd,ied-1
+    vmask = (ice_cell(i,j) .or. ice_cell(i+1,j)) .or. (ice_cell(i,j+1) .or. ice_cell(i+1,j+1))
+    if (.not. vmask) cycle
+    ! Quadrant 1: NE quarter of cell (i,j) (southwest of the node)
+    fv(1) =        f_flot(i,j)
+    fv(2) = 0.5 * (f_flot(i,j)   + f_flot(i+1,j))
+    fv(3) = 0.25*((f_flot(i,j) + f_flot(i+1,j+1)) + (f_flot(i+1,j) + f_flot(i,j+1)))
+    fv(4) = 0.5 * (f_flot(i,j)   + f_flot(i,j+1))
+    call gl_quadrant_grounded_frac(fv, fgq(1,i,j))
+    ! Quadrant 2: NW quarter of cell (i+1,j) (southeast of the node)
+    fv(1) = 0.5 * (f_flot(i+1,j) + f_flot(i,j))
+    fv(2) =        f_flot(i+1,j)
+    fv(3) = 0.5 * (f_flot(i+1,j) + f_flot(i+1,j+1))
+    fv(4) = 0.25*((f_flot(i,j) + f_flot(i+1,j+1)) + (f_flot(i+1,j) + f_flot(i,j+1)))
+    call gl_quadrant_grounded_frac(fv, fgq(2,i,j))
+    ! Quadrant 3: SW quarter of cell (i+1,j+1) (northeast of the node)
+    fv(1) = 0.25*((f_flot(i,j) + f_flot(i+1,j+1)) + (f_flot(i+1,j) + f_flot(i,j+1)))
+    fv(2) = 0.5 * (f_flot(i+1,j+1) + f_flot(i+1,j))
+    fv(3) =        f_flot(i+1,j+1)
+    fv(4) = 0.5 * (f_flot(i+1,j+1) + f_flot(i,j+1))
+    call gl_quadrant_grounded_frac(fv, fgq(3,i,j))
+    ! Quadrant 4: SE quarter of cell (i,j+1) (northwest of the node)
+    fv(1) = 0.5 * (f_flot(i,j+1) + f_flot(i,j))
+    fv(2) = 0.25*((f_flot(i,j) + f_flot(i+1,j+1)) + (f_flot(i+1,j) + f_flot(i,j+1)))
+    fv(3) = 0.5 * (f_flot(i,j+1) + f_flot(i+1,j+1))
+    fv(4) =        f_flot(i,j+1)
+    call gl_quadrant_grounded_frac(fv, fgq(4,i,j))
+
+    ! Quadrants 1..4 run SW, SE, NE, NW around the node, so a quarter turn permutes them
+    ! cyclically. Pairing opposite quadrants makes the sum bit-for-bit rotation-invariant:
+    ! the shift maps the two partial sums onto each other, and their addition commutes.
+    ! Pairing adjacent quadrants would instead regroup the four addends and change the
+    ! rounding. Same convention as the CG_action reductions in this module.
+    CS%f_ground_node(i,j) = 0.25*((fgq(1,i,j) + fgq(3,i,j)) + (fgq(2,i,j) + fgq(4,i,j)))
+  enddo ; enddo
+
+  ! Per-cell grounded fraction = mean of the four in-cell quadrants, taken from the node sums
+  ! above so the cell and node grounded areas are built from the same quadrant areas. Cell (i,j)
+  ! collects quadrant 3 of node (i-1,j-1), quadrant 4 of node (i,j-1), quadrant 1 of node (i,j),
+  ! and quadrant 2 of node (i-1,j).
+  do j=jsd+1,jed-1 ; do i=isd+1,ied-1
+    CS%f_ground_cell(i,j) = 0.25*((fgq(3,i-1,j-1) + fgq(1,i,j)) + (fgq(4,i,j-1) + fgq(2,i-1,j)))
+  enddo ; enddo
+
+  deallocate(fgq)
+  call pass_var(CS%f_ground_cell, G%Domain)
+  call pass_var(CS%f_ground_node, G%Domain, position=CORNER)
+
+end subroutine compute_gl_quadrant_fractions
+
+
 
 subroutine change_in_draft(CS, G, h_shelf0, h_shelf1, ddraft)
   type(ice_shelf_dyn_CS), intent(inout) :: CS !< A pointer to the ice shelf control structure
@@ -5473,6 +6454,8 @@ subroutine ice_shelf_dyn_end(CS)
   deallocate(CS%newton_visc_factor, CS%newton_str_ux, CS%newton_str_vy, CS%newton_str_sh)
   deallocate(CS%C_basal_friction)
   deallocate(CS%coef_prefactor, CS%fB_elem)
+  deallocate(CS%coef_prefactor_node, CS%fB_node, CS%area_node)
+  deallocate(CS%f_ground_node, CS%f_ground_cell)
   deallocate(CS%OD_rt, CS%OD_av)
   deallocate(CS%t_bdry_val, CS%bed_elev)
   deallocate(CS%ground_frac, CS%ground_frac_rt)
