@@ -713,6 +713,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! grounding line crosses, with corner bounds mapped from the surface.
   logical :: dg_lim_edge_mirror   !< If true, the face pass of the grounded limiter takes the cell means beyond a
                                   !! domain edge that is not reentrant as the mirror image of the cells inside.
+  integer :: dg_lim_twist_fb = 0  !< DG1_LIMITER_CROSSED_TWIST_FALLBACK: 0 remove the twist, 1 the least largest
+                                  !! violation.
   logical :: dg_lim_crossed_straddle !< If true, dg_lim_crossed also treats the two cells of a face the
                                   !! grounding line lies on: a grounded and a floating corner at one node, neither
                                   !! cell crossed.
@@ -12028,6 +12030,7 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   character(len=16) :: speed_where_str ! DG1_TILT_RELAX_SPEED_LAW_WHERE
   character(len=16) :: bounded_mean_str ! DG1_TILT_RELAX_BOUNDED_MEAN
   character(len=16) :: kink_allow_str   ! DG1_ART_VISC_KINK_ALLOW
+  character(len=40) :: twist_fb_str ! DG1_LIMITER_CROSSED_TWIST_FALLBACK
 
 
   call get_param(param_file, mdl, "DG_BASAL_SOURCE_SCHEME", src_scheme_str, &
@@ -12773,6 +12776,21 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "limits.  ground_frac (the quadrature points, refreshed at velocity solves) still serves the "//&
                  "friction, the driving stress, the band diffusion and the tilt relaxation.", &
                  default=.false., do_not_log=.not.CS%use_DG_thickness)
+  call get_param(param_file, mdl, "DG1_LIMITER_CROSSED_TWIST_FALLBACK", twist_fb_str, &
+                 "What the vertex pass of DG1_LIMITER_CROSSED, which changes only the twist of a crossed cell, "//&
+                 "does where no twist factor in [0, 1] keeps every corner in its bounds.  'REMOVE': the factor 0 "//&
+                 "(the whole twist goes), which can push a corner farther out of its bounds.  'LEAST_VIOLATION': "//&
+                 "the factor with the smallest largest violation of the corners (over or under a bound alike); "//&
+                 "every corner is linear in the factor, so the search over the crossings of those lines is "//&
+                 "exact, and ties go to the largest factor (the smallest change).  It joins the factor of the "//&
+                 "feasible case continuously where the feasible range closes.", &
+                 default="REMOVE", do_not_log=.not.CS%dg_lim_crossed)
+  select case (trim(twist_fb_str))
+    case ("REMOVE") ; CS%dg_lim_twist_fb = 0
+    case ("LEAST_VIOLATION") ; CS%dg_lim_twist_fb = 1
+    case default ; call MOM_error(FATAL, "read_DG_params: DG1_LIMITER_CROSSED_TWIST_FALLBACK must be REMOVE or "//&
+                                  "LEAST_VIOLATION, not "//trim(twist_fb_str)//".")
+  end select
   call get_param(param_file, mdl, "DG1_LIMITER_CROSSED_STRADDLE", CS%dg_lim_crossed_straddle, &
                  "If true, DG1_LIMITER_CROSSED also treats, in place of the main passes, the two cells of a "//&
                  "face the grounding line lies on: at a node of the face one of the two corners is grounded "//&
@@ -14222,6 +14240,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   logical :: ok_x, ok_y ! A shift meets every bound of the face pass along x and y
   logical :: finv    ! DG1_LIMITER_FACE_INVERSION is in use
   logical :: use_ngc ! The cells are classified by their corners (DG1_LIMITER_CORNER_CLASS or DG1_GROUND_FRAC_CORNERS)
+  real, dimension(2,2) :: base_c ! Corner thicknesses of a crossed cell without its twist [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G),4) :: fr ! DG1_LIMITER_FACE_INVERSION: bounds on the mean corner thickness of
                                  ! the W, E, S and N faces of a cell [Z ~> m]
   logical, dimension(SZDI_(G),SZDJ_(G),4) :: fhas ! That face has a bound in fr
@@ -15040,7 +15059,15 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         endif
       enddo ; enddo
       phi_t = 1.0 ; phi_w = 0.0
-      if (feas .and. (p_lo <= p_hi)) phi_w = p_hi
+      if (feas .and. (p_lo <= p_hi)) then
+        phi_w = p_hi
+      elseif (CS%dg_lim_twist_fb > 0) then
+        ! DG1_LIMITER_CROSSED_TWIST_FALLBACK: the factor with the least violation in place of 0.
+        do b = 1, 2 ; do a = 1, 2
+          base_c(a,b) = hb + lin_c(a,b)
+        enddo ; enddo
+        phi_w = dg1_lim_twist_least_violation(base_c, tw_c, lo_c, hi_c)
+      endif
 
       ! Fade-in between delta and 2 delta; no band weight.
       xf = min(1.0, max(0.0, e_max / delta - 1.0))
@@ -15201,6 +15228,50 @@ pure real function dg1_lim_ground_allow(ng, sb, d0, curv)
     dg1_lim_ground_allow = max(d0, curv * abs((sb(1) + sb(3)) - 2.0*sb(2)))
   endif
 end function dg1_lim_ground_allow
+
+!> DG1_LIMITER_CROSSED_TWIST_FALLBACK: the twist factor in [0, 1] with the least violation, where none keeps every
+!! corner in its bounds.  Corner c is base(c) + phi tw(c); its violation is the larger of its excess over hi(c) and its
+!! shortfall below lo(c), or 0.  The largest violation is convex and piecewise linear in phi, so its least value lies
+!! at 0, 1, a zero of one of the lines, or a crossing of two; these candidates are compared exactly.  Ties go to
+!! the largest factor.  The candidates come in pairs that a rotation or reflection of the cell only reorders, and the
+!! choice does not depend on their order, so the result keeps the symmetry of the grid.
+pure real function dg1_lim_twist_least_violation(base, tw, lo, hi)
+  real, dimension(2,2),    intent(in) :: base !< Corner thicknesses without the twist [Z ~> m]
+  real, dimension(2,2),    intent(in) :: tw   !< Twist of each corner at factor 1 [Z ~> m]
+  real, dimension(2,2),    intent(in) :: lo   !< Lower bounds of the corners [Z ~> m]
+  real, dimension(2,2),    intent(in) :: hi   !< Upper bounds of the corners [Z ~> m]
+  real, dimension(8) :: sl, ic   ! Slopes [Z ~> m] and intercepts [Z ~> m] of the violation lines
+  real, dimension(38) :: cand    ! Candidate factors [nondim]
+  real :: p, v, best_v, best_p
+  integer :: nl, nc, k, m, a, b
+
+  nl = 0
+  do b = 1, 2 ; do a = 1, 2
+    if (tw(a,b) == 0.0) cycle
+    nl = nl + 1 ; sl(nl) = tw(a,b) ; ic(nl) = base(a,b) - hi(a,b)    ! excess over hi
+    nl = nl + 1 ; sl(nl) = -tw(a,b) ; ic(nl) = lo(a,b) - base(a,b)   ! shortfall below lo
+  enddo ; enddo
+  nc = 2 ; cand(1) = 0.0 ; cand(2) = 1.0
+  do k = 1, nl
+    nc = nc + 1 ; cand(nc) = min(max(-ic(k) / sl(k), 0.0), 1.0)
+    do m = k + 1, nl
+      if (sl(k) /= sl(m)) then
+        nc = nc + 1 ; cand(nc) = min(max((ic(m) - ic(k)) / (sl(k) - sl(m)), 0.0), 1.0)
+      endif
+    enddo
+  enddo
+  best_p = 0.0 ; best_v = huge(1.0)
+  do k = 1, nc
+    p = cand(k) ; v = 0.0
+    do b = 1, 2 ; do a = 1, 2
+      v = max(v, max((base(a,b) + p * tw(a,b)) - hi(a,b), lo(a,b) - (base(a,b) + p * tw(a,b))))
+    enddo ; enddo
+    if ((v < best_v) .or. ((v == best_v) .and. (p > best_p))) then
+      best_p = p ; best_v = v
+    endif
+  enddo
+  dg1_lim_twist_least_violation = best_p
+end function dg1_lim_twist_least_violation
 
 !> DG1_LIMITER_FACE_INVERSION: whether a corner value v (cell mean vb) and the value w of the other cell at its node
 !! (cell mean wb) form a Gibbs pair: v above vb, w below wb, and v - w larger than vb - wb, each by more than d0.
