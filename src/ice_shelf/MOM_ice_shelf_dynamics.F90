@@ -734,7 +734,6 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! thickness order is the reverse of the cell means, downstream of the face, is
                                   !! held at or below the upstream trace where a grounded corner there oscillates.
   real :: dg_lim_face_inv_spike   !< dg_lim_face_inv: the smallest grounded excess of a corner it acts on [Z ~> m].
-  real :: dg_lim_face_inv_umin    !< dg_lim_face_inv: the smallest normal speed at a face it acts on [L T-1 ~> m s-1].
   logical :: dg_fc_on = .false.   !< If true, the band, the artificial viscosity and the grounded limiter classify the
                                   !! cells and measure the distance to the grounding line from dg_fc, at every stage.
   real, pointer, dimension(:,:) :: dg_fc => NULL() !< Grounded area fraction of each ice cell from its four corners
@@ -12739,9 +12738,9 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "order of the cell means (hbar_A < hbar_B but F_A > F_B, F the mean of a cell's two corner "//&
                  "thicknesses on the face, each by more than 0.5 m) takes the bound F_A <= max(F_B, hbar_A) "//&
                  "+ 0.5 m in thickness, on entry, where: B is upstream of A (at both quadrature points of the "//&
-                 "face, the normal velocity that the upwind flux of the advection reads flows from B into A, "//&
-                 "faster than DG1_LIMITER_FACE_INVERSION_U_MIN), so that B's trace is the one the upwind flux "//&
-                 "carries and A's is not used by it; a corner of A "//&
+                 "face, the normal velocity that the upwind flux of the advection reads flows from B into A, so "//&
+                 "that the flux carries B's trace and does not use A's; a face where that velocity is 0 or "//&
+                 "flows the other way at either point is left alone); a corner of A "//&
                  "on the face is grounded, more than DG1_LIMITER_FACE_INVERSION_SPIKE above every grounded "//&
                  "value at its node (the means of the wholly grounded cells and the grounded corners of the "//&
                  "other cells there), and a Gibbs pair with B's corner at that node in both surface and "//&
@@ -12756,12 +12755,6 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "The smallest excess of a grounded corner above every grounded value at its node that "//&
                  "DG1_LIMITER_FACE_INVERSION acts on.", &
                  units="m", default=5.0, scale=US%m_to_Z, do_not_log=.not.CS%dg_lim_face_inv)
-  call get_param(param_file, mdl, "DG1_LIMITER_FACE_INVERSION_U_MIN", CS%dg_lim_face_inv_umin, &
-                 "The smallest normal speed at both quadrature points of a face, from B into A, that "//&
-                 "DG1_LIMITER_FACE_INVERSION acts on; a face where the flow reverses along it, or is slower, is "//&
-                 "left alone, so the choice of the upstream cell does not flip with the sign of a speed near 0.", &
-                 units="m yr-1", default=1.0, scale=US%m_s_to_L_T/(365.0*86400.0), &
-                 do_not_log=.not.CS%dg_lim_face_inv)
   if (CS%dg_lim_face_inv .and. (.not.CS%dg_lim_grounded_upper)) &
     call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG1_LIMITER_FACE_INVERSION needs DG1_LIMITER_GROUNDED_UPPER.")
   call get_param(param_file, mdl, "DG1_GROUND_FRAC_CORNERS", CS%dg_fc_on, &
@@ -14478,7 +14471,8 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         if ((hmask(ib,jb) /= 1.0) .or. (.not.in_dom(ib,jb))) cycle
         if ((ngc(i,j) == 4) .and. (ngc(ib,jb) == 4)) cycle
         ! B is upstream: at both quadrature points of the face, the normal velocity that the upwind flux of the
-        ! advection reads flows from B into A.  A's trace on the face is then not used by that flux.
+        ! advection reads flows from B into A, so the flux carries B's trace and does not use A's.  A speed of exactly
+        ! 0 carries nothing either way and is left alone, which also keeps the test the same on every side.
         if (k == 1) then
           un1 = (gq2*CS%u_shelf(i-1,j-1)) + (gq1*CS%u_shelf(i-1,j))
           un2 = (gq1*CS%u_shelf(i-1,j-1)) + (gq2*CS%u_shelf(i-1,j))
@@ -14492,7 +14486,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
           un1 = -((gq2*CS%v_shelf(i-1,j)) + (gq1*CS%v_shelf(i,j)))
           un2 = -((gq1*CS%v_shelf(i-1,j)) + (gq2*CS%v_shelf(i,j)))
         endif
-        if (min(un1, un2) <= CS%dg_lim_face_inv_umin) cycle
+        if (min(un1, un2) <= 0.0) cycle
         f_a = 0.5*(CS%h_nodal(i,j,ca(1,1,k),ca(2,1,k)) + CS%h_nodal(i,j,ca(1,2,k),ca(2,2,k)))
         f_b = 0.5*(CS%h_nodal(ib,jb,cb(1,1,k),cb(2,1,k)) + CS%h_nodal(ib,jb,cb(1,2,k),cb(2,2,k)))
         if (.not.((hbar_e(i,j) < hbar_e(ib,jb) - CS%dg_lim_d0) .and. (f_a > f_b + CS%dg_lim_d0))) cycle
