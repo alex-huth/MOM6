@@ -725,6 +725,9 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! (some grounded, some floating), not from ground_frac, and a wholly grounded
                                   !! or floating cell whose surface pass would move a corner across flotation goes
                                   !! to the crossed pass instead of being left unchanged.
+  logical :: dg_lim_grounded_upper !< If true, the upper bounds of grounded values near the grounding line come
+                                  !! from grounded values only: a one-sided face allowance, and an upper bound on
+                                  !! the grounded corners of crossed cells without the flat-cell term.
   real, pointer, dimension(:,:,:) :: dg_lim_phi => NULL() !< Grounded limiter: the smallest tilt (1) and
                                   !! twist (2) factors of each cell over the stages of the last step [nondim].
   real, pointer, dimension(:,:,:) :: dg_lim_stat => NULL() !< Grounded limiter statistics of each cell, summed
@@ -12670,6 +12673,24 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  default=.false., do_not_log=.not.CS%dg_lim_crossed)
   if (CS%dg_lim_corner_class .and. (.not.CS%dg_lim_crossed)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics: DG1_LIMITER_CORNER_CLASS needs DG1_LIMITER_CROSSED.")
+  call get_param(param_file, mdl, "DG1_LIMITER_GROUNDED_UPPER", CS%dg_lim_grounded_upper, &
+                 "If true, with DG1_LIMITER_CORNER_CLASS and DG1_LIMITER_FACE_BOUNDS, the upper bounds of "//&
+                 "grounded values near the grounding line come from grounded values only; the lower bounds "//&
+                 "do not change.  (1) A face whose two corners are grounded takes, for its upper bound, the "//&
+                 "allowance from the second difference of three wholly grounded cells: centred if possible "//&
+                 "(as before), else the three cells on the grounded side next to the face, else 0.5 m; it is "//&
+                 "never larger than the centred allowance.  The centred second difference spans the surface "//&
+                 "kink at the line, so it let a grounded surface rise far above the cells around it.  (2) "//&
+                 "Each corner of a crossed cell is held, in the face pass (through the tilt shifts) and in "//&
+                 "the vertex pass, below the largest of the cell means at its node and the grounded corners "//&
+                 "of the other cells at that node, and never below the flotation surface there; the surface "//&
+                 "of the flat cell no longer widens this bound.  Where no shift meets every bound, the shift "//&
+                 "nearest 0 that meets these corner bounds is taken.  The face pass skips (2) where the cell "//&
+                 "mean is a smooth extremum, as the vertex pass does.", &
+                 default=.false., do_not_log=.not.CS%dg_lim_corner_class)
+  if (CS%dg_lim_grounded_upper .and. ((.not.CS%dg_lim_corner_class) .or. (.not.CS%dg_lim_face))) &
+    call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG1_LIMITER_GROUNDED_UPPER needs DG1_LIMITER_CORNER_CLASS "//&
+                   "and DG1_LIMITER_FACE_BOUNDS.")
   call get_param(param_file, mdl, "DG1_LIMITER_CROSSED_STRADDLE", CS%dg_lim_crossed_straddle, &
                  "If true, DG1_LIMITER_CROSSED also treats, in place of the main passes, the two cells of a "//&
                  "face the grounding line lies on: at a node of the face one of the two corners is grounded "//&
@@ -13956,6 +13977,17 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   real :: dm_x, dp_x, dm_y, dp_y ! Floors of the face allowances of the four faces of a crossed cell [Z ~> m]
   real :: cv_x, cv_y ! Curvature parts of the face allowances of a crossed cell [Z ~> m]
   real :: sl         ! d(corner surface)/d(corner thickness) of one corner [nondim]
+  logical :: gup     ! DG1_LIMITER_GROUNDED_UPPER is in use
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: sc_ent ! Corner surfaces on entry [Z ~> m]
+  logical, dimension(SZDI_(G),SZDJ_(G),2,2) :: gr_ent ! The corner is grounded on entry
+  real, dimension(SZDI_(G),SZDJ_(G),4) :: ag ! Grounded upper face allowances of the W, E, S and N faces [Z ~> m]
+  real, dimension(2,2) :: ucor ! DG1_LIMITER_GROUNDED_UPPER: upper bound of each corner surface [Z ~> m]
+  real, dimension(2,2) :: hmx  ! The corner thicknesses at those bounds plus d0 [Z ~> m]
+  real :: ga_x, gb_x, ga_y, gb_y ! Shifts allowed by the corner upper bounds along x and y [Z ~> m]
+  real :: s_fl       ! Flotation surface at a node [Z ~> m]
+  logical :: smooth_c ! The crossed cell mean is a smooth extremum
+  logical :: ok_x, ok_y ! A shift meets every bound of the face pass along x and y
+  integer :: ii, jj  ! Indices of a cell at a node
   real, dimension(SZDI_(G),SZDJ_(G),2) :: sw_lo, sw_hi ! Shifts of the x and y tilts the sweep may take [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G),2) :: sw_p ! Shifts of the x and y tilts chosen by the sweep [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: h_c ! Corner thicknesses before the troubled-cell passes [Z ~> m]
@@ -14119,6 +14151,31 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
     enddo ; enddo
   endif
 
+  ! DG1_LIMITER_GROUNDED_UPPER: the corner surfaces and branches on entry, and the upper face allowances from
+  ! three wholly grounded cells (ngc = 4), centred if possible, else the three on the grounded side next to the face.
+  gup = CS%dg_lim_grounded_upper
+  if (gup) then
+    if ((isc - isd < 4) .or. (jsc - jsd < 4)) call MOM_error(FATAL, &
+        "MOM_ice_shelf_dynamics: DG1_LIMITER_GROUNDED_UPPER needs a halo of at least 4 cells.")
+    sc_ent(:,:,:,:) = 0.0 ; gr_ent(:,:,:,:) = .false. ; ag(:,:,:) = CS%dg_lim_d0
+    do j = jsd+1, jed ; do i = isd+1, ied
+      if ((hmask(i,j) /= 1.0) .and. (hmask(i,j) /= 3.0)) cycle
+      do b = 1, 2 ; do a = 1, 2
+        d_c = CS%bed_node(i-2+a,j-2+b)
+        gr_ent(i,j,a,b) = (d_c <= 0.0) .or. (rr * CS%h_nodal(i,j,a,b) >= d_c)
+        sc_ent(i,j,a,b) = max(CS%h_nodal(i,j,a,b) - d_c, (1.0 - rr) * CS%h_nodal(i,j,a,b))
+        if (d_c <= 0.0) sc_ent(i,j,a,b) = CS%h_nodal(i,j,a,b) - d_c
+      enddo ; enddo
+    enddo ; enddo
+    do j = jsc, jec ; do i = isc, iec
+      if (hmask(i,j) /= 1.0) cycle
+      ag(i,j,1) = dg1_lim_ground_allow(ngc(i-3:i+1,j), sbar_f(i-3:i+1,j), CS%dg_lim_d0, CS%dg_lim_face_curv)
+      ag(i,j,2) = dg1_lim_ground_allow(ngc(i+3:i-1:-1,j), sbar_f(i+3:i-1:-1,j), CS%dg_lim_d0, CS%dg_lim_face_curv)
+      ag(i,j,3) = dg1_lim_ground_allow(ngc(i,j-3:j+1), sbar_f(i,j-3:j+1), CS%dg_lim_d0, CS%dg_lim_face_curv)
+      ag(i,j,4) = dg1_lim_ground_allow(ngc(i,j+3:j-1:-1), sbar_f(i,j+3:j-1:-1), CS%dg_lim_d0, CS%dg_lim_face_curv)
+    enddo ; enddo
+  endif
+
   ! Corner bounds; corner (I,J) is shared by cells i = I, I+1 and j = J, J+1.
   nmin(:,:) = 0.0 ; nmax(:,:) = 0.0
   do J = jsc-1, jec ; do I = isc-1, iec
@@ -14191,10 +14248,16 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         ! face, so a face that is continuous now is never cut.  A face to an ice-free cell sets no bound.
         call dg1_lim_face_bounds(sbar_f(i,j), al_x, f_use(i-1,j), f_ice(i-1,j), sbar_f(i-1,j), trc(i-1,j,2), lo_m, hi_m)
         call dg1_lim_face_bounds(sbar_f(i,j), al_x, f_use(i+1,j), f_ice(i+1,j), sbar_f(i+1,j), trc(i+1,j,1), lo_p, hi_p)
+        if (gup .and. (.not.flt_c)) then
+          hi_m = (hi_m - al_x) + min(al_x, ag(i,j,1)) ; hi_p = (hi_p - al_x) + min(al_x, ag(i,j,2))
+        endif
         phi_x = dg1_lim_face_factor(0.5*(s_c(1,1) + s_c(1,2)), t_x*(-0.5 - m_x), f_use(i-1,j), lo_m, hi_m, &
                                     0.5*(s_c(2,1) + s_c(2,2)), t_x*(0.5 - m_x), f_use(i+1,j), lo_p, hi_p)
         call dg1_lim_face_bounds(sbar_f(i,j), al_y, f_use(i,j-1), f_ice(i,j-1), sbar_f(i,j-1), trc(i,j-1,4), lo_m, hi_m)
         call dg1_lim_face_bounds(sbar_f(i,j), al_y, f_use(i,j+1), f_ice(i,j+1), sbar_f(i,j+1), trc(i,j+1,3), lo_p, hi_p)
+        if (gup .and. (.not.flt_c)) then
+          hi_m = (hi_m - al_y) + min(al_y, ag(i,j,3)) ; hi_p = (hi_p - al_y) + min(al_y, ag(i,j,4))
+        endif
         phi_y = dg1_lim_face_factor(0.5*(s_c(1,1) + s_c(2,1)), t_y*(-0.5 - m_y), f_use(i,j-1), lo_m, hi_m, &
                                     0.5*(s_c(1,2) + s_c(2,2)), t_y*(0.5 - m_y), f_use(i,j+1), lo_p, hi_p)
         phi_x = 1.0 - (1.0 - wb)*(1.0 - phi_x) ; phi_y = 1.0 - (1.0 - wb)*(1.0 - phi_y)
@@ -14389,6 +14452,27 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
               (CS%cell_mean_w(i,j,1,2) + CS%cell_mean_w(i,j,2,1)))
       if (area <= 0.0) cycle
       hb = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
+      ! DG1_LIMITER_GROUNDED_UPPER: the upper bound of each corner surface: the largest of the cell means at its node
+      ! and of the grounded corners of the other cells there (on entry), and never below the flotation surface.
+      ! hmx is the corner thickness at that surface plus d0, the most the face pass lets the corner reach.
+      if (gup) then
+        smooth_c = dg1_lim_smooth_ext(sbar(i-2:i+2,j-2:j+2), have(i-2:i+2,j-2:j+2), ratio_smooth)
+        do b = 1, 2 ; do a = 1, 2
+          d_c = CS%bed_node(i-2+a,j-2+b)
+          ucor(a,b) = nmax(i-2+a,j-2+b)
+          do n = 0, 1 ; do m = 0, 1
+            ii = i - 2 + a + m ; jj = j - 2 + b + n
+            if ((ii == i) .and. (jj == j)) cycle
+            if (hmask(ii,jj) /= 1.0) cycle
+            if (gr_ent(ii,jj,2-m,2-n)) ucor(a,b) = max(ucor(a,b), sc_ent(ii,jj,2-m,2-n))
+          enddo ; enddo
+          if (d_c > 0.0) then
+            s_fl = (1.0 - rr) * (d_c / rr)
+            ucor(a,b) = max(ucor(a,b), s_fl)
+          endif
+          hmx(a,b) = dg1_lim_h_from_s(ucor(a,b) + CS%dg_lim_d0, d_c, rr)
+        enddo ; enddo
+      endif
 
       ! The face pass on the thickness tilts, with the bounds of the face pass above.  Along each axis the
       ! two corners of a face move together as the tilt shifts, so the surface at the middle of the face is
@@ -14486,12 +14570,23 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         endif
         call dg1_lim_face_bounds(sbar_f(i,j), dm_x, f_use(i-1,j), f_ice(i-1,j), sbar_f(i-1,j), trc(i-1,j,2), lo_m, hi_m)
         call dg1_lim_face_bounds(sbar_f(i,j), dp_x, f_use(i+1,j), f_ice(i+1,j), sbar_f(i+1,j), trc(i+1,j,1), lo_p, hi_p)
-        if (CS%dg_lim_crossed_float) then
+        if (gup) then
+          ! A face whose two corners are grounded takes the grounded upper allowance.
+          if (gr_ent(i,j,1,1) .and. gr_ent(i,j,1,2)) hi_m = (hi_m - dm_x) + min(dm_x, ag(i,j,1))
+          if (gr_ent(i,j,2,1) .and. gr_ent(i,j,2,2)) hi_p = (hi_p - dp_x) + min(dp_x, ag(i,j,2))
+          ! The corner upper bounds as bounds on the shift: corner (a,b) moves by (a - 3/2 - m_x) per unit shift.
+          ga_x = pl_x ; gb_x = ph_x
+          if (.not.smooth_c) call dg1_lim_cshift_upper(CS%h_nodal(i,j,:,:), hmx, -0.5 - m_x, 0.5 - m_x, 1, ga_x, gb_x)
+          qa_x = max(qa_x, ga_x) ; qb_x = min(qb_x, gb_x)
+        endif
+        if (CS%dg_lim_crossed_float .or. gup) then
           call dg1_lim_crossed_face_shift(CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,1,2), d_n(1,1), d_n(1,2), &
                       -0.5 - m_x, f_use(i-1,j), lo_m, hi_m, &
                       CS%h_nodal(i,j,2,1), CS%h_nodal(i,j,2,2), d_n(2,1), d_n(2,2), &
                       0.5 - m_x, f_use(i+1,j), lo_p, hi_p, rr, pl_x, ph_x, &
-                      p_x, fl_x, fh_x, qa_x, qb_x)
+                      p_x, fl_x, fh_x, qa_x, qb_x, ok_x)
+          ! No shift meets every bound: the shift nearest 0 that meets the corner upper bounds.
+          if (gup .and. (.not.ok_x) .and. (ga_x <= gb_x)) p_x = min(max(0.0, ga_x), gb_x)
         else
           call dg1_lim_crossed_face_shift(CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,1,2), d_n(1,1), d_n(1,2), &
                       -0.5 - m_x, f_use(i-1,j), lo_m, hi_m, &
@@ -14501,12 +14596,20 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         endif
         call dg1_lim_face_bounds(sbar_f(i,j), dm_y, f_use(i,j-1), f_ice(i,j-1), sbar_f(i,j-1), trc(i,j-1,4), lo_m, hi_m)
         call dg1_lim_face_bounds(sbar_f(i,j), dp_y, f_use(i,j+1), f_ice(i,j+1), sbar_f(i,j+1), trc(i,j+1,3), lo_p, hi_p)
-        if (CS%dg_lim_crossed_float) then
+        if (gup) then
+          if (gr_ent(i,j,1,1) .and. gr_ent(i,j,2,1)) hi_m = (hi_m - dm_y) + min(dm_y, ag(i,j,3))
+          if (gr_ent(i,j,1,2) .and. gr_ent(i,j,2,2)) hi_p = (hi_p - dp_y) + min(dp_y, ag(i,j,4))
+          ga_y = pl_y ; gb_y = ph_y
+          if (.not.smooth_c) call dg1_lim_cshift_upper(CS%h_nodal(i,j,:,:), hmx, -0.5 - m_y, 0.5 - m_y, 2, ga_y, gb_y)
+          qa_y = max(qa_y, ga_y) ; qb_y = min(qb_y, gb_y)
+        endif
+        if (CS%dg_lim_crossed_float .or. gup) then
           call dg1_lim_crossed_face_shift(CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,2,1), d_n(1,1), d_n(2,1), &
                       -0.5 - m_y, f_use(i,j-1), lo_m, hi_m, &
                       CS%h_nodal(i,j,1,2), CS%h_nodal(i,j,2,2), d_n(1,2), d_n(2,2), &
                       0.5 - m_y, f_use(i,j+1), lo_p, hi_p, rr, pl_y, ph_y, &
-                      p_y, fl_y, fh_y, qa_y, qb_y)
+                      p_y, fl_y, fh_y, qa_y, qb_y, ok_y)
+          if (gup .and. (.not.ok_y) .and. (ga_y <= gb_y)) p_y = min(max(0.0, ga_y), gb_y)
         else
           call dg1_lim_crossed_face_shift(CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,2,1), d_n(1,1), d_n(2,1), &
                       -0.5 - m_y, f_use(i,j-1), lo_m, hi_m, &
@@ -14536,6 +14639,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         s_c(a,b) = max(CS%h_nodal(i,j,a,b) - d_c, (1.0 - rr) * CS%h_nodal(i,j,a,b))
         s_f = max(hb - d_c, (1.0 - rr) * hb)
         lo = min(nmin(i-2+a,j-2+b), s_f) ; hi = max(nmax(i-2+a,j-2+b), s_f)
+        if (gup) hi = ucor(a,b)   ! DG1_LIMITER_GROUNDED_UPPER: no flat-cell term in the upper bound
         if (CS%dg_lim_corner_class .and. CS%dg_lim_float_d0_thick) then
           ! The corner tolerance in thickness: a floating corner's excess and range are divided by 1 - r.
           sl = 1.0
@@ -14674,7 +14778,7 @@ end function dg1_lim_h_from_s
 !! no shift brings both in; the feasible interval is returned for the troubled-cell sweep.
 pure subroutine dg1_lim_crossed_face_shift(hm1, hm2, dm1, dm2, km, use_m, lo_m, hi_m, &
                                            hp1, hp2, dp1, dp2, kp, use_p, lo_p, hi_p, rr, p_min, p_max, &
-                                           p, f_lo, f_hi, qa, qb)
+                                           p, f_lo, f_hi, qa, qb, ok)
   real,    intent(in) :: hm1, hm2 !< Corner thicknesses of the minus face [Z ~> m]
   real,    intent(in) :: dm1, dm2 !< Bed depths at those corners, positive down [Z ~> m]
   real,    intent(in) :: km       !< Change of those corner thicknesses per unit shift [nondim]
@@ -14695,11 +14799,13 @@ pure subroutine dg1_lim_crossed_face_shift(hm1, hm2, dm1, dm2, km, use_m, lo_m, 
   real,    intent(out) :: f_hi    !< Largest shift that holds both faces, or p where none does [Z ~> m]
   real, optional, intent(in) :: qa !< Smallest shift allowed by DG1_LIMITER_CROSSED_FLOAT_BOUND [Z ~> m]
   real, optional, intent(in) :: qb !< Largest shift allowed by DG1_LIMITER_CROSSED_FLOAT_BOUND [Z ~> m]
+  logical, optional, intent(out) :: ok !< A shift meets every bound
 
   real :: pa_m, pb_m, pa_p, pb_p ! Feasible intervals of the shift for the two faces [Z ~> m]
   real :: p_lo, p_hi             ! The feasible interval of the shift for both faces [Z ~> m]
   logical :: ok_m, ok_p          ! The intervals are not empty
 
+  if (present(ok)) ok = .false.
   pa_m = p_min ; pb_m = p_max ; ok_m = .true.
   pa_p = p_min ; pb_p = p_max ; ok_p = .true.
   if (use_m) call dg1_lim_cface_interval(hm1, hm2, dm1, dm2, km, lo_m, hi_m, rr, p_min, p_max, pa_m, pb_m, ok_m)
@@ -14712,7 +14818,56 @@ pure subroutine dg1_lim_crossed_face_shift(hm1, hm2, dm1, dm2, km, use_m, lo_m, 
   endif
   if (p_lo > p_hi) return
   p = min(max(0.0, p_lo), p_hi) ; f_lo = p_lo ; f_hi = p_hi
+  if (present(ok)) ok = .true.
 end subroutine dg1_lim_crossed_face_shift
+
+!> DG1_LIMITER_GROUNDED_UPPER: the allowance of the upper face bound from three wholly grounded cells.  The five
+!! cells are ordered from the far side of the face inward, so that cells 3, 4, 5 are the centred triple (cell 4 is
+!! the cell itself), cells 2, 3, 4 the triple on the side of the face next to it, and cells 1, 2, 3 the next one out;
+!! the first triple whose three cells are wholly grounded gives the second difference.  Without one, d0.
+pure real function dg1_lim_ground_allow(ng, sb, d0, curv)
+  integer, dimension(5), intent(in) :: ng   !< Grounded corners of each cell, 4 = wholly grounded, -1 = no ice
+  real,    dimension(5), intent(in) :: sb   !< Cell-mean surfaces [Z ~> m]
+  real,                  intent(in) :: d0   !< Floor of the allowance [Z ~> m]
+  real,                  intent(in) :: curv !< Allowance per unit second difference [nondim]
+
+  dg1_lim_ground_allow = d0
+  if ((ng(3) == 4) .and. (ng(4) == 4) .and. (ng(5) == 4)) then
+    dg1_lim_ground_allow = max(d0, curv * abs((sb(3) + sb(5)) - 2.0*sb(4)))
+  elseif ((ng(2) == 4) .and. (ng(3) == 4) .and. (ng(4) == 4)) then
+    dg1_lim_ground_allow = max(d0, curv * abs((sb(2) + sb(4)) - 2.0*sb(3)))
+  elseif ((ng(1) == 4) .and. (ng(2) == 4) .and. (ng(3) == 4)) then
+    dg1_lim_ground_allow = max(d0, curv * abs((sb(1) + sb(3)) - 2.0*sb(2)))
+  endif
+end function dg1_lim_ground_allow
+
+!> DG1_LIMITER_GROUNDED_UPPER: narrow [ga, gb] to the shifts p of one axis of a crossed cell for which no corner
+!! thickness h + p k exceeds hmx; the corners on the minus side of the axis move by km per unit shift, those on the
+!! plus side by kp.
+pure subroutine dg1_lim_cshift_upper(hn, hmx, km, kp, axis, ga, gb)
+  real, dimension(2,2), intent(in) :: hn  !< Corner thicknesses [Z ~> m]
+  real, dimension(2,2), intent(in) :: hmx !< Largest corner thicknesses allowed [Z ~> m]
+  real,    intent(in)    :: km    !< Change of a minus-side corner per unit shift [nondim]
+  real,    intent(in)    :: kp    !< Change of a plus-side corner per unit shift [nondim]
+  integer, intent(in)    :: axis  !< 1 for x (a = 1 is the minus side), 2 for y (b = 1 is the minus side)
+  real,    intent(inout) :: ga    !< Smallest allowed shift [Z ~> m]
+  real,    intent(inout) :: gb    !< Largest allowed shift [Z ~> m]
+  real :: k ! Change of a corner per unit shift [nondim]
+  integer :: a, b
+
+  do b = 1, 2 ; do a = 1, 2
+    if (axis == 1) then
+      k = km ; if (a == 2) k = kp
+    else
+      k = km ; if (b == 2) k = kp
+    endif
+    if (k > 0.0) then
+      gb = min(gb, (hmx(a,b) - hn(a,b)) / k)
+    elseif (k < 0.0) then
+      ga = max(ga, (hmx(a,b) - hn(a,b)) / k)
+    endif
+  enddo ; enddo
+end subroutine dg1_lim_cshift_upper
 
 !> DG1_LIMITER_CROSSED: the shifts [p_min, p_max] of the thickness tilt of one axis that the face pass may take.
 !! Where both faces of the axis set a bound, every shift that keeps the four corner thicknesses at or above 0;
