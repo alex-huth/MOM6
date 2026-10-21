@@ -723,6 +723,14 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! floating cells, so their surface floor is (1 - rho_i/rho_w) dg_lim_d0.
   real, pointer, dimension(:,:,:) :: dg_lim_phi => NULL() !< Grounded limiter: the smallest tilt (1) and
                                   !! twist (2) factors of each cell over the stages of the last step [nondim].
+  real, pointer, dimension(:,:,:) :: dg_lim_stat => NULL() !< Grounded limiter statistics of each cell, summed
+                                  !! over the limiter calls since the last post: 1 vertex tilt steps, 2 those in
+                                  !! floating cells [nondim]; 3 their largest corner surface changes, 4 the corner
+                                  !! excess a twist-only vertex pass would leave [Z ~> m]; 5 steps where that
+                                  !! excess is above the trigger; 6, 7, 8 cells skipped by the branch check on
+                                  !! entry, in the face pass and in the vertex pass [nondim].
+  real :: dg_lim_nstage = 0.0     !< Limiter calls since the last post of dg_lim_stat [nondim]
+  integer, dimension(8) :: id_dg_lim_stat = -1 !< Diagnostic ids of the 8 fields of dg_lim_stat
   logical :: dg_art_visc_node_weight !< Artificial viscosity: the band weight of a face QP is interpolated along
                                   !! the face from the node weights, each the largest weight of the 4 cells there.
   real :: dg_art_visc_lump_frac  !< Artificial viscosity: the lumped fraction theta of the mass matrix whose
@@ -2182,6 +2190,31 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         CS%id_dg_lim_phi_w = register_diag_field('ice_shelf_model', 'dg_lim_phi_w', CS%diag%axesT1, Time, &
            'DG(1) grounded limiter: smallest factor on the twist over the stages of the last step, '//&
            'band weight included; 1 where it does not act', 'nondim')
+        CS%id_dg_lim_stat(1) = register_diag_field('ice_shelf_model', 'dg_lim_vtilt_frac', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: fraction of limiter calls in which the vertex pass scaled the tilts '//&
+           '(no twist factor fitted)', 'nondim')
+        CS%id_dg_lim_stat(2) = register_diag_field('ice_shelf_model', 'dg_lim_vtilt_frac_float', &
+           CS%diag%axesT1, Time, 'DG(1) grounded limiter: as dg_lim_vtilt_frac, in wholly floating cells only', &
+           'nondim')
+        CS%id_dg_lim_stat(3) = register_diag_field('ice_shelf_model', 'dg_lim_vtilt_ds', CS%diag%axesT1, Time, &
+           'DG(1) grounded limiter: largest corner surface change of the vertex tilt step, summed over its '//&
+           'steps, per limiter call', 'm', conversion=US%Z_to_m)
+        CS%id_dg_lim_stat(4) = register_diag_field('ice_shelf_model', 'dg_lim_vtilt_res', CS%diag%axesT1, Time, &
+           'DG(1) grounded limiter: corner excess that a twist-only vertex pass would leave, summed over the '//&
+           'vertex tilt steps, per limiter call', 'm', conversion=US%Z_to_m)
+        CS%id_dg_lim_stat(5) = register_diag_field('ice_shelf_model', 'dg_lim_vtilt_res_frac', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: fraction of limiter calls in which a twist-only vertex pass would '//&
+           'leave a corner excess above the trigger', 'nondim')
+        CS%id_dg_lim_stat(6) = register_diag_field('ice_shelf_model', 'dg_lim_brskip_entry', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: fraction of limiter calls that skipped a grounded or floating cell '//&
+           'because a corner was already on the other branch', 'nondim')
+        CS%id_dg_lim_stat(7) = register_diag_field('ice_shelf_model', 'dg_lim_brskip_face', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: fraction of limiter calls in which the branch check skipped the '//&
+           'face pass of a grounded or floating cell', 'nondim')
+        CS%id_dg_lim_stat(8) = register_diag_field('ice_shelf_model', 'dg_lim_brskip_vertex', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: fraction of limiter calls in which the branch check skipped the '//&
+           'vertex pass of a grounded or floating cell', 'nondim')
+        if (any(CS%id_dg_lim_stat(:) > 0)) allocate(CS%dg_lim_stat(G%isd:G%ied,G%jsd:G%jed,8), source=0.0)
       endif
       if (CS%dg_source_positive) then
         allocate(CS%dg_src_cut_smb(G%isd:G%ied,G%jsd:G%jed), source=0.0)
@@ -2591,6 +2624,8 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
   real :: Hbar_face_avg                           ! Mean thickness of the two cells [Z ~> m]
   real :: rr                                      ! Ice to ocean density ratio [nondim]
   real :: bed1, bed2                              ! Bed at the face endpoints [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: lim_st    ! One limiter statistic per limiter call [nondim] or [Z ~> m]
+  integer :: k                                    ! Index of a limiter statistic
   real :: h_m1, h_p1, h_m2, h_p2                  ! Minus/plus corner thickness at endpoints 1,2 [Z ~> m]
   real :: s_m1, s_p1, s_m2, s_p2                  ! Minus/plus corner surface at endpoints 1,2 [Z ~> m]
 
@@ -2918,6 +2953,17 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_lim_phi_t, CS%dg_lim_phi(:,:,1), CS%diag)
     if (CS%id_dg_lim_phi_w > 0) &
         call post_data(CS%id_dg_lim_phi_w, CS%dg_lim_phi(:,:,2), CS%diag)
+    if (associated(CS%dg_lim_stat)) then
+      if (CS%dg_lim_nstage > 0.0) then
+        do k = 1, 8
+          if (CS%id_dg_lim_stat(k) > 0) then
+            lim_st(:,:) = CS%dg_lim_stat(:,:,k) / CS%dg_lim_nstage
+            call post_data(CS%id_dg_lim_stat(k), lim_st, CS%diag)
+          endif
+        enddo
+      endif
+      CS%dg_lim_stat(:,:,:) = 0.0 ; CS%dg_lim_nstage = 0.0
+    endif
     if (CS%id_dg_src_cut_smb > 0) &
         call post_data(CS%id_dg_src_cut_smb, CS%dg_src_cut_smb, CS%diag)
     if (CS%id_dg_src_cut_bmb > 0) &
@@ -10342,6 +10388,7 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_band_kappa)) deallocate(CS%dg_band_kappa)
   if (associated(CS%dg_band_w)) deallocate(CS%dg_band_w)
   if (associated(CS%dg_lim_phi)) deallocate(CS%dg_lim_phi)
+  if (associated(CS%dg_lim_stat)) deallocate(CS%dg_lim_stat)
   if (associated(CS%dg_src_cut_smb)) deallocate(CS%dg_src_cut_smb)
   if (associated(CS%dg_src_cut_bmb)) deallocate(CS%dg_src_cut_bmb)
   if (associated(CS%dg_outflow_ratio)) deallocate(CS%dg_outflow_ratio)
@@ -13894,11 +13941,17 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   logical :: str     ! A face has a grounded and a floating corner at one of its nodes
   real :: hb_f   ! Mean thickness of a wholly floating neighbour [Z ~> m]
   real :: al_f   ! Allowance of the floating-corner bound [Z ~> m]
+  real :: e_tw0  ! Corner excess left with the twist removed and the tilts held [Z ~> m]
+  real :: ds_t   ! Largest corner surface change of the vertex tilt step [Z ~> m]
+  logical :: tstep ! The vertex pass found no twist factor, so it scales the tilts
+  logical :: do_st ! Accumulate the limiter statistics
   integer :: i, j, a, b, m, n, k, ig, jg, isc, iec, jsc, jec, isd, ied, jsd, jed
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
   rr = CS%density_ice / CS%density_ocean_avg
+  do_st = associated(CS%dg_lim_stat)
+  if (do_st) CS%dg_lim_nstage = CS%dg_lim_nstage + 1.0
   north_open = (G%Domain%Y_FLAGS == FOLD_NORTH_EDGE)
 
   ! Cell-mean surfaces inside the domain.
@@ -14061,7 +14114,10 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
       endif
       lo_c(a,b) = nmin(i-2+a,j-2+b) ; hi_c(a,b) = nmax(i-2+a,j-2+b)
     enddo ; enddo
-    if (.not.ok_br) cycle
+    if (.not.ok_br) then
+      if (do_st) CS%dg_lim_stat(i,j,6) = CS%dg_lim_stat(i,j,6) + 1.0
+      cycle
+    endif
 
     ! DG1_LIMITER_FACE_BOUNDS: the face pass on the tilts.  s_c - sbar = t_x p_x + t_y p_y + tw_c, with
     ! p_x = (a - 3/2) - m_x and p_y = (b - 3/2) - m_y of zero weighted mean, so scaling a tilt keeps the
@@ -14118,6 +14174,8 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
               s_c(a,b) = s_c(a,b) + ds_f(a,b)
             enddo ; enddo
             CS%dg_lim_phi(i,j,1) = min(CS%dg_lim_phi(i,j,1), min(phi_x, phi_y))
+          elseif (do_st) then
+            CS%dg_lim_stat(i,j,7) = CS%dg_lim_stat(i,j,7) + 1.0
           endif
         endif
       endif
@@ -14191,10 +14249,15 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         feas = .false.
       endif
     enddo ; enddo
+    tstep = .false. ; e_tw0 = 0.0
     if (feas .and. (p_lo <= p_hi)) then
       phi_w = p_hi ; phi_t = 1.0
     else
       ! No twist brings the corners in, so the twist goes and one factor scales both tilts.
+      tstep = .true.
+      if (do_st) then ; do b = 1, 2 ; do a = 1, 2
+        e_tw0 = max(e_tw0, max((sbar(i,j) + lin_c(a,b)) - hi_c(a,b), lo_c(a,b) - (sbar(i,j) + lin_c(a,b))))
+      enddo ; enddo ; endif
       phi_w = 0.0 ; phi_t = 1.0
       do b = 1, 2 ; do a = 1, 2
         if (lin_c(a,b) > 0.0) then
@@ -14218,7 +14281,10 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         dh = (((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b))) / (1.0 - rr)
         if (rr * (CS%h_nodal(i,j,a,b) + dh) > CS%bed_node(i-2+a,j-2+b)) ok_br = .false.
       enddo ; enddo
-      if (.not.ok_br) cycle
+      if (.not.ok_br) then
+        if (do_st) CS%dg_lim_stat(i,j,8) = CS%dg_lim_stat(i,j,8) + 1.0
+        cycle
+      endif
       do b = 1, 2 ; do a = 1, 2
         CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + &
             ((((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b))) / (1.0 - rr))
@@ -14228,13 +14294,29 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         dh = ((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b))
         if (rr * (CS%h_nodal(i,j,a,b) + dh) < CS%bed_node(i-2+a,j-2+b)) ok_br = .false.
       enddo ; enddo
-      if (.not.ok_br) cycle
+      if (.not.ok_br) then
+        if (do_st) CS%dg_lim_stat(i,j,8) = CS%dg_lim_stat(i,j,8) + 1.0
+        cycle
+      endif
       do b = 1, 2 ; do a = 1, 2
         CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + (((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b)))
       enddo ; enddo
     endif
     CS%dg_lim_phi(i,j,1) = min(CS%dg_lim_phi(i,j,1), phi_t)
     CS%dg_lim_phi(i,j,2) = min(CS%dg_lim_phi(i,j,2), phi_w)
+    ! Statistics of the vertex tilt step: how often it acts, the largest corner surface change it makes, and
+    ! the corner excess that a twist-only vertex pass would leave.
+    if (do_st .and. tstep .and. (phi_t < 1.0)) then
+      ds_t = 0.0
+      do b = 1, 2 ; do a = 1, 2
+        ds_t = max(ds_t, abs((phi_t - 1.0)*lin_c(a,b)))
+      enddo ; enddo
+      CS%dg_lim_stat(i,j,1) = CS%dg_lim_stat(i,j,1) + 1.0
+      if (flt_c) CS%dg_lim_stat(i,j,2) = CS%dg_lim_stat(i,j,2) + 1.0
+      CS%dg_lim_stat(i,j,3) = CS%dg_lim_stat(i,j,3) + ds_t
+      CS%dg_lim_stat(i,j,4) = CS%dg_lim_stat(i,j,4) + e_tw0
+      if (e_tw0 > delta) CS%dg_lim_stat(i,j,5) = CS%dg_lim_stat(i,j,5) + 1.0
+    endif
   enddo ; enddo
 
   ! DG1_LIMITER_CROSSED: the troubled cells (crossed cells, and the two cells of a face the grounding line lies
