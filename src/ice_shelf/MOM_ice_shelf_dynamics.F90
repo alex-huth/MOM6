@@ -1693,6 +1693,11 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "If true, advect ice shelf and evolve thickness", &
                  default=.true.)
     call read_DG_params(param_file, mdl, CS, US)
+    ! DG1_LIMITER_GROUNDED_UPPER (and DG1_LIMITER_FACE_INVERSION, which needs it) read cells up to 4 away; stop
+    ! here, before the first step, rather than in the first limiter call.
+    if (CS%dg_lim_grounded_upper .and. ((G%isc - G%isd < 4) .or. (G%jsc - G%jsd < 4))) &
+      call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG1_LIMITER_GROUNDED_UPPER and DG1_LIMITER_FACE_INVERSION "//&
+                     "need a halo of at least 4 cells (NIHALO and NJHALO >= 4).")
     call get_param(param_file, mdl, "REENTRANT_X", CS%reentrant_x, &
                  " If true, the domain is zonally reentrant.", &
                  default=.false.)
@@ -12691,7 +12696,9 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "grounded values near the grounding line come from grounded values only; the lower bounds "//&
                  "do not change.  (1) A face whose two corners are grounded takes, for its upper bound, the "//&
                  "allowance from the second difference of three wholly grounded cells: centred if possible "//&
-                 "(as before), else the three cells on the grounded side next to the face, else 0.5 m; it is "//&
+                 "(as before), else the three cells on the grounded side next to the face; without three "//&
+                 "wholly grounded cells in a row (a feature one or two cells wide) the centred allowance is "//&
+                 "kept; it is "//&
                  "never larger than the centred allowance.  The centred second difference spans the surface "//&
                  "kink at the line, so it let a grounded surface rise far above the cells around it.  (2) "//&
                  "Each corner of a crossed cell is held, in the face pass (through the tilt shifts) and in "//&
@@ -14988,14 +14995,16 @@ end subroutine dg1_lim_crossed_face_shift
 !> DG1_LIMITER_GROUNDED_UPPER: the allowance of the upper face bound from three wholly grounded cells.  The five
 !! cells are ordered from the far side of the face inward, so that cells 3, 4, 5 are the centred triple (cell 4 is
 !! the cell itself), cells 2, 3, 4 the triple on the side of the face next to it, and cells 1, 2, 3 the next one out;
-!! the first triple whose three cells are wholly grounded gives the second difference.  Without one, d0.
+!! the first triple whose three cells are wholly grounded gives the second difference.  Without one (a grounded
+!! feature one or two cells wide), huge, so that the caller keeps its centred allowance there: the grounded
+!! curvature cannot be measured, and a 0.5 m allowance would flatten real crests of narrow ice rises.
 pure real function dg1_lim_ground_allow(ng, sb, d0, curv)
   integer, dimension(5), intent(in) :: ng   !< Grounded corners of each cell, 4 = wholly grounded, -1 = no ice
   real,    dimension(5), intent(in) :: sb   !< Cell-mean surfaces [Z ~> m]
   real,                  intent(in) :: d0   !< Floor of the allowance [Z ~> m]
   real,                  intent(in) :: curv !< Allowance per unit second difference [nondim]
 
-  dg1_lim_ground_allow = d0
+  dg1_lim_ground_allow = huge(d0)
   if ((ng(3) == 4) .and. (ng(4) == 4) .and. (ng(5) == 4)) then
     dg1_lim_ground_allow = max(d0, curv * abs((sb(3) + sb(5)) - 2.0*sb(4)))
   elseif ((ng(2) == 4) .and. (ng(3) == 4) .and. (ng(4) == 4)) then
