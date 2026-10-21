@@ -721,6 +721,10 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! cell on a face with a wholly floating cell is bounded in thickness by that cell.
   logical :: dg_lim_float_d0_thick !< If true, the grounded limiter takes dg_lim_d0 as a thickness on wholly
                                   !! floating cells, so their surface floor is (1 - rho_i/rho_w) dg_lim_d0.
+  logical :: dg_lim_corner_class  !< If true, dg_lim_crossed takes the crossed cells from the corners on entry
+                                  !! (some grounded, some floating), not from ground_frac, and a wholly grounded
+                                  !! or floating cell whose surface pass would move a corner across flotation goes
+                                  !! to the crossed pass instead of being left unchanged.
   real, pointer, dimension(:,:,:) :: dg_lim_phi => NULL() !< Grounded limiter: the smallest tilt (1) and
                                   !! twist (2) factors of each cell over the stages of the last step [nondim].
   real, pointer, dimension(:,:,:) :: dg_lim_stat => NULL() !< Grounded limiter statistics of each cell, summed
@@ -12652,6 +12656,20 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "corner is not bounded here: on which side of flotation it lies is for a term that moves "//&
                  "mass to settle.  The bound acts through the thickness tilt of the axis, as the face pass.", &
                  default=.false., do_not_log=.not.CS%dg_lim_crossed)
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_CLASS", CS%dg_lim_corner_class, &
+                 "If true, with DG1_LIMITER_CROSSED, the limiter sorts the cells by their corners on entry: "//&
+                 "a cell with a grounded and a floating corner is crossed, one with every corner grounded "//&
+                 "(r h >= D) is wholly grounded, and one with every corner floating is wholly floating; "//&
+                 "ground_frac is not read.  The grounded fraction comes from quadrature points, so a cell "//&
+                 "can have a corner past flotation and still a fraction of 0 or 1; the limiter then skipped "//&
+                 "it at every call.  A wholly grounded or floating cell whose face or vertex pass would move "//&
+                 "a corner across flotation goes to the crossed (thickness) pass instead of being left "//&
+                 "unchanged.  With DG1_LIMITER_FLOAT_D0_THICKNESS the crossed pass also takes the 0.5 m "//&
+                 "floor as a thickness: per face from the branches of its corners, and the corner tolerance "//&
+                 "of the vertex pass in thickness.", &
+                 default=.false., do_not_log=.not.CS%dg_lim_crossed)
+  if (CS%dg_lim_corner_class .and. (.not.CS%dg_lim_crossed)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics: DG1_LIMITER_CORNER_CLASS needs DG1_LIMITER_CROSSED.")
   call get_param(param_file, mdl, "DG1_LIMITER_CROSSED_STRADDLE", CS%dg_lim_crossed_straddle, &
                  "If true, DG1_LIMITER_CROSSED also treats, in place of the main passes, the two cells of a "//&
                  "face the grounding line lies on: at a node of the face one of the two corners is grounded "//&
@@ -13932,6 +13950,12 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   logical, dimension(SZDI_(G),SZDJ_(G)) :: trb ! DG1_LIMITER_CROSSED: the cell is troubled, crossed by the grounding
                                  ! line or on a face whose two corners lie on the two sides of flotation at a node
   logical, dimension(SZDI_(G),SZDJ_(G)) :: crs ! The ice cell is crossed by the grounding line
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: wflt ! The ice cell is wholly floating (for the floating-corner bound)
+  integer, dimension(SZDI_(G),SZDJ_(G)) :: ngc ! DG1_LIMITER_CORNER_CLASS: grounded corners of an ice cell, -1 unset
+  real, dimension(2,2) :: slp_c ! d(corner surface)/d(corner thickness): 1 grounded, 1 - r floating [nondim]
+  real :: dm_x, dp_x, dm_y, dp_y ! Floors of the face allowances of the four faces of a crossed cell [Z ~> m]
+  real :: cv_x, cv_y ! Curvature parts of the face allowances of a crossed cell [Z ~> m]
+  real :: sl         ! d(corner surface)/d(corner thickness) of one corner [nondim]
   real, dimension(SZDI_(G),SZDJ_(G),2) :: sw_lo, sw_hi ! Shifts of the x and y tilts the sweep may take [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G),2) :: sw_p ! Shifts of the x and y tilts chosen by the sweep [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: h_c ! Corner thicknesses before the troubled-cell passes [Z ~> m]
@@ -14047,11 +14071,28 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   ! node of that face one of the two corners is grounded and the other floats: the grounding line then lies on
   ! the face.  Cells beyond a domain
   ! edge that is not reentrant hold no ice state and are never troubled.
-  trb(:,:) = .false. ; crs(:,:) = .false.
+  ! With DG1_LIMITER_CORNER_CLASS the cells are sorted by their corners: ngc(i,j) is the number of grounded corners
+  ! (r h >= D) of an ice cell, and wflt marks the wholly floating ice cells, which the floating-corner bound reads.
+  trb(:,:) = .false. ; crs(:,:) = .false. ; wflt(:,:) = .false. ; ngc(:,:) = -1
   if (CS%dg_lim_crossed) then
     do j = jsd, jed ; do i = isd, ied
-      if ((hmask(i,j) /= 1.0) .or. (.not.in_dom(i,j))) cycle
-      crs(i,j) = (CS%ground_frac(i,j) > f_eps) .and. (CS%ground_frac(i,j) < 1.0 - f_eps)
+      if (hmask(i,j) /= 1.0) cycle
+      if (CS%dg_lim_corner_class) then
+        if ((i == isd) .or. (j == jsd)) cycle   ! the corners of the outermost halo cells are not all held
+        ngc(i,j) = 0
+        do b = 1, 2 ; do a = 1, 2
+          if (rr * CS%h_nodal(i,j,a,b) >= CS%bed_node(i-2+a,j-2+b)) ngc(i,j) = ngc(i,j) + 1
+        enddo ; enddo
+        wflt(i,j) = (ngc(i,j) == 0)
+      else
+        wflt(i,j) = (CS%ground_frac(i,j) <= f_eps)
+      endif
+      if (.not.in_dom(i,j)) cycle
+      if (CS%dg_lim_corner_class) then
+        crs(i,j) = (ngc(i,j) > 0) .and. (ngc(i,j) < 4)
+      else
+        crs(i,j) = (CS%ground_frac(i,j) > f_eps) .and. (CS%ground_frac(i,j) < 1.0 - f_eps)
+      endif
       trb(i,j) = crs(i,j)
     enddo ; enddo
   endif
@@ -14093,7 +14134,13 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
     if (hmask(i,j) /= 1.0) cycle
     if (trb(i,j)) cycle   ! DG1_LIMITER_CROSSED limits it below
     flt_c = .false.
-    if (CS%ground_frac(i,j) < 1.0 - f_eps) then
+    if (CS%dg_lim_corner_class) then
+      ! Crossed cells are in trb already, so every corner here is on one branch.
+      if (ngc(i,j) == 0) then
+        if (.not.CS%dg_band_float) cycle
+        flt_c = .true.
+      endif
+    elseif (CS%ground_frac(i,j) < 1.0 - f_eps) then
       if (.not.CS%dg_band_float) cycle
       if (CS%ground_frac(i,j) > f_eps) cycle
       flt_c = .true.
@@ -14116,6 +14163,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
     enddo ; enddo
     if (.not.ok_br) then
       if (do_st) CS%dg_lim_stat(i,j,6) = CS%dg_lim_stat(i,j,6) + 1.0
+      if (CS%dg_lim_corner_class .and. CS%dg_lim_crossed) trb(i,j) = .true.
       cycle
     endif
 
@@ -14174,8 +14222,12 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
               s_c(a,b) = s_c(a,b) + ds_f(a,b)
             enddo ; enddo
             CS%dg_lim_phi(i,j,1) = min(CS%dg_lim_phi(i,j,1), min(phi_x, phi_y))
-          elseif (do_st) then
-            CS%dg_lim_stat(i,j,7) = CS%dg_lim_stat(i,j,7) + 1.0
+          else
+            if (do_st) CS%dg_lim_stat(i,j,7) = CS%dg_lim_stat(i,j,7) + 1.0
+            ! DG1_LIMITER_CORNER_CLASS: the crossed pass takes the cell; its vertex pass replaces this one.
+            if (CS%dg_lim_corner_class .and. CS%dg_lim_crossed) then
+              trb(i,j) = .true. ; cycle
+            endif
           endif
         endif
       endif
@@ -14283,6 +14335,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
       enddo ; enddo
       if (.not.ok_br) then
         if (do_st) CS%dg_lim_stat(i,j,8) = CS%dg_lim_stat(i,j,8) + 1.0
+        if (CS%dg_lim_corner_class .and. CS%dg_lim_crossed) trb(i,j) = .true.
         cycle
       endif
       do b = 1, 2 ; do a = 1, 2
@@ -14296,6 +14349,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
       enddo ; enddo
       if (.not.ok_br) then
         if (do_st) CS%dg_lim_stat(i,j,8) = CS%dg_lim_stat(i,j,8) + 1.0
+        if (CS%dg_lim_corner_class .and. CS%dg_lim_crossed) trb(i,j) = .true.
         cycle
       endif
       do b = 1, 2 ; do a = 1, 2
@@ -14354,6 +14408,24 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
           al_x = max(al_x, CS%dg_lim_face_curv * abs((sbar_f(i-1,j) + sbar_f(i+1,j)) - 2.0*sbar_f(i,j)))
         if (f_use(i,j-1) .and. f_use(i,j+1)) &
           al_y = max(al_y, CS%dg_lim_face_curv * abs((sbar_f(i,j-1) + sbar_f(i,j+1)) - 2.0*sbar_f(i,j)))
+        ! DG1_LIMITER_CORNER_CLASS with DG1_LIMITER_FLOAT_D0_THICKNESS: the floor of each face is 0.5 m of
+        ! thickness, as surface on the branches of the two corners of the face on entry.
+        dm_x = al_x ; dp_x = al_x ; dm_y = al_y ; dp_y = al_y
+        if (CS%dg_lim_corner_class .and. CS%dg_lim_float_d0_thick) then
+          do b = 1, 2 ; do a = 1, 2
+            slp_c(a,b) = 1.0
+            if (rr * CS%h_nodal(i,j,a,b) < d_n(a,b)) slp_c(a,b) = 1.0 - rr
+          enddo ; enddo
+          cv_x = 0.0 ; cv_y = 0.0
+          if (f_use(i-1,j) .and. f_use(i+1,j)) &
+            cv_x = CS%dg_lim_face_curv * abs((sbar_f(i-1,j) + sbar_f(i+1,j)) - 2.0*sbar_f(i,j))
+          if (f_use(i,j-1) .and. f_use(i,j+1)) &
+            cv_y = CS%dg_lim_face_curv * abs((sbar_f(i,j-1) + sbar_f(i,j+1)) - 2.0*sbar_f(i,j))
+          dm_x = max(CS%dg_lim_d0 * (0.5*(slp_c(1,1) + slp_c(1,2))), cv_x)
+          dp_x = max(CS%dg_lim_d0 * (0.5*(slp_c(2,1) + slp_c(2,2))), cv_x)
+          dm_y = max(CS%dg_lim_d0 * (0.5*(slp_c(1,1) + slp_c(2,1))), cv_y)
+          dp_y = max(CS%dg_lim_d0 * (0.5*(slp_c(1,2) + slp_c(2,2))), cv_y)
+        endif
         ! The tilt shifts each axis may take; the corners of the minus and plus faces move by -0.5 - m and
         ! 0.5 - m per unit shift.
         call dg1_lim_cshift_range(CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,1,2), -0.5 - m_x, CS%h_nodal(i,j,2,1), &
@@ -14363,7 +14435,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         qa_x = pl_x ; qb_x = ph_x ; qa_y = pl_y ; qb_y = ph_y
         if (CS%dg_lim_crossed_float) then
           ! Each face to a wholly floating ice cell F: its floating corners are held by F in thickness.
-          if ((hmask(i-1,j) == 1.0) .and. (CS%ground_frac(i-1,j) <= f_eps)) then
+          if (wflt(i-1,j)) then
             hb_f = nodal_cell_mean(h_c(i-1,j,:,:), CS%cell_mean_w(i-1,j,:,:))
             al_f = CS%dg_lim_d0
             if (hmask(i-2,j) == 1.0) al_f = max(al_f, CS%dg_lim_face_curv * abs((hb + &
@@ -14375,7 +14447,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
                      min(hb_f, h_c(i-1,j,2,2)) - al_f, max(hb_f, h_c(i-1,j,2,2)) + al_f, rr, &
                      pl_x, ph_x, qa_x, qb_x)
           endif
-          if ((hmask(i+1,j) == 1.0) .and. (CS%ground_frac(i+1,j) <= f_eps)) then
+          if (wflt(i+1,j)) then
             hb_f = nodal_cell_mean(h_c(i+1,j,:,:), CS%cell_mean_w(i+1,j,:,:))
             al_f = CS%dg_lim_d0
             if (hmask(i+2,j) == 1.0) al_f = max(al_f, CS%dg_lim_face_curv * abs((hb + &
@@ -14387,7 +14459,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
                      min(hb_f, h_c(i+1,j,1,2)) - al_f, max(hb_f, h_c(i+1,j,1,2)) + al_f, rr, &
                      pl_x, ph_x, qa_x, qb_x)
           endif
-          if ((hmask(i,j-1) == 1.0) .and. (CS%ground_frac(i,j-1) <= f_eps)) then
+          if (wflt(i,j-1)) then
             hb_f = nodal_cell_mean(h_c(i,j-1,:,:), CS%cell_mean_w(i,j-1,:,:))
             al_f = CS%dg_lim_d0
             if (hmask(i,j-2) == 1.0) al_f = max(al_f, CS%dg_lim_face_curv * abs((hb + &
@@ -14399,7 +14471,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
                      min(hb_f, h_c(i,j-1,2,2)) - al_f, max(hb_f, h_c(i,j-1,2,2)) + al_f, rr, &
                      pl_y, ph_y, qa_y, qb_y)
           endif
-          if ((hmask(i,j+1) == 1.0) .and. (CS%ground_frac(i,j+1) <= f_eps)) then
+          if (wflt(i,j+1)) then
             hb_f = nodal_cell_mean(h_c(i,j+1,:,:), CS%cell_mean_w(i,j+1,:,:))
             al_f = CS%dg_lim_d0
             if (hmask(i,j+2) == 1.0) al_f = max(al_f, CS%dg_lim_face_curv * abs((hb + &
@@ -14412,8 +14484,8 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
                      pl_y, ph_y, qa_y, qb_y)
           endif
         endif
-        call dg1_lim_face_bounds(sbar_f(i,j), al_x, f_use(i-1,j), f_ice(i-1,j), sbar_f(i-1,j), trc(i-1,j,2), lo_m, hi_m)
-        call dg1_lim_face_bounds(sbar_f(i,j), al_x, f_use(i+1,j), f_ice(i+1,j), sbar_f(i+1,j), trc(i+1,j,1), lo_p, hi_p)
+        call dg1_lim_face_bounds(sbar_f(i,j), dm_x, f_use(i-1,j), f_ice(i-1,j), sbar_f(i-1,j), trc(i-1,j,2), lo_m, hi_m)
+        call dg1_lim_face_bounds(sbar_f(i,j), dp_x, f_use(i+1,j), f_ice(i+1,j), sbar_f(i+1,j), trc(i+1,j,1), lo_p, hi_p)
         if (CS%dg_lim_crossed_float) then
           call dg1_lim_crossed_face_shift(CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,1,2), d_n(1,1), d_n(1,2), &
                       -0.5 - m_x, f_use(i-1,j), lo_m, hi_m, &
@@ -14427,8 +14499,8 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
                       0.5 - m_x, f_use(i+1,j), lo_p, hi_p, rr, pl_x, ph_x, &
                       p_x, fl_x, fh_x)
         endif
-        call dg1_lim_face_bounds(sbar_f(i,j), al_y, f_use(i,j-1), f_ice(i,j-1), sbar_f(i,j-1), trc(i,j-1,4), lo_m, hi_m)
-        call dg1_lim_face_bounds(sbar_f(i,j), al_y, f_use(i,j+1), f_ice(i,j+1), sbar_f(i,j+1), trc(i,j+1,3), lo_p, hi_p)
+        call dg1_lim_face_bounds(sbar_f(i,j), dm_y, f_use(i,j-1), f_ice(i,j-1), sbar_f(i,j-1), trc(i,j-1,4), lo_m, hi_m)
+        call dg1_lim_face_bounds(sbar_f(i,j), dp_y, f_use(i,j+1), f_ice(i,j+1), sbar_f(i,j+1), trc(i,j+1,3), lo_p, hi_p)
         if (CS%dg_lim_crossed_float) then
           call dg1_lim_crossed_face_shift(CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,2,1), d_n(1,1), d_n(2,1), &
                       -0.5 - m_y, f_use(i,j-1), lo_m, hi_m, &
@@ -14464,8 +14536,16 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         s_c(a,b) = max(CS%h_nodal(i,j,a,b) - d_c, (1.0 - rr) * CS%h_nodal(i,j,a,b))
         s_f = max(hb - d_c, (1.0 - rr) * hb)
         lo = min(nmin(i-2+a,j-2+b), s_f) ; hi = max(nmax(i-2+a,j-2+b), s_f)
-        e_max = max(e_max, max(s_c(a,b) - hi, lo - s_c(a,b)))
-        r_max = max(r_max, hi - lo)
+        if (CS%dg_lim_corner_class .and. CS%dg_lim_float_d0_thick) then
+          ! The corner tolerance in thickness: a floating corner's excess and range are divided by 1 - r.
+          sl = 1.0
+          if ((d_c > 0.0) .and. (rr * CS%h_nodal(i,j,a,b) < d_c)) sl = 1.0 - rr
+          e_max = max(e_max, max(s_c(a,b) - hi, lo - s_c(a,b)) / sl)
+          r_max = max(r_max, (hi - lo) / sl)
+        else
+          e_max = max(e_max, max(s_c(a,b) - hi, lo - s_c(a,b)))
+          r_max = max(r_max, hi - lo)
+        endif
         lo_c(a,b) = max(dg1_lim_h_from_s(lo, d_c, rr), 0.0) ; hi_c(a,b) = dg1_lim_h_from_s(hi, d_c, rr)
       enddo ; enddo
       delta = max(CS%dg_lim_d0, lim_eps * r_max)
