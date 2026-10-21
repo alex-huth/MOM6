@@ -733,6 +733,10 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! held at or below the upstream trace where a grounded corner there oscillates.
   real :: dg_lim_face_inv_spike   !< dg_lim_face_inv: the smallest grounded excess of a corner it acts on [Z ~> m].
   real :: dg_lim_face_inv_umin    !< dg_lim_face_inv: the smallest normal speed at a face it acts on [L T-1 ~> m s-1].
+  logical :: dg_fc_on = .false.   !< If true, the band, the artificial viscosity and the grounded limiter classify the
+                                  !! cells and measure the distance to the grounding line from dg_fc, at every stage.
+  real, pointer, dimension(:,:) :: dg_fc => NULL() !< Grounded area fraction of each ice cell from its four corners
+                                  !! (the bilinear flotation field r h - D), set at every advection stage [nondim].
   real, pointer, dimension(:,:,:) :: dg_lim_phi => NULL() !< Grounded limiter: the smallest tilt (1) and
                                   !! twist (2) factors of each cell over the stages of the last step [nondim].
   real, pointer, dimension(:,:,:) :: dg_lim_stat => NULL() !< Grounded limiter statistics of each cell, summed
@@ -867,7 +871,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_phi_x_FV = -1, id_phi_y_FV = -1, &
              id_dg_art_visc_coef_u = -1, id_dg_art_visc_coef_v = -1, &
              id_dg_art_visc_nu_u = -1, id_dg_art_visc_nu_v = -1, &
-             id_dg_art_visc_cell_scale = -1, id_dg_band_kappa = -1, id_dg_band_w = -1, &
+             id_dg_art_visc_cell_scale = -1, id_dg_band_kappa = -1, id_dg_band_w = -1, id_dg_fc = -1, &
              id_dg_lim_phi_t = -1, id_dg_lim_phi_w = -1, &
              id_dg_src_cut_smb = -1, id_dg_src_cut_bmb = -1, id_dg_outflow_ratio = -1, &
              id_dg_slow_idle_face_u = -1, id_dg_slow_idle_face_v = -1, &
@@ -1698,6 +1702,13 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     if (CS%dg_lim_grounded_upper .and. ((G%isc - G%isd < 4) .or. (G%jsc - G%jsd < 4))) &
       call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG1_LIMITER_GROUNDED_UPPER and DG1_LIMITER_FACE_INVERSION "//&
                      "need a halo of at least 4 cells (NIHALO and NJHALO >= 4).")
+    ! They are for the limiter-only law: with the band, its artificial viscosity and diffusion treat the cells at the
+    ! grounding line, and these bounds would act there only in crossed cells, at full strength, against the band.
+    if ((CS%dg_lim_grounded_upper .or. CS%dg_lim_face_inv) .and. (CS%dg_band_width >= 0) .and. &
+        (.not.CS%dg_lim_no_band)) &
+      call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG1_LIMITER_GROUNDED_UPPER and DG1_LIMITER_FACE_INVERSION are "//&
+                     "for the limiter-only law; with the band (DG1_BAND_WIDTH >= 0) set DG1_LIMITER_NO_BAND = True "//&
+                     "or turn them off.")
     call get_param(param_file, mdl, "REENTRANT_X", CS%reentrant_x, &
                  " If true, the domain is zonally reentrant.", &
                  default=.false.)
@@ -2196,6 +2207,12 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
            conversion=365.0*86400.0*US%L_T_to_m_s*US%L_to_m)
       endif
       if (CS%dg_band_width >= 0) allocate(CS%dg_band_w(G%isd:G%ied,G%jsd:G%jed), source=0.0)
+      if (CS%dg_fc_on) then
+        allocate(CS%dg_fc(G%isd:G%ied,G%jsd:G%jed), source=0.0)
+        CS%id_dg_fc = register_diag_field('ice_shelf_model', 'dg_ground_frac_corners', CS%diag%axesT1, Time, &
+           'DG(1) grounded area fraction of each ice cell from its four corners (DG1_GROUND_FRAC_CORNERS), '//&
+           'at the start of the last stage', 'nondim')
+      endif
       if (CS%dg_band_width >= 0) &
         CS%id_dg_band_w = register_diag_field('ice_shelf_model', 'dg_band_w', CS%diag%axesT1, Time, &
            'DG(1) shared band weight of DG1_BAND_WIDTH: 1 in the band, falling to 0 across '//&
@@ -2974,6 +2991,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_band_kappa, CS%dg_band_kappa, CS%diag)
     if (CS%id_dg_band_w > 0) &
         call post_data(CS%id_dg_band_w, CS%dg_band_w, CS%diag)
+    if (CS%id_dg_fc > 0) call post_data(CS%id_dg_fc, CS%dg_fc, CS%diag)
     if (CS%id_dg_lim_phi_t > 0) &
         call post_data(CS%id_dg_lim_phi_t, CS%dg_lim_phi(:,:,1), CS%diag)
     if (CS%id_dg_lim_phi_w > 0) &
@@ -10412,6 +10430,7 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_art_visc_cell_scale)) deallocate(CS%dg_art_visc_cell_scale)
   if (associated(CS%dg_band_kappa)) deallocate(CS%dg_band_kappa)
   if (associated(CS%dg_band_w)) deallocate(CS%dg_band_w)
+  if (associated(CS%dg_fc)) deallocate(CS%dg_fc)
   if (associated(CS%dg_lim_phi)) deallocate(CS%dg_lim_phi)
   if (associated(CS%dg_lim_stat)) deallocate(CS%dg_lim_stat)
   if (associated(CS%dg_src_cut_smb)) deallocate(CS%dg_src_cut_smb)
@@ -12742,6 +12761,18 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  do_not_log=.not.CS%dg_lim_face_inv)
   if (CS%dg_lim_face_inv .and. (.not.CS%dg_lim_grounded_upper)) &
     call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG1_LIMITER_FACE_INVERSION needs DG1_LIMITER_GROUNDED_UPPER.")
+  call get_param(param_file, mdl, "DG1_GROUND_FRAC_CORNERS", CS%dg_fc_on, &
+                 "If true, the DG(1) band weight (DG1_BAND_WIDTH), the artificial viscosity (its ground band and "//&
+                 "its crossed and floating face classes) and DG1_GROUNDED_LIMITER classify the ice cells, and "//&
+                 "measure the distance to the grounding line, from the cell's four corners at every advection "//&
+                 "stage, not from ground_frac: a cell is wholly grounded if r h >= D at all four corners, "//&
+                 "wholly floating if at none, and crossed otherwise, and its grounded fraction is the exact area "//&
+                 "fraction where the bilinear field r h - D is not negative (1 and 0 only for the wholly grounded "//&
+                 "and floating cells), so it moves continuously with the corners.  The band weight is found "//&
+                 "again at every stage, from the state the stage starts from; the limiter classifies the state it "//&
+                 "limits.  ground_frac (the quadrature points, refreshed at velocity solves) still serves the "//&
+                 "friction, the driving stress, the band diffusion and the tilt relaxation.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
   call get_param(param_file, mdl, "DG1_LIMITER_CROSSED_STRADDLE", CS%dg_lim_crossed_straddle, &
                  "If true, DG1_LIMITER_CROSSED also treats, in place of the main passes, the two cells of a "//&
                  "face the grounding line lies on: at a node of the face one of the two corners is grounded "//&
@@ -13824,7 +13855,11 @@ subroutine dg1_av_ground_band_weight(CS, G, hmask, wgt)
     if (hmask(i,j) == 3.0) then
       src(i,j) = .true.
     elseif (hmask(i,j) == 1.0) then
-      src(i,j) = (CS%ground_frac(i,j) < 1.0 - f_eps)
+      if (CS%dg_fc_on) then
+        src(i,j) = (CS%dg_fc(i,j) < 1.0)
+      else
+        src(i,j) = (CS%ground_frac(i,j) < 1.0 - f_eps)
+      endif
     endif
   enddo ; enddo
   wgt(:,:) = 0.0
@@ -13841,6 +13876,140 @@ subroutine dg1_av_ground_band_weight(CS, G, hmask, wgt)
   enddo ; enddo
   call pass_var(wgt, G%domain)
 end subroutine dg1_av_ground_band_weight
+
+!> DG1_GROUND_FRAC_CORNERS: the grounded area fraction CS%dg_fc of each ice cell from its four corners of h_n, valid
+!! in the halo: 1 if r h >= D at all four corners, 0 if at none, else the area fraction where the bilinear field
+!! r h - D is not negative (dg1_bilin_pos_frac), kept inside (0, 1).  Partly filled front cells and ice-free cells
+!! take 0; the band and the artificial viscosity treat them by their mask.
+subroutine dg1_corner_ground_frac(CS, G, hmask, h_n)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS  !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(inout) :: G   !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in) :: h_n !< Corner thicknesses [Z ~> m]
+
+  real, dimension(2,2) :: phi ! r h - D at the corners [Z ~> m]
+  real :: rr   ! Ice/ocean density ratio [nondim]
+  integer :: i, j, a, b
+
+  rr = CS%density_ice / CS%density_ocean_avg
+  CS%dg_fc(:,:) = 0.0
+  do j = G%jsc, G%jec ; do i = G%isc, G%iec
+    if (hmask(i,j) /= 1.0) cycle
+    do b = 1, 2 ; do a = 1, 2
+      phi(a,b) = rr * h_n(i,j,a,b) - CS%bed_node(i-2+a,j-2+b)
+    enddo ; enddo
+    CS%dg_fc(i,j) = dg1_bilin_pos_frac(phi)
+  enddo ; enddo
+  call pass_var(CS%dg_fc, G%domain)
+end subroutine dg1_corner_ground_frac
+
+!> The fraction of the unit cell where the bilinear field with corner values p (p(1,1) south-west, p(2,1)
+!! south-east, p(1,2) north-west, p(2,2) north-east) is not negative.  1 if no corner is negative and 0 if all are;
+!! otherwise the mean of the eight integrals of dg1_bilin_area_x over the images of the cell under its eight
+!! symmetries, summed in sorted order, so that a rotation or a reflection of the grid gives the same bits, kept
+!! inside [1e-12, 1 - 1e-12] so that the class of a crossed cell never reads as wholly grounded or floating.
+pure real function dg1_bilin_pos_frac(p)
+  real, dimension(2,2), intent(in) :: p !< Corner values [arbitrary]
+  real, parameter :: f_in = 1.0e-12 ! Margin that keeps a crossed cell's fraction inside (0, 1) [nondim]
+  real, dimension(8) :: v ! The integrals over the eight images [nondim]
+  real :: a, b, c, d, t
+  integer :: k, m
+
+  a = p(1,1) ; b = p(2,1) ; c = p(1,2) ; d = p(2,2)
+  if ((a >= 0.0) .and. (b >= 0.0) .and. (c >= 0.0) .and. (d >= 0.0)) then
+    dg1_bilin_pos_frac = 1.0 ; return
+  endif
+  if ((a < 0.0) .and. (b < 0.0) .and. (c < 0.0) .and. (d < 0.0)) then
+    dg1_bilin_pos_frac = 0.0 ; return
+  endif
+  v(1) = dg1_bilin_area_x(a, b, c, d) ; v(2) = dg1_bilin_area_x(b, a, d, c)
+  v(3) = dg1_bilin_area_x(c, d, a, b) ; v(4) = dg1_bilin_area_x(d, c, b, a)
+  v(5) = dg1_bilin_area_x(a, c, b, d) ; v(6) = dg1_bilin_area_x(c, a, d, b)
+  v(7) = dg1_bilin_area_x(b, d, a, c) ; v(8) = dg1_bilin_area_x(d, b, c, a)
+  do k = 2, 8   ! insertion sort
+    t = v(k) ; m = k - 1
+    do while (m >= 1)
+      if (v(m) <= t) exit
+      v(m+1) = v(m) ; m = m - 1
+    enddo
+    v(m+1) = t
+  enddo
+  dg1_bilin_pos_frac = 0.125 * (((v(1) + v(2)) + (v(3) + v(4))) + ((v(5) + v(6)) + (v(7) + v(8))))
+  dg1_bilin_pos_frac = min(max(dg1_bilin_pos_frac, f_in), 1.0 - f_in)
+end function dg1_bilin_pos_frac
+
+!> The fraction of the unit cell where a (1-x)(1-y) + b x (1-y) + c (1-x) y + d x y is not negative, as the integral
+!! over x of the length in y where it is.  Along y the field is linear, so that length is 1, 0, or the share of the
+!! segment on the non-negative side of its root; the x where the field is 0 on the south (y = 0) or north (y = 1)
+!! edge split [0, 1] into pieces in each of which the length is one smooth expression: 1, 0, or the ratio of two
+!! linear functions, integrated in closed form (or by 8-point Gauss-Legendre where the ratio is close to linear).
+pure real function dg1_bilin_area_x(a, b, c, d)
+  real, intent(in) :: a !< Value at x = 0, y = 0 [arbitrary]
+  real, intent(in) :: b !< Value at x = 1, y = 0 [arbitrary]
+  real, intent(in) :: c !< Value at x = 0, y = 1 [arbitrary]
+  real, intent(in) :: d !< Value at x = 1, y = 1 [arbitrary]
+  real, dimension(4), parameter :: gx = (/ 0.1834346424956498, 0.5255324099163290, &
+                                           0.7966664774136267, 0.9602898564975363 /) ! Nodes on [0,1] of +-gx [nondim]
+  real, dimension(4), parameter :: gw = (/ 0.3626837833783620, 0.3137066458778873, &
+                                           0.2223810344533745, 0.1012285362903763 /) ! Their weights [nondim]
+  real, dimension(4) :: xs ! The ends of the pieces [nondim]
+  real :: x0, x1, xm, hw, x, ps, pn, s, t, ell
+  real :: alf, bet, q0, q1, zq ! P - N = alf + bet x, its values at x0 and x1, and its relative change over the piece
+  logical :: lo_side ! The field is non-negative on the south part of the segment in y
+  integer :: n, k, m, q, sg
+
+  n = 1 ; xs(1) = 0.0
+  if ((a >= 0.0) .neqv. (b >= 0.0)) then ; n = n + 1 ; xs(n) = a / (a - b) ; endif
+  if ((c >= 0.0) .neqv. (d >= 0.0)) then ; n = n + 1 ; xs(n) = c / (c - d) ; endif
+  n = n + 1 ; xs(n) = 1.0
+  do k = 2, n - 1   ! insertion sort of the inner ends
+    t = xs(k) ; m = k - 1
+    do while (m >= 2)
+      if (xs(m) <= t) exit
+      xs(m+1) = xs(m) ; m = m - 1
+    enddo
+    xs(m+1) = t
+  enddo
+  s = 0.0
+  do k = 1, n - 1
+    x0 = xs(k) ; x1 = xs(k+1)
+    if (x1 <= x0) cycle
+    xm = 0.5*(x0 + x1)
+    ps = a + (b - a)*xm ; pn = c + (d - c)*xm
+    if ((ps >= 0.0) .and. (pn >= 0.0)) then
+      s = s + (x1 - x0)
+    elseif ((ps >= 0.0) .or. (pn >= 0.0)) then
+      ! The length is P/(P - N) (non-negative from y = 0 up to the root) or 1 minus it, with P and N the south and
+      ! north values, linear in x.  Where P - N changes by more than 10% over the piece its integral is the closed
+      ! form (B/beta) dx + ((a beta - B alpha)/beta^2) ln(q1/q0), q = P - N = alpha + beta x, B = b - a; else the
+      ! integrand is close to linear and 8-point Gauss-Legendre is exact to roundoff.
+      lo_side = (pn < 0.0)
+      alf = a - c ; bet = (b - a) - (d - c)
+      q0 = alf + bet*x0 ; q1 = alf + bet*x1
+      ! q0 or q1 is 0 only where P and N vanish together (a saddle on the edge); the ratio is then constant.
+      zq = 0.0
+      if (q0*q1 > 0.0) zq = bet*(x1 - x0) / q0
+      if ((q0*q1 > 0.0) .and. (abs(zq) > 0.1)) then
+        ell = ((b - a)/bet)*(x1 - x0) + (((a*bet) - ((b - a)*alf)) / (bet*bet)) * log(1.0 + zq)
+        if (.not.lo_side) ell = (x1 - x0) - ell
+        s = s + min(max(ell, 0.0), x1 - x0)
+      else
+        hw = 0.5*(x1 - x0)
+        do q = 1, 4 ; do sg = -1, 1, 2
+          x = xm + real(sg) * gx(q) * hw
+          ps = a + (b - a)*x ; pn = c + (d - c)*x
+          if (lo_side) then
+            ell = ps / (ps - pn)   ! non-negative from y = 0 up to the root
+          else
+            ell = pn / (pn - ps)   ! non-negative from the root up to y = 1
+          endif
+          s = s + gw(q) * hw * min(max(ell, 0.0), 1.0)
+        enddo ; enddo
+      endif
+    endif
+  enddo
+  dg1_bilin_area_x = min(max(s, 0.0), 1.0)
+end function dg1_bilin_area_x
 
 !> DG1_BAND_WIDTH: the shared band weight w of each cell, valid in the halo.  The distance d of a
 !! cell to the grounding line, in cells, is the smallest cheb(i,k) - 1 + f_k over the ice cells k that
@@ -13871,6 +14040,16 @@ subroutine dg1_band_weight(CS, G, hmask)
   do j = G%jsd, G%jed ; do i = G%isd, G%ied
     if (hmask(i,j) == 3.0) then
       src(i,j) = .true. ; dd(i,j) = -1.0 ; flt(i,j) = .true.
+    elseif ((hmask(i,j) == 1.0) .and. CS%dg_fc_on) then
+      ! DG1_GROUND_FRAC_CORNERS: the classes are exact (1 and 0 only for wholly grounded and floating cells).
+      if (CS%dg_fc(i,j) < 1.0) then
+        src(i,j) = .true. ; dd(i,j) = CS%dg_fc(i,j) - 1.0
+      endif
+      if (CS%dg_fc(i,j) > 0.0) then
+        ddf(i,j) = -CS%dg_fc(i,j)
+      else
+        flt(i,j) = .true.
+      endif
     elseif (hmask(i,j) == 1.0) then
       if (CS%ground_frac(i,j) < 1.0 - f_eps) then
         src(i,j) = .true. ; dd(i,j) = min(max(CS%ground_frac(i,j), 0.0), 1.0) - 1.0
@@ -14042,6 +14221,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   logical :: smooth_c ! The crossed cell mean is a smooth extremum
   logical :: ok_x, ok_y ! A shift meets every bound of the face pass along x and y
   logical :: finv    ! DG1_LIMITER_FACE_INVERSION is in use
+  logical :: use_ngc ! The cells are classified by their corners (DG1_LIMITER_CORNER_CLASS or DG1_GROUND_FRAC_CORNERS)
   real, dimension(SZDI_(G),SZDJ_(G),4) :: fr ! DG1_LIMITER_FACE_INVERSION: bounds on the mean corner thickness of
                                  ! the W, E, S and N faces of a cell [Z ~> m]
   logical, dimension(SZDI_(G),SZDJ_(G),4) :: fhas ! That face has a bound in fr
@@ -14174,21 +14354,28 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   ! With DG1_LIMITER_CORNER_CLASS the cells are sorted by their corners: ngc(i,j) is the number of grounded corners
   ! (r h >= D) of an ice cell, and wflt marks the wholly floating ice cells, which the floating-corner bound reads.
   trb(:,:) = .false. ; crs(:,:) = .false. ; wflt(:,:) = .false. ; ngc(:,:) = -1
+  ! With DG1_LIMITER_CORNER_CLASS or DG1_GROUND_FRAC_CORNERS every ice cell is classified by its corners now.
+  use_ngc = CS%dg_lim_corner_class .or. CS%dg_fc_on
+  if (use_ngc) then
+    do j = jsd+1, jed ; do i = isd+1, ied   ! the corners of the outermost halo cells are not all held
+      if (hmask(i,j) /= 1.0) cycle
+      ngc(i,j) = 0
+      do b = 1, 2 ; do a = 1, 2
+        if (rr * CS%h_nodal(i,j,a,b) >= CS%bed_node(i-2+a,j-2+b)) ngc(i,j) = ngc(i,j) + 1
+      enddo ; enddo
+    enddo ; enddo
+  endif
   if (CS%dg_lim_crossed) then
     do j = jsd, jed ; do i = isd, ied
       if (hmask(i,j) /= 1.0) cycle
-      if (CS%dg_lim_corner_class) then
-        if ((i == isd) .or. (j == jsd)) cycle   ! the corners of the outermost halo cells are not all held
-        ngc(i,j) = 0
-        do b = 1, 2 ; do a = 1, 2
-          if (rr * CS%h_nodal(i,j,a,b) >= CS%bed_node(i-2+a,j-2+b)) ngc(i,j) = ngc(i,j) + 1
-        enddo ; enddo
+      if (use_ngc) then
+        if ((i == isd) .or. (j == jsd)) cycle
         wflt(i,j) = (ngc(i,j) == 0)
       else
         wflt(i,j) = (CS%ground_frac(i,j) <= f_eps)
       endif
       if (.not.in_dom(i,j)) cycle
-      if (CS%dg_lim_corner_class) then
+      if (use_ngc) then
         crs(i,j) = (ngc(i,j) > 0) .and. (ngc(i,j) < 4)
       else
         crs(i,j) = (CS%ground_frac(i,j) > f_eps) .and. (CS%ground_frac(i,j) < 1.0 - f_eps)
@@ -14346,8 +14533,9 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
     if (hmask(i,j) /= 1.0) cycle
     if (trb(i,j)) cycle   ! DG1_LIMITER_CROSSED limits it below
     flt_c = .false.
-    if (CS%dg_lim_corner_class) then
-      ! Crossed cells are in trb already, so every corner here is on one branch.
+    if (use_ngc) then
+      ! A crossed cell is in trb already (DG1_LIMITER_CROSSED), or not limited here.
+      if ((ngc(i,j) > 0) .and. (ngc(i,j) < 4)) cycle
       if (ngc(i,j) == 0) then
         if (.not.CS%dg_band_float) cycle
         flt_c = .true.
@@ -15532,8 +15720,13 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
                          (1.0 - rhoi_rhow_wb) * h_nodal_in(i,j,a,b))
       enddo ; enddo
       sbar_k(i,j) = nodal_cell_mean(s_nod, CS%cell_mean_w(i,j,:,:))
-      cross_k(i,j) = (CS%ground_frac(i,j) > 0.0) .and. (CS%ground_frac(i,j) < 1.0)
-      flt_k(i,j) = (CS%ground_frac(i,j) <= 0.0)
+      if (CS%dg_fc_on) then
+        cross_k(i,j) = (CS%dg_fc(i,j) > 0.0) .and. (CS%dg_fc(i,j) < 1.0)
+        flt_k(i,j) = (CS%dg_fc(i,j) <= 0.0)
+      else
+        cross_k(i,j) = (CS%ground_frac(i,j) > 0.0) .and. (CS%ground_frac(i,j) < 1.0)
+        flt_k(i,j) = (CS%ground_frac(i,j) <= 0.0)
+      endif
     enddo ; enddo
   endif
 
@@ -17370,8 +17563,9 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
   ! that step's grounding-line motion.
   if (CS%dg_tilt_relax .and. (CS%dg_tilt_relax_ground_mig_len > 0.0)) &
     call dg1_ground_migration_update(CS, G, time_step)
-  ! The grounded fraction and the mask hold through both stages, so the band weight is set once.
-  if (CS%dg_band_width >= 0) call dg1_band_weight(CS, G, hmask)
+  ! The grounded fraction and the mask hold through both stages, so the band weight is set once; with
+  ! DG1_GROUND_FRAC_CORNERS it follows the corners, so it is set at each stage below.
+  if ((CS%dg_band_width >= 0) .and. (.not.CS%dg_fc_on)) call dg1_band_weight(CS, G, hmask)
   if (CS%dg_grounded_limiter) CS%dg_lim_phi(:,:,:) = 1.0
 
   ! Dirichlet thickness BC.  A boundary cell keeps the nodal thicknesses it was given, so that it
@@ -17405,6 +17599,10 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
 
   ! Stage 1: positivity limit, spatial operator, M^-1, Euler step.
   call nodal_positivity_limit(CS, G, ISS)
+  if (CS%dg_fc_on) then
+    call dg1_corner_ground_frac(CS, G, hmask, CS%h_nodal)
+    if (CS%dg_band_width >= 0) call dg1_band_weight(CS, G, hmask)
+  endif
   if (need_v) then
     call DG1_nodal_spatial_operator(CS, G, hmask, CS%h_nodal, rhs, uh_ice, vh_ice, time_step, rhs_v)
   else
@@ -17521,6 +17719,10 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
     enddo ; enddo
   endif
   h_curr(:,:,:,:) = CS%h_nodal(:,:,:,:)
+  if (CS%dg_fc_on) then
+    call dg1_corner_ground_frac(CS, G, hmask, h_curr)
+    if (CS%dg_band_width >= 0) call dg1_band_weight(CS, G, hmask)
+  endif
   if (need_v) then
     call DG1_nodal_spatial_operator(CS, G, hmask, h_curr, rhs, uh_ice, vh_ice, time_step, rhs_v)
   else
