@@ -12673,8 +12673,11 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   call get_param(param_file, mdl, "DG1_LIMITER_EDGE_MIRROR", CS%dg_lim_edge_mirror, &
                  "If true, the face pass of DG1_GROUNDED_LIMITER (DG1_LIMITER_FACE_BOUNDS) takes the "//&
                  "cell-mean surface of a cell beyond a domain edge that is not reentrant as the mirror image "//&
-                 "of the cells inside, as at a free-slip wall or a divide, in place of the linear "//&
-                 "extrapolation of the two cells inside.  The corner bounds and the smooth-extremum test "//&
+                 "of the cells inside, in place of the linear extrapolation of the two cells inside, where "//&
+                 "the edge face is a wall or a divide: velocity boundary code 5 (free slip) or 3 (set "//&
+                 "velocity) with zero normal velocity at both nodes.  Across any other edge face, such as a "//&
+                 "calving front at the domain edge, it keeps the extrapolation.  The ghost cell takes only "//&
+                 "the mirrored cell mean, not its corners.  The corner bounds and the smooth-extremum test "//&
                  "keep the extrapolation: under the mirror image every wall cell is an extremum across the "//&
                  "wall, and the corner bounds have no allowance for its curvature.", &
                  default=.false., do_not_log=.not.CS%dg_grounded_limiter)
@@ -14144,9 +14147,9 @@ end subroutine dg1_band_distance
 !! other cell at that face (on entry), widened by an allowance that grows with the second difference of
 !! the means along the axis; a face to an ice-free cell sets no bound.  With DG1_LIMITER_NO_BAND w is taken
 !! as 0.  With DG1_LIMITER_CROSSED a last vertex pass acts on the thickness of the crossed cells, with the
-!! surface bounds mapped to thickness bounds; with DG1_LIMITER_EDGE_MIRROR the cells beyond a closed domain
-!! edge mirror the cells inside.  The halo of h_nodal must be valid on entry; only the computational domain
-!! is changed.
+!! surface bounds mapped to thickness bounds; with DG1_LIMITER_EDGE_MIRROR the cells beyond a wall or a divide
+!! at the domain edge mirror the cells inside.  The halo of h_nodal must be valid on entry; only the computational
+!! domain is changed.
 subroutine dg1_grounded_limiter(CS, G, hmask)
   type(ice_shelf_dyn_CS), intent(inout) :: CS  !< Ice shelf dynamics control structure
   type(ocean_grid_type),  intent(inout) :: G   !< The grid structure
@@ -14262,6 +14265,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   logical :: tstep ! The vertex pass found no twist factor, so it scales the tilts
   logical :: do_st ! Accumulate the limiter statistics
   integer :: i, j, a, b, m, n, k, ig, jg, isc, iec, jsc, jec, isd, ied, jsd, jed
+  integer :: ix, jy ! Edge faces of a cell beyond a corner of the domain
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -14293,8 +14297,11 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
 
   ! Cells beyond a domain edge: the linear extrapolation along the axis normal to the edge, or along
   ! the diagonal beyond a corner of the domain.  k is the distance to the first cell inside.  With
-  ! DG1_LIMITER_EDGE_MIRROR the face pass takes the mirror image instead: the cell k - 1 cells inside the first
-  ! one.  Both are found (sbar the extrapolation, sbar_f the mirror image), from cells inside the domain only.
+  ! DG1_LIMITER_EDGE_MIRROR the face pass takes the mirror image instead (the cell k - 1 cells inside the first
+  ! one), but only across a wall or a divide: an edge face of velocity boundary code 5 (free slip) or 3 (set
+  ! velocity) with zero normal velocity at both its nodes.  Across any other edge face, such as a calving front
+  ! at the domain edge, it keeps the extrapolation; beyond a corner of the domain both edge faces must pass.
+  ! Both are found (sbar the extrapolation, sbar_f the face-pass value), from cells inside the domain only.
   sbar_f(:,:) = sbar(:,:)
   do j = jsd+1, jed-1 ; do i = isd+1, ied-1
     if (in_dom(i,j)) cycle
@@ -14303,25 +14310,33 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
       if (i+k+1 <= ied) then ; if (in_dom(i+k,j) .and. have(i+k,j) .and. have(i+k+1,j) .and. &
                                    (.not.in_dom(i+k-1,j))) then
         sbar(i,j) = sbar(i+k,j) + real(k)*(sbar(i+k,j) - sbar(i+k+1,j))
-        sbar_f(i,j) = sbar(i+2*k-1,j)
+        sbar_f(i,j) = sbar(i,j)
+        if (dg1_lim_wall_face(CS%u_face_mask_bdry(i+k-1,j), CS%u_bdry_val(i+k-1,j-1), CS%u_bdry_val(i+k-1,j))) &
+          sbar_f(i,j) = sbar(i+2*k-1,j)
         have(i,j) = .true. ; cycle
       endif ; endif
       if (i-k-1 >= isd) then ; if (in_dom(i-k,j) .and. have(i-k,j) .and. have(i-k-1,j) .and. &
                                    (.not.in_dom(i-k+1,j))) then
         sbar(i,j) = sbar(i-k,j) + real(k)*(sbar(i-k,j) - sbar(i-k-1,j))
-        sbar_f(i,j) = sbar(i-2*k+1,j)
+        sbar_f(i,j) = sbar(i,j)
+        if (dg1_lim_wall_face(CS%u_face_mask_bdry(i-k,j), CS%u_bdry_val(i-k,j-1), CS%u_bdry_val(i-k,j))) &
+          sbar_f(i,j) = sbar(i-2*k+1,j)
         have(i,j) = .true. ; cycle
       endif ; endif
       if (j+k+1 <= jed) then ; if (in_dom(i,j+k) .and. have(i,j+k) .and. have(i,j+k+1) .and. &
                                    (.not.in_dom(i,j+k-1))) then
         sbar(i,j) = sbar(i,j+k) + real(k)*(sbar(i,j+k) - sbar(i,j+k+1))
-        sbar_f(i,j) = sbar(i,j+2*k-1)
+        sbar_f(i,j) = sbar(i,j)
+        if (dg1_lim_wall_face(CS%v_face_mask_bdry(i,j+k-1), CS%v_bdry_val(i-1,j+k-1), CS%v_bdry_val(i,j+k-1))) &
+          sbar_f(i,j) = sbar(i,j+2*k-1)
         have(i,j) = .true. ; cycle
       endif ; endif
       if (j-k-1 >= jsd) then ; if (in_dom(i,j-k) .and. have(i,j-k) .and. have(i,j-k-1) .and. &
                                    (.not.in_dom(i,j-k+1))) then
         sbar(i,j) = sbar(i,j-k) + real(k)*(sbar(i,j-k) - sbar(i,j-k-1))
-        sbar_f(i,j) = sbar(i,j-2*k+1)
+        sbar_f(i,j) = sbar(i,j)
+        if (dg1_lim_wall_face(CS%v_face_mask_bdry(i,j-k), CS%v_bdry_val(i-1,j-k), CS%v_bdry_val(i,j-k))) &
+          sbar_f(i,j) = sbar(i,j-2*k+1)
         have(i,j) = .true. ; cycle
       endif ; endif
     enddo
@@ -14332,7 +14347,12 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
       if (in_dom(i+m,j+n) .and. have(i+m,j+n) .and. have(i+2*m,j+2*n) .and. &
           (.not.in_dom(i+m,j)) .and. (.not.in_dom(i,j+n))) then
         sbar(i,j) = sbar(i+m,j+n) + (sbar(i+m,j+n) - sbar(i+2*m,j+2*n))
-        sbar_f(i,j) = sbar(i+m,j+n)
+        sbar_f(i,j) = sbar(i,j)
+        ! The edge faces of the inside cell (i+m, j+n) toward this cell: x face Ix, y face Jy.
+        ix = i - (1 - m)/2 ; jy = j - (1 - n)/2
+        if (dg1_lim_wall_face(CS%u_face_mask_bdry(ix,j+n), CS%u_bdry_val(ix,j+n-1), CS%u_bdry_val(ix,j+n)) .and. &
+            dg1_lim_wall_face(CS%v_face_mask_bdry(i+m,jy), CS%v_bdry_val(i+m-1,jy), CS%v_bdry_val(i+m,jy))) &
+          sbar_f(i,j) = sbar(i+m,j+n)
         have(i,j) = .true.
       endif
     enddo ; enddo
@@ -15266,6 +15286,17 @@ pure real function dg1_lim_twist_least_violation(base, tw, lo, hi)
   enddo
   dg1_lim_twist_least_violation = best_p
 end function dg1_lim_twist_least_violation
+
+!> DG1_LIMITER_EDGE_MIRROR: whether a face at the domain edge is a wall or a divide, across which the ice is a mirror
+!! image of the ice inside: velocity boundary code 5 (free slip) or 3 (set velocity), with zero normal velocity at
+!! both nodes of the face.  A calving front (code 2) or an open edge is not.
+pure logical function dg1_lim_wall_face(code, un1, un2)
+  real, intent(in) :: code !< Velocity boundary code of the face [nondim]
+  real, intent(in) :: un1  !< Set normal velocity at one node of the face [L T-1 ~> m s-1]
+  real, intent(in) :: un2  !< Set normal velocity at the other node of the face [L T-1 ~> m s-1]
+
+  dg1_lim_wall_face = ((code == 5.0) .or. (code == 3.0)) .and. (un1 == 0.0) .and. (un2 == 0.0)
+end function dg1_lim_wall_face
 
 !> DG1_LIMITER_FACE_INVERSION: whether a corner value v (cell mean vb) and the value w of the other cell at its node
 !! (cell mean wb) form a Gibbs pair: v above vb, w below wb, and v - w larger than vb - wb, each by more than d0.
