@@ -707,6 +707,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! each axis by the means of the two cells that share the face.
   real :: dg_lim_face_curv        !< Grounded limiter face bounds: the allowance per unit second difference
                                   !! of the cell means along the axis [nondim].
+  logical :: dg_lim_vertex_split  !< If true, the vertex tilt step of the grounded limiter scales the x and y
+                                  !! tilts by separate factors (Aizinger et al. 2017 operator splitting).
   logical :: dg_lim_no_band       !< If true, the grounded limiter acts at full strength in every wholly grounded
                                   !! (and, with DG1_BAND_FLOAT, wholly floating) cell, whatever its band weight.
   logical :: dg_lim_crossed       !< If true, the grounded limiter also acts on the thickness of every cell the
@@ -12645,6 +12647,21 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  units="nondim", default=0.5, do_not_log=.not.CS%dg_lim_face)
   if (CS%dg_lim_face .and. (.not.CS%dg_grounded_limiter)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics: DG1_LIMITER_FACE_BOUNDS needs DG1_GROUNDED_LIMITER.")
+  call get_param(param_file, mdl, "DG1_LIMITER_VERTEX_SPLIT", CS%dg_lim_vertex_split, &
+                 "If true, the vertex pass of DG1_GROUNDED_LIMITER, where no twist factor brings the "//&
+                 "corners of a wholly grounded or floating cell into their bounds, removes the twist and "//&
+                 "scales the x and y tilts by separate factors, in place of one factor for both "//&
+                 "(anisotropic limiting, Aizinger et al. 2017, operator splitting): the tilt of one axis "//&
+                 "alone takes the largest factor that holds every corner in its bounds, then the other "//&
+                 "tilt the largest factor that holds them with the first in place.  Both orders are "//&
+                 "tried and the one that keeps more slope (tx^2 fx + ty^2 fy) is used; if the two give "//&
+                 "the same value with different factors, one factor for both is used, as without this "//&
+                 "flag.  So a tilt that is in bounds by itself is not cut because the other tilt is out "//&
+                 "of bounds, and the result is the same under a quarter turn of the grid.  The bounds, "//&
+                 "the trigger, the fade-in, the band weight and the branch check are unchanged.", &
+                 default=.false., do_not_log=.not.CS%dg_grounded_limiter)
+  if (CS%dg_lim_vertex_split .and. (.not.CS%dg_grounded_limiter)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics: DG1_LIMITER_VERTEX_SPLIT needs DG1_GROUNDED_LIMITER.")
   call get_param(param_file, mdl, "DG1_LIMITER_NO_BAND", CS%dg_lim_no_band, &
                  "If true, DG1_GROUNDED_LIMITER acts at full strength in every wholly grounded cell, and "//&
                  "with DG1_BAND_FLOAT in every wholly floating cell, whatever its band weight w; only the "//&
@@ -14263,6 +14280,10 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   real :: e_tw0  ! Corner excess left with the twist removed and the tilts held [Z ~> m]
   real :: ds_t   ! Largest corner surface change of the vertex tilt step [Z ~> m]
   logical :: tstep ! The vertex pass found no twist factor, so it scales the tilts
+  logical :: vsplit  ! DG1_LIMITER_VERTEX_SPLIT scales the two tilts of this cell separately
+  real :: px_v, py_v ! Factors on the x and y tilts with DG1_LIMITER_VERTEX_SPLIT [nondim]
+  real, dimension(2,2) :: dx_v, dy_v ! Corner surface parts of the x and y tilts [Z ~> m]
+  real, dimension(2,2) :: dl_v ! Change of the corner surfaces by the two tilt factors [Z ~> m]
   logical :: do_st ! Accumulate the limiter statistics
   integer :: i, j, a, b, m, n, k, ig, jg, isc, iec, jsc, jec, isd, ied, jsd, jed
   integer :: ix, jy ! Edge faces of a cell beyond a corner of the domain
@@ -14749,7 +14770,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         feas = .false.
       endif
     enddo ; enddo
-    tstep = .false. ; e_tw0 = 0.0
+    tstep = .false. ; e_tw0 = 0.0 ; vsplit = .false.
     if (feas .and. (p_lo <= p_hi)) then
       phi_w = p_hi ; phi_t = 1.0
     else
@@ -14767,6 +14788,11 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         endif
       enddo ; enddo
       phi_t = max(phi_t, 0.0)
+      ! DG1_LIMITER_VERTEX_SPLIT: separate factors for the x and y tilts.
+      if (CS%dg_lim_vertex_split) then
+        call dg1_lim_vertex_split(s_c, sbar(i,j), wn, lo_c, hi_c, phi_t, px_v, py_v, dx_v, dy_v)
+        vsplit = .true.
+      endif
     endif
 
     ! Fade-in between delta and 2 delta, then the band weight.
@@ -14774,11 +14800,24 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
     g_f = 0.5*(1.0 + cos(pi_lim*xf))
     phi_w = g_f + (1.0 - g_f)*phi_w ; phi_t = g_f + (1.0 - g_f)*phi_t
     phi_w = 1.0 - (1.0 - wb)*(1.0 - phi_w) ; phi_t = 1.0 - (1.0 - wb)*(1.0 - phi_t)
+    if (vsplit) then
+      px_v = g_f + (1.0 - g_f)*px_v ; py_v = g_f + (1.0 - g_f)*py_v
+      px_v = 1.0 - (1.0 - wb)*(1.0 - px_v) ; py_v = 1.0 - (1.0 - wb)*(1.0 - py_v)
+      do b = 1, 2 ; do a = 1, 2
+        dl_v(a,b) = ((px_v - 1.0)*dx_v(a,b)) + ((py_v - 1.0)*dy_v(a,b))
+      enddo ; enddo
+      ! The diagnostics and statistics read the smaller of the two factors.
+      phi_t = min(px_v, py_v)
+    endif
 
     ok_br = .true.
     if (flt_c) then
       do b = 1, 2 ; do a = 1, 2
-        dh = (((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b))) / (1.0 - rr)
+        if (vsplit) then
+          dh = (dl_v(a,b) + ((phi_w - 1.0)*tw_c(a,b))) / (1.0 - rr)
+        else
+          dh = (((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b))) / (1.0 - rr)
+        endif
         if (rr * (CS%h_nodal(i,j,a,b) + dh) > CS%bed_node(i-2+a,j-2+b)) ok_br = .false.
       enddo ; enddo
       if (.not.ok_br) then
@@ -14787,12 +14826,20 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         cycle
       endif
       do b = 1, 2 ; do a = 1, 2
-        CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + &
-            ((((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b))) / (1.0 - rr))
+        if (vsplit) then
+          CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + ((dl_v(a,b) + ((phi_w - 1.0)*tw_c(a,b))) / (1.0 - rr))
+        else
+          CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + &
+              ((((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b))) / (1.0 - rr))
+        endif
       enddo ; enddo
     else
       do b = 1, 2 ; do a = 1, 2
-        dh = ((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b))
+        if (vsplit) then
+          dh = dl_v(a,b) + ((phi_w - 1.0)*tw_c(a,b))
+        else
+          dh = ((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b))
+        endif
         if (rr * (CS%h_nodal(i,j,a,b) + dh) < CS%bed_node(i-2+a,j-2+b)) ok_br = .false.
       enddo ; enddo
       if (.not.ok_br) then
@@ -14801,7 +14848,11 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         cycle
       endif
       do b = 1, 2 ; do a = 1, 2
-        CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + (((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b)))
+        if (vsplit) then
+          CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + (dl_v(a,b) + ((phi_w - 1.0)*tw_c(a,b)))
+        else
+          CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + (((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b)))
+        endif
       enddo ; enddo
     endif
     CS%dg_lim_phi(i,j,1) = min(CS%dg_lim_phi(i,j,1), phi_t)
@@ -14811,7 +14862,11 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
     if (do_st .and. tstep .and. (phi_t < 1.0)) then
       ds_t = 0.0
       do b = 1, 2 ; do a = 1, 2
-        ds_t = max(ds_t, abs((phi_t - 1.0)*lin_c(a,b)))
+        if (vsplit) then
+          ds_t = max(ds_t, abs(dl_v(a,b)))
+        else
+          ds_t = max(ds_t, abs((phi_t - 1.0)*lin_c(a,b)))
+        endif
       enddo ; enddo
       CS%dg_lim_stat(i,j,1) = CS%dg_lim_stat(i,j,1) + 1.0
       if (flt_c) CS%dg_lim_stat(i,j,2) = CS%dg_lim_stat(i,j,2) + 1.0
@@ -15152,6 +15207,92 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
     endif
   endif
 end subroutine dg1_grounded_limiter
+
+!> DG1_LIMITER_VERTEX_SPLIT: the factors on the x and y tilts of a cell whose corners no twist factor brings
+!! into their bounds, with the twist removed (anisotropic limiting by operator splitting, Aizinger et al. 2017).
+!! The tilt of one axis alone takes the largest factor in [0, 1] that holds every corner in its bounds
+!! (Barth-Jespersen), then the other tilt the largest factor that holds them with the first in place.  Of the
+!! two orders, the one with the larger tx^2 fx + ty^2 fy is used.  Where both orders give that value with
+!! different factors, both tilts take phi_iso, the one factor of the vertex pass, so the result does not depend
+!! on which axis is called x.
+pure subroutine dg1_lim_vertex_split(s_c, sb, wn, lo_c, hi_c, phi_iso, px, py, dxc, dyc)
+  real, dimension(2,2), intent(in)  :: s_c     !< Corner surfaces of the cell [Z ~> m]
+  real,                 intent(in)  :: sb      !< Cell-mean surface [Z ~> m]
+  real, dimension(2,2), intent(in)  :: wn      !< Corner weights over the cell area, summing to 1 [nondim]
+  real, dimension(2,2), intent(in)  :: lo_c    !< Lower bounds of the corner surfaces [Z ~> m]
+  real, dimension(2,2), intent(in)  :: hi_c    !< Upper bounds of the corner surfaces [Z ~> m]
+  real,                 intent(in)  :: phi_iso !< The one factor on both tilts of the vertex pass [nondim]
+  real,                 intent(out) :: px      !< Factor on the x tilt [nondim]
+  real,                 intent(out) :: py      !< Factor on the y tilt [nondim]
+  real, dimension(2,2), intent(out) :: dxc     !< Corner surface parts of the x tilt, of zero cell mean [Z ~> m]
+  real, dimension(2,2), intent(out) :: dyc     !< Corner surface parts of the y tilt, of zero cell mean [Z ~> m]
+
+  real :: m_x, m_y   ! Weighted mean of the x and y corner offsets [nondim]
+  real :: t_x, t_y   ! The x and y tilts [Z ~> m]
+  real :: qx, qy     ! Squares of the x and y tilts [Z2 ~> m2]
+  real :: px1, py1   ! Factors with the x tilt limited first [nondim]
+  real :: px2, py2   ! Factors with the y tilt limited first [nondim]
+  real :: v1, v2     ! Slope kept by the two orders [Z2 ~> m2]
+  real, dimension(2,2) :: base ! Corner surfaces before the tilt being limited [Z ~> m]
+  integer :: a, b
+
+  m_x = 0.5*((wn(2,1) + wn(2,2)) - (wn(1,1) + wn(1,2)))
+  m_y = 0.5*((wn(1,2) + wn(2,2)) - (wn(1,1) + wn(2,1)))
+  t_x = 0.5*((s_c(2,1) - s_c(1,1)) + (s_c(2,2) - s_c(1,2)))
+  t_y = 0.5*((s_c(1,2) - s_c(1,1)) + (s_c(2,2) - s_c(2,1)))
+  do b = 1, 2 ; do a = 1, 2
+    dxc(a,b) = t_x * ((real(a) - 1.5) - m_x)
+    dyc(a,b) = t_y * ((real(b) - 1.5) - m_y)
+    base(a,b) = sb
+  enddo ; enddo
+  ! The x tilt first.
+  px1 = dg1_lim_bj_factor(base, dxc, lo_c, hi_c)
+  do b = 1, 2 ; do a = 1, 2
+    base(a,b) = sb + px1*dxc(a,b)
+  enddo ; enddo
+  py1 = dg1_lim_bj_factor(base, dyc, lo_c, hi_c)
+  ! The y tilt first.
+  do b = 1, 2 ; do a = 1, 2
+    base(a,b) = sb
+  enddo ; enddo
+  py2 = dg1_lim_bj_factor(base, dyc, lo_c, hi_c)
+  do b = 1, 2 ; do a = 1, 2
+    base(a,b) = sb + py2*dyc(a,b)
+  enddo ; enddo
+  px2 = dg1_lim_bj_factor(base, dxc, lo_c, hi_c)
+
+  qx = t_x*t_x ; qy = t_y*t_y
+  v1 = (px1*qx) + (py1*qy) ; v2 = (px2*qx) + (py2*qy)
+  if (v1 > v2) then
+    px = px1 ; py = py1
+  elseif (v2 > v1) then
+    px = px2 ; py = py2
+  elseif ((px1 == px2) .and. (py1 == py2)) then
+    px = px1 ; py = py1
+  else
+    px = phi_iso ; py = phi_iso
+  endif
+end subroutine dg1_lim_vertex_split
+
+!> The largest factor in [0, 1] on the corner changes d that keeps base + factor*d inside [lo_c, hi_c] at every
+!! corner (the Barth-Jespersen factor).
+pure real function dg1_lim_bj_factor(base, d, lo_c, hi_c) result(f)
+  real, dimension(2,2), intent(in) :: base !< Corner surfaces without the change [Z ~> m]
+  real, dimension(2,2), intent(in) :: d    !< Corner surface changes at a factor of 1 [Z ~> m]
+  real, dimension(2,2), intent(in) :: lo_c !< Lower bounds of the corner surfaces [Z ~> m]
+  real, dimension(2,2), intent(in) :: hi_c !< Upper bounds of the corner surfaces [Z ~> m]
+  integer :: a, b
+
+  f = 1.0
+  do b = 1, 2 ; do a = 1, 2
+    if (d(a,b) > 0.0) then
+      f = min(f, (hi_c(a,b) - base(a,b)) / d(a,b))
+    elseif (d(a,b) < 0.0) then
+      f = min(f, (lo_c(a,b) - base(a,b)) / d(a,b))
+    endif
+  enddo ; enddo
+  f = max(f, 0.0)
+end function dg1_lim_bj_factor
 
 !> DG1_LIMITER_CROSSED: the corner thickness whose corner surface max(h - D, (1 - rr) h) is s.  The corner
 !! surface increases with h, so this is its inverse: the grounded branch above the flotation surface
