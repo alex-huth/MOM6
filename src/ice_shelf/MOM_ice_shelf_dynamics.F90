@@ -654,8 +654,9 @@ type, public :: ice_shelf_dyn_CS ; private
   real, pointer, dimension(:,:,:) :: dg_bud => NULL() !< DG(1) tilt budget: the change of the x and y
                                   !! thickness tilts made by each term of the thickness step since the
                                   !! run started, index 2*(term-1)+axis, terms transport, artificial
-                                  !! viscosity, sources, tilt relaxation, positivity limit, total [Z ~> m].
-  integer :: id_dg_bud(12) = -1   !< Diagnostic handles for dg_bud.
+                                  !! viscosity, sources, tilt relaxation, positivity limit, total, and the
+                                  !! face, vertex and crossed-cell passes of DG1_GROUNDED_LIMITER [Z ~> m].
+  integer :: id_dg_bud(18) = -1   !< Diagnostic handles for dg_bud.
   real :: dg_art_visc_r_hi        !< Artificial viscosity: surface jump over mean thickness at which the
                                   !! face coefficient reaches 1 [nondim].
   real :: dg_art_visc_kcell       !< Artificial viscosity: per-cell bound on dt times the summed face
@@ -1087,7 +1088,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
     allocate(CS%dg_tilt_relax_acc_x(isd:ied,jsd:jed), source=0.0)
     allocate(CS%dg_tilt_relax_acc_y(isd:ied,jsd:jed), source=0.0)
     allocate(CS%dg_tilt_relax_acc_w(isd:ied,jsd:jed), source=0.0)
-    allocate(CS%dg_bud(isd:ied,jsd:jed,12), source=0.0)
+    allocate(CS%dg_bud(isd:ied,jsd:jed,18), source=0.0)
     allocate(CS%f_ground_node(IsdB:IedB,JsdB:JedB), source=0.0)
     allocate(CS%f_ground_cell(isd:ied,jsd:jed), source=0.0)
     allocate(CS%H_node(IsdB:IedB,JsdB:JedB), source=0.0)
@@ -1225,8 +1226,9 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
   character(len=40)  :: var_name
   character(len=40)  :: mdl = "MOM_ice_shelf_dyn"  ! This module's name.
   integer :: n_bud   ! Index of a tilt-budget diagnostic
-  character(len=8), parameter :: bud_term(6) = (/ 'adv     ', 'visc    ', 'src     ', &
-                                                  'relax   ', 'pos     ', 'total   ' /) ! Budget terms
+  character(len=8), parameter :: bud_term(9) = (/ 'adv     ', 'visc    ', 'src     ', &
+                                                  'relax   ', 'pos     ', 'total   ', &
+                                                  'limface ', 'limvert ', 'limcross' /) ! Budget terms
   character(len=1), parameter :: bud_axis(2) = (/ 'x', 'y' /) ! Budget axes
   logical :: shelf_mass_is_dynamic, override_shelf_movement, active_shelf_dynamics
   logical :: enable_bugs  ! If true, the defaults for recently added bug-fix flags are set to
@@ -2134,8 +2136,9 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          'twist since this run started; NOT carried across a restart', 'm', conversion=US%Z_to_m)
     endif
     ! The tilt budget: running totals of the x and y thickness tilt change made by each term of the
-    ! DG(1) thickness step, from the start of this run.  The terms add up to the change in the step.
-    do n_bud = 1, 12
+    ! DG(1) thickness step, from the start of this run.  The terms add up to the change in the step
+    ! (total); the last three are the passes of DG1_GROUNDED_LIMITER.
+    do n_bud = 1, 18
       CS%id_dg_bud(n_bud) = register_diag_field('ice_shelf_model', &
          'dg_bud_'//trim(bud_term(1+(n_bud-1)/2))//'_'//bud_axis(2-mod(n_bud,2)), &
          CS%diag%axesT1, Time, 'change of the DG(1) '//bud_axis(2-mod(n_bud,2))//' thickness '//&
@@ -2787,7 +2790,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
       call post_data(CS%id_dg_tilt_relax_acc_y, CS%dg_tilt_relax_acc_y, CS%diag)
     if (CS%id_dg_tilt_relax_acc_w > 0) &
       call post_data(CS%id_dg_tilt_relax_acc_w, CS%dg_tilt_relax_acc_w, CS%diag)
-    do n_b = 1, 12
+    do n_b = 1, 18
       if (CS%id_dg_bud(n_b) > 0) call post_data(CS%id_dg_bud(n_b), CS%dg_bud(:,:,n_b), CS%diag)
     enddo
     if (CS%id_ground_frac > 0) call post_data(CS%id_ground_frac, CS%ground_frac, CS%diag)
@@ -14265,10 +14268,12 @@ end subroutine dg1_band_distance
 !! surface bounds mapped to thickness bounds; with DG1_LIMITER_EDGE_MIRROR the cells beyond a wall or a divide
 !! at the domain edge mirror the cells inside.  The halo of h_nodal must be valid on entry; only the computational
 !! domain is changed.
-subroutine dg1_grounded_limiter(CS, G, hmask)
+subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   type(ice_shelf_dyn_CS), intent(inout) :: CS  !< Ice shelf dynamics control structure
   type(ocean_grid_type),  intent(inout) :: G   !< The grid structure
   real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
+  real, optional,         intent(in)    :: bud_w !< If present, the weight of this call in the SSP-RK2
+                                               !! step, for the limiter terms of the tilt budget [nondim]
 
   real, parameter :: f_eps = 1.0e-6      ! Grounded-fraction tolerance for a pure flotation state [nondim]
   real, parameter :: lim_eps = 0.02      ! Excess tolerance as a fraction of a corner's bound range [nondim]
@@ -14383,6 +14388,8 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   real, dimension(2,2) :: dx_v, dy_v ! Corner surface parts of the x and y tilts [Z ~> m]
   real, dimension(2,2) :: dl_v ! Change of the corner surfaces by the two tilt factors [Z ~> m]
   logical :: do_st ! Accumulate the limiter statistics
+  logical :: do_bud ! Add the changes of the passes to the tilt budget
+  real, dimension(2,2) :: h_bud ! Corner thicknesses of a cell before a pass, for the tilt budget [Z ~> m]
   integer :: i, j, a, b, m, n, k, ig, jg, isc, iec, jsc, jec, isd, ied, jsd, jed
   integer :: ix, jy ! Edge faces of a cell beyond a corner of the domain
 
@@ -14391,6 +14398,8 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
   rr = CS%density_ice / CS%density_ocean_avg
   do_st = associated(CS%dg_lim_stat)
   if (do_st) CS%dg_lim_nstage = CS%dg_lim_nstage + 1.0
+  do_bud = present(bud_w) .and. associated(CS%dg_bud)
+  if (do_bud) do_bud = any(CS%id_dg_bud(13:18) > 0)
   north_open = (G%Domain%Y_FLAGS == FOLD_NORTH_EDGE)
 
   ! Cell-mean surfaces inside the domain.
@@ -14780,6 +14789,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
             endif
           enddo ; enddo
           if (ok_br) then
+            if (do_bud) h_bud(:,:) = CS%h_nodal(i,j,:,:)
             do b = 1, 2 ; do a = 1, 2
               if (flt_c) then
                 CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + ds_f(a,b) / (1.0 - rr)
@@ -14788,6 +14798,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
               endif
               s_c(a,b) = s_c(a,b) + ds_f(a,b)
             enddo ; enddo
+            if (do_bud) call dg1_bud_add(CS, i, j, 7, bud_w, CS%h_nodal(i,j,:,:) - h_bud(:,:))
             CS%dg_lim_phi(i,j,1) = min(CS%dg_lim_phi(i,j,1), min(phi_x, phi_y))
           else
             if (do_st) CS%dg_lim_stat(i,j,7) = CS%dg_lim_stat(i,j,7) + 1.0
@@ -14923,6 +14934,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         if (CS%dg_lim_corner_class .and. CS%dg_lim_crossed) trb(i,j) = .true.
         cycle
       endif
+      if (do_bud) h_bud(:,:) = CS%h_nodal(i,j,:,:)
       do b = 1, 2 ; do a = 1, 2
         if (vsplit) then
           CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + ((dl_v(a,b) + ((phi_w - 1.0)*tw_c(a,b))) / (1.0 - rr))
@@ -14945,6 +14957,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         if (CS%dg_lim_corner_class .and. CS%dg_lim_crossed) trb(i,j) = .true.
         cycle
       endif
+      if (do_bud) h_bud(:,:) = CS%h_nodal(i,j,:,:)
       do b = 1, 2 ; do a = 1, 2
         if (vsplit) then
           CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + (dl_v(a,b) + ((phi_w - 1.0)*tw_c(a,b)))
@@ -14953,6 +14966,8 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
         endif
       enddo ; enddo
     endif
+    ! The twist part has no x or y tilt, so the budget term of the vertex pass is its tilt step.
+    if (do_bud) call dg1_bud_add(CS, i, j, 8, bud_w, CS%h_nodal(i,j,:,:) - h_bud(:,:))
     CS%dg_lim_phi(i,j,1) = min(CS%dg_lim_phi(i,j,1), phi_t)
     CS%dg_lim_phi(i,j,2) = min(CS%dg_lim_phi(i,j,2), phi_w)
     ! Statistics of the vertex tilt step: how often it acts, the largest corner surface change it makes, and
@@ -15301,6 +15316,13 @@ subroutine dg1_grounded_limiter(CS, G, hmask)
           CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + &
               ((sw_p(i,j,1) * ((real(a) - 1.5) - m_x)) + (sw_p(i,j,2) * ((real(b) - 1.5) - m_y)))
         enddo ; enddo
+      enddo ; enddo
+    endif
+    ! The crossed-cell passes and the sweep together, from h_c (the state before them).
+    if (do_bud) then
+      do j = jsc, jec ; do i = isc, iec
+        if ((hmask(i,j) /= 1.0) .or. (.not.trb(i,j))) cycle
+        call dg1_bud_add(CS, i, j, 9, bud_w, CS%h_nodal(i,j,:,:) - h_c(i,j,:,:))
       enddo ; enddo
     endif
   endif
@@ -17821,7 +17843,7 @@ end function dg1_bounded_excess
 subroutine dg1_bud_add(CS, i, j, n_term, w, f)
   type(ice_shelf_dyn_CS), intent(inout) :: CS
   integer,                intent(in)    :: i, j   !< Cell indices
-  integer,                intent(in)    :: n_term !< Budget term, 1 to 6
+  integer,                intent(in)    :: n_term !< Budget term, 1 to 9
   real,                   intent(in)    :: w      !< Weight, a time [T ~> s] or a fraction [nondim]
   real, dimension(2,2),   intent(in)    :: f      !< Nodal increment or rate [Z ~> m] or [Z T-1 ~> m s-1]
 
@@ -18042,7 +18064,8 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
     endif
   enddo ; enddo
   call pass_corner_field(CS%h_nodal, G)
-  if (CS%dg_grounded_limiter) call dg1_grounded_limiter(CS, G, hmask)
+  ! The stage-1 state enters the SSP-RK2 combination with weight 1/2, so the limiter does too.
+  if (CS%dg_grounded_limiter) call dg1_grounded_limiter(CS, G, hmask, bud_w=0.5)
 
   ! Stage 2: grounded limiter, positivity limit, spatial operator, M^-1, SSP-RK2 combination.
   if (bud_on) h_pre(:,:,:,:) = CS%h_nodal(:,:,:,:)
@@ -18112,7 +18135,7 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
     endif
   enddo ; enddo
   call pass_corner_field(CS%h_nodal, G)
-  if (CS%dg_grounded_limiter) call dg1_grounded_limiter(CS, G, hmask)
+  if (CS%dg_grounded_limiter) call dg1_grounded_limiter(CS, G, hmask, bud_w=1.0)
 
   ! Keep the consumed source for diagnostics and reset the buffers.
   CS%h_source_rate_last(:,:) = CS%h_source_rate(:,:)
