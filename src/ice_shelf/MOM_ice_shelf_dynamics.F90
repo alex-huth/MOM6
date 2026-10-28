@@ -707,6 +707,10 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! each axis by the means of the two cells that share the face.
   real :: dg_lim_face_curv        !< Grounded limiter face bounds: the allowance per unit second difference
                                   !! of the cell means along the axis [nondim].
+  logical :: dg_gl_shared_h = .false. !< If true, the velocity solve reads corner thicknesses that are blended
+                                  !! toward one shared value at nodes where the corners straddle flotation.
+  real :: dg_gl_shared_h_reach = 1.0 !< DG1_GL_SHARED_H: the blend starts where the corner nearest flotation is
+                                  !! within this many jumps (largest minus smallest corner) of it [nondim].
   logical :: dg_lim_vertex_split  !< If true, the vertex tilt step of the grounded limiter scales the x and y
                                   !! tilts by separate factors (Aizinger et al. 2017 operator splitting).
   logical :: dg_lim_no_band       !< If true, the grounded limiter acts at full strength in every wholly grounded
@@ -2501,6 +2505,8 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
                                               !! the caller, as the elapsed velocity time can also
                                               !! trigger an update.
   integer :: iters
+  real, allocatable, dimension(:,:,:,:) :: h_keep ! The transported corner thicknesses [Z ~> m]
+  real, allocatable, dimension(:,:,:,:) :: h_ssa  ! The corner thicknesses of DG1_GL_SHARED_H [Z ~> m]
   logical :: update_ice_vel, coupled_GL
   logical :: refresh_gfrac ! If true, refresh the grounded geometry after the advection, rather
                            ! than leaving it to the next velocity solve.
@@ -2543,7 +2549,20 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
   endif
 
   if (update_ice_vel) then
+    if (CS%dg_gl_shared_h) then
+      ! DG1_GL_SHARED_H: the solve reads the blended corners; the transported corners come back after it.
+      allocate(h_keep(G%isd:G%ied,G%jsd:G%jed,2,2), h_ssa(G%isd:G%ied,G%jsd:G%jed,2,2))
+      h_keep(:,:,:,:) = CS%h_nodal(:,:,:,:)
+      call dg1_gl_shared_h(CS, G, ISS%hmask, h_ssa)
+      CS%h_nodal(:,:,:,:) = h_ssa(:,:,:,:)
+      CS%grounded_geom_current = .false.
+    endif
     call ice_shelf_solve_outer(CS, ISS, G, US, CS%u_shelf, CS%v_shelf,CS%taudx_shelf,CS%taudy_shelf, iters, Time)
+    if (CS%dg_gl_shared_h) then
+      CS%h_nodal(:,:,:,:) = h_keep(:,:,:,:)
+      CS%grounded_geom_current = .false.
+      deallocate(h_keep, h_ssa)
+    endif
     CS%elapsed_velocity_time = 0.0
   endif
 
@@ -12662,6 +12681,21 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  default=.false., do_not_log=.not.CS%dg_grounded_limiter)
   if (CS%dg_lim_vertex_split .and. (.not.CS%dg_grounded_limiter)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics: DG1_LIMITER_VERTEX_SPLIT needs DG1_GROUNDED_LIMITER.")
+  call get_param(param_file, mdl, "DG1_GL_SHARED_H", CS%dg_gl_shared_h, &
+                 "If true, the velocity solve (driving stress, flotation, friction and viscosity) reads "//&
+                 "corner thicknesses that are blended toward one shared value at the nodes of the "//&
+                 "grounding line, while the transport keeps its own corners.  At a node where the "//&
+                 "corners of the ice cells that share it straddle flotation, every corner takes their "//&
+                 "mean weighted by the cell areas they stand for, so the total volume is unchanged; "//&
+                 "where they do not, the blend falls linearly from 1 to 0 as the corner nearest flotation "//&
+                 "moves from 0 to DG1_GL_SHARED_H_REACH times the jump (largest minus smallest corner) "//&
+                 "away from it.  So a jump at a face cannot hold the line on that face.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
+  call get_param(param_file, mdl, "DG1_GL_SHARED_H_REACH", CS%dg_gl_shared_h_reach, &
+                 "The reach of the blend of DG1_GL_SHARED_H, in jumps of the corner thickness at the node.", &
+                 units="nondim", default=1.0, do_not_log=.not.CS%dg_gl_shared_h)
+  if (CS%dg_gl_shared_h .and. (.not.CS%use_DG_thickness)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics: DG1_GL_SHARED_H needs USE_DG_THICKNESS.")
   call get_param(param_file, mdl, "DG1_LIMITER_NO_BAND", CS%dg_lim_no_band, &
                  "If true, DG1_GROUNDED_LIMITER acts at full strength in every wholly grounded cell, and "//&
                  "with DG1_BAND_FLOAT in every wholly floating cell, whatever its band weight w; only the "//&
@@ -13052,6 +13086,70 @@ subroutine pass_corner_field(h_nodal, G)
   enddo ; enddo
 
 end subroutine pass_corner_field
+
+!> DG1_GL_SHARED_H: the corner thicknesses the velocity solve reads.  At each node, the corners of the ice cells
+!! that share it (hmask 1 or 3) are compared with the flotation thickness of the node.  Where they straddle it,
+!! every corner takes their mean weighted by cell_mean_w (the cell area each corner stands for), so the
+!! volume of the cells is unchanged in total and the flotation contour must cross inside a cell.  Where they do
+!! not, the corners move toward that mean by a weight that falls linearly from 1 to 0 as the corner nearest
+!! flotation moves from 0 to DG1_GL_SHARED_H_REACH times the jump (largest minus smallest corner) away from it.
+!! Sums pair diagonally opposite corners, so the result does not depend on the orientation of the grid.
+subroutine dg1_gl_shared_h(CS, G, hmask, h_ssa)
+  type(ice_shelf_dyn_CS), intent(in)    :: CS    !< The ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(inout) :: G     !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out) :: h_ssa !< Corner thicknesses for the solve [Z ~> m]
+
+  real, dimension(2,2) :: hc  ! Corner thicknesses at the node, by the corner index of each cell [Z ~> m]
+  real, dimension(2,2) :: wc  ! Their cell_mean_w weights, 0 for a cell without ice [L2 ~> m2]
+  real :: rr      ! Ratio of the ice and ocean densities [nondim]
+  real :: hf      ! Flotation thickness at the node [Z ~> m]
+  real :: hm      ! Weighted mean of the corners at the node [Z ~> m]
+  real :: wsum    ! Sum of the weights [L2 ~> m2]
+  real :: hmin, hmax ! Smallest and largest corner at the node [Z ~> m]
+  real :: dmin    ! Distance of the corner nearest flotation from it [Z ~> m]
+  real :: wn      ! Blend weight of the node [nondim]
+  integer :: a, b, ic, jc, In, Jn, n
+
+  h_ssa(:,:,:,:) = CS%h_nodal(:,:,:,:)
+  rr = CS%density_ice / CS%density_ocean_avg
+  do Jn = G%jsd, G%jed-1 ; do In = G%isd, G%ied-1
+    ! Corner (a,b) of cell (In+2-a, Jn+2-b) lies on node (In, Jn).
+    n = 0 ; hmin = 0.0 ; hmax = 0.0
+    do b = 1, 2 ; do a = 1, 2
+      ic = In + 2 - a ; jc = Jn + 2 - b
+      hc(a,b) = 0.0 ; wc(a,b) = 0.0
+      if ((hmask(ic,jc) == 1.0) .or. (hmask(ic,jc) == 3.0)) then
+        hc(a,b) = CS%h_nodal(ic,jc,a,b) ; wc(a,b) = CS%cell_mean_w(ic,jc,a,b)
+        if (n == 0) then
+          hmin = hc(a,b) ; hmax = hc(a,b)
+        else
+          hmin = min(hmin, hc(a,b)) ; hmax = max(hmax, hc(a,b))
+        endif
+        n = n + 1
+      endif
+    enddo ; enddo
+    if ((n < 2) .or. (hmax <= hmin)) cycle
+    wsum = (wc(1,1) + wc(2,2)) + (wc(1,2) + wc(2,1))
+    if (wsum <= 0.0) cycle
+    hf = CS%bed_node(In,Jn) / rr
+    if ((hmin < hf) .and. (hmax > hf)) then
+      wn = 1.0
+    else
+      dmin = min(abs(hmin - hf), abs(hmax - hf))
+      wn = max(0.0, 1.0 - dmin / (CS%dg_gl_shared_h_reach * (hmax - hmin)))
+    endif
+    if (wn <= 0.0) cycle
+    hm = (((wc(1,1)*hc(1,1)) + (wc(2,2)*hc(2,2))) + ((wc(1,2)*hc(1,2)) + (wc(2,1)*hc(2,1)))) / wsum
+    do b = 1, 2 ; do a = 1, 2
+      if (wc(a,b) > 0.0) then
+        ic = In + 2 - a ; jc = Jn + 2 - b
+        h_ssa(ic,jc,a,b) = hc(a,b) + wn*(hm - hc(a,b))
+      endif
+    enddo ; enddo
+  enddo ; enddo
+  call pass_corner_field(h_ssa, G)
+end subroutine dg1_gl_shared_h
 
 
 !> Publish ISS%h_shelf from CS%h_nodal as the area-weighted mean.
