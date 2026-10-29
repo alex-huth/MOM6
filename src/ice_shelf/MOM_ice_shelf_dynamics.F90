@@ -14407,9 +14407,10 @@ subroutine dg1_cpl_rhs(CS, G, u, v, is, ie, js, je, RHSu, RHSv)
   enddo ; enddo
 end subroutine dg1_cpl_rhs
 
-!> DG1_COUPLED_BUBBLE: after a linear solve, update the bubble velocity of each compute cell with a bubble:
+!> DG1_COUPLED_BUBBLE: after a linear solve, update the bubble velocity of each cell of the solve with a bubble:
 !! c = c + K_bb^-1 R_b - W du with the linear-solve blocks, where du is the change of the node velocity in
-!! the solve and K_bb^-1 R_b is from dg1_cpl_rhs.  Then the halos are updated.
+!! the solve and K_bb^-1 R_b is from dg1_cpl_rhs.  The halo row of the solve keeps this PE's own update; the
+!! outer halo comes from the owners.
 subroutine dg1_cpl_update(CS, G, du, dv)
   type(ice_shelf_dyn_CS), intent(in)    :: CS !< The ice shelf dynamics control structure; only the
                                               !! targets of its DG1_COUPLED_BUBBLE pointers are written
@@ -14419,17 +14420,33 @@ subroutine dg1_cpl_update(CS, G, du, dv)
   real, dimension(SZDIB_(G),SZDJB_(G)), &
                           intent(in)    :: dv !< The change of the node velocity v [L T-1 ~> m s-1]
   real, dimension(2) :: gb, wb ! W du and the bubble change [L T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: ub_l, vb_l ! The bubble velocities from this PE's own node changes
+                                                   ! [L T-1 ~> m s-1]
   integer :: i, j
 
-  do j=G%jsc,G%jec ; do i=G%isc,G%iec
+  ! The cells of the solve (the compute cells and one halo row) update from this PE's node changes.  The halo
+  ! row must not take the owner's values: at a periodic edge the two copies of an edge node (I = 0 and
+  ! I = NIGLOBAL) are separate unknowns of the node solve, and the bubble of a halo cell must match the node
+  ! copies that its row of the solve used, or the node residual there cannot vanish.  At other PE edges the
+  ! two are the same.
+  ub_l(:,:) = CS%dg_post_ub(:,:) ; vb_l(:,:) = CS%dg_post_vb(:,:)
+  do j=G%jsc-1,G%jec+1 ; do i=G%isc-1,G%iec+1
     if (CS%cpl_on(i,j) <= 0.0) cycle
     call dg1_cpl_bubble_force(CS, i, j, CPL_W, du(I-1:I,J-1:J), dv(I-1:I,J-1:J), gb)
     wb(:) = CS%cpl_rb(:,i,j) - gb(:)
-    CS%dg_post_ub(i,j) = CS%dg_post_ub(i,j) + wb(1)
-    CS%dg_post_vb(i,j) = CS%dg_post_vb(i,j) + wb(2)
+    ub_l(i,j) = CS%dg_post_ub(i,j) + wb(1)
+    vb_l(i,j) = CS%dg_post_vb(i,j) + wb(2)
+  enddo ; enddo
+  ! The outer halo from the owners, as before; then the halo row of the solve from this PE.
+  do j=G%jsc,G%jec ; do i=G%isc,G%iec
+    CS%dg_post_ub(i,j) = ub_l(i,j) ; CS%dg_post_vb(i,j) = vb_l(i,j)
   enddo ; enddo
   call pass_var(CS%dg_post_ub, G%domain, complete=.false.)
   call pass_var(CS%dg_post_vb, G%domain, complete=.true.)
+  do j=G%jsc-1,G%jec+1 ; do i=G%isc-1,G%iec+1
+    if ((i >= G%isc) .and. (i <= G%iec) .and. (j >= G%jsc) .and. (j <= G%jec)) cycle
+    CS%dg_post_ub(i,j) = ub_l(i,j) ; CS%dg_post_vb(i,j) = vb_l(i,j)
+  enddo ; enddo
 end subroutine dg1_cpl_update
 
 !> DG1_COUPLED_BUBBLE: the Jacobi diagonal of the condensed operator of a linear solve.  Each node loses,
