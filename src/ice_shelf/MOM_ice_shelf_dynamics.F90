@@ -771,6 +771,10 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! cell on a face with a wholly floating cell is bounded in thickness by that cell.
   logical :: dg_lim_float_d0_thick !< If true, the grounded limiter takes dg_lim_d0 as a thickness on wholly
                                   !! floating cells, so their surface floor is (1 - rho_i/rho_w) dg_lim_d0.
+  logical :: dg_lim_br_partial = .false. !< If true (DG1_LIMITER_BRANCH_RULE = PARTIAL), a face or vertex pass of a
+                                  !! wholly grounded or floating cell that would move a corner across flotation
+                                  !! applies the part of its change that brings that corner to flotation, and
+                                  !! with dg_lim_corner_class the crossed pass then takes the cell.
   logical :: dg_lim_corner_class  !< If true, dg_lim_crossed takes the crossed cells from the corners on entry
                                   !! (some grounded, some floating), not from ground_frac, and a wholly grounded
                                   !! or floating cell whose surface pass would move a corner across flotation goes
@@ -796,7 +800,7 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! entry, in the face pass and in the vertex pass [nondim]; 9 faces given a bound
                                   !! by DG1_LIMITER_FACE_INVERSION [nondim], 10 the cuts those bounds ask [Z ~> m].
   real :: dg_lim_nstage = 0.0     !< Limiter calls since the last post of dg_lim_stat [nondim]
-  integer, dimension(10) :: id_dg_lim_stat = -1 !< Diagnostic ids of the 10 fields of dg_lim_stat
+  integer, dimension(11) :: id_dg_lim_stat = -1 !< Diagnostic ids of the 11 fields of dg_lim_stat
   logical :: dg_art_visc_node_weight !< Artificial viscosity: the band weight of a face QP is interpolated along
                                   !! the face from the node weights, each the largest weight of the 4 cells there.
   real :: dg_art_visc_lump_frac  !< Artificial viscosity: the lumped fraction theta of the mass matrix whose
@@ -2346,7 +2350,10 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
            Time, 'DG(1) grounded limiter: cut of the mean face thickness that the bounds of '//&
            'DG1_LIMITER_FACE_INVERSION ask (face thickness on entry minus the bound), summed over the faces '//&
            'of the cell, per limiter call', 'm', conversion=US%Z_to_m)
-        if (any(CS%id_dg_lim_stat(:) > 0)) allocate(CS%dg_lim_stat(G%isd:G%ied,G%jsd:G%jed,10), source=0.0)
+        CS%id_dg_lim_stat(11) = register_diag_field('ice_shelf_model', 'dg_lim_brpart', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: fraction of limiter calls in which DG1_LIMITER_BRANCH_RULE = PARTIAL '//&
+           'cut the face or vertex pass of a grounded or floating cell short at flotation', 'nondim')
+        if (any(CS%id_dg_lim_stat(:) > 0)) allocate(CS%dg_lim_stat(G%isd:G%ied,G%jsd:G%jed,11), source=0.0)
       endif
       if (CS%dg_source_positive) then
         allocate(CS%dg_src_cut_smb(G%isd:G%ied,G%jsd:G%jed), source=0.0)
@@ -3109,7 +3116,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_lim_phi_w, CS%dg_lim_phi(:,:,2), CS%diag)
     if (associated(CS%dg_lim_stat)) then
       if (CS%dg_lim_nstage > 0.0) then
-        do k = 1, 10
+        do k = 1, 11
           if (CS%id_dg_lim_stat(k) > 0) then
             lim_st(:,:) = CS%dg_lim_stat(:,:,k) / CS%dg_lim_nstage
             call post_data(CS%id_dg_lim_stat(k), lim_st, CS%diag)
@@ -12340,6 +12347,7 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   character(len=16) :: bounded_mean_str ! DG1_TILT_RELAX_BOUNDED_MEAN
   character(len=16) :: kink_allow_str   ! DG1_ART_VISC_KINK_ALLOW
   character(len=40) :: twist_fb_str ! DG1_LIMITER_CROSSED_TWIST_FALLBACK
+  character(len=16) :: br_rule      ! DG1_LIMITER_BRANCH_RULE
 
 
   call get_param(param_file, mdl, "DG_BASAL_SOURCE_SCHEME", src_scheme_str, &
@@ -13116,6 +13124,21 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "floor as a thickness: per face from the branches of its corners, and the corner tolerance "//&
                  "of the vertex pass in thickness.", &
                  default=.false., do_not_log=.not.CS%dg_lim_crossed)
+  call get_param(param_file, mdl, "DG1_LIMITER_BRANCH_RULE", br_rule, &
+                 "What the face and vertex passes of the grounded limiter do in a wholly grounded or floating "//&
+                 "cell when their change would move a corner across flotation.\n"//&
+                 " SKIP    - do not change the cell; with DG1_LIMITER_CORNER_CLASS the crossed pass takes it.\n"//&
+                 " PARTIAL - apply the part of the change (the same fraction of every corner change) that "//&
+                 "brings the first corner to flotation, then go on; with DG1_LIMITER_CORNER_CLASS the crossed "//&
+                 "pass then takes the cell for the rest.  The tight bounds act as far as they can, the limit "//&
+                 "is continuous in the state, and only the crossed (thickness) pass moves a corner across.", &
+                 default="SKIP", do_not_log=.not.CS%dg_grounded_limiter)
+  select case (trim(br_rule))
+    case ("SKIP") ; CS%dg_lim_br_partial = .false.
+    case ("PARTIAL") ; CS%dg_lim_br_partial = .true.
+    case default ; call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_BRANCH_RULE "//&
+                                  "must be SKIP or PARTIAL, not "//trim(br_rule)//".")
+  end select
   if (CS%dg_lim_corner_class .and. (.not.CS%dg_lim_crossed)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics: DG1_LIMITER_CORNER_CLASS needs DG1_LIMITER_CROSSED.")
   call get_param(param_file, mdl, "DG1_LIMITER_GROUNDED_UPPER", CS%dg_lim_grounded_upper, &
@@ -15686,6 +15709,10 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   logical :: feas   ! The twist factor has a feasible value
   logical :: smooth ! Every axis along which the cell mean is an extremum passes the curvature test
   logical :: ok_br  ! Every corner stays on the grounded branch, or on the floating branch in a floating cell
+  real :: tau_b     ! DG1_LIMITER_BRANCH_RULE = PARTIAL: the part of a change that brings the first corner to
+                    ! flotation [nondim]
+  logical :: part_c ! DG1_LIMITER_BRANCH_RULE = PARTIAL cut a pass of this cell short
+  real, dimension(2,2) :: dh_v ! Change of the corner thicknesses by the vertex pass [Z ~> m]
   logical :: flt_c  ! The cell is wholly floating
   real, dimension(2,2) :: ds_f   ! Change of the corner surfaces by the face bounds [Z ~> m]
   real :: t_x, t_y  ! Tilts of the cell along x and y, from the west to the east corners [Z ~> m]
@@ -16084,6 +16111,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
     wb = CS%dg_band_w(i,j)
     if (CS%dg_lim_no_band) wb = 0.0
     if (wb >= 1.0) cycle
+    part_c = .false.
     ok_br = .true.
     do b = 1, 2 ; do a = 1, 2
       if (flt_c) then
@@ -16152,15 +16180,36 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
             ds_f(a,b) = ((phi_x - 1.0) * (t_x * ((real(a) - 1.5) - m_x))) + &
                         ((phi_y - 1.0) * (t_y * ((real(b) - 1.5) - m_y)))
           enddo ; enddo
-          ! As below, the face pass leaves the cell alone if a corner would change branch.
-          ok_br = .true.
+          ! As below, the face pass leaves the cell alone if a corner would change branch, or with
+          ! DG1_LIMITER_BRANCH_RULE = PARTIAL applies the part of the change that brings the first corner
+          ! there.  Corner (a,b) is (r h - D) / r from flotation, and its thickness changes by ds_f(a,b)
+          ! (grounded) or ds_f(a,b) / (1 - r) (floating).
+          ok_br = .true. ; tau_b = 1.0
           do b = 1, 2 ; do a = 1, 2
             if (flt_c) then
-              if (rr * (CS%h_nodal(i,j,a,b) + ds_f(a,b) / (1.0 - rr)) > CS%bed_node(i-2+a,j-2+b)) ok_br = .false.
+              if (rr * (CS%h_nodal(i,j,a,b) + ds_f(a,b) / (1.0 - rr)) > CS%bed_node(i-2+a,j-2+b)) then
+                ok_br = .false.
+                tau_b = min(tau_b, (CS%bed_node(i-2+a,j-2+b) - rr * CS%h_nodal(i,j,a,b)) / &
+                                   (rr * (ds_f(a,b) / (1.0 - rr))))
+              endif
             else
-              if (rr * (CS%h_nodal(i,j,a,b) + ds_f(a,b)) < CS%bed_node(i-2+a,j-2+b)) ok_br = .false.
+              if (rr * (CS%h_nodal(i,j,a,b) + ds_f(a,b)) < CS%bed_node(i-2+a,j-2+b)) then
+                ok_br = .false.
+                tau_b = min(tau_b, (rr * CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b)) / (rr * (-ds_f(a,b))))
+              endif
             endif
           enddo ; enddo
+          if ((.not.ok_br) .and. CS%dg_lim_br_partial) then
+            tau_b = max(0.0, min(1.0, tau_b))
+            do b = 1, 2 ; do a = 1, 2
+              ds_f(a,b) = tau_b * ds_f(a,b)
+            enddo ; enddo
+            phi_x = 1.0 - tau_b*(1.0 - phi_x) ; phi_y = 1.0 - tau_b*(1.0 - phi_y)
+            if (do_st .and. (.not.part_c)) CS%dg_lim_stat(i,j,11) = CS%dg_lim_stat(i,j,11) + 1.0
+            part_c = .true. ; ok_br = .true.
+            ! The crossed pass takes the rest; the vertex pass below still acts first.
+            if (CS%dg_lim_corner_class .and. CS%dg_lim_crossed) trb(i,j) = .true.
+          endif
           if (ok_br) then
             if (do_bud) h_bud(:,:) = CS%h_nodal(i,j,:,:)
             do b = 1, 2 ; do a = 1, 2
@@ -16292,53 +16341,48 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
       phi_t = min(px_v, py_v)
     endif
 
-    ok_br = .true.
-    if (flt_c) then
-      do b = 1, 2 ; do a = 1, 2
-        if (vsplit) then
-          dh = (dl_v(a,b) + ((phi_w - 1.0)*tw_c(a,b))) / (1.0 - rr)
-        else
-          dh = (((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b))) / (1.0 - rr)
-        endif
-        if (rr * (CS%h_nodal(i,j,a,b) + dh) > CS%bed_node(i-2+a,j-2+b)) ok_br = .false.
-      enddo ; enddo
-      if (.not.ok_br) then
-        if (do_st) CS%dg_lim_stat(i,j,8) = CS%dg_lim_stat(i,j,8) + 1.0
-        if (CS%dg_lim_corner_class .and. CS%dg_lim_crossed) trb(i,j) = .true.
-        cycle
+    ! The change of the corner thicknesses, then the branch check (as the face pass above).
+    do b = 1, 2 ; do a = 1, 2
+      if (vsplit) then
+        dh_v(a,b) = dl_v(a,b) + ((phi_w - 1.0)*tw_c(a,b))
+      else
+        dh_v(a,b) = ((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b))
       endif
-      if (do_bud) h_bud(:,:) = CS%h_nodal(i,j,:,:)
-      do b = 1, 2 ; do a = 1, 2
-        if (vsplit) then
-          CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + ((dl_v(a,b) + ((phi_w - 1.0)*tw_c(a,b))) / (1.0 - rr))
-        else
-          CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + &
-              ((((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b))) / (1.0 - rr))
+      if (flt_c) dh_v(a,b) = dh_v(a,b) / (1.0 - rr)
+    enddo ; enddo
+    ok_br = .true. ; tau_b = 1.0
+    do b = 1, 2 ; do a = 1, 2
+      if (flt_c) then
+        if (rr * (CS%h_nodal(i,j,a,b) + dh_v(a,b)) > CS%bed_node(i-2+a,j-2+b)) then
+          ok_br = .false.
+          tau_b = min(tau_b, (CS%bed_node(i-2+a,j-2+b) - rr * CS%h_nodal(i,j,a,b)) / (rr * dh_v(a,b)))
         endif
-      enddo ; enddo
-    else
-      do b = 1, 2 ; do a = 1, 2
-        if (vsplit) then
-          dh = dl_v(a,b) + ((phi_w - 1.0)*tw_c(a,b))
-        else
-          dh = ((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b))
+      else
+        if (rr * (CS%h_nodal(i,j,a,b) + dh_v(a,b)) < CS%bed_node(i-2+a,j-2+b)) then
+          ok_br = .false.
+          tau_b = min(tau_b, (rr * CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b)) / (rr * (-dh_v(a,b))))
         endif
-        if (rr * (CS%h_nodal(i,j,a,b) + dh) < CS%bed_node(i-2+a,j-2+b)) ok_br = .false.
-      enddo ; enddo
-      if (.not.ok_br) then
-        if (do_st) CS%dg_lim_stat(i,j,8) = CS%dg_lim_stat(i,j,8) + 1.0
-        if (CS%dg_lim_corner_class .and. CS%dg_lim_crossed) trb(i,j) = .true.
-        cycle
       endif
-      if (do_bud) h_bud(:,:) = CS%h_nodal(i,j,:,:)
+    enddo ; enddo
+    if ((.not.ok_br) .and. CS%dg_lim_br_partial) then
+      tau_b = max(0.0, min(1.0, tau_b))
       do b = 1, 2 ; do a = 1, 2
-        if (vsplit) then
-          CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + (dl_v(a,b) + ((phi_w - 1.0)*tw_c(a,b)))
-        else
-          CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + (((phi_t - 1.0)*lin_c(a,b)) + ((phi_w - 1.0)*tw_c(a,b)))
-        endif
+        dh_v(a,b) = tau_b * dh_v(a,b)
       enddo ; enddo
+      phi_t = 1.0 - tau_b*(1.0 - phi_t) ; phi_w = 1.0 - tau_b*(1.0 - phi_w)
+      if (do_st .and. (.not.part_c)) CS%dg_lim_stat(i,j,11) = CS%dg_lim_stat(i,j,11) + 1.0
+      part_c = .true. ; ok_br = .true.
+      if (CS%dg_lim_corner_class .and. CS%dg_lim_crossed) trb(i,j) = .true.
     endif
+    if (.not.ok_br) then
+      if (do_st) CS%dg_lim_stat(i,j,8) = CS%dg_lim_stat(i,j,8) + 1.0
+      if (CS%dg_lim_corner_class .and. CS%dg_lim_crossed) trb(i,j) = .true.
+      cycle
+    endif
+    if (do_bud) h_bud(:,:) = CS%h_nodal(i,j,:,:)
+    do b = 1, 2 ; do a = 1, 2
+      CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + dh_v(a,b)
+    enddo ; enddo
     ! The twist part has no x or y tilt, so the budget term of the vertex pass is its tilt step.
     if (do_bud) call dg1_bud_add(CS, i, j, 8, bud_w, CS%h_nodal(i,j,:,:) - h_bud(:,:))
     CS%dg_lim_phi(i,j,1) = min(CS%dg_lim_phi(i,j,1), phi_t)
