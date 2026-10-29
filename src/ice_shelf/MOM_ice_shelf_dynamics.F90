@@ -753,6 +753,8 @@ type, public :: ice_shelf_dyn_CS ; private
   integer :: id_clock_solve = -1  !< CPU clock for the velocity solve (ice_shelf_solve_outer)
   integer :: id_clock_fcache = -1 !< CPU clock for the friction cache of BASAL_FRICTION_PRECOMPUTE
   integer :: id_clock_cpl = -1    !< CPU clock for the DG1_COUPLED_BUBBLE block build
+  logical :: dg_pos_split = .false. !< If true (DG1_POSITIVITY_SPLIT), the nodal positivity limit cuts the x tilt,
+                                  !! the y tilt and the twist of a cell by separate factors.
   logical :: dg_lim_vertex_split  !< If true, the vertex tilt step of the grounded limiter scales the x and y
                                   !! tilts by separate factors (Aizinger et al. 2017 operator splitting).
   logical :: dg_lim_no_band       !< If true, the grounded limiter acts at full strength in every wholly grounded
@@ -12984,6 +12986,17 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "of bounds, and the result is the same under a quarter turn of the grid.  The bounds, "//&
                  "the trigger, the fade-in, the band weight and the branch check are unchanged.", &
                  default=.false., do_not_log=.not.CS%dg_grounded_limiter)
+  call get_param(param_file, mdl, "DG1_POSITIVITY_SPLIT", CS%dg_pos_split, &
+                 "If true, the nodal positivity limit of a cell with a corner below MIN_H_SHELF cuts the "//&
+                 "x tilt, the y tilt and the twist of the cell by separate factors, in place of one factor "//&
+                 "on all of the corner deviations from the cell mean.  The three parts are put back on the "//&
+                 "mean one at a time, each with the largest factor in [0, 1] that holds every corner at or "//&
+                 "above MIN_H_SHELF.  All 6 orders are tried and the one that keeps more of the deviation "//&
+                 "(the sum of the factor times the weighted square of each part) is used; if two orders "//&
+                 "give the same value with different factors, one factor for all is used, as without this "//&
+                 "flag.  So a part that raises the low corner is not cut, and the result is the same under "//&
+                 "a quarter turn of the grid.  The cell mean is kept.", &
+                 default=.false.)
   if (CS%dg_lim_vertex_split .and. (.not.CS%dg_grounded_limiter)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics: DG1_LIMITER_VERTEX_SPLIT needs DG1_GROUNDED_LIMITER.")
   call get_param(param_file, mdl, "DG1_GL_SHARED_H", CS%dg_gl_shared_h, &
@@ -14553,6 +14566,7 @@ subroutine nodal_positivity_limit(CS, G, ISS)
 
   integer :: i, j, a, b
   real :: Hbar, hmin, phi_pos, denom
+  real, dimension(2,2) :: h_new ! Corner thicknesses of DG1_POSITIVITY_SPLIT [Z ~> m]
 
   do j = G%jsc, G%jec ; do i = G%isc, G%iec
     if (ISS%hmask(i,j) /= 1.0) cycle
@@ -14566,6 +14580,11 @@ subroutine nodal_positivity_limit(CS, G, ISS)
     else
       phi_pos = 0.0
     endif
+    if (CS%dg_pos_split .and. (phi_pos > 0.0)) then
+      call dg1_pos_split(CS%h_nodal(i,j,:,:), Hbar, CS%cell_mean_w(i,j,:,:), CS%min_h_shelf, phi_pos, h_new)
+      CS%h_nodal(i,j,:,:) = h_new(:,:)
+      cycle
+    endif
     do b = 1, 2 ; do a = 1, 2
       CS%h_nodal(i,j,a,b) = Hbar + phi_pos*(CS%h_nodal(i,j,a,b) - Hbar)
     enddo ; enddo
@@ -14573,6 +14592,88 @@ subroutine nodal_positivity_limit(CS, G, ISS)
 
   call pass_corner_field(CS%h_nodal, G)
 end subroutine nodal_positivity_limit
+
+!> DG1_POSITIVITY_SPLIT: the corner thicknesses of a cell with a corner below h_min, with its x tilt, y tilt
+!! and twist cut by separate factors.  The parts have zero weighted cell mean (as in the vertex pass of the
+!! grounded limiter).  In each of the 6 orders the parts are put back on the mean one at a time, each with the
+!! largest factor in [0, 1] that holds every corner at or above h_min; the order with the largest kept value
+!! sum_k f_k E_k (E_k the weighted square of part k) is used.  Where orders tie with different factors, all
+!! parts take phi_iso, the one factor of the limit without this flag, so the result does not depend on which
+!! axis is called x.  The mean must be above h_min, so the parts at a factor of 0 hold every corner.
+pure subroutine dg1_pos_split(hc, hb, w, h_min, phi_iso, h_new)
+  real, dimension(2,2), intent(in)  :: hc      !< Corner thicknesses [Z ~> m]
+  real,                 intent(in)  :: hb      !< Cell-mean thickness [Z ~> m]
+  real, dimension(2,2), intent(in)  :: w       !< Corner weights over the cell [L2 ~> m2]
+  real,                 intent(in)  :: h_min   !< Smallest corner thickness [Z ~> m]
+  real,                 intent(in)  :: phi_iso !< The one factor on all parts [nondim]
+  real, dimension(2,2), intent(out) :: h_new   !< Limited corner thicknesses [Z ~> m]
+
+  integer, dimension(3,6), parameter :: ord = reshape([1,2,3, 1,3,2, 2,1,3, 2,3,1, 3,1,2, 3,2,1], [3,6])
+  real, dimension(2,2,3) :: pt ! The x tilt, y tilt and twist parts of hc - hb [Z ~> m]
+  real, dimension(2,2) :: wn   ! Corner weights over the cell area [nondim]
+  real, dimension(2,2) :: base ! Corner thicknesses with the parts put back so far [Z ~> m]
+  real, dimension(2,2) :: lo_c, hi_c ! Corner bounds [Z ~> m]
+  real, dimension(3) :: en     ! Weighted squares of the parts [Z2 ~> m2]
+  real, dimension(3,6) :: fo   ! Factors of the parts in each order [nondim]
+  real, dimension(6) :: vo     ! Kept value of each order [Z2 ~> m2]
+  real :: area, m_x, m_y, t_x, t_y, tw, wT ! As in dg1_lim_vertex_split and the vertex pass
+  real :: v_max ! Largest kept value [Z2 ~> m2]
+  logical :: tie ! Orders with the largest value have different factors
+  integer :: a, b, k, n, q, p_best
+
+  area = (w(1,1) + w(2,2)) + (w(1,2) + w(2,1))
+  do b = 1, 2 ; do a = 1, 2
+    wn(a,b) = w(a,b) / area
+    lo_c(a,b) = h_min ; hi_c(a,b) = huge(h_min)
+  enddo ; enddo
+  m_x = 0.5*((wn(2,1) + wn(2,2)) - (wn(1,1) + wn(1,2)))
+  m_y = 0.5*((wn(1,2) + wn(2,2)) - (wn(1,1) + wn(2,1)))
+  t_x = 0.5*((hc(2,1) - hc(1,1)) + (hc(2,2) - hc(1,2)))
+  t_y = 0.5*((hc(1,2) - hc(1,1)) + (hc(2,2) - hc(2,1)))
+  tw = 0.25*((hc(1,1) + hc(2,2)) - (hc(2,1) + hc(1,2)))
+  wT = (wn(1,1) + wn(2,2)) - (wn(2,1) + wn(1,2))
+  do b = 1, 2 ; do a = 1, 2
+    pt(a,b,1) = t_x * ((real(a) - 1.5) - m_x)
+    pt(a,b,2) = t_y * ((real(b) - 1.5) - m_y)
+  enddo ; enddo
+  pt(1,1,3) = tw*(1.0 - wT) ; pt(2,2,3) = tw*(1.0 - wT)
+  pt(2,1,3) = tw*(-1.0 - wT) ; pt(1,2,3) = tw*(-1.0 - wT)
+  do k = 1, 3
+    en(k) = ((wn(1,1)*pt(1,1,k)**2) + (wn(2,2)*pt(2,2,k)**2)) + ((wn(2,1)*pt(2,1,k)**2) + (wn(1,2)*pt(1,2,k)**2))
+  enddo
+
+  do n = 1, 6
+    base(:,:) = hb
+    do k = 1, 3
+      q = ord(k,n)
+      fo(q,n) = dg1_lim_bj_factor(base, pt(:,:,q), lo_c, hi_c)
+      do b = 1, 2 ; do a = 1, 2
+        base(a,b) = base(a,b) + fo(q,n)*pt(a,b,q)
+      enddo ; enddo
+    enddo
+    vo(n) = ((fo(1,n)*en(1)) + (fo(2,n)*en(2))) + (fo(3,n)*en(3))
+  enddo
+  v_max = maxval(vo)
+  p_best = 0 ; tie = .false.
+  do n = 1, 6
+    if (vo(n) < v_max) cycle
+    if (p_best == 0) then
+      p_best = n
+    elseif (any(fo(:,n) /= fo(:,p_best))) then
+      tie = .true.
+    endif
+  enddo
+
+  if (tie) then
+    do b = 1, 2 ; do a = 1, 2
+      h_new(a,b) = hb + phi_iso*(hc(a,b) - hb)
+    enddo ; enddo
+  else
+    do b = 1, 2 ; do a = 1, 2
+      h_new(a,b) = hb + (((fo(1,p_best)*pt(a,b,1)) + (fo(2,p_best)*pt(a,b,2))) + (fo(3,p_best)*pt(a,b,3)))
+    enddo ; enddo
+  endif
+end subroutine dg1_pos_split
 
 !> (p1 + p2) + (p3 + p4) with each product rounded before the sum. A fused multiply-add keeps
 !! one product unrounded, and a quarter turn cycles the corners through the slots, so no
