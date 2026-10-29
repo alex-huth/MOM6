@@ -121,6 +121,19 @@ real, parameter, dimension(2) :: SEP2_GC = (/ SEP2_GP(2), SEP2_GP(1) /)
 ! High-order SEP2 rules (GROUNDING_LINE_SUBGRID_BAND): a 6-pt degree-4 triangle rule (Dunavant 1985)
 ! and 3x3 Gauss on quad pieces, so a cut parent triangle carries up to 6 + 9 QPs.
 integer, parameter :: SEP2_MAXQP = 15    !< Largest number of QPs on one SEP2 parent triangle
+! The layout of the DG1_COUPLED_BUBBLE block values of a cell (cpl_blk): a set of 19 for the Picard operator
+! (the residual) and one for the operator of the linear solve, each the node-bubble block (16 values, cpl_nb)
+! and then the bubble block 11, 12, 22; then the driving stress against the two bubbles; then W.
+integer, parameter :: CPL_NV  = 56 !< The number of block values of a cell
+integer, parameter :: CPL_PIC = 0  !< The offset of the Picard set
+integer, parameter :: CPL_LIN = 19 !< The offset of the linear-solve set
+integer, parameter :: CPL_BB  = 16 !< The offset of the bubble block within a set
+integer, parameter :: CPL_NSET = 19 !< The number of values of one set
+integer, parameter :: CPL_FB  = 38 !< The offset of the driving stress against the bubbles
+integer, parameter :: CPL_W   = 40 !< The offset of W = K_bb^-1 K_bn of the linear-solve set (cpl_nb layout)
+integer, parameter :: CPL_KM  = 40 !< In the work values of dg1_cpl_blocks only: the offset of the corner
+                                   !! friction matrix (10 corner pairs times 4 blocks, as gl_fric_K)
+integer, parameter :: CPL_NWK = 80 !< The number of work values of dg1_cpl_blocks
 real, parameter :: SEP2_T6L1 = 0.44594849091596488632 !< Light barycentric of 6-pt orbit 1 [nondim]
 real, parameter :: SEP2_T6H1 = 1.0 - 2.0*SEP2_T6L1    !< Heavy barycentric of 6-pt orbit 1 [nondim]
 real, parameter :: SEP2_T6L2 = 0.09157621350977074346 !< Light barycentric of 6-pt orbit 2 [nondim]
@@ -722,6 +735,24 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! Gauss points of each cell (the same at all four) [L T-1 ~> m s-1]
   real, pointer, dimension(:,:) :: dg_post_skip => NULL() !< DG1_POST_BUBBLE: 1 in a cell whose last bubble
                                   !! solve was skipped (no positive determinant or no finite result), else 0 [nondim]
+  logical :: dg_coupled = .false. !< If true, the velocity solve has one bubble per ice cell for u and for v,
+                                  !! eliminated cell by cell (static condensation), and the bubble velocity, kept
+                                  !! in dg_post_ub and dg_post_vb, is used in the transport volume term.
+  logical :: dg_cpl_crossed = .true. !< If true, DG1_COUPLED_BUBBLE also has a bubble in the grounding-line
+                                  !! cells, with the sub-cell quadrature of the velocity solve.
+  real, pointer, dimension(:,:,:) :: cpl_blk => NULL() !< DG1_COUPLED_BUBBLE blocks of each cell for the current
+                                  !! linearization: 1-16 the Picard node-bubble block (8 node unknowns, u then v
+                                  !! at SW, SE, NW, NE, times 2 bubbles), 17-19 the Picard bubble block (11, 12, 22)
+                                  !! [R L2 Z T-1 ~> kg s-1], 20-38 the same for the Krylov operator (Newton when
+                                  !! Newton is on, else a copy), 39-40 the driving stress against the two
+                                  !! bubbles [R L3 Z T-2 ~> kg m s-2]
+  real, pointer, dimension(:,:,:) :: cpl_rb => NULL() !< DG1_COUPLED_BUBBLE: K_bb^-1 R_b of each cell, with R_b the
+                                  !! bubble residual at the start of a linear solve [L T-1 ~> m s-1]
+  real, pointer, dimension(:,:) :: cpl_on => NULL() !< DG1_COUPLED_BUBBLE: 1 in a cell that has a bubble for the
+                                  !! current linearization, else 0 [nondim]
+  integer :: id_clock_solve = -1  !< CPU clock for the velocity solve (ice_shelf_solve_outer)
+  integer :: id_clock_fcache = -1 !< CPU clock for the friction cache of BASAL_FRICTION_PRECOMPUTE
+  integer :: id_clock_cpl = -1    !< CPU clock for the DG1_COUPLED_BUBBLE block build
   logical :: dg_lim_vertex_split  !< If true, the vertex tilt step of the grounded limiter scales the x and y
                                   !! tilts by separate factors (Aizinger et al. 2017 operator splitting).
   logical :: dg_lim_no_band       !< If true, the grounded limiter acts at full strength in every wholly grounded
@@ -1003,6 +1034,7 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
   logical :: thickness_nodal ! If true, the thickness is read at nodes (INIT_ICE_THICKNESS_NODAL)
   real :: mig_len ! DG1_TILT_RELAX_GROUND_MIG_LENGTH, read here only to decide what is restarted [m]
   logical :: post_bubble ! DG1_POST_BUBBLE, read here only to decide what is restarted
+  logical :: cpl_bubble  ! DG1_COUPLED_BUBBLE, read here only to decide what is restarted
   character(len=40)  :: mdl = "MOM_ice_shelf_dyn"  ! This module's name.
   integer :: isd, ied, jsd, jed, IsdB, IedB, JsdB, JedB
 
@@ -1204,17 +1236,19 @@ subroutine register_ice_shelf_dyn_restarts(G, US, param_file, CS, restart_CS)
                                     conversion=US%s_to_T)
       endif
       ! The DG1_POST_BUBBLE velocities are set at each velocity solve and used until the next one, so
-      ! they are restarted.  A restart without them uses no bubble until the next velocity solve.
+      ! they are restarted.  A restart without them uses no bubble until the next velocity solve.  The
+      ! DG1_COUPLED_BUBBLE velocities are unknowns of the velocity solve and are its first guess.
       call get_param(param_file, mdl, "DG1_POST_BUBBLE", post_bubble, default=.false., do_not_log=.true.)
-      if (post_bubble) then
+      call get_param(param_file, mdl, "DG1_COUPLED_BUBBLE", cpl_bubble, default=.false., do_not_log=.true.)
+      if (post_bubble .or. cpl_bubble) then
         allocate(CS%dg_post_ub(isd:ied,jsd:jed), source=0.0)
         allocate(CS%dg_post_vb(isd:ied,jsd:jed), source=0.0)
         allocate(CS%dg_post_skip(isd:ied,jsd:jed), source=0.0)
         call register_restart_field(CS%dg_post_ub, "dg_post_ub", .false., restart_CS, &
-                                    "DG1_POST_BUBBLE x bubble velocity at the Gauss points", "m s-1", &
+                                    "DG1 POST or COUPLED x bubble velocity at the Gauss points", "m s-1", &
                                     conversion=US%L_T_to_m_s)
         call register_restart_field(CS%dg_post_vb, "dg_post_vb", .false., restart_CS, &
-                                    "DG1_POST_BUBBLE y bubble velocity at the Gauss points", "m s-1", &
+                                    "DG1 POST or COUPLED y bubble velocity at the Gauss points", "m s-1", &
                                     conversion=US%L_T_to_m_s)
       endif
     endif
@@ -1732,6 +1766,9 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "If true, advect ice shelf and evolve thickness", &
                  default=.true.)
     call read_DG_params(param_file, mdl, CS, US)
+    CS%id_clock_solve = cpu_clock_id(' Ice shelf velocity solve', grain=CLOCK_ROUTINE)
+    CS%id_clock_fcache = cpu_clock_id('  Ice shelf friction cache', grain=CLOCK_ROUTINE)
+    CS%id_clock_cpl = cpu_clock_id('  Ice shelf bubble blocks', grain=CLOCK_ROUTINE)
     ! DG1_LIMITER_GROUNDED_UPPER (and DG1_LIMITER_FACE_INVERSION, which needs it) read cells up to 4 away; stop
     ! here, before the first step, rather than in the first limiter call.
     if (CS%dg_lim_grounded_upper .and. ((G%isc - G%isd < 4) .or. (G%jsc - G%jsd < 4))) &
@@ -1844,6 +1881,11 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       allocate(CS%fric_qp_u(4,isd:ied,jsd:jed), source=0.0)
       allocate(CS%fric_qp_v(4,isd:ied,jsd:jed), source=0.0)
       allocate(CS%gl_fric_K(4,4,4,isd:ied,jsd:jed), source=0.0)
+    endif
+    if (CS%dg_coupled) then
+      allocate(CS%cpl_blk(CPL_NV,isd:ied,jsd:jed), source=0.0)
+      allocate(CS%cpl_rb(2,isd:ied,jsd:jed), source=0.0)
+      allocate(CS%cpl_on(isd:ied,jsd:jed), source=0.0)
     endif
     allocate(CS%Jac(1:4,isd:ied,jsd:jed), source=0.0)
     do j=G%jsd,G%jed ; do i=G%isd,G%ied
@@ -2253,7 +2295,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         CS%id_dg_band_w = register_diag_field('ice_shelf_model', 'dg_band_w', CS%diag%axesT1, Time, &
            'DG(1) shared band weight of DG1_BAND_WIDTH: 1 in the band, falling to 0 across '//&
            'DG1_BAND_RAMP', 'nondim')
-      if (CS%dg_post_bubble) then
+      if (CS%dg_post_bubble .or. CS%dg_coupled) then
         CS%id_dg_post_ub = register_diag_field('ice_shelf_model', 'dg_post_ub', CS%diag%axesT1, Time, &
            'DG(1) DG1_POST_BUBBLE: x bubble velocity at the Gauss points of each cell, from the last '//&
            'velocity solve', 'm yr-1', conversion=365.0*86400.0*US%L_T_to_m_s)
@@ -2262,7 +2304,8 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
            'velocity solve', 'm yr-1', conversion=365.0*86400.0*US%L_T_to_m_s)
         CS%id_dg_post_skip = register_diag_field('ice_shelf_model', 'dg_post_skip', CS%diag%axesT1, Time, &
            'DG(1) DG1_POST_BUBBLE: 1 where the last bubble solve was skipped (no positive determinant '//&
-           'or no finite result)', 'nondim')
+           'or no finite result); DG1_COUPLED_BUBBLE: 1 where the cell has no bubble, 0.5 where its '//&
+           'linear solve uses the Picard bubble blocks', 'nondim')
       endif
       if (CS%dg_grounded_limiter) then
         allocate(CS%dg_lim_phi(G%isd:G%ied,G%jsd:G%jed,2), source=1.0)
@@ -3474,6 +3517,8 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   real, dimension(SZDIB_(G),SZDJB_(G)) :: u_pre_newton, v_pre_newton ! Velocities saved at the
                                               ! Picard-to-Newton switch, restored if Newton
                                               ! diverges [L T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: ub_pre_newton, vb_pre_newton ! DG1_COUPLED_BUBBLE bubble velocities
+                                              ! saved at the Picard-to-Newton switch [L T-1 ~> m s-1]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: Normvec  ! Velocities used for convergence [L2 T-2 ~> m2 s-2]
   logical :: converged ! Indicates nonlinear convergence
   logical :: calc_Au_for_convergence ! Used for convergence criteria than need a CG_action
@@ -3502,8 +3547,13 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   logical :: rescue_enabled   ! Newton divergence rescue is configured and applicable
   logical :: newton_armed     ! Pre-Newton state is saved; divergence rescue available
   logical :: diverging        ! The current Newton residual triggers a rescue
+  logical :: cpl_ready        ! DG1_COUPLED_BUBBLE: the bubble blocks are those of the current iterate and
+                              ! solve kind, from a residual check, so the linear solve need not build them
+  logical :: cpl_cache        ! DG1_COUPLED_BUBBLE with BASAL_FRICTION_PRECOMPUTE: the residual checks use
+                              ! the friction cache that the block build of the same iterate sets
   integer :: n_rescue         ! Number of divergence rescues performed in this solve
 
+  call cpu_clock_begin(CS%id_clock_solve)
   Isdq = G%IsdB ; Iedq = G%IedB ; Jsdq = G%JsdB ; Jedq = G%JedB
   Iscq = G%IscB ; Iecq = G%IecB ; Jscq = G%JscB ; Jecq = G%JecB
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -3528,6 +3578,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
   taudx(:,:) = 0.0 ; taudy(:,:) = 0.0
   Au(:,:) = 0.0 ; Av(:,:) = 0.0
+  cpl_ready = .false.
 
   ! Warning: This turns off Picard entirely and may not converge.
   if (CS%newton_after_tolerance<=0.0) CS%doing_newton=.true.
@@ -3546,6 +3597,19 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   endif
   call pass_vector(taudx, taudy, G%domain, TO_ALL, BGRID_NE)
 
+  ! DG1_COUPLED_BUBBLE: the bubble velocity is part of the iterate, so its halos must be current.  A cell that
+  ! has no bubble now (not an ice cell, or a sub-cell cell with DG1_COUPLED_BUBBLE_CROSSED false) loses it
+  ! before the viscosity and the friction are first set.
+  if (CS%dg_coupled) then
+    do j=G%jsc,G%jec ; do i=G%isc,G%iec
+      if ((ISS%hmask(i,j) /= 1.0) .or. (gl_subgrid_cell(CS, i, j) .and. .not.CS%dg_cpl_crossed)) then
+        CS%dg_post_ub(i,j) = 0.0 ; CS%dg_post_vb(i,j) = 0.0
+      endif
+    enddo ; enddo
+    call pass_var(CS%dg_post_ub, G%domain, complete=.false.)
+    call pass_var(CS%dg_post_vb, G%domain, complete=.true.)
+  endif
+
   ! Calculate basal drag constants and initial velocity
   call calc_shelf_basal_prefactors(CS, ISS, G, US)
   if (CS%local_basal_friction) call calc_shelf_basal_prefactors_node(CS, ISS, G, US)
@@ -3559,13 +3623,23 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     call pass_var(CS%ice_visc, G%domain, complete=.true.)
   endif
 
+  ! DG1_COUPLED_BUBBLE: the blocks of the first iterate, the only build that sets the driving stress against
+  ! the bubbles (the thickness does not change in the solve); the first linear solve uses them.
+  if (CS%dg_coupled) then
+    call dg1_cpl_blocks(CS, ISS, G, US, u_shlf, v_shlf, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, &
+                        CS%doing_newton, .true.)
+    cpl_ready = .true.
+  endif
+  ! With COUPLED, each block build also sets the friction cache, so the residual checks use it too.
+  cpl_cache = CS%dg_coupled .and. CS%fric_precompute
+
   ! Calculate err_init, the denominator for some convergence criteria
   if (CS%nonlin_solve_err_mode == 1 .or. CS%nonlin_solve_err_mode == 4) then
     Au(:,:) = 0.0 ; Av(:,:) = 0.0
     call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, CS%H_node, &
       CS%ice_visc, CS%bed_elev, u_shlf, v_shlf, &
       G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow, use_newton_in=.false., &
-      h_shelf=ISS%h_shelf)
+      h_shelf=ISS%h_shelf, use_fric_cache=cpl_cache, bubble_mode=merge(1, 0, CS%dg_coupled))
     call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE) ! TODO: is this needed?
   endif
 
@@ -3644,7 +3718,9 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
 
     ! The linear solve
     call ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, CS%H_node, &
-                               ISS%hmask, conv_flag, iters, time, CS%Phi, CS%Phisub)
+                               ISS%hmask, conv_flag, iters, time, CS%Phi, CS%Phisub, &
+                               cpl_blocks_ready=cpl_ready)
+    cpl_ready = .false.
 
     if (CS%debug) then
       call qchksum(u_shlf, "u shelf", G%HI, haloshift=2, unscale=US%L_T_to_m_s)
@@ -3669,10 +3745,13 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
     ! Calculate convergence norms
     if (calc_Au_for_convergence) then
       Au(:,:) = 0 ; Av(:,:) = 0
+      if (CS%dg_coupled) call dg1_cpl_blocks(CS, ISS, G, US, u_shlf, v_shlf, &
+                                             G%isc-1, G%iec+1, G%jsc-1, G%jec+1, CS%doing_newton, .false.)
+      cpl_ready = CS%dg_coupled
       call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, &
         CS%H_node, CS%ice_visc, CS%bed_elev, u_shlf, v_shlf, &
         G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow, use_newton_in=.false., &
-        h_shelf=ISS%h_shelf)
+        h_shelf=ISS%h_shelf, use_fric_cache=cpl_cache, bubble_mode=merge(1, 0, CS%dg_coupled))
 
       if (CS%nonlin_solve_err_mode == 1) then
         err_max = 0
@@ -3777,6 +3856,10 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
         if (diverging) then
           n_rescue = n_rescue + 1
           u_shlf(:,:) = u_pre_newton(:,:) ; v_shlf(:,:) = v_pre_newton(:,:)
+          if (CS%dg_coupled) then
+            CS%dg_post_ub(:,:) = ub_pre_newton(:,:) ; CS%dg_post_vb(:,:) = vb_pre_newton(:,:)
+          endif
+          cpl_ready = .false.
           u_last(:,:) = u_shlf(:,:) ; v_last(:,:) = v_shlf(:,:)
           if (CS%nonlin_solve_err_mode == 3) Norm = Norm_newton_enter
           CS%doing_newton = .false. ; newton_armed = .false.
@@ -3805,11 +3888,15 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
         if (rescue_enabled) then
           ! Save the switch state so a divergent Newton excursion can be undone.
           u_pre_newton(:,:) = u_shlf(:,:) ; v_pre_newton(:,:) = v_shlf(:,:)
+          if (CS%dg_coupled) then
+            ub_pre_newton(:,:) = CS%dg_post_ub(:,:) ; vb_pre_newton(:,:) = CS%dg_post_vb(:,:)
+          endif
           err_newton_enter = err_max
           if (CS%nonlin_solve_err_mode == 3) Norm_newton_enter = Norm
           newton_armed = .true.
         endif
         CS%doing_newton = .true.
+        cpl_ready = .false.  ! The bubble blocks of the residual check have no Newton terms.
         write(mesg,*) "ice_shelf_solve_outer: switching to Newton iterations at iter = ", iter
         call MOM_mesg(mesg, 7)
         call pass_var(CS%newton_str_sh, G%domain, complete=.false.)
@@ -3832,10 +3919,13 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
         else
           if (.not. calc_Au_for_convergence) then
             Au(:,:) = 0 ; Av(:,:) = 0
+            if (CS%dg_coupled) call dg1_cpl_blocks(CS, ISS, G, US, u_shlf, v_shlf, &
+                                                   G%isc-1, G%iec+1, G%jsc-1, G%jec+1, CS%doing_newton, .false.)
+            cpl_ready = CS%dg_coupled
             call CG_action(CS, Au, Av, u_shlf, v_shlf, CS%Phi, CS%Phisub, CS%umask, CS%vmask, ISS%hmask, &
               CS%H_node, CS%ice_visc, CS%bed_elev, u_shlf, v_shlf, &
               G, US, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, rhoi_rhow, use_newton_in=.false., &
-              h_shelf=ISS%h_shelf)
+              h_shelf=ISS%h_shelf, use_fric_cache=cpl_cache, bubble_mode=merge(1, 0, CS%dg_coupled))
           endif
           Normvec(:,:) = 0.0
           do J=Jscq_sv,Jecq ; do I=Iscq_sv,Iecq
@@ -3899,6 +3989,7 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   endif
   write(mesg,*) "ice_shelf_solve_outer: exiting nonlinear solve after ",iter," iterations"
   call MOM_mesg(mesg)
+  call cpu_clock_end(CS%id_clock_solve)
 
 end subroutine ice_shelf_solve_outer
 
@@ -3906,7 +3997,7 @@ end subroutine ice_shelf_solve_outer
 !! Performs shared setup (RHS, preconditioner, initial matrix-vector product),
 !! dispatches to the selected Krylov method, and applies boundary conditions.
 subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H_node, &
-                                  hmask, conv_flag, iters, time, Phi, Phisub)
+                                  hmask, conv_flag, iters, time, Phi, Phisub, cpl_blocks_ready)
   type(ice_shelf_dyn_CS), intent(in)    :: CS !< A pointer to the ice shelf control structure
   type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe the ice-shelf state
   type(ocean_grid_type),  intent(inout) :: G  !< The grid structure used by the ice shelf.
@@ -3934,13 +4025,19 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
   real, dimension(:,:,:,:,:,:), &
                           intent(in)    :: Phisub !< Quadrature structure weights at subgridscale
                                                   !! locations for finite element calculations [nondim]
+  logical,      optional, intent(in)    :: cpl_blocks_ready !< DG1_COUPLED_BUBBLE: if true, the bubble blocks
+                                                  !! are those of this iterate and of this kind of solve (from a
+                                                  !! residual check), and the solve uses them as they are
 
   real, dimension(SZDIB_(G),SZDJB_(G)) :: &
         RHSu, RHSv, &      ! Right hand side of the stress balance [R L3 Z T-2 ~> m kg s-2]
         Au, Av, &          ! Matrix-vector product A*x [R L3 Z T-2 ~> kg m s-2]
         DIAGu, DIAGv, &    ! Diagonals [R L2 Z T-1 ~> kg s-1]
-        IDIAGu, IDIAGv     ! Reciprocal diagonals [R-1 L-2 Z-1 T ~> kg-1 s]
+        IDIAGu, IDIAGv, &  ! Reciprocal diagonals [R-1 L-2 Z-1 T ~> kg-1 s]
+        u_k, v_k           ! DG1_COUPLED_BUBBLE: the node velocity at the start of the solve, then its
+                           ! change in the solve [L T-1 ~> m s-1]
   real    :: rhoi_rhow     ! The density of ice divided by a typical water density [nondim]
+  logical :: cpl_build     ! DG1_COUPLED_BUBBLE: build the bubble blocks of this linearization
   real    :: resid_scale   ! A scaling factor for redimensionalizing the global residuals
                            ! [T3 kg m2 R-1 Z-1 L-4 s-3 ~> 1]
   integer :: Is_sum, Js_sum, Ie_sum, Je_sum ! Loop bounds for global sums or arrays starting at 1.
@@ -3977,20 +4074,40 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
 
   ! The basal friction depends on the frozen iterate, which every inner solver takes from u_shlf and
   ! keeps for the whole linear solve, so it is evaluated once here and applied from storage.
-  if (CS%fric_precompute) &
+  ! With DG1_COUPLED_BUBBLE the block build sets the friction cache.
+  if (CS%fric_precompute .and. .not.CS%dg_coupled) then
+    call cpu_clock_begin(CS%id_clock_fcache)
     call build_basal_friction_cache(CS, G, US, u_shlf, v_shlf, Phisub, hmask, H_node, CS%bed_elev, &
                                     rhoi_rhow, isc-1, iec+1, jsc-1, jec+1, h_shelf=ISS%h_shelf)
+    call cpu_clock_end(CS%id_clock_fcache)
+  endif
+  ! DG1_COUPLED_BUBBLE: the bubble blocks of this linearization, Picard for the residual and the operator
+  ! of this solve (Newton or Picard) for the condensation.
+  ! A residual check at this iterate built the same blocks (Picard and, under Newton, Newton).
+  cpl_build = CS%dg_coupled
+  if (cpl_build .and. present(cpl_blocks_ready)) cpl_build = .not.cpl_blocks_ready
+  if (cpl_build) &
+    call dg1_cpl_blocks(CS, ISS, G, US, u_shlf, v_shlf, isc-1, iec+1, jsc-1, jec+1, CS%doing_newton, .false.)
 
   call matrix_diagonal(CS, G, US, H_node, CS%ice_visc, u_shlf, v_shlf, &
                        hmask, rhoi_rhow, Phi, Phisub, DIAGu, DIAGv, h_shelf=ISS%h_shelf, &
                        use_fric_cache=CS%fric_precompute)
+  if (CS%dg_coupled) call dg1_cpl_diag(CS, G, isc-1, iec+1, jsc-1, jec+1, DIAGu, DIAGv)
   call pass_vector(DIAGu, DIAGv, G%domain, TO_ALL, BGRID_NE, complete=.false.)
 
   call CG_action(CS, Au, Av, u_shlf, v_shlf, Phi, Phisub, CS%umask, CS%vmask, hmask, &
                  H_node, CS%ice_visc, CS%bed_elev, u_shlf, v_shlf, &
                  G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, use_newton_in=.false., &
-                 h_shelf=ISS%h_shelf, use_fric_cache=CS%fric_precompute)
+                 h_shelf=ISS%h_shelf, use_fric_cache=CS%fric_precompute, &
+                 bubble_mode=merge(1, 0, CS%dg_coupled))
   call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE, complete=.true.)
+
+  if (CS%dg_coupled) then
+    ! The bubble rows are condensed onto the right-hand side; the bubbles follow from the solve.
+    call dg1_cpl_rhs(CS, G, u_shlf, v_shlf, isc-1, iec+1, jsc-1, jec+1, RHSu, RHSv)
+    call pass_vector(RHSu, RHSv, G%domain, TO_ALL, BGRID_NE)
+    u_k(:,:) = u_shlf(:,:) ; v_k(:,:) = v_shlf(:,:)
+  endif
 
   ! Precompute reciprocal diagonal
   IDIAGu(:,:) = 0.0 ; IDIAGv(:,:) = 0.0
@@ -4039,6 +4156,11 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
   enddo ; enddo
 
   call pass_vector(u_shlf, v_shlf, G%domain, TO_ALL, BGRID_NE)
+
+  if (CS%dg_coupled) then
+    u_k(:,:) = u_shlf(:,:) - u_k(:,:) ; v_k(:,:) = v_shlf(:,:) - v_k(:,:)
+    call dg1_cpl_update(CS, G, u_k, v_k)
+  endif
 
   if (conv_flag == 0) then
     iters = CS%cg_max_iterations
@@ -4194,7 +4316,8 @@ subroutine ice_shelf_solve_inner_CG(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, A
 
     call CG_action(CS, Au, Av, Du, Dv, Phi, Phisub, CS%umask, CS%vmask, hmask, &
                    H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
-                   G, US, is, ie, js, je, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute)
+                   G, US, is, ie, js, je, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute, &
+                   bubble_mode=merge(2, 0, CS%dg_coupled))
 
     sum_vec(:,:) = 0.0
 
@@ -4426,7 +4549,8 @@ subroutine ice_shelf_solve_inner_MINRES(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, A
     Qu(:,:) = 0 ; Qv(:,:) = 0
     call CG_action(CS, Qu, Qv, Z_curr_u, Z_curr_v, Phi, Phisub, CS%umask, CS%vmask, hmask, &
                    H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
-                   G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute)
+                   G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute, &
+                   bubble_mode=merge(2, 0, CS%dg_coupled))
     ! --- STEP 2: alpha = q dot z_curr ---
     sum_vec_3d(:,:) = 0.0
     do J=Jscq_sv,Jecq ; do I=Iscq_sv,Iecq
@@ -4626,7 +4750,8 @@ subroutine ice_shelf_solve_inner_CR(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, A
   Au(:,:) = 0 ; Av(:,:) = 0
   call CG_action(CS, Au, Av, Zu, Zv, Phi, Phisub, CS%umask, CS%vmask, hmask, &
                  H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
-                 G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute)
+                 G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute, &
+                   bubble_mode=merge(2, 0, CS%dg_coupled))
   call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
 
   ! q_0 = A * p_0
@@ -4704,7 +4829,8 @@ subroutine ice_shelf_solve_inner_CR(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, A
     Au(:,:) = 0 ; Av(:,:) = 0
     call CG_action(CS, Au, Av, Zu, Zv, Phi, Phisub, CS%umask, CS%vmask, hmask, &
                    H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
-                   G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute)
+                   G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute, &
+                   bubble_mode=merge(2, 0, CS%dg_coupled))
     call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
 
     ! --- STEP 4: beta and convergence check ---
@@ -6010,7 +6136,7 @@ end subroutine calc_shelf_driving_stress_vertex
 
 subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, hmask, H_node, &
                      ice_visc, bathyT, u_curr, v_curr, G, US, is, ie, js, je, dens_ratio, &
-                     use_newton_in, h_shelf, use_fric_cache)
+                     use_newton_in, h_shelf, use_fric_cache, bubble_mode)
 
   type(ice_shelf_dyn_CS), intent(in)    :: CS !< A pointer to the ice shelf control structure
   type(ocean_grid_type), intent(in) :: G  !< The grid structure used by the ice shelf.
@@ -6066,6 +6192,11 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   logical, optional,     intent(in)    :: use_fric_cache !< If true, apply the basal friction stored by
                                                !! build_basal_friction_cache for this u_curr instead of
                                                !! evaluating it. Only valid inside a linear solve.
+  integer, optional,     intent(in)    :: bubble_mode !< DG1_COUPLED_BUBBLE: 0 (default) no bubble term,
+                                               !! 1 add K_nb c for the bubble velocity c in dg_post_ub and
+                                               !! dg_post_vb with the Picard blocks (a residual), 2 add
+                                               !! -K_nb W u with the linear-solve blocks, W = K_bb^-1 K_bn
+                                               !! (the condensed operator of a linear solve)
 
 ! the linear action of the matrix on (u,v) with bilinear finite elements
 ! as of now everything is passed in so no grid pointers or anything of the sort have to be dereferenced,
@@ -6116,6 +6247,9 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   real, dimension(2,2) :: Hcell   ! Ice shelf thickness at nodal (corner) points [Z ~> m]
   real, dimension(2,2,4) :: uret_qp, vret_qp                ! Temporary arrays in [R Z L3 T-2 ~> kg m s-2]
   real, dimension(SZDIB_(G),SZDJB_(G),4) :: uret_b, vret_b  ! Temporary arrays in [R Z L3 T-2 ~> kg m s-2]
+  integer :: bub_mode    ! DG1_COUPLED_BUBBLE term to add: 0 none, 1 Picard residual, 2 condensed operator
+  real, dimension(2) :: bub_c, bub_g ! Bubble velocities [L T-1 ~> m s-1] and bubble rows [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(8) :: bub_ru, bub_rv ! Node returns of the bubbles of a cell [R L3 Z T-2 ~> kg m s-2]
 
   xquad(1) = .5 * (1-sqrt(1./3)) ; xquad(2) = .5 * (1+sqrt(1./3))
 
@@ -6133,6 +6267,7 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   do_DG = CS%use_DG_thickness .and. present(h_shelf)
   fv_sub_fric = CS%i2n_friction
   use_cache = .false. ; if (present(use_fric_cache)) use_cache = use_fric_cache
+  bub_mode = 0 ; if (present(bubble_mode)) bub_mode = bubble_mode
   if (do_DG) then
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
     rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
@@ -6343,6 +6478,27 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
         if (vmask(I  ,J-1) == 1) vret_b(I  ,J-1,3) = vret_b(I  ,J-1,3) + Vsub(2,1)
         if (vmask(I  ,J  ) == 1) vret_b(I  ,J  ,1) = vret_b(I  ,J  ,1) + Vsub(2,2)
       endif
+
+      ! DG1_COUPLED_BUBBLE: the node returns K_nb c of the cell's bubbles, with c the bubble velocity
+      ! (residual) or the bubble of the search direction from its own bubble rows (static condensation).
+      if (bub_mode > 0) then ; if (CS%cpl_on(i,j) > 0.0) then
+        if (bub_mode == 1) then
+          bub_c(1) = CS%dg_post_ub(i,j) ; bub_c(2) = CS%dg_post_vb(i,j)
+          call dg1_cpl_node_returns(CS%cpl_blk(CPL_PIC+1:CPL_PIC+16,i,j), bub_c, bub_ru, bub_rv)
+        else
+          call dg1_cpl_bubble_force(CS, i, j, CPL_W, u_shlf(I-1:I,J-1:J), v_shlf(I-1:I,J-1:J), bub_g)
+          bub_c(:) = -bub_g(:)
+          call dg1_cpl_node_returns(CS%cpl_blk(CPL_LIN+1:CPL_LIN+16,i,j), bub_c, bub_ru, bub_rv)
+        endif
+        if (umask(I-1,J-1) == 1) uret_b(I-1,J-1,4) = uret_b(I-1,J-1,4) + bub_ru(1)
+        if (umask(I  ,J-1) == 1) uret_b(I  ,J-1,3) = uret_b(I  ,J-1,3) + bub_ru(2)
+        if (umask(I-1,J  ) == 1) uret_b(I-1,J  ,2) = uret_b(I-1,J  ,2) + bub_ru(3)
+        if (umask(I  ,J  ) == 1) uret_b(I  ,J  ,1) = uret_b(I  ,J  ,1) + bub_ru(4)
+        if (vmask(I-1,J-1) == 1) vret_b(I-1,J-1,4) = vret_b(I-1,J-1,4) + bub_rv(1)
+        if (vmask(I  ,J-1) == 1) vret_b(I  ,J-1,3) = vret_b(I  ,J-1,3) + bub_rv(2)
+        if (vmask(I-1,J  ) == 1) vret_b(I-1,J  ,2) = vret_b(I-1,J  ,2) + bub_rv(3)
+        if (vmask(I  ,J  ) == 1) vret_b(I  ,J  ,1) = vret_b(I  ,J  ,1) + bub_rv(4)
+      endif ; endif
   endif ; enddo ; enddo
 
   do J=js-1,je ; do I=is-1,ie
@@ -6457,6 +6613,12 @@ subroutine basal_friction_qp(CS, G, US, i, j, iq, jq, xquad, u_curr, v_curr, do_
                  (v_curr(I,J) * (xquad(iq) * xquad(jq)))) + &
                 ((v_curr(I,J-1) * (xquad(iq) * xquad(3-jq))) + &
                  (v_curr(I-1,J) * (xquad(3-iq) * xquad(jq))))
+    if (CS%dg_coupled) then
+      ! DG1_COUPLED_BUBBLE: the friction sees the total velocity; the bubble is the same at the four
+      ! Gauss points, and it is zero in a cell without a bubble.
+      u_curr_qp = u_curr_qp + CS%dg_post_ub(i,j)
+      v_curr_qp = v_curr_qp + CS%dg_post_vb(i,j)
+    endif
     unorm2_qp = ((u_curr_qp**2) + (v_curr_qp**2)) + eps_vel2_e
     call compute_basal_coef(unorm2_qp, coef_prefactor_e, min_trac_e, fB_local, &
         CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, use_newton, &
@@ -6537,6 +6699,7 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
   real :: v_curr_loc    ! Frozen v^k interpolated to sub-qp [L T-1 ~> m s-1]
   real :: u_delta_loc   ! Search direction δu interpolated to sub-qp [L T-1 ~> m s-1]
   real :: v_delta_loc   ! Search direction δv interpolated to sub-qp [L T-1 ~> m s-1]
+  real :: bt_loc        ! DG1_COUPLED_BUBBLE bubble at the sub-qp, 1 at the Gauss points [nondim]
   real :: unorm2_loc    ! Regularized |u^k|^2 at sub-qp [L2 T-2 ~> m2 s-2]
   real :: basal_coef_loc ! Picard friction coefficient at sub-qp [R L2 Z T-1 ~> kg s-1]
   real :: drag_newt_loc  ! Newton drag coefficient at sub-qp [R Z T ~> kg m-2 s]
@@ -6635,6 +6798,15 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
                        ((Phisub(qx,qy,i,j,1,2)*U_curr(1,2))  + (Phisub(qx,qy,i,j,2,1)*U_curr(2,1))))
         v_curr_loc  = (((Phisub(qx,qy,i,j,1,1)*V_curr(1,1))  + (Phisub(qx,qy,i,j,2,2)*V_curr(2,2)))  + &
                        ((Phisub(qx,qy,i,j,1,2)*V_curr(1,2))  + (Phisub(qx,qy,i,j,2,1)*V_curr(2,1))))
+        if (do_DG .and. CS%dg_coupled) then
+          ! DG1_COUPLED_BUBBLE: the friction sees the total velocity at the sub-point.
+          bt_loc = dg1_bubble_tilde(Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2), &
+                                    Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2), &
+                                    Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1), &
+                                    Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2))
+          u_curr_loc = u_curr_loc + (bt_loc * CS%dg_post_ub(i_elem,j_elem))
+          v_curr_loc = v_curr_loc + (bt_loc * CS%dg_post_vb(i_elem,j_elem))
+        endif
         if (.not. build_K) then
           u_delta_loc = (((Phisub(qx,qy,i,j,1,1)*U_delta(1,1)) + (Phisub(qx,qy,i,j,2,2)*U_delta(2,2))) + &
                          ((Phisub(qx,qy,i,j,1,2)*U_delta(1,2)) + (Phisub(qx,qy,i,j,2,1)*U_delta(2,1))))
@@ -6797,6 +6969,37 @@ subroutine build_basal_friction_cache(CS, G, US, u_curr, v_curr, Phisub, hmask, 
   real, dimension(SZDI_(G),SZDJ_(G)), &
                 optional, intent(in) :: h_shelf !< Cell-averaged ice thickness for DG mode [Z ~> m]
 
+  logical :: do_DG
+  integer :: i, j
+
+  do_DG = CS%use_DG_thickness .and. present(h_shelf)
+  do j=js,je ; do i=is,ie ; if (hmask(i,j) == 1 .or. hmask(i,j) == 3) then
+    call fric_cache_cell(CS, G, US, u_curr, v_curr, Phisub, H_node, bathyT, dens_ratio, do_DG, i, j)
+  endif ; enddo ; enddo
+
+end subroutine build_basal_friction_cache
+
+!> The friction cache of build_basal_friction_cache for one ice cell (i, j): the coefficients at its 2x2
+!! quadrature points and, on the grounding-line sub-element path, its corner friction matrix.
+subroutine fric_cache_cell(CS, G, US, u_curr, v_curr, Phisub, H_node, bathyT, dens_ratio, do_DG, i, j)
+  type(ice_shelf_dyn_CS), intent(in) :: CS !< The ice shelf dynamics control structure; only the
+                                           !! targets of its friction-cache pointers are written
+  type(ocean_grid_type),  intent(in) :: G  !< The grid structure used by the ice shelf
+  type(unit_scale_type),  intent(in) :: US !< A structure containing unit conversion factors
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in) :: u_curr !< Frozen iterate u^k at the corners [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in) :: v_curr !< Frozen iterate v^k at the corners [L T-1 ~> m s-1]
+  real, dimension(:,:,:,:,:,:), intent(in) :: Phisub !< Sub-grid quadrature weights [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in) :: H_node !< The ice thickness at the corners [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(in) :: bathyT !< The ocean bathymetry depth at tracer points [Z ~> m]
+  real,                   intent(in) :: dens_ratio !< Ice density / water density [nondim]
+  logical,                intent(in) :: do_DG !< If true, use the DG nodal thickness and bed
+  integer,                intent(in) :: i  !< The i-index of the cell
+  integer,                intent(in) :: j  !< The j-index of the cell
+
   real, dimension(2) :: xquad   ! The 2-pt Gauss abscissae on [0,1] [nondim]
   real, dimension(2,2) :: Hcell ! Ice thickness at the cell corners [Z ~> m]
   real, dimension(2,2) :: zero2 ! A zero search direction for the matrix builds [L T-1 ~> m s-1]
@@ -6809,12 +7012,11 @@ subroutine build_basal_friction_cache(CS, G, US, u_curr, v_curr, Phisub, hmask, 
   real :: rho_ice_g_LtoZ   ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
   real :: bc, dn           ! Picard [R L2 Z T-1 ~> kg s-1] and Newton [R Z T ~> kg m-2 s] coefficients
   real :: uq, vq           ! u^k and v^k at a quadrature point [L T-1 ~> m s-1]
-  logical :: do_DG, fv_sub_fric, grounded_qp
-  integer :: i, j, iq, jq, qp
+  logical :: fv_sub_fric, grounded_qp
+  integer :: iq, jq, qp
 
   xquad(1) = .5 * (1-sqrt(1./3)) ; xquad(2) = .5 * (1+sqrt(1./3))
   zero2(:,:) = 0.0
-  do_DG = CS%use_DG_thickness .and. present(h_shelf)
   fv_sub_fric = CS%i2n_friction
   rho_oi_ratio = 0.0 ; rho_ice_g_LtoZ = 0.0
   if (do_DG) then
@@ -6822,66 +7024,64 @@ subroutine build_basal_friction_cache(CS, G, US, u_curr, v_curr, Phisub, hmask, 
     rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
   endif
 
-  do j=js,je ; do i=is,ie ; if (hmask(i,j) == 1 .or. hmask(i,j) == 3) then
-    coef_prefactor_e = CS%coef_prefactor(i,j)
-    eps_vel2_e = CS%eps_glen_min**2 * ((G%dxT(i,j)**2) + (G%dyT(i,j)**2))
-    min_trac_e = CS%min_basal_traction * G%areaT(i,j)
-    fB_e = CS%fB_elem(i,j)
+  coef_prefactor_e = CS%coef_prefactor(i,j)
+  eps_vel2_e = CS%eps_glen_min**2 * ((G%dxT(i,j)**2) + (G%dyT(i,j)**2))
+  min_trac_e = CS%min_basal_traction * G%areaT(i,j)
+  fB_e = CS%fB_elem(i,j)
 
-    do iq=1,2 ; do jq=1,2
-      qp = 2*(jq-1)+iq
-      call basal_friction_qp(CS, G, US, i, j, iq, jq, xquad, u_curr, v_curr, do_DG, dens_ratio, &
-                             rho_oi_ratio, rho_ice_g_LtoZ, coef_prefactor_e, min_trac_e, fB_e, &
-                             eps_vel2_e, .true., grounded_qp, bc, dn, uq, vq)
-      CS%fric_qp_on(qp,i,j) = merge(1.0, 0.0, grounded_qp)
-      CS%fric_qp_coef(qp,i,j) = bc ; CS%fric_qp_newt(qp,i,j) = dn
-      CS%fric_qp_u(qp,i,j) = uq ; CS%fric_qp_v(qp,i,j) = vq
-    enddo ; enddo
+  do iq=1,2 ; do jq=1,2
+    qp = 2*(jq-1)+iq
+    call basal_friction_qp(CS, G, US, i, j, iq, jq, xquad, u_curr, v_curr, do_DG, dens_ratio, &
+                           rho_oi_ratio, rho_ice_g_LtoZ, coef_prefactor_e, min_trac_e, fB_e, &
+                           eps_vel2_e, .true., grounded_qp, bc, dn, uq, vq)
+    CS%fric_qp_on(qp,i,j) = merge(1.0, 0.0, grounded_qp)
+    CS%fric_qp_coef(qp,i,j) = bc ; CS%fric_qp_newt(qp,i,j) = dn
+    CS%fric_qp_u(qp,i,j) = uq ; CS%fric_qp_v(qp,i,j) = vq
+  enddo ; enddo
 
-    if (CS%GL_regularize .and. .not. CS%gl_quad_friction .and. .not. CS%local_basal_friction .and. &
-        gl_subgrid_cell(CS, i, j)) then
-      Hcell(:,:) = H_node(I-1:I,J-1:J)
-      if (CS%use_sep2) then
-        if (fv_sub_fric) then
-          call CG_action_sep2_basal(CS, G, US, Hcell, u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
-              zero2, zero2, bathyT(i,j), dens_ratio, i, j, fB_e, .true., Usub, Vsub, &
-              G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
-              h_nodal_cell=CS%H_corner(I-1:I,J-1:J), fls_cell=CS%fls_corner(I-1:I,J-1:J), &
-              Kmat=CS%gl_fric_K(:,:,:,i,j))
-        elseif (do_DG) then
-          call CG_action_sep2_basal(CS, G, US, Hcell, u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
-              zero2, zero2, bathyT(i,j), dens_ratio, i, j, fB_e, .true., Usub, Vsub, &
-              G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
-              use_DG=.true., h_nodal_cell=CS%h_nodal(i,j,:,:), bed_corners=CS%bed_node(I-1:I,J-1:J), &
-              Kmat=CS%gl_fric_K(:,:,:,i,j))
-        else
-          call CG_action_sep2_basal(CS, G, US, Hcell, u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
-              zero2, zero2, bathyT(i,j), dens_ratio, i, j, fB_e, .true., Usub, Vsub, &
-              G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
-              Kmat=CS%gl_fric_K(:,:,:,i,j))
-        endif
-      elseif (fv_sub_fric) then
-        call CG_action_subgrid_basal(CS, G, US, Phisub, Hcell, u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+  if (CS%GL_regularize .and. .not. CS%gl_quad_friction .and. .not. CS%local_basal_friction .and. &
+      gl_subgrid_cell(CS, i, j)) then
+    Hcell(:,:) = H_node(I-1:I,J-1:J)
+    if (CS%use_sep2) then
+      if (fv_sub_fric) then
+        call CG_action_sep2_basal(CS, G, US, Hcell, u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
             zero2, zero2, bathyT(i,j), dens_ratio, i, j, fB_e, .true., Usub, Vsub, &
             G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
             h_nodal_cell=CS%H_corner(I-1:I,J-1:J), fls_cell=CS%fls_corner(I-1:I,J-1:J), &
             Kmat=CS%gl_fric_K(:,:,:,i,j))
       elseif (do_DG) then
-        call CG_action_subgrid_basal(CS, G, US, Phisub, Hcell, u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+        call CG_action_sep2_basal(CS, G, US, Hcell, u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
             zero2, zero2, bathyT(i,j), dens_ratio, i, j, fB_e, .true., Usub, Vsub, &
             G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
             use_DG=.true., h_nodal_cell=CS%h_nodal(i,j,:,:), bed_corners=CS%bed_node(I-1:I,J-1:J), &
             Kmat=CS%gl_fric_K(:,:,:,i,j))
       else
-        call CG_action_subgrid_basal(CS, G, US, Phisub, Hcell, u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+        call CG_action_sep2_basal(CS, G, US, Hcell, u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
             zero2, zero2, bathyT(i,j), dens_ratio, i, j, fB_e, .true., Usub, Vsub, &
             G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
             Kmat=CS%gl_fric_K(:,:,:,i,j))
       endif
+    elseif (fv_sub_fric) then
+      call CG_action_subgrid_basal(CS, G, US, Phisub, Hcell, u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+          zero2, zero2, bathyT(i,j), dens_ratio, i, j, fB_e, .true., Usub, Vsub, &
+          G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
+          h_nodal_cell=CS%H_corner(I-1:I,J-1:J), fls_cell=CS%fls_corner(I-1:I,J-1:J), &
+          Kmat=CS%gl_fric_K(:,:,:,i,j))
+    elseif (do_DG) then
+      call CG_action_subgrid_basal(CS, G, US, Phisub, Hcell, u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+          zero2, zero2, bathyT(i,j), dens_ratio, i, j, fB_e, .true., Usub, Vsub, &
+          G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
+          use_DG=.true., h_nodal_cell=CS%h_nodal(i,j,:,:), bed_corners=CS%bed_node(I-1:I,J-1:J), &
+          Kmat=CS%gl_fric_K(:,:,:,i,j))
+    else
+      call CG_action_subgrid_basal(CS, G, US, Phisub, Hcell, u_curr(I-1:I,J-1:J), v_curr(I-1:I,J-1:J), &
+          zero2, zero2, bathyT(i,j), dens_ratio, i, j, fB_e, .true., Usub, Vsub, &
+          G%dxCv(i,j-1), G%dxCv(i,j), G%dyCu(i-1,j), G%dyCu(i,j), G%IareaT(i,j), &
+          Kmat=CS%gl_fric_K(:,:,:,i,j))
     endif
-  endif ; enddo ; enddo
+  endif
 
-end subroutine build_basal_friction_cache
+end subroutine fric_cache_cell
 
 !> Compute the Picard basal friction coefficient and Newton drag coefficient at a
 !! single quadrature point. Encapsulates the 3-path dispatch (linear Weertman / nonlinear
@@ -7252,6 +7452,11 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
                      (v_curr(I,J) * (xquad(iq) * xquad(jq)))) + &
                     ((v_curr(I,J-1) * (xquad(iq) * xquad(3-jq))) + &
                      (v_curr(I-1,J) * (xquad(3-iq) * xquad(jq))))
+        if (CS%dg_coupled) then
+          ! DG1_COUPLED_BUBBLE: the friction sees the total velocity, as in basal_friction_qp.
+          u_curr_qp = u_curr_qp + CS%dg_post_ub(i,j)
+          v_curr_qp = v_curr_qp + CS%dg_post_vb(i,j)
+        endif
         unorm2_qp = ((u_curr_qp**2) + (v_curr_qp**2)) + eps_vel2_e
         call compute_basal_coef(unorm2_qp, coef_prefactor_e, min_trac_e, fB_local, &
             CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .true., &
@@ -7480,6 +7685,7 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
   real :: bed_sub        ! Bed elevation at sub-quadrature point [Z ~> m]
   real :: u_curr_loc     ! Frozen u^k interpolated to sub-qp [L T-1 ~> m s-1]
   real :: v_curr_loc     ! Frozen v^k interpolated to sub-qp [L T-1 ~> m s-1]
+  real :: bt_loc         ! DG1_COUPLED_BUBBLE bubble at the sub-qp, 1 at the Gauss points [nondim]
   real :: unorm2_loc     ! Regularized |u^k|^2 at sub-qp [L2 T-2 ~> m2 s-2]
   real :: basal_coef_loc ! Picard friction coefficient at sub-qp [R L2 Z T-1 ~> kg s-1]
   real :: drag_newt_loc  ! Newton drag coefficient at sub-qp [R Z T ~> kg m-2 s]
@@ -7551,6 +7757,15 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
                       ((Phisub(qx,qy,i,j,1,2)*U_curr(1,2)) + (Phisub(qx,qy,i,j,2,1)*U_curr(2,1))))
         v_curr_loc = (((Phisub(qx,qy,i,j,1,1)*V_curr(1,1)) + (Phisub(qx,qy,i,j,2,2)*V_curr(2,2))) + &
                       ((Phisub(qx,qy,i,j,1,2)*V_curr(1,2)) + (Phisub(qx,qy,i,j,2,1)*V_curr(2,1))))
+        if (do_DG .and. CS%dg_coupled) then
+          ! DG1_COUPLED_BUBBLE: the friction sees the total velocity at the sub-point.
+          bt_loc = dg1_bubble_tilde(Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,1,2), &
+                                    Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2), &
+                                    Phisub(qx,qy,i,j,1,1) + Phisub(qx,qy,i,j,2,1), &
+                                    Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2))
+          u_curr_loc = u_curr_loc + (bt_loc * CS%dg_post_ub(i_elem,j_elem))
+          v_curr_loc = v_curr_loc + (bt_loc * CS%dg_post_vb(i_elem,j_elem))
+        endif
 
         unorm2_loc = ((u_curr_loc**2) + (v_curr_loc**2)) + eps_vel2
 
@@ -7938,6 +8153,7 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
   real :: hloc              ! Ice thickness at the QP [Z ~> m]
   real :: bed_sub           ! Bed elevation at the QP [Z ~> m]
   real :: u_curr_loc, v_curr_loc   ! Frozen velocity at the QP [L T-1 ~> m s-1]
+  real :: bt_loc            ! DG1_COUPLED_BUBBLE bubble at the QP, 1 at the Gauss points [nondim]
   real :: u_delta_loc, v_delta_loc ! Search direction at the QP [L T-1 ~> m s-1]
   real :: unorm2_loc        ! Regularized |u^k|^2 at the QP [L2 T-2 ~> m2 s-2]
   real :: basal_coef_loc    ! Picard friction coefficient at the QP [R L2 Z T-1 ~> kg s-1]
@@ -8035,6 +8251,12 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
       endif
       u_curr_loc  = ((b1 * uc(1))  + (b4 * uc(4)))  + ((b2 * uc(2))  + (b3 * uc(3)))
       v_curr_loc  = ((b1 * vc(1))  + (b4 * vc(4)))  + ((b2 * vc(2))  + (b3 * vc(3)))
+      if (do_DG .and. CS%dg_coupled) then
+        ! DG1_COUPLED_BUBBLE: the friction sees the total velocity at the QP.
+        bt_loc = dg1_bubble_tilde(mW, mE, mS, mN)
+        u_curr_loc = u_curr_loc + (bt_loc * CS%dg_post_ub(i_elem,j_elem))
+        v_curr_loc = v_curr_loc + (bt_loc * CS%dg_post_vb(i_elem,j_elem))
+      endif
       u_delta_loc = ((b1 * duc(1)) + (b4 * duc(4))) + ((b2 * duc(2)) + (b3 * duc(3)))
       v_delta_loc = ((b1 * dvc(1)) + (b4 * dvc(4))) + ((b2 * dvc(2)) + (b3 * dvc(3)))
 
@@ -8166,6 +8388,7 @@ subroutine CG_diagonal_sep2_basal(CS, G, US, H, U_curr, V_curr, &
   real :: hloc              ! Ice thickness at the QP [Z ~> m]
   real :: bed_sub           ! Bed elevation at the QP [Z ~> m]
   real :: u_curr_loc, v_curr_loc ! Frozen velocity at the QP [L T-1 ~> m s-1]
+  real :: bt_loc            ! DG1_COUPLED_BUBBLE bubble at the QP, 1 at the Gauss points [nondim]
   real :: unorm2_loc        ! Regularized |u^k|^2 at the QP [L2 T-2 ~> m2 s-2]
   real :: basal_coef_loc    ! Picard friction coefficient at the QP [R L2 Z T-1 ~> kg s-1]
   real :: drag_newt_loc     ! Newton drag coefficient at the QP [R Z T ~> kg m-2 s]
@@ -8241,6 +8464,12 @@ subroutine CG_diagonal_sep2_basal(CS, G, US, H, U_curr, V_curr, &
       endif
       u_curr_loc = ((b1 * uc(1)) + (b4 * uc(4))) + ((b2 * uc(2)) + (b3 * uc(3)))
       v_curr_loc = ((b1 * vc(1)) + (b4 * vc(4))) + ((b2 * vc(2)) + (b3 * vc(3)))
+      if (do_DG .and. CS%dg_coupled) then
+        ! DG1_COUPLED_BUBBLE: the friction sees the total velocity at the QP.
+        bt_loc = dg1_bubble_tilde(mW, mE, mS, mN)
+        u_curr_loc = u_curr_loc + (bt_loc * CS%dg_post_ub(i_elem,j_elem))
+        v_curr_loc = v_curr_loc + (bt_loc * CS%dg_post_vb(i_elem,j_elem))
+      endif
 
       unorm2_loc = ((u_curr_loc**2) + (v_curr_loc**2)) + eps_vel2
 
@@ -8455,6 +8684,7 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
   real :: ux, uy, vx, vy
   real :: eps_min   ! Velocity shears [T-1 ~> s-1]
   real :: h_gp      ! DG-evaluated ice thickness at quadrature point [Z ~> m]
+  real :: btx, bty  ! Gradient of the DG1_COUPLED_BUBBLE bubble at a quadrature point [L-1 ~> m-1]
   real, dimension(2) :: xquad ! Gauss quadrature positions on [0,1] [nondim]
   logical :: model_qp1, model_qp4
 
@@ -8572,6 +8802,13 @@ subroutine calc_shelf_visc(CS, ISS, G, US, u_shlf, v_shlf)
                 (v_shlf(I,J) * CS%Phi(8,2*(jq-1)+iq,i,j))) + &
                ((v_shlf(I,J-1) * CS%Phi(4,2*(jq-1)+iq,i,j)) + &
                 (v_shlf(I-1,J) * CS%Phi(6,2*(jq-1)+iq,i,j)))
+
+          if (CS%dg_coupled) then
+            ! DG1_COUPLED_BUBBLE: the viscosity sees the strain of the total velocity.
+            call dg1_bubble_grad_qp(CS, i, j, iq, jq, xquad, btx, bty)
+            ux = ux + (btx * CS%dg_post_ub(i,j)) ; uy = uy + (bty * CS%dg_post_ub(i,j))
+            vx = vx + (btx * CS%dg_post_vb(i,j)) ; vy = vy + (bty * CS%dg_post_vb(i,j))
+          endif
 
           CS%ice_visc(i,j,2*(jq-1)+iq) = (G%areaT(i,j) * h_gp) * &
               max(0.5 * Visc_coef * &
@@ -10488,6 +10725,9 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%fric_qp_u)) deallocate(CS%fric_qp_u)
   if (associated(CS%fric_qp_v)) deallocate(CS%fric_qp_v)
   if (associated(CS%gl_fric_K)) deallocate(CS%gl_fric_K)
+  if (associated(CS%cpl_blk)) deallocate(CS%cpl_blk)
+  if (associated(CS%cpl_rb)) deallocate(CS%cpl_rb)
+  if (associated(CS%cpl_on)) deallocate(CS%cpl_on)
   if (associated(CS%h_source_rate_last)) deallocate(CS%h_source_rate_last)
   if (associated(CS%phi_x_FV)) deallocate(CS%phi_x_FV)
   if (associated(CS%phi_y_FV)) deallocate(CS%phi_y_FV)
@@ -12766,13 +13006,47 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  default=.false., do_not_log=.not.CS%dg_post_bubble)
   if (CS%dg_post_bubble) then
     if (.not.CS%use_DG_thickness) call MOM_error(FATAL, &
-        "MOM_ice_shelf_dynamics: DG1_POST_BUBBLE needs USE_DG_THICKNESS.")
+        "MOM_ice_shelf_dynamics, read_DG_params: DG1_POST_BUBBLE needs USE_DG_THICKNESS.")
     if (.not.associated(CS%dg_post_ub)) call MOM_error(FATAL, &
-        "MOM_ice_shelf_dynamics: DG1_POST_BUBBLE was not seen when the restart fields were registered.")
+        "MOM_ice_shelf_dynamics, read_DG_params: DG1_POST_BUBBLE was not seen when the restart fields "//&
+        "were registered.")
     if ((CS%cism_taud /= CISM_OFF) .or. CS%local_basal_friction .or. CS%gl_quad_friction .or. &
         CS%i2n_friction) call MOM_error(FATAL, &
-        "MOM_ice_shelf_dynamics: DG1_POST_BUBBLE supports only the DG element friction and driving "//&
+        "MOM_ice_shelf_dynamics, read_DG_params: DG1_POST_BUBBLE supports only the DG element friction "//&
+        "and driving "//&
         "stress (CISM_FRICTION and CISM_TAUD 'off', I2N_FRICTION False).")
+  endif
+  call get_param(param_file, mdl, "DG1_COUPLED_BUBBLE", CS%dg_coupled, &
+                 "If true, the velocity has one bubble 16 xi (1 - xi) eta (1 - eta) per ice cell for u "//&
+                 "and one for v, as unknowns of the velocity solve (Galerkin in the bilinear space plus "//&
+                 "the bubbles).  The bubbles are eliminated cell by cell (static condensation), so the "//&
+                 "linear solves keep the node unknowns only.  The viscosity and the friction use the "//&
+                 "total velocity.  The transport adds the bubble velocity to its volume term, as for "//&
+                 "DG1_POST_BUBBLE.  Unlike DG1_POST_BUBBLE, the bubbles also change the node velocities, "//&
+                 "and the solution minimizes the SSA functional over the larger space, so it is no worse "//&
+                 "than the bilinear solution in that energy.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
+  call get_param(param_file, mdl, "DG1_COUPLED_BUBBLE_CROSSED", CS%dg_cpl_crossed, &
+                 "If true, DG1_COUPLED_BUBBLE also has bubbles in the cells with sub-cell grounding-line "//&
+                 "quadrature, where their friction and driving stress use the same SEP2 or SEP3 "//&
+                 "sub-points as the velocity solve.  If false, these cells have no bubble.", &
+                 default=.true., do_not_log=.not.CS%dg_coupled)
+  if (CS%dg_coupled) then
+    if (.not.CS%use_DG_thickness) call MOM_error(FATAL, &
+        "MOM_ice_shelf_dynamics, read_DG_params: DG1_COUPLED_BUBBLE needs USE_DG_THICKNESS.")
+    if (CS%dg_post_bubble) call MOM_error(FATAL, &
+        "MOM_ice_shelf_dynamics, read_DG_params: DG1_COUPLED_BUBBLE and DG1_POST_BUBBLE cannot both be true.")
+    if (.not.associated(CS%dg_post_ub)) call MOM_error(FATAL, &
+        "MOM_ice_shelf_dynamics, read_DG_params: DG1_COUPLED_BUBBLE was not seen when the restart fields "//&
+        "were registered.")
+    if ((CS%cism_taud /= CISM_OFF) .or. CS%local_basal_friction .or. CS%gl_quad_friction .or. &
+        CS%i2n_friction) call MOM_error(FATAL, &
+        "MOM_ice_shelf_dynamics, read_DG_params: DG1_COUPLED_BUBBLE supports only the DG element friction "//&
+        "and driving "//&
+        "stress (CISM_FRICTION and CISM_TAUD 'off', I2N_FRICTION False).")
+    if ((CS%inner_solver == INNER_CG) .and. CS%cg_halo_shrink) call MOM_error(FATAL, &
+        "MOM_ice_shelf_dynamics, read_DG_params: DG1_COUPLED_BUBBLE with ICE_SHELF_INNER_SOLVER = CG needs "//&
+        "CG_HALO_SHRINK = False, because its blocks are set on the compute cells and one halo cell only.")
   endif
   call get_param(param_file, mdl, "DG1_LIMITER_NO_BAND", CS%dg_lim_no_band, &
                  "If true, DG1_GROUNDED_LIMITER acts at full strength in every wholly grounded cell, and "//&
@@ -13569,6 +13843,645 @@ subroutine dg1_post_bubble(CS, ISS, G, US)
   deallocate(qs)
 end subroutine dg1_post_bubble
 
+!> DG1_COUPLED_BUBBLE: the bubble blocks of each ice cell for the linearization at (u_curr, v_curr) and the
+!! bubble velocity in dg_post_ub and dg_post_vb.  The bubble is scaled to 1 at the 2x2 Gauss points, so its
+!! coefficient is the bubble velocity there.  For the two bubbles of a cell the routine forms, with the
+!! quadrature, viscosity and friction of CG_action (the 2x2 Gauss points, and in a cell with sub-cell
+!! grounding-line quadrature the SEP2 partition or the SEP3 sub-points for the friction):
+!!   the node-bubble block K_nb (the node returns of each unit bubble),
+!!   the bubble block K_bb,
+!! once for the Picard operator (the residual) and once for the operator of the linear solve (Newton when
+!! use_newton, else the same as Picard), and the driving stress F_b against the two bubbles, as in
+!! calc_shelf_driving_stress_DG.  A cell has a bubble (cpl_on = 1) if it is an ice cell (hmask = 1), if it
+!! is not a sub-cell cell or DG1_COUPLED_BUBBLE_CROSSED is true, and if its Picard bubble block is positive
+!! definite.  Elsewhere the blocks and the bubble velocity are zero.  Where the Newton bubble block is not
+!! positive definite, the linear-solve blocks are the Picard blocks.  The routine also stores W = K_bb^-1 K_bn of
+!! the linear-solve blocks and, with BASAL_FRICTION_PRECOMPUTE, sets the friction cache of
+!! build_basal_friction_cache from the same friction evaluations (fric_cache_cell for the cells without a
+!! bubble), so the friction is evaluated once per linearization.
+subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_newton, with_fb)
+  type(ice_shelf_dyn_CS), intent(in) :: CS  !< The ice shelf dynamics control structure; only the targets
+                                            !! of its DG1_COUPLED_BUBBLE pointers are written
+  type(ice_shelf_state),  intent(in) :: ISS !< A structure with elements that describe the ice-shelf state
+  type(ocean_grid_type),  intent(in) :: G   !< The grid structure used by the ice shelf
+  type(unit_scale_type),  intent(in) :: US  !< A structure containing unit conversion factors
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in) :: u_curr !< The frozen node velocity u^k [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in) :: v_curr !< The frozen node velocity v^k [L T-1 ~> m s-1]
+  integer,                intent(in) :: is  !< The starting i-index to work on
+  integer,                intent(in) :: ie  !< The ending i-index to work on
+  integer,                intent(in) :: js  !< The starting j-index to work on
+  integer,                intent(in) :: je  !< The ending j-index to work on
+  logical,                intent(in) :: use_newton !< If true, the operator of the linear solve is Newton's
+  logical,                intent(in) :: with_fb !< If true, also set the driving stress against the bubbles; it
+                                          !! depends on the thickness only, so once per velocity solve is enough
+
+  real, dimension(2) :: xquad  ! The 2-point Gauss abscissae on [0,1] [nondim]
+  real :: btx, bty  ! The bubble gradient at a Gauss point [L-1 ~> m-1]
+  real :: jac_wt    ! Per-quadrature-point metric correction |J_q|/areaT [nondim]
+  real :: nu        ! Viscous weight of a Gauss point [R L4 Z T-1 ~> kg m2 s-1]
+  real :: fnw        ! Newton viscosity weight of a Gauss point [R L4 Z T ~> kg m2 s]
+  real :: g1, g2, g3 ! Newton strain factors 2 ux + vy, 2 vy + ux and (uy + vx)/2 [T-1 ~> s-1]
+  real, dimension(2) :: dn_f ! Newton strain products of the two bubbles [L-1 T-1 ~> m-1 s-1]
+  ! Stresses of the two unit bubbles at a Gauss point, S(a,d,f): component a (u, v), derivative d (x, y),
+  ! bubble f (x, y), Picard (Sp) and linear-solve (Sn) [R L3 Z T-1 ~> kg m s-1].
+  real, dimension(2,2,2) :: Sp, Sn
+  ! Friction of the two unit bubbles at a point, F(a,f), Picard and linear-solve [R L2 Z T-1 ~> kg s-1].
+  real, dimension(2,2) :: Fp, Fk
+  real, dimension(2) :: cur   ! The total frozen velocity at a quadrature point [L T-1 ~> m s-1]
+  real :: bcf, dnw  ! Picard [R L2 Z T-1 ~> kg s-1] and Newton [R Z T ~> kg m-2 s] friction coefficients
+  real :: phi_c, phx, phy ! A node basis function [nondim] and its gradient [L-1 ~> m-1] at a point
+  logical :: grounded_qp, do_newton_visc
+  real :: coef_prefactor_e ! Area * C_basal_friction * L_T_to_m_s of the cell [R L2 Z T-1 ~> kg s-1]
+  real :: eps_vel2_e   ! Velocity regularization squared of the cell [L2 T-2 ~> m2 s-2]
+  real :: min_trac_e   ! min_basal_traction * areaT [R L2 Z T-1 ~> kg s-1]
+  real :: fB_e         ! Element Coulomb fB; 0 for Weertman [(T L-1)^CF_PostPeak]
+  real :: fB_local     ! Coulomb fB at a sub-point [(T L-1)^CF_PostPeak]
+  real :: unorm2       ! Regularized squared speed at a sub-point [L2 T-2 ~> m2 s-2]
+  real :: rho, grav, rhoi_rhow, rho_oi_ratio ! Density [R ~> kg m-3], gravity [L2 Z-1 T-2 ~> m s-2], ratios [nondim]
+  real :: rho_ice_g_LtoZ ! US%L_to_Z * density_ice * g_Earth [R L Z-1 T-2]
+  real :: dxCv_S, dxCv_N, dyCu_W, dyCu_E ! Cell-edge lengths [L ~> m]
+  real :: a_qp, d_qp   ! Cell-edge lengths interpolated to a quadrature point [L ~> m]
+  real :: weight       ! Driving-stress weight of a quadrature point [L2 ~> m2]
+  real :: wj           ! Friction weight of a sub-point [nondim]
+  real :: h_gp, bed_gp ! Thickness and bed depth at a quadrature point [Z ~> m]
+  real :: dhdx_gp, dhdy_gp, dbdx_gp, dbdy_gp ! Thickness and bed-depth gradients [Z L-1 ~> nondim]
+  real :: dsdx_gp, dsdy_gp ! Surface gradients [Z L-1 ~> nondim]
+  real :: fx_gp, fy_gp ! Driving-force density at a quadrature point [R Z L T-2 ~> kg m-1 s-2]
+  real :: xm1, xm2, ym1, ym2 ! Marginal weights 1 - xi, xi, 1 - eta, eta at a sub-point [nondim]
+  real :: bt           ! The bubble at a sub-point [nondim]
+  real :: subarea      ! Fractional area of a sub-cell [nondim]
+  real, dimension(2,2) :: Hc, Bc ! Corner thicknesses and bed depths of the cell [Z ~> m]
+  real, dimension(2,2) :: Uc, Vc ! Corner frozen velocities of the cell [L T-1 ~> m s-1]
+  real, dimension(CPL_NWK,2,2) :: qv  ! The block values at the four (sub-)quadrature points [various]
+  real, allocatable, dimension(:,:,:) :: qs ! The block values summed over each sub-cell [various]
+  real, dimension(CPL_NWK) :: tot, tsub ! The block values summed over the cell and over its sub-cells [various]
+  real :: detp, detn   ! Determinants of the two bubble blocks [R2 L4 Z2 T-2 ~> kg2 s-2]
+  logical :: sub_cell, is_grounded, ok
+  logical :: fallback  ! The linear-solve blocks of the cell are the Picard blocks
+  real, dimension(2) :: fb_keep  ! The stored driving stress against the bubbles [R L3 Z T-2 ~> kg m s-2]
+  real :: i11, i12, i22, x1, x2  ! The inverse linear-solve bubble block [R-1 L-2 Z-1 T ~> kg-1 s] and
+                                 ! two node-bubble entries [R L2 Z T-1 ~> kg s-1]
+  integer :: ip
+  integer, dimension(10), parameter :: pc = (/ 1, 1, 2, 1, 2, 3, 1, 2, 3, 4 /) ! First corner of a pair
+  integer, dimension(10), parameter :: pn = (/ 1, 2, 2, 3, 3, 3, 4, 4, 4, 4 /) ! Second corner of a pair
+  real, dimension(4) :: hc4, bc4, uc4, vc4 ! SEP2 corner values, SW, SE, NW, NE [various]
+  real, dimension(4) :: fls      ! Corner flotation deficit r*h - bed [Z ~> m]
+  integer, dimension(4) :: nqp   ! QPs per parent triangle
+  real, dimension(4,SEP2_MAXQP,4) :: beta ! Corner-basis weights per (corner, QP, triangle) [nondim]
+  real, dimension(SEP2_MAXQP,4)   :: wref ! Reference measure per (QP, triangle) [nondim]
+  logical, dimension(SEP2_MAXQP,4) :: qpg ! Grounded state per (QP, triangle)
+  real, dimension(4) :: dhxi, dheta, dbxi, dbeta ! P1 fan gradients of h and bed per triangle [Z ~> m]
+  real, dimension(CPL_NWK,SEP2_MAXQP) :: val ! The block values at the QPs of one triangle [various]
+  real, dimension(CPL_NWK,4) :: ptri  ! The block values summed over each triangle [various]
+  real :: b1, b2, b3, b4         ! Corner-basis weights at a QP [nondim]
+  real :: mS, mN, mW, mE         ! Marginal sums: 1 - eta, eta, 1 - xi, xi at a QP [nondim]
+  real, dimension(4) :: phc      ! The four node basis functions at a sub-point [nondim]
+  integer, dimension(4), parameter :: mc = (/ 1, 2, 1, 2 /) ! x-index of corner c (SW,SE,NW,NE)
+  integer, dimension(4), parameter :: nc = (/ 1, 1, 2, 2 /) ! y-index of corner c
+  integer :: i, j, iq, jq, qp, qpv, k, c, f, a, isub, jsub, nsub, t, kq, ilq, jlq
+
+  call cpu_clock_begin(CS%id_clock_cpl)
+  rho = CS%density_ice ; grav = CS%g_Earth
+  rhoi_rhow = CS%density_ice / CS%density_ocean_avg
+  rho_oi_ratio = CS%density_ocean_avg / CS%density_ice
+  rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
+  xquad(1) = .5 * (1-sqrt(1./3)) ; xquad(2) = .5 * (1+sqrt(1./3))
+  nsub = size(CS%Phisub, 3)
+  subarea = 1.0 / real(nsub)**2
+  allocate(qs(nsub,nsub,CPL_NWK), source=0.0)
+  do_newton_visc = use_newton .and. trim(CS%ice_viscosity_compute) == "MODEL"
+  qpv = 1
+
+  do j=js,je ; do i=is,ie
+    fb_keep(:) = CS%cpl_blk(CPL_FB+1:CPL_FB+2,i,j)
+    CS%cpl_blk(:,i,j) = 0.0 ; CS%cpl_on(i,j) = 0.0
+    sub_cell = gl_subgrid_cell(CS, i, j)
+    if ((ISS%hmask(i,j) /= 1.0) .or. (sub_cell .and. .not.CS%dg_cpl_crossed)) then
+      ! No bubble.  With BASAL_FRICTION_PRECOMPUTE this routine also sets the friction cache, so an ice
+      ! cell gets it as build_basal_friction_cache would.
+      CS%dg_post_ub(i,j) = 0.0 ; CS%dg_post_vb(i,j) = 0.0
+      CS%dg_post_skip(i,j) = merge(1.0, 0.0, ISS%hmask(i,j) == 1.0)
+      if (CS%fric_precompute .and. ((ISS%hmask(i,j) == 1.0) .or. (ISS%hmask(i,j) == 3.0))) &
+        call fric_cache_cell(CS, G, US, u_curr, v_curr, CS%Phisub, CS%H_node, CS%bed_elev, rhoi_rhow, &
+                             .true., i, j)
+      cycle
+    endif
+
+    Hc(:,:) = CS%h_nodal(i,j,:,:) ; Bc(:,:) = CS%bed_node(I-1:I,J-1:J)
+    Uc(:,:) = u_curr(I-1:I,J-1:J) ; Vc(:,:) = v_curr(I-1:I,J-1:J)
+    dxCv_S = G%dxCv(i,J-1) ; dxCv_N = G%dxCv(i,J)
+    dyCu_W = G%dyCu(I-1,j) ; dyCu_E = G%dyCu(I,j)
+    coef_prefactor_e = CS%coef_prefactor(i,j)
+    eps_vel2_e = CS%eps_glen_min**2 * ((G%dxT(i,j)**2) + (G%dyT(i,j)**2))
+    min_trac_e = CS%min_basal_traction * G%areaT(i,j)
+    fB_e = CS%fB_elem(i,j)
+
+    ! The 2x2 Gauss points: viscosity and friction as in CG_action, driving stress as in
+    ! calc_shelf_driving_stress_DG (there only where the cell has no sub-cell quadrature).
+    qv(:,:,:) = 0.0
+    do jq=1,2 ; do iq=1,2
+      qp = 2*(jq-1)+iq
+      if (CS%visc_qps == 4) qpv = qp
+      call dg1_bubble_grad_qp(CS, i, j, iq, jq, xquad, btx, bty)
+      jac_wt = CS%Jac(qp,i,j) * G%IareaT(i,j)
+      nu = jac_wt * CS%ice_visc(i,j,qpv)
+      Sp(1,1,1) = nu * (4.0*btx) ; Sp(1,2,1) = nu * bty ; Sp(2,1,1) = nu * bty ; Sp(2,2,1) = nu * (2.0*btx)
+      Sp(1,1,2) = nu * (2.0*bty) ; Sp(1,2,2) = nu * btx ; Sp(2,1,2) = nu * btx ; Sp(2,2,2) = nu * (4.0*bty)
+      Sn(:,:,:) = Sp(:,:,:)
+      dn_f(:) = 0.0 ; fnw = 0.0
+      if (do_newton_visc) then
+        g1 = 2.0*CS%newton_str_ux(i,j,qpv) + CS%newton_str_vy(i,j,qpv)
+        g2 = 2.0*CS%newton_str_vy(i,j,qpv) + CS%newton_str_ux(i,j,qpv)
+        g3 = 0.5 * CS%newton_str_sh(i,j,qpv)
+        fnw = jac_wt * CS%newton_visc_factor(i,j,qpv)
+        dn_f(1) = (g1 * btx) + (g3 * bty) ; dn_f(2) = (g2 * bty) + (g3 * btx)
+        do f=1,2
+          Sn(1,1,f) = Sn(1,1,f) + ((fnw * dn_f(f)) * g1) ; Sn(1,2,f) = Sn(1,2,f) + ((fnw * dn_f(f)) * g3)
+          Sn(2,1,f) = Sn(2,1,f) + ((fnw * dn_f(f)) * g3) ; Sn(2,2,f) = Sn(2,2,f) + ((fnw * dn_f(f)) * g2)
+        enddo
+      endif
+
+      Fp(:,:) = 0.0 ; Fk(:,:) = 0.0
+      ! The Newton coefficient is always formed, for the friction cache; the blocks use it with Newton only.
+      call basal_friction_qp(CS, G, US, i, j, iq, jq, xquad, u_curr, v_curr, .true., rhoi_rhow, &
+                             rho_oi_ratio, rho_ice_g_LtoZ, coef_prefactor_e, min_trac_e, fB_e, &
+                             eps_vel2_e, .true., grounded_qp, bcf, dnw, cur(1), cur(2))
+      if (CS%fric_precompute) then
+        CS%fric_qp_on(qp,i,j) = merge(1.0, 0.0, grounded_qp)
+        CS%fric_qp_coef(qp,i,j) = bcf ; CS%fric_qp_newt(qp,i,j) = dnw
+        CS%fric_qp_u(qp,i,j) = cur(1) ; CS%fric_qp_v(qp,i,j) = cur(2)
+      endif
+      if (grounded_qp) then
+        Fp(1,1) = jac_wt * bcf ; Fp(2,2) = jac_wt * bcf
+        do f=1,2 ; do a=1,2
+          Fk(a,f) = Fp(a,f) + (jac_wt * (dnw * (cur(a) * cur(f))))
+        enddo ; enddo
+      endif
+
+      do c=1,4
+        k = 2*(nc(c)-1) + mc(c)
+        phx = CS%Phi(2*k-1,qp,i,j) ; phy = CS%Phi(2*k,qp,i,j)
+        ilq = 1 ; if (iq == mc(c)) ilq = 2
+        jlq = 1 ; if (jq == nc(c)) jlq = 2
+        phi_c = xquad(ilq) * xquad(jlq)
+        do f=1,2 ; do a=1,2
+          qv(CPL_PIC+cpl_nb(a,c,f), iq, jq) = 0.25 * &
+              (((Sp(a,1,f) * phx) + (Sp(a,2,f) * phy)) + (Fp(a,f) * phi_c))
+          if (use_newton) qv(CPL_LIN+cpl_nb(a,c,f), iq, jq) = 0.25 * &
+              (((Sn(a,1,f) * phx) + (Sn(a,2,f) * phy)) + (Fk(a,f) * phi_c))
+        enddo ; enddo
+      enddo
+      qv(CPL_PIC+CPL_BB+1,iq,jq) = 0.25 * ((nu * ((4.0 * (btx*btx)) + (bty*bty))) + Fp(1,1))
+      qv(CPL_PIC+CPL_BB+2,iq,jq) = 0.25 * (nu * (3.0 * (btx*bty)))
+      qv(CPL_PIC+CPL_BB+3,iq,jq) = 0.25 * ((nu * ((btx*btx) + (4.0 * (bty*bty)))) + Fp(2,2))
+      if (use_newton) then
+        ! fnw (dn dn): the product of the two strain factors first, so that a quarter turn, which swaps
+        ! them, gives the same rounding.
+        qv(CPL_LIN+CPL_BB+1,iq,jq) = qv(CPL_PIC+CPL_BB+1,iq,jq) + &
+            0.25 * ((fnw * (dn_f(1) * dn_f(1))) + (Fk(1,1) - Fp(1,1)))
+        qv(CPL_LIN+CPL_BB+2,iq,jq) = qv(CPL_PIC+CPL_BB+2,iq,jq) + 0.25 * ((fnw * (dn_f(1) * dn_f(2))) + Fk(1,2))
+        qv(CPL_LIN+CPL_BB+3,iq,jq) = qv(CPL_PIC+CPL_BB+3,iq,jq) + &
+            0.25 * ((fnw * (dn_f(2) * dn_f(2))) + (Fk(2,2) - Fp(2,2)))
+      endif
+
+      if (with_fb .and. .not.sub_cell) then
+        a_qp = (dxCv_S * xquad(3-jq)) + (dxCv_N * xquad(jq))
+        d_qp = (dyCu_W * xquad(3-iq)) + (dyCu_E * xquad(iq))
+        weight = 0.25 * (a_qp * d_qp)
+        h_gp = ((Hc(1,1) * (xquad(3-iq) * xquad(3-jq))) + (Hc(2,2) * (xquad(iq) * xquad(jq)))) + &
+               ((Hc(2,1) * (xquad(iq) * xquad(3-jq))) + (Hc(1,2) * (xquad(3-iq) * xquad(jq))))
+        h_gp = max(h_gp, CS%min_h_shelf)
+        dhdx_gp = ( (((-xquad(3-jq))*Hc(1,1)) + (( xquad(jq))*Hc(2,2))) + &
+                    ((( xquad(3-jq))*Hc(2,1)) + ((-xquad(jq))*Hc(1,2))) ) / a_qp
+        dhdy_gp = ( (((-xquad(3-iq))*Hc(1,1)) + (( xquad(iq))*Hc(2,2))) + &
+                    (((-xquad(iq))*Hc(2,1)) + (( xquad(3-iq))*Hc(1,2))) ) / d_qp
+        bed_gp = ((Bc(1,1) * (xquad(3-iq) * xquad(3-jq))) + (Bc(2,2) * (xquad(iq) * xquad(jq)))) + &
+                 ((Bc(2,1) * (xquad(iq) * xquad(3-jq))) + (Bc(1,2) * (xquad(3-iq) * xquad(jq))))
+        dbdx_gp = (((Bc(1,1) * (-xquad(3-jq))) + (Bc(2,2) * ( xquad(jq)))) + &
+                   ((Bc(2,1) * ( xquad(3-jq))) + (Bc(1,2) * (-xquad(jq))))) / a_qp
+        dbdy_gp = (((Bc(1,1) * (-xquad(3-iq))) + (Bc(2,2) * ( xquad(iq)))) + &
+                   ((Bc(2,1) * (-xquad(iq))) + (Bc(1,2) * ( xquad(3-iq))))) / d_qp
+        if (CS%GL_couple) then
+          is_grounded = (CS%ground_frac(i,j) >= 1.0)
+        else
+          is_grounded = (rhoi_rhow * h_gp - bed_gp > 0.0)
+        endif
+        if (is_grounded) then
+          dsdx_gp = dhdx_gp - dbdx_gp ; dsdy_gp = dhdy_gp - dbdy_gp
+        else
+          dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp ; dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
+        endif
+        qv(CPL_FB+1,iq,jq) = weight * (-rho * grav * h_gp * dsdx_gp)
+        qv(CPL_FB+2,iq,jq) = weight * (-rho * grav * h_gp * dsdy_gp)
+      endif
+    enddo ; enddo
+    do k=1,CPL_NWK
+      tot(k) = (qv(k,1,1) + qv(k,2,2)) + (qv(k,1,2) + qv(k,2,1))
+    enddo
+
+    if (sub_cell .and. CS%use_sep2) then
+      ! The SEP2 partition: the driving stress as in calc_shelf_driving_stress_DG_sep2, the friction as
+      ! in the DG branch of CG_action_sep2_basal.
+      hc4(1) = Hc(1,1) ; hc4(2) = Hc(2,1) ; hc4(3) = Hc(1,2) ; hc4(4) = Hc(2,2)
+      bc4(1) = Bc(1,1) ; bc4(2) = Bc(2,1) ; bc4(3) = Bc(1,2) ; bc4(4) = Bc(2,2)
+      uc4(1) = Uc(1,1) ; uc4(2) = Uc(2,1) ; uc4(3) = Uc(1,2) ; uc4(4) = Uc(2,2)
+      vc4(1) = Vc(1,1) ; vc4(2) = Vc(2,1) ; vc4(3) = Vc(1,2) ; vc4(4) = Vc(2,2)
+      fls(:) = (rhoi_rhow * hc4(:)) - bc4(:)
+      call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
+      call sep2_fan_gradient(hc4, dhxi, dheta)
+      call sep2_fan_gradient(bc4, dbxi, dbeta)
+      do t=1,4
+        val(:,1:nqp(t)) = 0.0
+        do kq=1,nqp(t)
+          b1 = beta(1,kq,t) ; b2 = beta(2,kq,t) ; b3 = beta(3,kq,t) ; b4 = beta(4,kq,t)
+          mS = b1 + b2 ; mN = b3 + b4 ; mW = b1 + b3 ; mE = b2 + b4
+          bt = dg1_bubble_tilde(mW, mE, mS, mN)
+          a_qp = (dxCv_S * mS) + (dxCv_N * mN)
+          d_qp = (dyCu_W * mW) + (dyCu_E * mE)
+          weight = wref(kq,t) * (a_qp * d_qp)
+          h_gp = ((b1 * hc4(1)) + (b4 * hc4(4))) + ((b2 * hc4(2)) + (b3 * hc4(3)))
+          h_gp = max(h_gp, CS%min_h_shelf)
+          dhdx_gp = dhxi(t) / a_qp ; dhdy_gp = dheta(t) / d_qp
+          dbdx_gp = dbxi(t) / a_qp ; dbdy_gp = dbeta(t) / d_qp
+          if (qpg(kq,t)) then
+            dsdx_gp = dhdx_gp - dbdx_gp ; dsdy_gp = dhdy_gp - dbdy_gp
+          else
+            dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp ; dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
+          endif
+          if (with_fb) then
+            val(CPL_FB+1,kq) = (weight * bt) * (-rho * grav * h_gp * dsdx_gp)
+            val(CPL_FB+2,kq) = (weight * bt) * (-rho * grav * h_gp * dsdy_gp)
+          endif
+          if (qpg(kq,t)) then
+            bed_gp = ((b1 * bc4(1)) + (b4 * bc4(4))) + ((b2 * bc4(2)) + (b3 * bc4(3)))
+            cur(1) = (((b1 * uc4(1)) + (b4 * uc4(4))) + ((b2 * uc4(2)) + (b3 * uc4(3)))) + &
+                     (bt * CS%dg_post_ub(i,j))
+            cur(2) = (((b1 * vc4(1)) + (b4 * vc4(4))) + ((b2 * vc4(2)) + (b3 * vc4(3)))) + &
+                     (bt * CS%dg_post_vb(i,j))
+            unorm2 = ((cur(1)**2) + (cur(2)**2)) + eps_vel2_e
+            if (CS%CoulombFriction) then
+              fB_local = compute_fB_local(h_gp, bed_gp, rho_oi_ratio, rho_ice_g_LtoZ, &
+                  CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
+                  CS%CF_PostPeak, CS%n_basal_fric)
+            else
+              fB_local = fB_e
+            endif
+            call compute_basal_coef(unorm2, coef_prefactor_e, min_trac_e, fB_local, &
+                CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .true., bcf, dnw)
+            wj = (wref(kq,t) * (a_qp * d_qp)) * G%IareaT(i,j)
+            phc(1) = b1 ; phc(2) = b2 ; phc(3) = b3 ; phc(4) = b4
+            call dg1_cpl_fric_point(wj, bt, bcf, dnw, cur, phc, use_newton, val(:,kq))
+          endif
+        enddo
+        do k=1,CPL_NWK
+          ptri(k,t) = sep2_qp_sum(val(k,1:nqp(t)), nqp(t))
+        enddo
+      enddo
+      ! Opposite-pair grouping (S+N)+(E+W), invariant under the triangle permutations of a rotation.
+      do k=1,CPL_NWK
+        tsub(k) = (ptri(k,1) + ptri(k,3)) + (ptri(k,2) + ptri(k,4))
+        tot(k) = tot(k) + tsub(k)
+      enddo
+    elseif (sub_cell) then
+      ! The SEP3 sub-points: the driving stress as in calc_shelf_driving_stress_DG_subgrid, the friction
+      ! as in the DG branch of CG_action_subgrid_basal.
+      qs(:,:,:) = 0.0
+      do jsub=1,nsub ; do isub=1,nsub
+        qv(:,:,:) = 0.0
+        do jq=1,2 ; do iq=1,2
+          ym1 = CS%Phisub(iq,jq,isub,jsub,1,1) + CS%Phisub(iq,jq,isub,jsub,2,1)
+          ym2 = CS%Phisub(iq,jq,isub,jsub,1,2) + CS%Phisub(iq,jq,isub,jsub,2,2)
+          xm1 = CS%Phisub(iq,jq,isub,jsub,1,1) + CS%Phisub(iq,jq,isub,jsub,1,2)
+          xm2 = CS%Phisub(iq,jq,isub,jsub,2,1) + CS%Phisub(iq,jq,isub,jsub,2,2)
+          bt = dg1_bubble_tilde(xm1, xm2, ym1, ym2)
+          a_qp = (dxCv_S * ym1) + (dxCv_N * ym2)
+          d_qp = (dyCu_W * xm1) + (dyCu_E * xm2)
+          weight = 0.25 * subarea * (a_qp * d_qp)
+          h_gp = ((CS%Phisub(iq,jq,isub,jsub,1,1)*Hc(1,1)) + (CS%Phisub(iq,jq,isub,jsub,2,2)*Hc(2,2))) + &
+                 ((CS%Phisub(iq,jq,isub,jsub,1,2)*Hc(1,2)) + (CS%Phisub(iq,jq,isub,jsub,2,1)*Hc(2,1)))
+          h_gp = max(h_gp, CS%min_h_shelf)
+          bed_gp = ((CS%Phisub(iq,jq,isub,jsub,1,1)*Bc(1,1)) + (CS%Phisub(iq,jq,isub,jsub,2,2)*Bc(2,2))) + &
+                   ((CS%Phisub(iq,jq,isub,jsub,1,2)*Bc(1,2)) + (CS%Phisub(iq,jq,isub,jsub,2,1)*Bc(2,1)))
+          dhdx_gp = ( (((-ym1) * Hc(1,1)) + (( ym2) * Hc(2,2))) + &
+                      ((( ym1) * Hc(2,1)) + ((-ym2) * Hc(1,2))) ) / a_qp
+          dhdy_gp = ( (((-xm1) * Hc(1,1)) + (( xm2) * Hc(2,2))) + &
+                      (((-xm2) * Hc(2,1)) + (( xm1) * Hc(1,2))) ) / d_qp
+          dbdx_gp = (((Bc(1,1) * (-ym1)) + (Bc(2,2) * ( ym2))) + ((Bc(2,1) * ( ym1)) + (Bc(1,2) * (-ym2)))) / a_qp
+          dbdy_gp = (((Bc(1,1) * (-xm1)) + (Bc(2,2) * ( xm2))) + ((Bc(2,1) * (-xm2)) + (Bc(1,2) * ( xm1)))) / d_qp
+          ! The local flotation test, even with GL_couple, as in the velocity solve.
+          is_grounded = (rhoi_rhow * h_gp - bed_gp > 0.0)
+          if (is_grounded) then
+            dsdx_gp = dhdx_gp - dbdx_gp ; dsdy_gp = dhdy_gp - dbdy_gp
+          else
+            dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp ; dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
+          endif
+          if (with_fb) then
+            qv(CPL_FB+1,iq,jq) = (weight * bt) * (-rho * grav * h_gp * dsdx_gp)
+            qv(CPL_FB+2,iq,jq) = (weight * bt) * (-rho * grav * h_gp * dsdy_gp)
+          endif
+          if (is_grounded) then
+            cur(1) = (((CS%Phisub(iq,jq,isub,jsub,1,1)*Uc(1,1)) + (CS%Phisub(iq,jq,isub,jsub,2,2)*Uc(2,2))) + &
+                      ((CS%Phisub(iq,jq,isub,jsub,1,2)*Uc(1,2)) + (CS%Phisub(iq,jq,isub,jsub,2,1)*Uc(2,1)))) + &
+                     (bt * CS%dg_post_ub(i,j))
+            cur(2) = (((CS%Phisub(iq,jq,isub,jsub,1,1)*Vc(1,1)) + (CS%Phisub(iq,jq,isub,jsub,2,2)*Vc(2,2))) + &
+                      ((CS%Phisub(iq,jq,isub,jsub,1,2)*Vc(1,2)) + (CS%Phisub(iq,jq,isub,jsub,2,1)*Vc(2,1)))) + &
+                     (bt * CS%dg_post_vb(i,j))
+            unorm2 = ((cur(1)**2) + (cur(2)**2)) + eps_vel2_e
+            if (CS%CoulombFriction) then
+              fB_local = compute_fB_local(h_gp, bed_gp, rho_oi_ratio, rho_ice_g_LtoZ, &
+                  CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
+                  CS%CF_PostPeak, CS%n_basal_fric)
+            else
+              fB_local = fB_e
+            endif
+            call compute_basal_coef(unorm2, coef_prefactor_e, min_trac_e, fB_local, &
+                CS%n_basal_fric, CS%CoulombFriction, CS%CF_PostPeak, US%L_T_to_m_s, .true., bcf, dnw)
+            wj = 0.25 * subarea * (a_qp * d_qp) * G%IareaT(i,j)
+            do c=1,4
+              phc(c) = CS%Phisub(iq,jq,isub,jsub,mc(c),nc(c))
+            enddo
+            call dg1_cpl_fric_point(wj, bt, bcf, dnw, cur, phc, use_newton, qv(:,iq,jq))
+          endif
+        enddo ; enddo
+        do k=1,CPL_NWK
+          qs(isub,jsub,k) = (qv(k,1,1) + qv(k,2,2)) + (qv(k,1,2) + qv(k,2,1))
+        enddo
+      enddo ; enddo
+      do k=1,CPL_NWK
+        call sum_square_matrix(tsub(k), qs(:,:,k), nsub)
+        tot(k) = tot(k) + tsub(k)
+      enddo
+    endif
+
+    if (.not.with_fb) tot(CPL_FB+1:CPL_FB+2) = fb_keep(:)
+    ! The corner friction matrix of the friction cache, summed as in CG_action_subgrid_basal and
+    ! CG_action_sep2_basal.
+    if (CS%fric_precompute .and. sub_cell) then ; do ip=1,10 ; do k=1,4
+      CS%gl_fric_K(pc(ip),pn(ip),k,i,j) = tot(CPL_KM+ip+10*(k-1))
+      CS%gl_fric_K(pn(ip),pc(ip),k,i,j) = tot(CPL_KM+ip+10*(k-1))
+    enddo ; enddo ; endif
+    ! Without Newton the linear-solve set is the Picard set.
+    if (.not.use_newton) tot(CPL_LIN+1:CPL_LIN+CPL_NSET) = tot(CPL_PIC+1:CPL_PIC+CPL_NSET)
+    detp = (tot(CPL_PIC+CPL_BB+1) * tot(CPL_PIC+CPL_BB+3)) - (tot(CPL_PIC+CPL_BB+2) * tot(CPL_PIC+CPL_BB+2))
+    detn = (tot(CPL_LIN+CPL_BB+1) * tot(CPL_LIN+CPL_BB+3)) - (tot(CPL_LIN+CPL_BB+2) * tot(CPL_LIN+CPL_BB+2))
+    ok = (detp > 0.0) .and. (tot(CPL_PIC+CPL_BB+1) > 0.0) .and. (abs(detp) <= huge(detp))
+    fallback = .false.
+    if (ok .and. .not.((detn > 0.0) .and. (tot(CPL_LIN+CPL_BB+1) > 0.0) .and. (abs(detn) <= huge(detn)))) then
+      fallback = .true.
+      ! A Newton bubble block that is not positive definite (Coulomb friction past its peak): the
+      ! linear solve uses the Picard blocks of this cell (an inexact Newton step there).  The residual
+      ! always uses the Picard blocks, so the converged velocity does not change.
+      tot(CPL_LIN+1:CPL_LIN+CPL_NSET) = tot(CPL_PIC+1:CPL_PIC+CPL_NSET)
+    endif
+    if (ok) then
+      CS%cpl_blk(1:CPL_W,i,j) = tot(1:CPL_W) ; CS%cpl_on(i,j) = 1.0
+      CS%dg_post_skip(i,j) = merge(0.5, 0.0, fallback)
+      ! W = K_bb^-1 K_bn of the linear-solve set, so that a linear-solve iteration has no division.
+      detn = (tot(CPL_LIN+CPL_BB+1) * tot(CPL_LIN+CPL_BB+3)) - (tot(CPL_LIN+CPL_BB+2) * tot(CPL_LIN+CPL_BB+2))
+      i11 = tot(CPL_LIN+CPL_BB+3) / detn ; i12 = (-tot(CPL_LIN+CPL_BB+2)) / detn
+      i22 = tot(CPL_LIN+CPL_BB+1) / detn
+      do a=1,2 ; do c=1,4
+        x1 = tot(CPL_LIN+cpl_nb(a,c,1)) ; x2 = tot(CPL_LIN+cpl_nb(a,c,2))
+        CS%cpl_blk(CPL_W+cpl_nb(a,c,1),i,j) = (i11 * x1) + (i12 * x2)
+        CS%cpl_blk(CPL_W+cpl_nb(a,c,2),i,j) = (i12 * x1) + (i22 * x2)
+      enddo ; enddo
+    else
+      CS%cpl_blk(CPL_FB+1:CPL_FB+2,i,j) = tot(CPL_FB+1:CPL_FB+2)
+      CS%dg_post_ub(i,j) = 0.0 ; CS%dg_post_vb(i,j) = 0.0 ; CS%dg_post_skip(i,j) = 1.0
+    endif
+  enddo ; enddo
+  deallocate(qs)
+  call cpu_clock_end(CS%id_clock_cpl)
+end subroutine dg1_cpl_blocks
+
+!> DG1_COUPLED_BUBBLE: add the friction of one grounded sub-point to the block values of a cell.  The tangent
+!! of the friction is bc I (Picard) plus dnw cur cur^T (Newton, zero if dnw is zero); each unit bubble is bt
+!! at the point, and the node basis functions there are phc.
+subroutine dg1_cpl_fric_point(wj, bt, bc, dnw, cur, phc, use_newton, v)
+  real,               intent(in)    :: wj   !< Friction weight of the point [nondim]
+  real,               intent(in)    :: bt   !< The bubble at the point [nondim]
+  real,               intent(in)    :: bc   !< Picard friction coefficient [R L2 Z T-1 ~> kg s-1]
+  real,               intent(in)    :: dnw  !< Newton friction coefficient [R Z T ~> kg m-2 s]
+  real, dimension(2), intent(in)    :: cur  !< The total frozen velocity at the point [L T-1 ~> m s-1]
+  real, dimension(4), intent(in)    :: phc  !< The node basis functions SW, SE, NW, NE at the point [nondim]
+  logical,            intent(in)    :: use_newton !< If true, also add to the linear-solve set
+  real, dimension(CPL_NWK), intent(inout) :: v !< The work values of dg1_cpl_blocks [various]
+  real, dimension(2,2) :: Tp, Tn ! Picard and linear-solve friction tangents times wj bt [R L2 Z T-1 ~> kg s-1]
+  real :: wcn ! The weight times two corner basis functions [nondim]
+  integer :: a, f, c, ip
+  integer, dimension(10), parameter :: pc = (/ 1, 1, 2, 1, 2, 3, 1, 2, 3, 4 /) ! First corner of a pair
+  integer, dimension(10), parameter :: pn = (/ 1, 2, 2, 3, 3, 3, 4, 4, 4, 4 /) ! Second corner of a pair
+  Tp(:,:) = 0.0
+  Tp(1,1) = (wj * bc) * bt ; Tp(2,2) = (wj * bc) * bt
+  do f=1,2 ; do a=1,2
+    Tn(a,f) = Tp(a,f) + ((wj * (dnw * (cur(a) * cur(f)))) * bt)
+  enddo ; enddo
+  do c=1,4 ; do f=1,2 ; do a=1,2
+    v(CPL_PIC+cpl_nb(a,c,f)) = v(CPL_PIC+cpl_nb(a,c,f)) + (Tp(a,f) * phc(c))
+    if (use_newton) v(CPL_LIN+cpl_nb(a,c,f)) = v(CPL_LIN+cpl_nb(a,c,f)) + (Tn(a,f) * phc(c))
+  enddo ; enddo ; enddo
+  v(CPL_PIC+CPL_BB+1) = v(CPL_PIC+CPL_BB+1) + (Tp(1,1) * bt)
+  v(CPL_PIC+CPL_BB+3) = v(CPL_PIC+CPL_BB+3) + (Tp(2,2) * bt)
+  if (use_newton) then
+    v(CPL_LIN+CPL_BB+1) = v(CPL_LIN+CPL_BB+1) + (Tn(1,1) * bt)
+    v(CPL_LIN+CPL_BB+2) = v(CPL_LIN+CPL_BB+2) + (Tn(1,2) * bt)
+    v(CPL_LIN+CPL_BB+3) = v(CPL_LIN+CPL_BB+3) + (Tn(2,2) * bt)
+  endif
+  ! The corner friction matrix of the friction cache, with the products of CG_action_subgrid_basal.
+  do ip=1,10
+    wcn = wj * (phc(pc(ip)) * phc(pn(ip)))
+    v(CPL_KM+ip)    = v(CPL_KM+ip)    + (wcn * bc)
+    v(CPL_KM+ip+10) = v(CPL_KM+ip+10) + (wcn * (dnw * (cur(1) * cur(1))))
+    v(CPL_KM+ip+20) = v(CPL_KM+ip+20) + (wcn * (dnw * (cur(1) * cur(2))))
+    v(CPL_KM+ip+30) = v(CPL_KM+ip+30) + (wcn * (dnw * (cur(2) * cur(2))))
+  enddo
+end subroutine dg1_cpl_fric_point
+
+!> DG1_COUPLED_BUBBLE: at the start of a linear solve from (u, v) and the bubble velocity in dg_post_ub and
+!! dg_post_vb, form the bubble residual R_b = F_b - K_bn u - K_bb c of the Picard blocks in each cell with a
+!! bubble, store w = K_bb^-1 R_b of the linear-solve blocks, and take K_nb w off the right-hand side (static
+!! condensation of the bubble rows).  The cells are those of dg1_cpl_blocks; the node sums are complete
+!! on the nodes of the compute domain and of its first halo row only.
+subroutine dg1_cpl_rhs(CS, G, u, v, is, ie, js, je, RHSu, RHSv)
+  type(ice_shelf_dyn_CS), intent(in)    :: CS !< The ice shelf dynamics control structure; only the
+                                              !! targets of its DG1_COUPLED_BUBBLE pointers are written
+  type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in)    :: u  !< The node velocity u^k [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in)    :: v  !< The node velocity v^k [L T-1 ~> m s-1]
+  integer,                intent(in)    :: is !< The starting i-index of the cells
+  integer,                intent(in)    :: ie !< The ending i-index of the cells
+  integer,                intent(in)    :: js !< The starting j-index of the cells
+  integer,                intent(in)    :: je !< The ending j-index of the cells
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(inout) :: RHSu !< The x right-hand side [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(inout) :: RHSv !< The y right-hand side [R L3 Z T-2 ~> kg m s-2]
+
+  real, dimension(SZDIB_(G),SZDJB_(G),4) :: su, sv ! Node returns of each surrounding cell [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(2) :: rb, w ! The bubble residual [R L3 Z T-2 ~> kg m s-2] and K_bb^-1 R_b [L T-1 ~> m s-1]
+  real, dimension(8) :: ru, rv ! The node returns of the cell, u then v at SW, SE, NW, NE [R L3 Z T-2 ~> kg m s-2]
+  integer :: i, j
+
+  su(:,:,:) = 0.0 ; sv(:,:,:) = 0.0
+  do j=js,je ; do i=is,ie
+    CS%cpl_rb(:,i,j) = 0.0
+    if (CS%cpl_on(i,j) <= 0.0) cycle
+    call dg1_cpl_bubble_force(CS, i, j, CPL_PIC, u(I-1:I,J-1:J), v(I-1:I,J-1:J), rb)
+    rb(1) = (CS%cpl_blk(CPL_FB+1,i,j) - rb(1)) - &
+            ((CS%cpl_blk(CPL_PIC+CPL_BB+1,i,j) * CS%dg_post_ub(i,j)) + &
+             (CS%cpl_blk(CPL_PIC+CPL_BB+2,i,j) * CS%dg_post_vb(i,j)))
+    rb(2) = (CS%cpl_blk(CPL_FB+2,i,j) - rb(2)) - &
+            ((CS%cpl_blk(CPL_PIC+CPL_BB+2,i,j) * CS%dg_post_ub(i,j)) + &
+             (CS%cpl_blk(CPL_PIC+CPL_BB+3,i,j) * CS%dg_post_vb(i,j)))
+    call dg1_cpl_solve_bb(CS%cpl_blk(CPL_LIN+CPL_BB+1:CPL_LIN+CPL_BB+3,i,j), rb, w)
+    CS%cpl_rb(:,i,j) = w(:)
+    call dg1_cpl_node_returns(CS%cpl_blk(CPL_LIN+1:CPL_LIN+16,i,j), w, ru, rv)
+    call dg1_cpl_scatter(G, ru, rv, I, J, su, sv)
+  enddo ; enddo
+  do J=js-1,je ; do I=is-1,ie
+    if (CS%umask(I,J) == 1) RHSu(I,J) = RHSu(I,J) - ((su(I,J,1)+su(I,J,4)) + (su(I,J,2)+su(I,J,3)))
+    if (CS%vmask(I,J) == 1) RHSv(I,J) = RHSv(I,J) - ((sv(I,J,1)+sv(I,J,4)) + (sv(I,J,2)+sv(I,J,3)))
+  enddo ; enddo
+end subroutine dg1_cpl_rhs
+
+!> DG1_COUPLED_BUBBLE: after a linear solve, update the bubble velocity of each compute cell with a bubble:
+!! c = c + K_bb^-1 R_b - W du with the linear-solve blocks, where du is the change of the node velocity in
+!! the solve and K_bb^-1 R_b is from dg1_cpl_rhs.  Then the halos are updated.
+subroutine dg1_cpl_update(CS, G, du, dv)
+  type(ice_shelf_dyn_CS), intent(in)    :: CS !< The ice shelf dynamics control structure; only the
+                                              !! targets of its DG1_COUPLED_BUBBLE pointers are written
+  type(ocean_grid_type),  intent(inout) :: G  !< The grid structure used by the ice shelf
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in)    :: du !< The change of the node velocity u [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in)    :: dv !< The change of the node velocity v [L T-1 ~> m s-1]
+  real, dimension(2) :: gb, wb ! W du and the bubble change [L T-1 ~> m s-1]
+  integer :: i, j
+
+  do j=G%jsc,G%jec ; do i=G%isc,G%iec
+    if (CS%cpl_on(i,j) <= 0.0) cycle
+    call dg1_cpl_bubble_force(CS, i, j, CPL_W, du(I-1:I,J-1:J), dv(I-1:I,J-1:J), gb)
+    wb(:) = CS%cpl_rb(:,i,j) - gb(:)
+    CS%dg_post_ub(i,j) = CS%dg_post_ub(i,j) + wb(1)
+    CS%dg_post_vb(i,j) = CS%dg_post_vb(i,j) + wb(2)
+  enddo ; enddo
+  call pass_var(CS%dg_post_ub, G%domain, complete=.false.)
+  call pass_var(CS%dg_post_vb, G%domain, complete=.true.)
+end subroutine dg1_cpl_update
+
+!> DG1_COUPLED_BUBBLE: the Jacobi diagonal of the condensed operator of a linear solve.  Each node loses,
+!! from each surrounding cell with a bubble, k_nb^T K_bb^-1 k_nb = k_nb . w of the linear-solve blocks, with
+!! k_nb the row of the node unknown in the node-bubble block and w its column of W = K_bb^-1 K_bn.  The term
+!! is positive, and the condensed diagonal of the SPD system stays positive; the floor at 1 % of the bilinear
+!! diagonal only guards against rounding.
+subroutine dg1_cpl_diag(CS, G, is, ie, js, je, DIAGu, DIAGv)
+  type(ice_shelf_dyn_CS), intent(in)    :: CS !< The ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf
+  integer,                intent(in)    :: is !< The starting i-index of the cells
+  integer,                intent(in)    :: ie !< The ending i-index of the cells
+  integer,                intent(in)    :: js !< The starting j-index of the cells
+  integer,                intent(in)    :: je !< The ending j-index of the cells
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(inout) :: DIAGu !< The x diagonal [R L2 Z T-1 ~> kg s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(inout) :: DIAGv !< The y diagonal [R L2 Z T-1 ~> kg s-1]
+
+  real, dimension(SZDIB_(G),SZDJB_(G),4) :: su, sv ! Corrections from each surrounding cell [R L2 Z T-1 ~> kg s-1]
+  real, dimension(8) :: du, dv ! The corrections of a cell, at SW, SE, NW, NE in 1-4 [R L2 Z T-1 ~> kg s-1]
+  real :: cu, cv    ! The corrections of a node [R L2 Z T-1 ~> kg s-1]
+  integer :: i, j, k
+
+  su(:,:,:) = 0.0 ; sv(:,:,:) = 0.0
+  do j=js,je ; do i=is,ie
+    if (CS%cpl_on(i,j) <= 0.0) cycle
+    du(:) = 0.0 ; dv(:) = 0.0
+    do k=1,4
+      du(k) = (CS%cpl_blk(CPL_LIN+cpl_nb(1,k,1),i,j) * CS%cpl_blk(CPL_W+cpl_nb(1,k,1),i,j)) + &
+              (CS%cpl_blk(CPL_LIN+cpl_nb(1,k,2),i,j) * CS%cpl_blk(CPL_W+cpl_nb(1,k,2),i,j))
+      dv(k) = (CS%cpl_blk(CPL_LIN+cpl_nb(2,k,1),i,j) * CS%cpl_blk(CPL_W+cpl_nb(2,k,1),i,j)) + &
+              (CS%cpl_blk(CPL_LIN+cpl_nb(2,k,2),i,j) * CS%cpl_blk(CPL_W+cpl_nb(2,k,2),i,j))
+    enddo
+    call dg1_cpl_scatter(G, du, dv, I, J, su, sv)
+  enddo ; enddo
+  do J=js-1,je ; do I=is-1,ie
+    if (CS%umask(I,J) == 1) then
+      cu = (su(I,J,1)+su(I,J,4)) + (su(I,J,2)+su(I,J,3))
+      DIAGu(I,J) = max(DIAGu(I,J) - cu, 0.01 * DIAGu(I,J))
+    endif
+    if (CS%vmask(I,J) == 1) then
+      cv = (sv(I,J,1)+sv(I,J,4)) + (sv(I,J,2)+sv(I,J,3))
+      DIAGv(I,J) = max(DIAGv(I,J) - cv, 0.01 * DIAGv(I,J))
+    endif
+  enddo ; enddo
+end subroutine dg1_cpl_diag
+
+!> DG1_COUPLED_BUBBLE: the bubble rows K_bn p of a cell for the node values p at its corners, with the
+!! Picard blocks (ko = CPL_PIC), the linear-solve blocks (ko = CPL_LIN), or W p with ko = CPL_W.  Opposite
+!! corners are paired, with rounded products, so that the result is rotation invariant.
+subroutine dg1_cpl_bubble_force(CS, i, j, ko, pu, pv, g)
+  type(ice_shelf_dyn_CS), intent(in)  :: CS !< The ice shelf dynamics control structure
+  integer,                intent(in)  :: i  !< The i-index of the cell
+  integer,                intent(in)  :: j  !< The j-index of the cell
+  integer,                intent(in)  :: ko !< The offset of the blocks: CPL_PIC, CPL_LIN or CPL_W
+  real, dimension(2,2),   intent(in)  :: pu !< The u node values at the corners [L T-1 ~> m s-1]
+  real, dimension(2,2),   intent(in)  :: pv !< The v node values at the corners [L T-1 ~> m s-1]
+  real, dimension(2),     intent(out) :: g  !< K_bn p [R L3 Z T-2 ~> kg m s-2] or W p [L T-1 ~> m s-1]
+  integer :: f
+  do f=1,2
+    g(f) = dg_sum4_rounded(CS%cpl_blk(ko+cpl_nb(1,1,f),i,j)*pu(1,1), CS%cpl_blk(ko+cpl_nb(1,4,f),i,j)*pu(2,2), &
+                           CS%cpl_blk(ko+cpl_nb(1,2,f),i,j)*pu(2,1), CS%cpl_blk(ko+cpl_nb(1,3,f),i,j)*pu(1,2)) + &
+           dg_sum4_rounded(CS%cpl_blk(ko+cpl_nb(2,1,f),i,j)*pv(1,1), CS%cpl_blk(ko+cpl_nb(2,4,f),i,j)*pv(2,2), &
+                           CS%cpl_blk(ko+cpl_nb(2,2,f),i,j)*pv(2,1), CS%cpl_blk(ko+cpl_nb(2,3,f),i,j)*pv(1,2))
+  enddo
+end subroutine dg1_cpl_bubble_force
+
+!> DG1_COUPLED_BUBBLE: w = K_bb^-1 r for a positive definite 2x2 bubble block (11, 12, 22).
+subroutine dg1_cpl_solve_bb(kb, r, w)
+  real, dimension(3), intent(in)  :: kb !< The bubble block 11, 12, 22 [R L2 Z T-1 ~> kg s-1]
+  real, dimension(2), intent(in)  :: r  !< The right-hand side [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(2), intent(out) :: w  !< The solution [L T-1 ~> m s-1]
+  real :: det ! The determinant [R2 L4 Z2 T-2 ~> kg2 s-2]
+  det = (kb(1) * kb(3)) - (kb(2) * kb(2))
+  w(1) = ((kb(3) * r(1)) - (kb(2) * r(2))) / det
+  w(2) = ((kb(1) * r(2)) - (kb(2) * r(1))) / det
+end subroutine dg1_cpl_solve_bb
+
+!> DG1_COUPLED_BUBBLE: the node returns K_nb c of a cell, u then v at SW, SE, NW, NE.
+subroutine dg1_cpl_node_returns(knb, c, ru, rv)
+  real, dimension(16), intent(in)  :: knb !< The node-bubble block of dg1_cpl_blocks [R L2 Z T-1 ~> kg s-1]
+  real, dimension(2),  intent(in)  :: c   !< The bubble velocities [L T-1 ~> m s-1]
+  real, dimension(8),  intent(out) :: ru  !< The u node returns in 1-4 [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(8),  intent(out) :: rv  !< The v node returns in 1-4 [R L3 Z T-2 ~> kg m s-2]
+  integer :: k
+  ru(:) = 0.0 ; rv(:) = 0.0
+  do k=1,4
+    ru(k) = (knb(cpl_nb(1,k,1)) * c(1)) + (knb(cpl_nb(1,k,2)) * c(2))
+    rv(k) = (knb(cpl_nb(2,k,1)) * c(1)) + (knb(cpl_nb(2,k,2)) * c(2))
+  enddo
+end subroutine dg1_cpl_node_returns
+
+!> DG1_COUPLED_BUBBLE: put the node returns of cell (I, J) into the per-cell slots of its four corner nodes,
+!! as CG_action does: a node sees the cell as element 4 (SW corner), 3 (SE), 2 (NW) or 1 (NE).
+subroutine dg1_cpl_scatter(G, ru, rv, I, J, su, sv)
+  type(ocean_grid_type),    intent(in)    :: G  !< The grid structure used by the ice shelf
+  real, dimension(8),       intent(in)    :: ru !< The u node returns in 1-4 [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(8),       intent(in)    :: rv !< The v node returns in 1-4 [R L3 Z T-2 ~> kg m s-2]
+  integer,                  intent(in)    :: I  !< The i-index of the NE corner of the cell
+  integer,                  intent(in)    :: J  !< The j-index of the NE corner of the cell
+  real, dimension(SZDIB_(G),SZDJB_(G),4), &
+                            intent(inout) :: su !< The u slots of each node [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(SZDIB_(G),SZDJB_(G),4), &
+                            intent(inout) :: sv !< The v slots of each node [R L3 Z T-2 ~> kg m s-2]
+  su(I-1,J-1,4) = su(I-1,J-1,4) + ru(1) ; sv(I-1,J-1,4) = sv(I-1,J-1,4) + rv(1)
+  su(I  ,J-1,3) = su(I  ,J-1,3) + ru(2) ; sv(I  ,J-1,3) = sv(I  ,J-1,3) + rv(2)
+  su(I-1,J  ,2) = su(I-1,J  ,2) + ru(3) ; sv(I-1,J  ,2) = sv(I-1,J  ,2) + rv(3)
+  su(I  ,J  ,1) = su(I  ,J  ,1) + ru(4) ; sv(I  ,J  ,1) = sv(I  ,J  ,1) + rv(4)
+end subroutine dg1_cpl_scatter
+
 
 !> Publish ISS%h_shelf from CS%h_nodal as the area-weighted mean.
 subroutine recompute_h_shelf_from_nodal(CS, ISS, G)
@@ -13629,6 +14542,51 @@ function dg_sum4_rounded(p1, p2, p3, p4) result(s)
   t(1) = p1 ; t(2) = p2 ; t(3) = p3 ; t(4) = p4
   s = (t(1) + t(2)) + (t(3) + t(4))
 end function dg_sum4_rounded
+
+!> The index within a set of DG1_COUPLED_BUBBLE blocks of the node-bubble entry for velocity component a
+!! (1 u, 2 v), corner c (1 SW, 2 SE, 3 NW, 4 NE) and bubble f (1 x, 2 y).
+pure integer function cpl_nb(a, c, f)
+  integer, intent(in) :: a !< The velocity component of the node unknown
+  integer, intent(in) :: c !< The corner of the node
+  integer, intent(in) :: f !< The bubble
+  cpl_nb = c + 4*(a-1) + 8*(f-1)
+end function cpl_nb
+
+!> The DG1_COUPLED_BUBBLE bubble 16 xi (1 - xi) eta (1 - eta), scaled to 1 at the 2x2 Gauss points, from the
+!! four marginal weights 1 - xi, xi, 1 - eta and eta of a point.  With this scaling the bubble coefficient is
+!! the bubble velocity at the Gauss points, which the transport volume term uses.
+pure real function dg1_bubble_tilde(xm1, xm2, ym1, ym2)
+  real, intent(in) :: xm1 !< 1 - xi at the point [nondim]
+  real, intent(in) :: xm2 !< xi at the point [nondim]
+  real, intent(in) :: ym1 !< 1 - eta at the point [nondim]
+  real, intent(in) :: ym2 !< eta at the point [nondim]
+  real :: bb ! The product of the two Gauss abscissae on [0,1] [nondim]
+  bb = (.5 * (1-sqrt(1./3))) * (.5 * (1+sqrt(1./3)))
+  dg1_bubble_tilde = ((xm1 * xm2) * (ym1 * ym2)) / (bb * bb)
+end function dg1_bubble_tilde
+
+!> The gradient of the DG1_COUPLED_BUBBLE bubble (scaled to 1 at the Gauss points) at the 2x2 Gauss point
+!! (iq, jq) of cell (i, j).  grad(b) = b_xi grad(xi) + b_eta grad(eta), with xi = N_SE + N_NE and
+!! eta = N_NW + N_NE, so the gradient comes from Phi and keeps its metric, as in dg1_post_bubble.
+subroutine dg1_bubble_grad_qp(CS, i, j, iq, jq, xquad, btx, bty)
+  type(ice_shelf_dyn_CS), intent(in)  :: CS    !< The ice shelf dynamics control structure
+  integer,                intent(in)  :: i     !< The i-index of the cell
+  integer,                intent(in)  :: j     !< The j-index of the cell
+  integer,                intent(in)  :: iq    !< The x-index of the Gauss point
+  integer,                intent(in)  :: jq    !< The y-index of the Gauss point
+  real, dimension(2),     intent(in)  :: xquad !< The 2-point Gauss abscissae on [0,1] [nondim]
+  real,                   intent(out) :: btx   !< The x-gradient of the bubble [L-1 ~> m-1]
+  real,                   intent(out) :: bty   !< The y-gradient of the bubble [L-1 ~> m-1]
+  real :: bb, b_xi, b_eta ! xi (1 - xi) at a Gauss point, and the reference derivatives of the bubble [nondim]
+  integer :: qp
+  qp = 2*(jq-1)+iq
+  bb = xquad(1) * xquad(2)
+  ! 16 (1 - 2 xi) eta (1 - eta) / (16 bb^2), and 1 - 2 xi is the difference of the two abscissae.
+  b_xi  = (xquad(3-iq) - xquad(iq)) / bb
+  b_eta = (xquad(3-jq) - xquad(jq)) / bb
+  btx = (b_xi * (CS%Phi(3,qp,i,j) + CS%Phi(7,qp,i,j))) + (b_eta * (CS%Phi(5,qp,i,j) + CS%Phi(7,qp,i,j)))
+  bty = (b_xi * (CS%Phi(4,qp,i,j) + CS%Phi(8,qp,i,j))) + (b_eta * (CS%Phi(6,qp,i,j) + CS%Phi(8,qp,i,j)))
+end subroutine dg1_bubble_grad_qp
 
 !> Apply a cell's inverse mass matrix, out(a,b) = sum_pq Minv_cell(a,b,p,q)*rhs(p,q).
 subroutine apply_nodal_DG_mass_inverse(Minv_cell, rhs, out)
@@ -16527,8 +17485,9 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
               ((N21*CS%u_shelf(i,j-1))   + (N12*CS%u_shelf(i-1,j))))
       v_qp = (((N11*CS%v_shelf(i-1,j-1)) + (N22*CS%v_shelf(i,j))) + &
               ((N21*CS%v_shelf(i,j-1))   + (N12*CS%v_shelf(i-1,j))))
-      if (CS%dg_post_bubble) then
-        ! DG1_POST_BUBBLE: the bubble is the same at the four Gauss points and zero on the faces.
+      if (CS%dg_post_bubble .or. CS%dg_coupled) then
+        ! DG1_POST_BUBBLE or DG1_COUPLED_BUBBLE: the bubble is the same at the four Gauss points and
+        ! zero on the faces.
         u_qp = u_qp + CS%dg_post_ub(i,j)
         v_qp = v_qp + CS%dg_post_vb(i,j)
       endif
