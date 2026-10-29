@@ -738,6 +738,8 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: dg_coupled = .false. !< If true, the velocity solve has one bubble per ice cell for u and for v,
                                   !! eliminated cell by cell (static condensation), and the bubble velocity, kept
                                   !! in dg_post_ub and dg_post_vb, is used in the transport volume term.
+  logical :: dg_cpl_tr_crossed = .true. !< If false (DG1_COUPLED_BUBBLE_TRANSPORT_CROSSED), the cells with sub-cell
+                             !! quadrature keep their bubble in the velocity solve but not in the DG(1) volume term
   integer :: dg_cpl_quad = 2 !< DG1_COUPLED_BUBBLE_QUAD: the points per direction of the Gauss rule of the bubble
                              !! terms (2, as the rest of the solve, or 3)
   logical :: dg_cpl_crossed = .true. !< If true, DG1_COUPLED_BUBBLE also has a bubble in the grounding-line
@@ -13066,6 +13068,13 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "quadrature, where their friction and driving stress use the same SEP2 or SEP3 "//&
                  "sub-points as the velocity solve.  If false, these cells have no bubble.", &
                  default=.true., do_not_log=.not.CS%dg_coupled)
+  call get_param(param_file, mdl, "DG1_COUPLED_BUBBLE_TRANSPORT_CROSSED", CS%dg_cpl_tr_crossed, &
+                 "If true, the bubble velocity of DG1_COUPLED_BUBBLE also enters the DG(1) volume term in the "//&
+                 "cells with sub-cell quadrature (the grounding-line cells).  If false, those cells keep the "//&
+                 "bubble in the velocity solve, but the transport there uses the bilinear velocity only.  One "//&
+                 "symmetric bubble cannot carry the velocity kink at the grounding line, and in those cells it "//&
+                 "moves ice between the two halves of the cell.", &
+                 default=.true., do_not_log=.not.(CS%dg_coupled .and. CS%dg_cpl_crossed))
   call get_param(param_file, mdl, "DG1_COUPLED_BUBBLE_QUAD", CS%dg_cpl_quad, &
                  "The points per direction of the Gauss rule of the DG1_COUPLED_BUBBLE bubble terms: 2 (as "//&
                  "the rest of the velocity solve) or 3.  The 2-point rule makes the viscous part of the bubble "//&
@@ -17901,6 +17910,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: xi_q, eta_q, a_qp, d_qp
   real :: h_qp, u_qp, v_qp
   logical :: q3_tr  ! DG1_COUPLED_BUBBLE_QUAD = 3: the bubble part of the volume term uses 3x3 Gauss points
+  logical :: bub_tr ! The bubble velocity enters the volume term of this cell
   real, dimension(3) :: x3, w3 ! The 3-point Gauss abscissae on [0,1] and their weights [nondim]
   real, dimension(3,3,2,2) :: qb9 ! The bubble part of the volume term at the 3x3 points [Z L2 T-1 ~> m3 s-1]
   real :: bb_t, bt_t ! The product of the 2-point Gauss abscissae and the bubble at a point [nondim]
@@ -18054,6 +18064,9 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   endif
   do j = jsc, jec ; do i = isc, iec
     if (hmask(i,j) /= 1.0) cycle
+    ! DG1_COUPLED_BUBBLE_TRANSPORT_CROSSED = False: no bubble in the volume term of a cell with sub-cell quadrature.
+    bub_tr = .true.
+    if (CS%dg_coupled .and. .not.CS%dg_cpl_tr_crossed) bub_tr = .not.gl_subgrid_cell(CS, i, j)
     dxCv_S = G%dxCv(i,j-1) ; dxCv_N = G%dxCv(i,j)
     dyCu_W = G%dyCu(i-1,j) ; dyCu_E = G%dyCu(i,j)
 
@@ -18076,7 +18089,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
               ((N21*CS%u_shelf(i,j-1))   + (N12*CS%u_shelf(i-1,j))))
       v_qp = (((N11*CS%v_shelf(i-1,j-1)) + (N22*CS%v_shelf(i,j))) + &
               ((N21*CS%v_shelf(i,j-1))   + (N12*CS%v_shelf(i-1,j))))
-      if ((CS%dg_post_bubble .or. CS%dg_coupled) .and. .not.q3_tr) then
+      if ((CS%dg_post_bubble .or. CS%dg_coupled) .and. .not.q3_tr .and. bub_tr) then
         ! DG1_POST_BUBBLE or DG1_COUPLED_BUBBLE: the bubble is the same at the four Gauss points and
         ! zero on the faces.
         u_qp = u_qp + CS%dg_post_ub(i,j)
@@ -18095,7 +18108,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       rhs_vol(i,j,a,b) = (qv_vol(1,1,a,b) + qv_vol(2,2,a,b)) + &
                          (qv_vol(1,2,a,b) + qv_vol(2,1,a,b))
     enddo ; enddo
-    if (q3_tr) then
+    if (q3_tr .and. bub_tr) then
       ! DG1_COUPLED_BUBBLE_QUAD = 3: the bubble part with 3x3 Gauss points, so that the twist equation sees the
       ! bubble shape (the 2x2 rule is exact for the bubble only in the mean and tilt equations).  The 9 points are
       ! summed in opposite pairs and then the centre.
