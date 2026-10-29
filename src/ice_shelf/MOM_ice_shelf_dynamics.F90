@@ -771,6 +771,11 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! cell on a face with a wholly floating cell is bounded in thickness by that cell.
   logical :: dg_lim_float_d0_thick !< If true, the grounded limiter takes dg_lim_d0 as a thickness on wholly
                                   !! floating cells, so their surface floor is (1 - rho_i/rho_w) dg_lim_d0.
+  logical :: dg_init_lim = .false. !< If true (DG1_INIT_LIMIT_NODES), a DG cold start moves the initial nodal
+                                  !! thicknesses into the grounded-limiter bounds, one value per node.
+  integer :: dg_init_lim_iters = 100 !< DG1_INIT_LIMIT_ITERS: the most passes of dg1_init_limit_nodes
+  real :: dg_init_lim_tol = 0.0     !< DG1_INIT_LIMIT_TOL: dg1_init_limit_nodes stops when no node changes
+                                    !! by more than this in a pass [Z ~> m]
   logical :: dg_lim_br_partial = .false. !< If true (DG1_LIMITER_BRANCH_RULE = PARTIAL), a face or vertex pass of a
                                   !! wholly grounded or floating cell that would move a corner across flotation
                                   !! applies the part of its change that brings that corner to flotation, and
@@ -2478,6 +2483,9 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
        'max principal horizontal ice-shelf deviatoric stress', 'kPa', conversion=1.e-3*US%RLZ_T2_to_Pa)
     CS%id_pdevstress_2 = register_diag_field('ice_shelf_model','pdevstress_2',CS%diag%axesT1, Time, &
        'min principal ice-shelf deviatoric stress', 'kPa', conversion=1.e-3*US%RLZ_T2_to_Pa)
+
+    ! DG1_INIT_LIMIT_NODES: the initial corners into the limiter bounds, after the limiter fields are set up.
+    if (new_sim .and. CS%use_DG_thickness .and. CS%dg_init_lim) call dg1_init_limit_nodes(CS, ISS, G, US)
 
     !Update these variables so that they are nonzero in case
     !IS_dynamics_post_data is called before update_ice_shelf
@@ -13139,6 +13147,21 @@ subroutine read_DG_params(param_file, mdl, CS, US)
     case default ; call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_BRANCH_RULE "//&
                                   "must be SKIP or PARTIAL, not "//trim(br_rule)//".")
   end select
+  call get_param(param_file, mdl, "DG1_INIT_LIMIT_NODES", CS%dg_init_lim, &
+                 "If true, a DG cold start moves the initial nodal thicknesses into the bounds of the "//&
+                 "grounded limiter, so the limiter does not act at the first step.  Each pass applies "//&
+                 "DG1_GROUNDED_LIMITER as in a step, then sets each node to the mean of the corner values "//&
+                 "of the ice cells that share it, so the thickness stays continuous.  The cell means come "//&
+                 "from the nodes, so the ice volume changes; the change is logged.  Not on a restart.", &
+                 default=.false., do_not_log=.not.CS%dg_grounded_limiter)
+  call get_param(param_file, mdl, "DG1_INIT_LIMIT_ITERS", CS%dg_init_lim_iters, &
+                 "The largest number of passes of DG1_INIT_LIMIT_NODES.", &
+                 default=100, do_not_log=.not.CS%dg_init_lim)
+  call get_param(param_file, mdl, "DG1_INIT_LIMIT_TOL", CS%dg_init_lim_tol, &
+                 "DG1_INIT_LIMIT_NODES stops when no node changes by more than this in a pass.", &
+                 units="m", default=0.1, scale=US%m_to_Z, do_not_log=.not.CS%dg_init_lim)
+  if (CS%dg_init_lim .and. (.not.CS%dg_grounded_limiter)) call MOM_error(FATAL, &
+    "MOM_ice_shelf_dynamics, read_DG_params: DG1_INIT_LIMIT_NODES needs DG1_GROUNDED_LIMITER.")
   if (CS%dg_lim_corner_class .and. (.not.CS%dg_lim_crossed)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics: DG1_LIMITER_CORNER_CLASS needs DG1_LIMITER_CROSSED.")
   call get_param(param_file, mdl, "DG1_LIMITER_GROUNDED_UPPER", CS%dg_lim_grounded_upper, &
@@ -16810,6 +16833,150 @@ pure subroutine dg1_lim_vertex_split(s_c, sb, wn, lo_c, hi_c, phi_iso, px, py, d
     px = phi_iso ; py = phi_iso
   endif
 end subroutine dg1_lim_vertex_split
+
+!> DG1_INIT_LIMIT_NODES: move the nodal thicknesses of a cold start into the bounds of the grounded limiter.
+!! The vertex bound of a corner comes from the means of the four cells at its node, so one value per node
+!! keeps the field continuous.  Each pass sets the grounded fraction and the band weight as a step does,
+!! applies dg1_grounded_limiter, and then sets each node to the mean of the corner values of the ice cells
+!! that share it.  A node next to a Dirichlet (hmask = 3) cell keeps its value.  The cell means follow the
+!! nodes, so the volume changes.  The limiter statistics and factors of the first step are not changed.
+subroutine dg1_init_limit_nodes(CS, ISS, G, US)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS  !< Ice shelf dynamics control structure
+  type(ice_shelf_state),  intent(in)    :: ISS !< The ice-shelf state; h_shelf is a pointer and changes
+  type(ocean_grid_type),  intent(inout) :: G   !< The grid structure
+  type(unit_scale_type),  intent(in)    :: US  !< A structure containing unit conversion factors
+
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: h_init ! Corner thicknesses on entry [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: h_prev ! Corner thicknesses at the start of a pass [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: h_lim  ! Corner thicknesses after the limiter of a pass [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: h_nd     ! Mean corner value at a node [Z ~> m]
+  logical, dimension(SZDIB_(G),SZDJB_(G)) :: fix_nd ! The node keeps its value
+  real, dimension(SZDI_(G),SZDJ_(G)) :: tmp        ! Cell values for the global sums [various]
+  real, allocatable, dimension(:,:,:) :: st_keep   ! The limiter statistics on entry [nondim]
+  real :: n_keep    ! The limiter stage count on entry [nondim]
+  real :: v_sw, v_se, v_nw, v_ne ! Corner values of the four cells at a node, 0 for a cell without ice [Z ~> m]
+  real :: n_ice     ! Number of ice cells at a node [nondim]
+  real :: v_lo, v_hi ! Smallest and largest corner value of the ice cells at a node [Z ~> m]
+  real :: d_max     ! Largest change of a node in a pass [Z ~> m]
+  real :: d_tot     ! Largest change of a node from the entry state [Z ~> m]
+  real :: vol0, vol1 ! Ice volume of the hmask = 1 cells on entry and at the end [Z L2 ~> m3]
+  real :: n_chg     ! Number of cells with a changed corner [nondim]
+  real :: n_cut     ! Number of cells the limiter of the last pass changed by more than the tolerance [nondim]
+  character(len=200) :: mesg ! Log message
+  integer :: i, j, a, b, it, n_it
+
+  h_init(:,:,:,:) = CS%h_nodal(:,:,:,:)
+  if (associated(CS%dg_lim_stat)) then
+    allocate(st_keep, source=CS%dg_lim_stat)
+    n_keep = CS%dg_lim_nstage
+  endif
+  tmp(:,:) = 0.0
+  do j = G%jsc, G%jec ; do i = G%isc, G%iec
+    if (ISS%hmask(i,j) == 1.0) tmp(i,j) = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j)
+  enddo ; enddo
+  vol0 = reproducing_sum(tmp)
+
+  n_it = 0 ; d_max = 0.0 ; n_cut = 0.0
+  do it = 1, CS%dg_init_lim_iters
+    n_it = it
+    h_prev(:,:,:,:) = CS%h_nodal(:,:,:,:)
+    ! The grounded fraction and the band weight as the step reads them.
+    call update_grounded_geometry(CS, ISS, G)
+    if (CS%dg_fc_on) call dg1_corner_ground_frac(CS, G, ISS%hmask, CS%h_nodal)
+    if (CS%dg_band_width >= 0) call dg1_band_weight(CS, G, ISS%hmask)
+    call dg1_grounded_limiter(CS, G, ISS%hmask)
+    call pass_corner_field(CS%h_nodal, G)
+    h_lim(:,:,:,:) = CS%h_nodal(:,:,:,:)
+
+    ! One value per node: the mean of the corners of the ice cells at the node.  The cells are summed in
+    ! diagonal pairs, so a quarter turn of the grid gives the same sums.
+    do J = G%jsc-1, G%jec ; do I = G%isc-1, G%iec
+      fix_nd(I,J) = (ISS%hmask(I,J) == 3.0) .or. (ISS%hmask(I+1,J) == 3.0) .or. &
+                    (ISS%hmask(I,J+1) == 3.0) .or. (ISS%hmask(I+1,J+1) == 3.0)
+      v_sw = 0.0 ; v_se = 0.0 ; v_nw = 0.0 ; v_ne = 0.0 ; n_ice = 0.0
+      v_lo = huge(v_lo) ; v_hi = -huge(v_hi)
+      if (ISS%hmask(I,J) == 1.0) then
+        v_sw = CS%h_nodal(I,J,2,2) ; n_ice = n_ice + 1.0 ; v_lo = min(v_lo, v_sw) ; v_hi = max(v_hi, v_sw)
+      endif
+      if (ISS%hmask(I+1,J) == 1.0) then
+        v_se = CS%h_nodal(I+1,J,1,2) ; n_ice = n_ice + 1.0 ; v_lo = min(v_lo, v_se) ; v_hi = max(v_hi, v_se)
+      endif
+      if (ISS%hmask(I,J+1) == 1.0) then
+        v_nw = CS%h_nodal(I,J+1,2,1) ; n_ice = n_ice + 1.0 ; v_lo = min(v_lo, v_nw) ; v_hi = max(v_hi, v_nw)
+      endif
+      if (ISS%hmask(I+1,J+1) == 1.0) then
+        v_ne = CS%h_nodal(I+1,J+1,1,1) ; n_ice = n_ice + 1.0 ; v_lo = min(v_lo, v_ne) ; v_hi = max(v_hi, v_ne)
+      endif
+      ! Corners that agree keep their value exactly.
+      h_nd(I,J) = v_lo
+      if (v_hi > v_lo) h_nd(I,J) = ((v_sw + v_ne) + (v_se + v_nw)) / n_ice
+    enddo ; enddo
+    do j = G%jsc, G%jec ; do i = G%isc, G%iec
+      if (ISS%hmask(i,j) /= 1.0) cycle
+      do b = 1, 2 ; do a = 1, 2
+        if (fix_nd(i-2+a,j-2+b)) then
+          CS%h_nodal(i,j,a,b) = h_prev(i,j,a,b)
+        else
+          CS%h_nodal(i,j,a,b) = h_nd(i-2+a,j-2+b)
+        endif
+      enddo ; enddo
+    enddo ; enddo
+    call pass_corner_field(CS%h_nodal, G)
+    call enforce_wrap_corner_consistency(CS, ISS, G)
+    call recompute_h_shelf_from_nodal(CS, ISS, G)
+
+    d_max = 0.0 ; n_cut = 0.0
+    do j = G%jsc, G%jec ; do i = G%isc, G%iec
+      if (ISS%hmask(i,j) /= 1.0) cycle
+      if (maxval(abs(h_lim(i,j,:,:) - h_prev(i,j,:,:))) > CS%dg_init_lim_tol) n_cut = n_cut + 1.0
+      d_max = max(d_max, maxval(abs(CS%h_nodal(i,j,:,:) - h_prev(i,j,:,:))))
+    enddo ; enddo
+    call max_across_PEs(d_max)
+    tmp(:,:) = 0.0 ; tmp(G%isc,G%jsc) = n_cut
+    write(mesg, '("DG1_INIT_LIMIT_NODES: pass ",I0,", largest node change ",ES10.3," m, ",I0, &
+                &" cells cut by the limiter by more than DG1_INIT_LIMIT_TOL")') it, US%Z_to_m*d_max, &
+        nint(reproducing_sum(tmp))
+    call MOM_mesg(trim(mesg), 2)
+    if (d_max <= CS%dg_init_lim_tol) exit
+  enddo
+  CS%grounded_geom_current = .false.
+
+  ! The first step starts with its own statistics and factors.
+  if (associated(CS%dg_lim_phi)) CS%dg_lim_phi(:,:,:) = 1.0
+  if (allocated(st_keep)) then
+    CS%dg_lim_stat(:,:,:) = st_keep(:,:,:) ; CS%dg_lim_nstage = n_keep
+    deallocate(st_keep)
+  endif
+
+  tmp(:,:) = 0.0
+  do j = G%jsc, G%jec ; do i = G%isc, G%iec
+    if (ISS%hmask(i,j) == 1.0) tmp(i,j) = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j)
+  enddo ; enddo
+  vol1 = reproducing_sum(tmp)
+  d_tot = 0.0 ; tmp(:,:) = 0.0
+  do j = G%jsc, G%jec ; do i = G%isc, G%iec
+    if (ISS%hmask(i,j) /= 1.0) cycle
+    d_tot = max(d_tot, maxval(abs(CS%h_nodal(i,j,:,:) - h_init(i,j,:,:))))
+    if (any(CS%h_nodal(i,j,:,:) /= h_init(i,j,:,:))) tmp(i,j) = 1.0
+  enddo ; enddo
+  call max_across_PEs(d_tot)
+  n_chg = reproducing_sum(tmp)
+  tmp(:,:) = 0.0
+  tmp(G%isc,G%jsc) = n_cut
+  n_cut = reproducing_sum(tmp)
+  write(mesg, '("DG1_INIT_LIMIT_NODES: ",I0," passes, node change in the last pass ",ES10.3, &
+              &" m, largest node change ",ES10.3," m, ",I0," cells changed")') &
+      n_it, US%Z_to_m*d_max, US%Z_to_m*d_tot, nint(n_chg)
+  call MOM_mesg(trim(mesg), 2)
+  write(mesg, '("DG1_INIT_LIMIT_NODES: ice volume ",ES12.5," m3, change ",ES11.4," m3 (relative ",ES10.3,")")') &
+      US%Z_to_m*US%L_to_m**2*vol0, US%Z_to_m*US%L_to_m**2*(vol1 - vol0), (vol1 - vol0) / max(abs(vol0), tiny(vol0))
+  call MOM_mesg(trim(mesg), 2)
+  write(mesg, '("DG1_INIT_LIMIT_NODES: ",I0," cells changed by the limiter of the last pass by more than ", &
+              &"DG1_INIT_LIMIT_TOL")') nint(n_cut)
+  call MOM_mesg(trim(mesg), 2)
+  if (d_max > CS%dg_init_lim_tol) call MOM_error(WARNING, "MOM_ice_shelf_dynamics, dg1_init_limit_nodes: "//&
+    "DG1_INIT_LIMIT_NODES did not converge in DG1_INIT_LIMIT_ITERS passes.")
+end subroutine dg1_init_limit_nodes
 
 !> The largest factor in [0, 1] on the corner changes d that keeps base + factor*d inside [lo_c, hi_c] at every
 !! corner (the Barth-Jespersen factor).
