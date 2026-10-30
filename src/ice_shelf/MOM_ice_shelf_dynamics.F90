@@ -430,6 +430,14 @@ type, public :: ice_shelf_dyn_CS ; private
   real, pointer, dimension(:,:,:,:,:) :: gl_fric_K => NULL() !< Grounding-line cell friction matrix
                             !! K(c,n,blk,i,j) over corners c,n (SW,SE,NW,NE); blk 1 is the Picard
                             !! block, 2-4 the Newton uu, uv and vv blocks [R L3 Z T-1 L-1 ~> kg s-1]
+  logical :: ssa_elem_mats = .false. !< If true (ICE_SSA_ELEMENT_MATRICES), the Krylov iterations of a
+                            !! linear solve apply the stored cell matrices elem_K in place of CG_action.
+  real, pointer, dimension(:,:,:,:) :: elem_K => NULL() !< The operator of a linear solve per ice cell,
+                            !! elem_K(r,c,i,j) for the node unknowns u then v at SW, SE, NW, NE, with the
+                            !! rows of masked nodes zero [R L2 Z T-1 ~> kg s-1]
+  real, pointer, dimension(:,:,:) :: elem_locF => NULL() !< With CISM_FRICTION = local, the node friction of
+                            !! a linear solve for ssa_element_action, (1) the Picard drag [R L2 Z T-1 ~> kg s-1],
+                            !! (2) the Newton factor [R Z T ~> kg m-2 s], (3, 4) the frozen u and v [L T-1 ~> m s-1]
   real, pointer, dimension(:,:) :: gl_sub_nbr => NULL() !< 1 where a fully grounded cell uses the
                             !! grounding-line sub-element quadrature because of its neighbours
                             !! (set_gl_subgrid_neighbors), 0 elsewhere [nondim]
@@ -757,6 +765,7 @@ type, public :: ice_shelf_dyn_CS ; private
   integer :: id_clock_solve = -1  !< CPU clock for the velocity solve (ice_shelf_solve_outer)
   integer :: id_clock_fcache = -1 !< CPU clock for the friction cache of BASAL_FRICTION_PRECOMPUTE
   integer :: id_clock_cpl = -1    !< CPU clock for the DG1_COUPLED_BUBBLE block build
+  integer :: id_clock_emat = -1   !< CPU clock for the build of the ICE_SSA_ELEMENT_MATRICES cell matrices
   logical :: dg_pos_split = .false. !< If true (DG1_POSITIVITY_SPLIT), the nodal positivity limit cuts the x tilt,
                                   !! the y tilt and the twist of a cell by separate factors.
   logical :: dg_lim_vertex_split  !< If true, the vertex tilt step of the grounded limiter scales the x and y
@@ -1752,6 +1761,13 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                 "If false, uses a fixed CG_action range with one pass_vector(D) per iteration, "//&
                 "which may reduce total communication for typical halo widths.", &
                 default=.true.)
+    call get_param(param_file, mdl, "ICE_SSA_ELEMENT_MATRICES", CS%ssa_elem_mats, &
+                "If true, each linear solve of the SSA velocity builds one 8x8 matrix per ice cell, "//&
+                "from the viscosity, the Newton terms, the stored basal friction and, with "//&
+                "DG1_COUPLED_BUBBLE, the condensed bubble blocks, and its Krylov iterations apply these "//&
+                "matrices in place of the quadrature of CG_action.  The basal friction is taken from the "//&
+                "store of BASAL_FRICTION_PRECOMPUTE, which this option builds itself if that is off.  "//&
+                "Answers change at roundoff.", default=.false.)
     call get_param(param_file, mdl, "CONJUGATE_GRADIENT_MAXIT", CS%cg_max_iterations, &
                 "max iteratiions in CG solver", default=2000)
     call get_param(param_file, mdl, "THRESH_FLOAT_COL_DEPTH", CS%thresh_float_col_depth, &
@@ -1786,6 +1802,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     CS%id_clock_solve = cpu_clock_id(' Ice shelf velocity solve', grain=CLOCK_ROUTINE)
     CS%id_clock_fcache = cpu_clock_id('  Ice shelf friction cache', grain=CLOCK_ROUTINE)
     CS%id_clock_cpl = cpu_clock_id('  Ice shelf bubble blocks', grain=CLOCK_ROUTINE)
+    CS%id_clock_emat = cpu_clock_id('  Ice shelf element matrices', grain=CLOCK_ROUTINE)
     ! DG1_LIMITER_GROUNDED_UPPER (and DG1_LIMITER_FACE_INVERSION, which needs it) read cells up to 4 away; stop
     ! here, before the first step, rather than in the first limiter call.
     if (CS%dg_lim_grounded_upper .and. ((G%isc - G%isd < 4) .or. (G%jsc - G%jsd < 4))) &
@@ -1895,13 +1912,17 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     endif
 
     allocate(CS%Phi(1:8,1:4,isd:ied,jsd:jed), source=0.0)
-    if (CS%fric_precompute) then
+    if (CS%fric_precompute .or. CS%ssa_elem_mats) then
       allocate(CS%fric_qp_on(4,isd:ied,jsd:jed), source=0.0)
       allocate(CS%fric_qp_coef(4,isd:ied,jsd:jed), source=0.0)
       allocate(CS%fric_qp_newt(4,isd:ied,jsd:jed), source=0.0)
       allocate(CS%fric_qp_u(4,isd:ied,jsd:jed), source=0.0)
       allocate(CS%fric_qp_v(4,isd:ied,jsd:jed), source=0.0)
       allocate(CS%gl_fric_K(4,4,4,isd:ied,jsd:jed), source=0.0)
+    endif
+    if (CS%ssa_elem_mats) then
+      allocate(CS%elem_K(8,8,isd:ied,jsd:jed), source=0.0)
+      if (CS%local_basal_friction) allocate(CS%elem_locF(4,Isdq:Iedq,Jsdq:Jedq), source=0.0)
     endif
     if (CS%dg_coupled) then
       allocate(CS%cpl_blk(CPL_NV,isd:ied,jsd:jed), source=0.0)
@@ -4072,7 +4093,7 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
   integer :: I, J
   integer :: Isdq, Iedq, Jsdq, Jedq, Iscq, Iecq, Jscq, Jecq
   integer :: isc, iec, jsc, jec
-  integer :: em ! The number of halo cells with a friction cache
+  integer :: em ! The number of halo cells with friction cache and ICE_SSA_ELEMENT_MATRICES matrices
 
   Isdq = G%IsdB ; Iedq = G%IedB ; Jsdq = G%JsdB ; Jedq = G%JedB
   Iscq = G%IscB ; Iecq = G%IecB ; Jscq = G%JscB ; Jecq = G%JecB
@@ -4102,14 +4123,16 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
 
   ! The basal friction depends on the frozen iterate, which every inner solver takes from u_shlf and
   ! keeps for the whole linear solve, so it is evaluated once here and applied from storage.
-  ! With DG1_COUPLED_BUBBLE the block build sets the friction cache.  CG with CG_HALO_SHRINK applies the
-  ! operator out to the whole halo, so the cache must cover the same cells.
+  ! With DG1_COUPLED_BUBBLE the block build sets the friction cache.  ICE_SSA_ELEMENT_MATRICES takes its
+  ! friction from the cache, so it builds the cache itself if BASAL_FRICTION_PRECOMPUTE is off.  CG with
+  ! CG_HALO_SHRINK applies the operator out to the whole halo, so the cache (and the cell matrices) must
+  ! cover the same cells.
   em = 1
   if ((CS%inner_solver == INNER_CG) .and. CS%cg_halo_shrink) then
     em = min(G%domain%nihalo, G%domain%njhalo)
     if (.not.G%symmetric) em = em - 1
   endif
-  if (CS%fric_precompute .and. .not.CS%dg_coupled) then
+  if ((CS%fric_precompute .and. .not.CS%dg_coupled) .or. (CS%ssa_elem_mats .and. .not.CS%fric_precompute)) then
     call cpu_clock_begin(CS%id_clock_fcache)
     call build_basal_friction_cache(CS, G, US, u_shlf, v_shlf, Phisub, hmask, H_node, CS%bed_elev, &
                                     rhoi_rhow, isc-em, iec+em, jsc-em, jec+em, h_shelf=ISS%h_shelf)
@@ -4122,6 +4145,10 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
   if (cpl_build .and. present(cpl_blocks_ready)) cpl_build = .not.cpl_blocks_ready
   if (cpl_build) &
     call dg1_cpl_blocks(CS, ISS, G, US, u_shlf, v_shlf, isc-1, iec+1, jsc-1, jec+1, CS%doing_newton, .false.)
+  ! ICE_SSA_ELEMENT_MATRICES: the operator of this linear solve, cell by cell, for the Krylov iterations.
+  if (CS%ssa_elem_mats) &
+    call ssa_element_matrices(CS, G, US, Phi, CS%umask, CS%vmask, hmask, CS%ice_visc, u_shlf, v_shlf, &
+                              isc-em, iec+em, jsc-em, jec+em, CS%doing_newton, CS%dg_coupled)
 
   call matrix_diagonal(CS, G, US, H_node, CS%ice_visc, u_shlf, v_shlf, &
                        hmask, rhoi_rhow, Phi, Phisub, DIAGu, DIAGv, h_shelf=ISS%h_shelf, &
@@ -4348,10 +4375,14 @@ subroutine ice_shelf_solve_inner_CG(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, A
 
     Au(:,:) = 0 ; Av(:,:) = 0
 
-    call CG_action(CS, Au, Av, Du, Dv, Phi, Phisub, CS%umask, CS%vmask, hmask, &
-                   H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
-                   G, US, is, ie, js, je, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute, &
-                   bubble_mode=merge(2, 0, CS%dg_coupled))
+    if (CS%ssa_elem_mats) then
+      call ssa_element_action(CS, G, Au, Av, Du, Dv, hmask, is, ie, js, je)
+    else
+      call CG_action(CS, Au, Av, Du, Dv, Phi, Phisub, CS%umask, CS%vmask, hmask, &
+                     H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
+                     G, US, is, ie, js, je, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute, &
+                     bubble_mode=merge(2, 0, CS%dg_coupled))
+    endif
 
     sum_vec(:,:) = 0.0
 
@@ -4581,10 +4612,14 @@ subroutine ice_shelf_solve_inner_MINRES(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, A
 
     ! --- STEP 1: Matrix Vector Product ---
     Qu(:,:) = 0 ; Qv(:,:) = 0
-    call CG_action(CS, Qu, Qv, Z_curr_u, Z_curr_v, Phi, Phisub, CS%umask, CS%vmask, hmask, &
-                   H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
-                   G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute, &
-                   bubble_mode=merge(2, 0, CS%dg_coupled))
+    if (CS%ssa_elem_mats) then
+      call ssa_element_action(CS, G, Qu, Qv, Z_curr_u, Z_curr_v, hmask, isc-1, iec+1, jsc-1, jec+1)
+    else
+      call CG_action(CS, Qu, Qv, Z_curr_u, Z_curr_v, Phi, Phisub, CS%umask, CS%vmask, hmask, &
+                     H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
+                     G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute, &
+                     bubble_mode=merge(2, 0, CS%dg_coupled))
+    endif
     ! --- STEP 2: alpha = q dot z_curr ---
     sum_vec_3d(:,:) = 0.0
     do J=Jscq_sv,Jecq ; do I=Iscq_sv,Iecq
@@ -4782,10 +4817,14 @@ subroutine ice_shelf_solve_inner_CR(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, A
 
   ! Compute A * z_0
   Au(:,:) = 0 ; Av(:,:) = 0
-  call CG_action(CS, Au, Av, Zu, Zv, Phi, Phisub, CS%umask, CS%vmask, hmask, &
-                 H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
-                 G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute, &
+  if (CS%ssa_elem_mats) then
+    call ssa_element_action(CS, G, Au, Av, Zu, Zv, hmask, isc-1, iec+1, jsc-1, jec+1)
+  else
+    call CG_action(CS, Au, Av, Zu, Zv, Phi, Phisub, CS%umask, CS%vmask, hmask, &
+                   H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
+                   G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute, &
                    bubble_mode=merge(2, 0, CS%dg_coupled))
+  endif
   call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
 
   ! q_0 = A * p_0
@@ -4861,10 +4900,14 @@ subroutine ice_shelf_solve_inner_CR(CS, G, US, u_shlf, v_shlf, RHSu, RHSv, Au, A
 
     ! --- STEP 3: w_{k+1} = A z_{k+1} ---
     Au(:,:) = 0 ; Av(:,:) = 0
-    call CG_action(CS, Au, Av, Zu, Zv, Phi, Phisub, CS%umask, CS%vmask, hmask, &
-                   H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
-                   G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute, &
-                   bubble_mode=merge(2, 0, CS%dg_coupled))
+    if (CS%ssa_elem_mats) then
+      call ssa_element_action(CS, G, Au, Av, Zu, Zv, hmask, isc-1, iec+1, jsc-1, jec+1)
+    else
+      call CG_action(CS, Au, Av, Zu, Zv, Phi, Phisub, CS%umask, CS%vmask, hmask, &
+                     H_node, CS%ice_visc, CS%bed_elev, u_curr, v_curr, &
+                     G, US, isc-1, iec+1, jsc-1, jec+1, rhoi_rhow, h_shelf=h_shelf, use_fric_cache=CS%fric_precompute, &
+                     bubble_mode=merge(2, 0, CS%dg_coupled))
+    endif
     call pass_vector(Au, Av, G%domain, TO_ALL, BGRID_NE)
 
     ! --- STEP 4: beta and convergence check ---
@@ -6558,6 +6601,248 @@ subroutine CG_action(CS, uret, vret, u_shlf, v_shlf, Phi, Phisub, umask, vmask, 
   endif
 
 end subroutine CG_action
+
+!> ICE_SSA_ELEMENT_MATRICES: build the operator of a linear solve as one 8x8 matrix per ice cell, from the terms
+!! that CG_action applies with the friction cache in a Krylov iteration: the viscous stress, its Newton
+!! tangent, the stored basal friction at the 2x2 quadrature points, the corner friction matrix of the
+!! grounding-line cells and, with DG1_COUPLED_BUBBLE, the condensed bubble term -K_nb W.  The unknowns of a
+!! cell are u then v at its SW, SE, NW and NE corners; the rows of nodes whose mask is not 1 are zero, as
+!! in CG_action.  With CISM_FRICTION = local the friction is a node term, stored per node in elem_locF.
+subroutine ssa_element_matrices(CS, G, US, Phi, umask, vmask, hmask, ice_visc, u_curr, v_curr, is, ie, js, je, &
+                                use_newton, bubble)
+  type(ice_shelf_dyn_CS), intent(in) :: CS !< The ice shelf dynamics control structure; only the targets
+                                           !! of its elem_K and elem_locF pointers are written
+  type(ocean_grid_type),  intent(in) :: G  !< The grid structure used by the ice shelf
+  type(unit_scale_type),  intent(in) :: US !< A structure containing unit conversion factors
+  real, dimension(8,4,SZDI_(G),SZDJ_(G)), &
+                          intent(in) :: Phi !< The gradients of the bilinear basis functions at the
+                                            !! quadrature points [L-1 ~> m-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in) :: umask !< A coded mask of the zonal flow at the corners [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in) :: vmask !< A coded mask of the meridional flow at the corners [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(in) :: hmask !< A mask of the ice-covered tracer points [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G),CS%visc_qps), &
+                          intent(in) :: ice_visc !< The ice viscosity field of Glen's law [R L4 Z T-1 ~> kg m2 s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in) :: u_curr !< The frozen u of the linear solve at the corners [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in) :: v_curr !< The frozen v of the linear solve at the corners [L T-1 ~> m s-1]
+  integer,                intent(in) :: is !< The starting i-index to work on
+  integer,                intent(in) :: ie !< The ending i-index to work on
+  integer,                intent(in) :: js !< The starting j-index to work on
+  integer,                intent(in) :: je !< The ending j-index to work on
+  logical,                intent(in) :: use_newton !< If true, add the Newton tangent terms
+  logical,                intent(in) :: bubble !< If true, add the condensed DG1_COUPLED_BUBBLE term
+
+  real, dimension(8,8) :: Kq    ! The matrix terms of one quadrature point [R L2 Z T-1 ~> kg s-1]
+  real, dimension(8,8,4) :: Kqp ! The matrix terms of each quadrature point [R L2 Z T-1 ~> kg s-1]
+  real, dimension(4) :: px, py  ! The x and y gradients of the corner basis functions [L-1 ~> m-1]
+  real, dimension(4) :: bn      ! The corner basis functions at a quadrature point [nondim]
+  real, dimension(4) :: gu, gv  ! The Newton strain projections of a unit u or v at a corner [T-1 ~> s-1]
+  real, dimension(4) :: tu, tv  ! The Newton strain projections of the u and v test functions [T-1 ~> s-1]
+  real, dimension(2) :: xquad   ! The 2-point Gauss abscissae on [0,1] [nondim]
+  real, dimension(8) :: rmask   ! 1 for a row whose node mask is 1, else 0 [nondim]
+  real :: jvisc       ! jac_wt times the viscosity at the quadrature point [R L4 Z T-1 ~> kg m2 s-1]
+  real :: jnewt       ! jac_wt times the Newton viscosity factor [R L4 Z T ~> kg m2 s]
+  real :: jbc, jdn    ! jac_wt times the Picard [R L2 Z T-1 ~> kg s-1] and Newton [R Z T ~> kg m-2 s]
+                      ! friction coefficients
+  real :: uk, vk      ! The frozen velocity at the quadrature point [L T-1 ~> m s-1]
+  real :: strx, stry, strsh ! The Newton strain fields at the quadrature point [T-1 ~> s-1]
+  real :: jac_wt      ! The metric correction |J_q|/areaT [nondim]
+  real, dimension(2) :: wcol    ! The bubble response -W of a unit node value [nondim]
+  integer :: i, j, iq, jq, qp, qpv, m, c, a, n, f
+  logical :: do_newton_visc, gl_cell
+
+  if (CS%id_clock_emat > 0) call cpu_clock_begin(CS%id_clock_emat)
+  xquad(1) = .5 * (1-sqrt(1./3)) ; xquad(2) = .5 * (1+sqrt(1./3))
+  do_newton_visc = use_newton .and. trim(CS%ice_viscosity_compute) == "MODEL"
+  qpv = 1
+
+  do j=js,je ; do i=is,ie
+    CS%elem_K(:,:,i,j) = 0.0
+    if (.not.(hmask(i,j) == 1.0 .or. hmask(i,j) == 3.0)) cycle
+    rmask(1) = merge(1.0, 0.0, umask(I-1,J-1) == 1.0) ; rmask(2) = merge(1.0, 0.0, umask(I,J-1) == 1.0)
+    rmask(3) = merge(1.0, 0.0, umask(I-1,J) == 1.0) ; rmask(4) = merge(1.0, 0.0, umask(I,J) == 1.0)
+    rmask(5) = merge(1.0, 0.0, vmask(I-1,J-1) == 1.0) ; rmask(6) = merge(1.0, 0.0, vmask(I,J-1) == 1.0)
+    rmask(7) = merge(1.0, 0.0, vmask(I-1,J) == 1.0) ; rmask(8) = merge(1.0, 0.0, vmask(I,J) == 1.0)
+
+    do iq=1,2 ; do jq=1,2
+      qp = 2*(jq-1)+iq
+      if (CS%visc_qps == 4) qpv = qp
+      jac_wt = CS%Jac(qp,i,j) * G%IareaT(i,j)
+      do m=1,4
+        px(m) = Phi(2*m-1,qp,i,j) ; py(m) = Phi(2*m,qp,i,j)
+        ! The corner basis function at this point, as in the friction term of CG_action.
+        a = 1 ; if (iq == 2-mod(m,2)) a = 2
+        n = 1 ; if (jq == 1+(m-1)/2) n = 2
+        bn(m) = xquad(a) * xquad(n)
+      enddo
+      jvisc = jac_wt * ice_visc(i,j,qpv)
+      Kq(:,:) = 0.0
+      ! The viscous stress: the u row of test function m against a unit u or v at corner c.
+      do c=1,4 ; do m=1,4
+        Kq(m,c)     = jvisc * (((4.*px(c)) * px(m)) + (py(c) * py(m)))
+        Kq(m,c+4)   = jvisc * (((2.*py(c)) * px(m)) + (px(c) * py(m)))
+        Kq(m+4,c)   = jvisc * ((py(c) * px(m)) + ((2.*px(c)) * py(m)))
+        Kq(m+4,c+4) = jvisc * ((px(c) * px(m)) + ((4.*py(c)) * py(m)))
+      enddo ; enddo
+      if (do_newton_visc) then
+        strx = CS%newton_str_ux(i,j,qpv) ; stry = CS%newton_str_vy(i,j,qpv) ; strsh = CS%newton_str_sh(i,j,qpv)
+        jnewt = jac_wt * CS%newton_visc_factor(i,j,qpv)
+        do m=1,4
+          gu(m) = ((2.*strx + stry) * px(m)) + (strsh * (py(m) * 0.5))
+          gv(m) = ((2.*stry + strx) * py(m)) + (strsh * (px(m) * 0.5))
+          tu(m) = ((2.*strx + stry) * px(m)) + ((strsh * 0.5) * py(m))
+          tv(m) = ((strsh * 0.5) * px(m)) + ((2.*stry + strx) * py(m))
+        enddo
+        do c=1,4 ; do m=1,4
+          Kq(m,c)     = Kq(m,c)     + (jnewt * gu(c)) * tu(m)
+          Kq(m,c+4)   = Kq(m,c+4)   + (jnewt * gv(c)) * tu(m)
+          Kq(m+4,c)   = Kq(m+4,c)   + (jnewt * gu(c)) * tv(m)
+          Kq(m+4,c+4) = Kq(m+4,c+4) + (jnewt * gv(c)) * tv(m)
+        enddo ; enddo
+      endif
+      if ((CS%fric_qp_on(qp,i,j) > 0.0) .and. .not.CS%local_basal_friction) then
+        jbc = jac_wt * CS%fric_qp_coef(qp,i,j)
+        do c=1,4 ; do m=1,4
+          Kq(m,c)     = Kq(m,c)     + (jbc * bn(c)) * bn(m)
+          Kq(m+4,c+4) = Kq(m+4,c+4) + (jbc * bn(c)) * bn(m)
+        enddo ; enddo
+        if (use_newton) then
+          jdn = jac_wt * CS%fric_qp_newt(qp,i,j)
+          uk = CS%fric_qp_u(qp,i,j) ; vk = CS%fric_qp_v(qp,i,j)
+          do c=1,4 ; do m=1,4
+            Kq(m,c)     = Kq(m,c)     + ((jdn * uk) * (uk * bn(c))) * bn(m)
+            Kq(m,c+4)   = Kq(m,c+4)   + ((jdn * uk) * (vk * bn(c))) * bn(m)
+            Kq(m+4,c)   = Kq(m+4,c)   + ((jdn * vk) * (uk * bn(c))) * bn(m)
+            Kq(m+4,c+4) = Kq(m+4,c+4) + ((jdn * vk) * (vk * bn(c))) * bn(m)
+          enddo ; enddo
+        endif
+      endif
+      Kqp(:,:,qp) = Kq(:,:)
+    enddo ; enddo
+    ! The 2x2 sum in the order of CG_action, so the matrix is invariant under a quarter turn.
+    do c=1,8 ; do m=1,8
+      CS%elem_K(m,c,i,j) = 0.25 * ((Kqp(m,c,1) + Kqp(m,c,4)) + (Kqp(m,c,2) + Kqp(m,c,3)))
+    enddo ; enddo
+
+    ! The grounding-line cells: the stored corner friction matrix (apply_gl_fric_matrix).
+    gl_cell = CS%GL_regularize .and. .not. CS%gl_quad_friction .and. .not. CS%local_basal_friction
+    if (gl_cell) gl_cell = gl_subgrid_cell(CS, i, j)
+    if (gl_cell) then
+      do n=1,4 ; do m=1,4
+        CS%elem_K(m,n,i,j) = CS%elem_K(m,n,i,j) + CS%gl_fric_K(m,n,1,i,j)
+        CS%elem_K(m+4,n+4,i,j) = CS%elem_K(m+4,n+4,i,j) + CS%gl_fric_K(m,n,1,i,j)
+        if (use_newton) then
+          CS%elem_K(m,n,i,j) = CS%elem_K(m,n,i,j) + CS%gl_fric_K(m,n,2,i,j)
+          CS%elem_K(m,n+4,i,j) = CS%elem_K(m,n+4,i,j) + CS%gl_fric_K(m,n,3,i,j)
+          CS%elem_K(m+4,n,i,j) = CS%elem_K(m+4,n,i,j) + CS%gl_fric_K(m,n,3,i,j)
+          CS%elem_K(m+4,n+4,i,j) = CS%elem_K(m+4,n+4,i,j) + CS%gl_fric_K(m,n,4,i,j)
+        endif
+      enddo ; enddo
+    endif
+
+    ! DG1_COUPLED_BUBBLE: the condensed term -K_nb W of the linear-solve blocks (CG_action bubble_mode 2).
+    if (bubble) then ; if (CS%cpl_on(i,j) > 0.0) then
+      do a=1,2 ; do n=1,4
+        c = n + 4*(a-1)
+        do f=1,2
+          wcol(f) = -CS%cpl_blk(CPL_W+cpl_nb(a,n,f),i,j)
+        enddo
+        do m=1,4
+          CS%elem_K(m,c,i,j) = CS%elem_K(m,c,i,j) + &
+              ((CS%cpl_blk(CPL_LIN+cpl_nb(1,m,1),i,j) * wcol(1)) + (CS%cpl_blk(CPL_LIN+cpl_nb(1,m,2),i,j) * wcol(2)))
+          CS%elem_K(m+4,c,i,j) = CS%elem_K(m+4,c,i,j) + &
+              ((CS%cpl_blk(CPL_LIN+cpl_nb(2,m,1),i,j) * wcol(1)) + (CS%cpl_blk(CPL_LIN+cpl_nb(2,m,2),i,j) * wcol(2)))
+        enddo
+      enddo ; enddo
+    endif ; endif
+
+    do c=1,8 ; do m=1,8
+      CS%elem_K(m,c,i,j) = rmask(m) * CS%elem_K(m,c,i,j)
+    enddo ; enddo
+  enddo ; enddo
+
+  ! CISM_FRICTION = local: the node drag of CG_action, from the frozen node velocity.
+  if (CS%local_basal_friction) then
+    do J=js-1,je ; do I=is-1,ie
+      CS%elem_locF(:,I,J) = 0.0
+      if (CS%f_ground_node(I,J) > 0.0) then
+        call compute_basal_coef_node(CS, G, US, I, J, u_curr(I,J), v_curr(I,J), use_newton, &
+                                     CS%elem_locF(1,I,J), CS%elem_locF(2,I,J))
+        CS%elem_locF(3,I,J) = u_curr(I,J) ; CS%elem_locF(4,I,J) = v_curr(I,J)
+      endif
+    enddo ; enddo
+  endif
+  if (CS%id_clock_emat > 0) call cpu_clock_end(CS%id_clock_emat)
+
+end subroutine ssa_element_matrices
+
+!> ICE_SSA_ELEMENT_MATRICES: the action of the stored cell matrices of ssa_element_matrices on (u, v), in
+!! place of CG_action in a Krylov iteration.  Each cell adds its 8 returns to the slots of its corner nodes,
+!! and each node sums its four slots in the order of CG_action; with CISM_FRICTION = local the node drag
+!! is then added.
+subroutine ssa_element_action(CS, G, uret, vret, u, v, hmask, is, ie, js, je)
+  type(ice_shelf_dyn_CS), intent(in)    :: CS !< The ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(inout) :: uret !< The zonal returns at the corners [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(inout) :: vret !< The meridional returns at the corners [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in)    :: u  !< The zonal velocity at the corners [L T-1 ~> m s-1]
+  real, dimension(SZDIB_(G),SZDJB_(G)), &
+                          intent(in)    :: v  !< The meridional velocity at the corners [L T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G)), &
+                          intent(in)    :: hmask !< A mask of the ice-covered tracer points [nondim]
+  integer,                intent(in)    :: is !< The starting i-index to work on
+  integer,                intent(in)    :: ie !< The ending i-index to work on
+  integer,                intent(in)    :: js !< The starting j-index to work on
+  integer,                intent(in)    :: je !< The ending j-index to work on
+
+  real, dimension(SZDIB_(G),SZDJB_(G),4) :: uret_b, vret_b ! The returns of each of the four cells of a
+                                                             ! node [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(8) :: x ! The node values of a cell, u then v at SW, SE, NW, NE [L T-1 ~> m s-1]
+  real, dimension(8) :: y ! The returns of a cell [R L3 Z T-2 ~> kg m s-2]
+  real :: idot            ! The frozen node velocity dotted with (u, v) [L2 T-2 ~> m2 s-2]
+  integer :: i, j, m
+
+  uret(:,:) = 0.0 ; vret(:,:) = 0.0
+  uret_b(:,:,:) = 0.0 ; vret_b(:,:,:) = 0.0
+
+  do j=js,je ; do i=is,ie ; if (hmask(i,j) == 1.0 .or. hmask(i,j) == 3.0) then
+    x(1) = u(I-1,J-1) ; x(2) = u(I,J-1) ; x(3) = u(I-1,J) ; x(4) = u(I,J)
+    x(5) = v(I-1,J-1) ; x(6) = v(I,J-1) ; x(7) = v(I-1,J) ; x(8) = v(I,J)
+    ! The corners pair across the diagonals (SW with NE, SE with NW), as in CG_action.
+    do m=1,8
+      y(m) = (((CS%elem_K(m,1,i,j) * x(1)) + (CS%elem_K(m,4,i,j) * x(4))) + &
+              ((CS%elem_K(m,2,i,j) * x(2)) + (CS%elem_K(m,3,i,j) * x(3)))) + &
+             (((CS%elem_K(m,5,i,j) * x(5)) + (CS%elem_K(m,8,i,j) * x(8))) + &
+              ((CS%elem_K(m,6,i,j) * x(6)) + (CS%elem_K(m,7,i,j) * x(7))))
+    enddo
+    uret_b(I-1,J-1,4) = y(1) ; uret_b(I,J-1,3) = y(2) ; uret_b(I-1,J,2) = y(3) ; uret_b(I,J,1) = y(4)
+    vret_b(I-1,J-1,4) = y(5) ; vret_b(I,J-1,3) = y(6) ; vret_b(I-1,J,2) = y(7) ; vret_b(I,J,1) = y(8)
+  endif ; enddo ; enddo
+
+  do J=js-1,je ; do I=is-1,ie
+    uret(I,J) = (uret_b(I,J,1)+uret_b(I,J,4)) + (uret_b(I,J,2)+uret_b(I,J,3))
+    vret(I,J) = (vret_b(I,J,1)+vret_b(I,J,4)) + (vret_b(I,J,2)+vret_b(I,J,3))
+  enddo ; enddo
+
+  ! CISM_FRICTION = local: the node drag, as in CG_action.
+  if (CS%local_basal_friction) then
+    do J=js-1,je ; do I=is-1,ie ; if (CS%f_ground_node(I,J) > 0.0) then
+      idot = (CS%elem_locF(3,I,J)*u(I,J)) + (CS%elem_locF(4,I,J)*v(I,J))
+      if (CS%umask(I,J) == 1) uret(I,J) = uret(I,J) + &
+          ((CS%elem_locF(1,I,J) * u(I,J)) + (CS%elem_locF(2,I,J) * CS%elem_locF(3,I,J) * idot))
+      if (CS%vmask(I,J) == 1) vret(I,J) = vret(I,J) + &
+          ((CS%elem_locF(1,I,J) * v(I,J)) + (CS%elem_locF(2,I,J) * CS%elem_locF(4,I,J) * idot))
+    endif ; enddo ; enddo
+  endif
+
+end subroutine ssa_element_action
 
 !> Basal friction coefficients at one 2x2 quadrature point of a regular (not sub-element) cell: the
 !! grounded test, the Picard coefficient and, if use_newton, the Newton drag coefficient, both scaled by
@@ -10759,6 +11044,8 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%fric_qp_u)) deallocate(CS%fric_qp_u)
   if (associated(CS%fric_qp_v)) deallocate(CS%fric_qp_v)
   if (associated(CS%gl_fric_K)) deallocate(CS%gl_fric_K)
+  if (associated(CS%elem_K)) deallocate(CS%elem_K)
+  if (associated(CS%elem_locF)) deallocate(CS%elem_locF)
   if (associated(CS%cpl_blk)) deallocate(CS%cpl_blk)
   if (associated(CS%cpl_rb)) deallocate(CS%cpl_rb)
   if (associated(CS%cpl_on)) deallocate(CS%cpl_on)
