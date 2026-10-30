@@ -4072,6 +4072,7 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
   integer :: I, J
   integer :: Isdq, Iedq, Jsdq, Jedq, Iscq, Iecq, Jscq, Jecq
   integer :: isc, iec, jsc, jec
+  integer :: em ! The number of halo cells with a friction cache
 
   Isdq = G%IsdB ; Iedq = G%IedB ; Jsdq = G%JsdB ; Jedq = G%JedB
   Iscq = G%IscB ; Iecq = G%IecB ; Jscq = G%JscB ; Jecq = G%JecB
@@ -4101,11 +4102,17 @@ subroutine ice_shelf_solve_inner(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, H
 
   ! The basal friction depends on the frozen iterate, which every inner solver takes from u_shlf and
   ! keeps for the whole linear solve, so it is evaluated once here and applied from storage.
-  ! With DG1_COUPLED_BUBBLE the block build sets the friction cache.
+  ! With DG1_COUPLED_BUBBLE the block build sets the friction cache.  CG with CG_HALO_SHRINK applies the
+  ! operator out to the whole halo, so the cache must cover the same cells.
+  em = 1
+  if ((CS%inner_solver == INNER_CG) .and. CS%cg_halo_shrink) then
+    em = min(G%domain%nihalo, G%domain%njhalo)
+    if (.not.G%symmetric) em = em - 1
+  endif
   if (CS%fric_precompute .and. .not.CS%dg_coupled) then
     call cpu_clock_begin(CS%id_clock_fcache)
     call build_basal_friction_cache(CS, G, US, u_shlf, v_shlf, Phisub, hmask, H_node, CS%bed_elev, &
-                                    rhoi_rhow, isc-1, iec+1, jsc-1, jec+1, h_shelf=ISS%h_shelf)
+                                    rhoi_rhow, isc-em, iec+em, jsc-em, jec+em, h_shelf=ISS%h_shelf)
     call cpu_clock_end(CS%id_clock_fcache)
   endif
   ! DG1_COUPLED_BUBBLE: the bubble blocks of this linearization, Picard for the residual and the operator
