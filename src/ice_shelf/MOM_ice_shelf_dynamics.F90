@@ -16143,6 +16143,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   real, dimension(2,2) :: s_n    ! Corner surfaces of a cell for trc [Z ~> m]
   real :: lo_m, hi_m, lo_p, hi_p ! Face bounds on the minus and plus faces of an axis [Z ~> m]
   logical :: north_open ! The north edge is a fold, so its halo lies inside the domain
+  real, dimension(SZDI_(G),SZDJ_(G)) :: trb_r ! The troubled flags as 1 or 0, for their halo update [nondim]
   real :: hb        ! Cell-mean thickness of a crossed cell [Z ~> m]
   real :: d_c       ! Bed depth at a corner, positive down [Z ~> m]
   real :: s_f       ! Corner surface of the flat thickness hb [Z ~> m]
@@ -16831,6 +16832,21 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   ! above.  Last, with DG1_LIMITER_CROSSED_SWEEP, the troubled-cell sweep below.
   if (CS%dg_lim_crossed) then
     sw_lo(:,:,:) = 0.0 ; sw_hi(:,:,:) = 0.0
+    ! The vertex pass above changes the compute cells only, and this pass reads the corners of the neighbours,
+    ! so their halo copies are made current first; otherwise a cell at the edge of a PE reads a neighbour
+    ! that the vertex pass has not seen, and the answers depend on the layout.  The sweep below also reads
+    ! the troubled flags of the neighbours, which the vertex pass sets with DG1_LIMITER_CORNER_CLASS.
+    call pass_corner_field(CS%h_nodal, G)
+    if (CS%dg_lim_corner_class .and. CS%dg_lim_crossed_sweep) then
+      trb_r(:,:) = 0.0
+      do j = jsd, jed ; do i = isd, ied
+        if (trb(i,j)) trb_r(i,j) = 1.0
+      enddo ; enddo
+      call pass_var(trb_r, G%domain)
+      do j = jsd, jed ; do i = isd, ied
+        trb(i,j) = (trb_r(i,j) > 0.5)
+      enddo ; enddo
+    endif
     ! Neighbours are read from this copy, so that the result does not depend on the order of the loop.
     h_c(:,:,:,:) = CS%h_nodal(:,:,:,:)
     do j = jsc, jec ; do i = isc, iec
