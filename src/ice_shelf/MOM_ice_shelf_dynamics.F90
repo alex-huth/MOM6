@@ -765,6 +765,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! (and, with DG1_BAND_FLOAT, wholly floating) cell, whatever its band weight.
   logical :: dg_lim_crossed       !< If true, the grounded limiter also acts on the thickness of every cell the
                                   !! grounding line crosses, with corner bounds mapped from the surface.
+  logical :: dg_lim_crossed_only  !< If true, the face and vertex passes of the grounded limiter skip the wholly
+                                  !! grounded and wholly floating cells, so only the crossed cells are limited.
   logical :: dg_lim_edge_mirror   !< If true, the face pass of the grounded limiter takes the cell means beyond a
                                   !! domain edge that is not reentrant as the mirror image of the cells inside.
   integer :: dg_lim_twist_fb = 0  !< DG1_LIMITER_CROSSED_TWIST_FALLBACK: 0 remove the twist, 1 the least largest
@@ -13128,6 +13130,13 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "Where only one face sets a bound, the tilt may only become flatter.  In these cells the "//&
                  "vertex pass acts on the twist only; the tilts are left to the face pass.", &
                  default=.false., do_not_log=.not.CS%dg_grounded_limiter)
+  call get_param(param_file, mdl, "DG1_LIMITER_CROSSED_ONLY", CS%dg_lim_crossed_only, &
+                 "If true, with DG1_LIMITER_CROSSED, the face and vertex passes of DG1_GROUNDED_LIMITER "//&
+                 "skip every wholly grounded and wholly floating cell, so that only the cells the "//&
+                 "grounding line crosses are limited.  The positivity limit acts in every cell as before.", &
+                 default=.false., do_not_log=.not.CS%dg_lim_crossed)
+  if (CS%dg_lim_crossed_only .and. (.not.CS%dg_lim_crossed)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CROSSED_ONLY needs DG1_LIMITER_CROSSED.")
   call get_param(param_file, mdl, "DG1_LIMITER_EDGE_MIRROR", CS%dg_lim_edge_mirror, &
                  "If true, the face pass of DG1_GROUNDED_LIMITER (DG1_LIMITER_FACE_BOUNDS) takes the "//&
                  "cell-mean surface of a cell beyond a domain edge that is not reentrant as the mirror image "//&
@@ -16493,6 +16502,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
     CS%dg_lim_phi(i,j,:) = min(CS%dg_lim_phi(i,j,:), 1.0)
     if (hmask(i,j) /= 1.0) cycle
     if (trb(i,j)) cycle   ! DG1_LIMITER_CROSSED limits it below
+    if (CS%dg_lim_crossed_only) cycle
     flt_c = .false.
     if (use_ngc) then
       ! A crossed cell is in trb already (DG1_LIMITER_CROSSED), or not limited here.
