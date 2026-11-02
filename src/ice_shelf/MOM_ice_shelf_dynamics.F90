@@ -735,6 +735,14 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! toward one shared value at nodes where the corners straddle flotation.
   real :: dg_gl_shared_h_reach = 1.0 !< DG1_GL_SHARED_H: the blend starts where the corner nearest flotation is
                                   !! within this many jumps (largest minus smallest corner) of it [nondim].
+  logical :: dg_gl_shared_flot = .false. !< If true, the flotation tests of the velocity solve read the corners
+                                  !! of DG1_GL_SHARED_H (h_flot), while every thickness it multiplies by stays
+                                  !! the transported one.
+  real, allocatable, dimension(:,:,:,:) :: h_flot !< DG1_GL_SHARED_FLOTATION: the corner thicknesses that the
+                                  !! flotation tests of the velocity solve read [Z ~> m].
+  integer :: dg_gl_flot_band = -1 !< DG1_GL_SHARED_FLOTATION_BAND: the nodes within this chessboard distance of
+                                  !! the grounding-line nodes take the full blend; negative turns it off.
+  real :: dg_gl_flot_band_ramp = 1.0 !< DG1_GL_SHARED_FLOTATION_BAND_RAMP: the ramp of the band, in nodes [nondim].
   logical :: dg_post_bubble = .false. !< If true, the transport volume term adds a bubble velocity per cell that
                                   !! is set after each velocity solve from the in-cell force balance.
   logical :: dg_post_crossed = .true. !< If true, DG1_POST_BUBBLE also acts in the grounding-line cells, with
@@ -750,6 +758,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! in dg_post_ub and dg_post_vb, is used in the transport volume term.
   logical :: dg_cpl_tr_crossed = .true. !< If false (DG1_COUPLED_BUBBLE_TRANSPORT_CROSSED), the cells with sub-cell
                              !! quadrature keep their bubble in the velocity solve but not in the DG(1) volume term
+  logical :: dg_cpl_tr_ramp = .false. !< If true (DG1_COUPLED_BUBBLE_TRANSPORT_RAMP), the bubble velocity in the
+                                  !! transport takes the weight (1 - 2 f)**2 of the grounded fraction f of the cell.
   integer :: dg_cpl_quad = 2 !< DG1_COUPLED_BUBBLE_QUAD: the points per direction of the Gauss rule of the bubble
                              !! terms (2, as the rest of the solve, or 3)
   logical :: dg_cpl_crossed = .true. !< If true, DG1_COUPLED_BUBBLE also has a bubble in the grounding-line
@@ -3510,6 +3520,10 @@ subroutine update_grounded_geometry(CS, ISS, G)
   integer :: i, j
 
   rhoi_rhow = CS%density_ice / CS%density_ocean_avg
+
+  ! DG1_GL_SHARED_FLOTATION: the corners that every flotation test of the solve reads, from the current
+  ! transported corners.
+  if (CS%dg_gl_shared_flot) call dg1_set_h_flot(CS, G, ISS%hmask)
 
   ! need to make these conditional on GL interpolation
   CS%H_node(:,:) = 0.0
@@ -7149,6 +7163,8 @@ subroutine basal_friction_qp(CS, G, US, i, j, iq, jq, xquad, u_curr, v_curr, do_
              ((CS%h_nodal(i,j,2,1) * (xquad(iq)   * xquad(3-jq))) + &
               (CS%h_nodal(i,j,1,2) * (xquad(3-iq) * xquad(jq))))
       h_gp = max(h_gp, CS%min_h_shelf)
+      ! DG1_GL_SHARED_FLOTATION: the flotation test and the effective pressure read the blended corners.
+      if (CS%dg_gl_shared_flot) h_gp = max(dg1_qp_bilinear(CS%h_flot(i,j,:,:), xquad, iq, jq), CS%min_h_shelf)
       bed_gp = ((CS%bed_node(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
                 (CS%bed_node(I,J)     * (xquad(iq)   * xquad(jq))))  + &
                ((CS%bed_node(I,J-1)   * (xquad(iq)   * xquad(3-jq))) + &
@@ -7986,6 +8002,8 @@ subroutine matrix_diagonal(CS, G, US, H_node, ice_visc, u_curr, v_curr, &
                  ((CS%h_nodal(i,j,2,1) * (xquad(iq)   * xquad(3-jq))) + &
                   (CS%h_nodal(i,j,1,2) * (xquad(3-iq) * xquad(jq))))
           h_gp = max(h_gp, CS%min_h_shelf)
+          if (CS%dg_gl_shared_flot) &
+            h_gp = max(dg1_qp_bilinear(CS%h_flot(i,j,:,:), xquad, iq, jq), CS%min_h_shelf)
           ! Bed at the QP with the same rotation-paired bilinear pattern as
           ! u_curr_qp below, for symmetric rotation-cancel structure.
           bed_gp = ((CS%bed_node(I-1,J-1) * (xquad(3-iq) * xquad(3-jq))) + &
@@ -8705,6 +8723,7 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
   real, dimension(4)     :: uc, vc    ! Corner frozen velocities [L T-1 ~> m s-1]
   real, dimension(4)     :: duc, dvc  ! Corner search directions [L T-1 ~> m s-1]
   real, dimension(4)     :: fls       ! Corner flotation deficit r*h - bed [Z ~> m]
+  real, dimension(4)     :: hfc       ! DG1_GL_SHARED_FLOTATION: blended corners, SW, SE, NW, NE [Z ~> m]
   integer, dimension(4)  :: nqp       ! QPs per parent triangle
   real, dimension(4,SEP2_MAXQP,4) :: beta      ! Corner-basis weights per (corner, QP, triangle) [nondim]
   real, dimension(SEP2_MAXQP,4)   :: wref      ! Reference measure per (QP, triangle) [nondim]
@@ -8784,6 +8803,11 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
   else
     ! Unclamped bilinear deficit defines the partition; magnitudes keep the min_h clamp below.
     fls(:) = (dens_ratio * hc(:)) - bedc(:)
+    if (do_DG .and. CS%dg_gl_shared_flot) then
+      call dg1_flot_deficit(CS, i_elem, j_elem, dens_ratio, bedc, fls)
+      hfc(1) = CS%h_flot(i_elem,j_elem,1,1) ; hfc(2) = CS%h_flot(i_elem,j_elem,2,1)
+      hfc(3) = CS%h_flot(i_elem,j_elem,1,2) ; hfc(4) = CS%h_flot(i_elem,j_elem,2,2)
+    endif
   endif
   call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
   build_K = present(Kmat)
@@ -8810,6 +8834,9 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
         bed_sub = bathyT
       elseif (do_DG) then
         hloc = max(hloc, CS%min_h_shelf)
+        ! DG1_GL_SHARED_FLOTATION: the effective pressure reads the thickness of the partition.
+        if (CS%dg_gl_shared_flot) &
+          hloc = max(((b1 * hfc(1)) + (b4 * hfc(4))) + ((b2 * hfc(2)) + (b3 * hfc(3))), CS%min_h_shelf)
         bed_sub = ((b1 * bedc(1)) + (b4 * bedc(4))) + ((b2 * bedc(2)) + (b3 * bedc(3)))
       else
         bed_sub = bathyT
@@ -8940,6 +8967,7 @@ subroutine CG_diagonal_sep2_basal(CS, G, US, H, U_curr, V_curr, &
   real, dimension(4)     :: hc, bedc  ! Corner thickness and bed, flattened SW,SE,NW,NE [Z ~> m]
   real, dimension(4)     :: uc, vc    ! Corner frozen velocities [L T-1 ~> m s-1]
   real, dimension(4)     :: fls       ! Corner flotation deficit r*h - bed [Z ~> m]
+  real, dimension(4)     :: hfc       ! DG1_GL_SHARED_FLOTATION: blended corners, SW, SE, NW, NE [Z ~> m]
   integer, dimension(4)  :: nqp       ! QPs per parent triangle
   real, dimension(4,SEP2_MAXQP,4) :: beta      ! Corner-basis weights per (corner, QP, triangle) [nondim]
   real, dimension(SEP2_MAXQP,4)   :: wref      ! Reference measure per (QP, triangle) [nondim]
@@ -9000,6 +9028,11 @@ subroutine CG_diagonal_sep2_basal(CS, G, US, H, U_curr, V_curr, &
   vc(1) = V_curr(1,1) ; vc(2) = V_curr(2,1) ; vc(3) = V_curr(1,2) ; vc(4) = V_curr(2,2)
 
   fls(:) = (dens_ratio * hc(:)) - bedc(:)
+  if (do_DG .and. CS%dg_gl_shared_flot) then
+    call dg1_flot_deficit(CS, i_elem, j_elem, dens_ratio, bedc, fls)
+    hfc(1) = CS%h_flot(i_elem,j_elem,1,1) ; hfc(2) = CS%h_flot(i_elem,j_elem,2,1)
+    hfc(3) = CS%h_flot(i_elem,j_elem,1,2) ; hfc(4) = CS%h_flot(i_elem,j_elem,2,2)
+  endif
   call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
 
   do t=1,4
@@ -9023,6 +9056,9 @@ subroutine CG_diagonal_sep2_basal(CS, G, US, H, U_curr, V_curr, &
         bed_sub = bathyT
       elseif (do_DG) then
         hloc = max(hloc, CS%min_h_shelf)
+        ! DG1_GL_SHARED_FLOTATION: the effective pressure reads the thickness of the partition.
+        if (CS%dg_gl_shared_flot) &
+          hloc = max(((b1 * hfc(1)) + (b4 * hfc(4))) + ((b2 * hfc(2)) + (b3 * hfc(3))), CS%min_h_shelf)
         bed_sub = ((b1 * bedc(1)) + (b4 * bedc(4))) + ((b2 * bedc(2)) + (b3 * bedc(3)))
       else
         bed_sub = bathyT
@@ -9763,10 +9799,17 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
     if (CS%use_DG_thickness) then
       bed_corners(1,1) = CS%bed_node(i-1,j-1) ; bed_corners(2,1) = CS%bed_node(i,j-1)
       bed_corners(1,2) = CS%bed_node(i-1,j  ) ; bed_corners(2,2) = CS%bed_node(i,j  )
-      fls_corners(1,1) = (rhoi_rhow*CS%h_nodal(i,j,1,1)) - bed_corners(1,1)
-      fls_corners(2,1) = (rhoi_rhow*CS%h_nodal(i,j,2,1)) - bed_corners(2,1)
-      fls_corners(1,2) = (rhoi_rhow*CS%h_nodal(i,j,1,2)) - bed_corners(1,2)
-      fls_corners(2,2) = (rhoi_rhow*CS%h_nodal(i,j,2,2)) - bed_corners(2,2)
+      if (CS%dg_gl_shared_flot) then
+        fls_corners(1,1) = (rhoi_rhow*CS%h_flot(i,j,1,1)) - bed_corners(1,1)
+        fls_corners(2,1) = (rhoi_rhow*CS%h_flot(i,j,2,1)) - bed_corners(2,1)
+        fls_corners(1,2) = (rhoi_rhow*CS%h_flot(i,j,1,2)) - bed_corners(1,2)
+        fls_corners(2,2) = (rhoi_rhow*CS%h_flot(i,j,2,2)) - bed_corners(2,2)
+      else
+        fls_corners(1,1) = (rhoi_rhow*CS%h_nodal(i,j,1,1)) - bed_corners(1,1)
+        fls_corners(2,1) = (rhoi_rhow*CS%h_nodal(i,j,2,1)) - bed_corners(2,1)
+        fls_corners(1,2) = (rhoi_rhow*CS%h_nodal(i,j,1,2)) - bed_corners(1,2)
+        fls_corners(2,2) = (rhoi_rhow*CS%h_nodal(i,j,2,2)) - bed_corners(2,2)
+      endif
     elseif (fv_sub) then
       ! FV sub-element path: both corner fields come from build_corner_flotation_fields, which
       ! carried h and r*h-bed to the corners with one weight set, so fls = r*H - bed holds here and
@@ -11815,7 +11858,7 @@ end subroutine add_Neumann_face_DG
 subroutine add_taud_edge_correction_DG(face_length, face_sign, &
     h_loc_A, h_loc_B, h_ngh_A, h_ngh_B, b_corner_A, b_corner_B, &
     rho, rhoi_rhow, grav, min_h_shelf, &
-    xquad, face_A, face_B)
+    xquad, face_A, face_B, use_flot, hf4)
   real, intent(in)    :: face_length      !< Face length [L ~> m]
   real, intent(in)    :: face_sign        !< +1 or -1, outward unit-normal component [nondim]
   real, intent(in)    :: h_loc_A          !< Local-cell h_nodal at face endpoint A [Z ~> m]
@@ -11831,8 +11874,12 @@ subroutine add_taud_edge_correction_DG(face_length, face_sign, &
   real, dimension(2), intent(in) :: xquad !< 2-point Gauss-Legendre nodes on [0,1] [nondim]
   real, intent(inout) :: face_A           !< Accumulator for corner A [R L3 Z T-2 ~> kg m s-2]
   real, intent(inout) :: face_B           !< Accumulator for corner B [R L3 Z T-2 ~> kg m s-2]
+  logical, intent(in) :: use_flot         !< DG1_GL_SHARED_FLOTATION: s = (1 - r) h + max(r h_f - b, 0)
+  real, dimension(4), intent(in) :: hf4   !< The blended corners h_f of use_flot, local A and B, then
+                                          !! neighbour A and B [Z ~> m]
 
   real :: hL_A, hL_B, hN_A, hN_B, b_A, b_B
+  real :: hf_loc, hf_ngh ! The blended thicknesses at the face point, clamped [Z ~> m]
   real :: t_face, h_loc, h_ngh, b_loc
   real :: s_loc, s_ngh, h_avg, jump_factor
   real :: phi_A, phi_B
@@ -11848,15 +11895,22 @@ subroutine add_taud_edge_correction_DG(face_length, face_sign, &
     h_ngh = ((1.0 - t_face)*hN_A) + (t_face*hN_B)
     b_loc = ((1.0 - t_face)*b_A) + (t_face*b_B)
 
-    if (rhoi_rhow * h_loc - b_loc > 0.0) then
-      s_loc = h_loc - b_loc                          ! grounded
+    if (use_flot) then
+      hf_loc = max(((1.0 - t_face)*hf4(1)) + (t_face*hf4(2)), min_h_shelf)
+      hf_ngh = max(((1.0 - t_face)*hf4(3)) + (t_face*hf4(4)), min_h_shelf)
+      s_loc = ((1.0 - rhoi_rhow) * h_loc) + max((rhoi_rhow * hf_loc) - b_loc, 0.0)
+      s_ngh = ((1.0 - rhoi_rhow) * h_ngh) + max((rhoi_rhow * hf_ngh) - b_loc, 0.0)
     else
-      s_loc = (1.0 - rhoi_rhow) * h_loc              ! floating
-    endif
-    if (rhoi_rhow * h_ngh - b_loc > 0.0) then
-      s_ngh = h_ngh - b_loc                          ! grounded
-    else
-      s_ngh = (1.0 - rhoi_rhow) * h_ngh              ! floating
+      if (rhoi_rhow * h_loc - b_loc > 0.0) then
+        s_loc = h_loc - b_loc                          ! grounded
+      else
+        s_loc = (1.0 - rhoi_rhow) * h_loc              ! floating
+      endif
+      if (rhoi_rhow * h_ngh - b_loc > 0.0) then
+        s_ngh = h_ngh - b_loc                          ! grounded
+      else
+        s_ngh = (1.0 - rhoi_rhow) * h_ngh              ! floating
+      endif
     endif
 
     h_avg = 0.5 * (h_loc + h_ngh)
@@ -11898,6 +11952,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, taudx, taudy)
   real :: dxCv_S, dxCv_N        ! Cell-edge spacings on south and north faces [L ~> m]
   real :: dyCu_W, dyCu_E        ! Cell-edge spacings on west and east faces [L ~> m]
   real :: fx_gp, fy_gp          ! Driving-force density at a qp [R Z L T-2 ~> kg m-1 s-2]
+  real :: h_flt                 ! DG1_GL_SHARED_FLOTATION: blended thickness at a qp [Z ~> m]
+  real :: dhfdx, dhfdy          ! Its gradients in physical coords [Z L-1 ~> nondim]
+  real, dimension(4) :: hf4     ! DG1_GL_SHARED_FLOTATION: blended corners on a face, this cell's two
+                                ! (A, B) then the neighbour's two (A, B) [Z ~> m]
 
   logical :: is_ext_bdry         ! True if the face is an external (ocean) boundary
   logical :: loc_is_bc           ! True if local cell has hmask==3 (Dirichlet thickness BC)
@@ -11941,6 +11999,10 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, taudx, taudy)
   taudx_b(:,:,:) = 0.0 ; taudy_b(:,:,:) = 0.0
 
   calc_slope_diag = (CS%id_sx_shelf > 0 .or. CS%id_sy_shelf > 0 .or. CS%id_surf_slope_mag_shelf > 0)
+  ! The diagnostic call at initialization can come before the first update_grounded_geometry.
+  if (CS%dg_gl_shared_flot) then
+    if (.not.allocated(CS%h_flot)) call dg1_set_h_flot(CS, G, ISS%hmask)
+  endif
 
   do j=jsc-1,jec+1 ; do i=isc-1,iec+1
     if (ISS%hmask(i,j) /= 1 .and. ISS%hmask(i,j) /= 3) cycle
@@ -11957,9 +12019,15 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, taudx, taudy)
     use_subgrid_cell = gl_subgrid_cell(CS, i, j)
     if (use_subgrid_cell) then
       if (CS%use_sep2) then
-        call calc_shelf_driving_stress_DG_sep2(CS, CS%h_nodal(i,j,:,:), bed_corners, &
-            dxCv_S, dxCv_N, dyCu_W, dyCu_E, rho, rhoi_rhow, grav, vol_dx, vol_dy, &
-            CS%sx_shelf(i,j), CS%sy_shelf(i,j), calc_slope_diag)
+        if (CS%dg_gl_shared_flot) then
+          call calc_shelf_driving_stress_DG_sep2(CS, CS%h_nodal(i,j,:,:), bed_corners, &
+              dxCv_S, dxCv_N, dyCu_W, dyCu_E, rho, rhoi_rhow, grav, vol_dx, vol_dy, &
+              CS%sx_shelf(i,j), CS%sy_shelf(i,j), calc_slope_diag, h_flot_cell=CS%h_flot(i,j,:,:))
+        else
+          call calc_shelf_driving_stress_DG_sep2(CS, CS%h_nodal(i,j,:,:), bed_corners, &
+              dxCv_S, dxCv_N, dyCu_W, dyCu_E, rho, rhoi_rhow, grav, vol_dx, vol_dy, &
+              CS%sx_shelf(i,j), CS%sy_shelf(i,j), calc_slope_diag)
+        endif
       else
         call calc_shelf_driving_stress_DG_subgrid(CS, CS%Phisub, &
             CS%h_nodal(i,j,:,:), bed_corners, &
@@ -12005,7 +12073,20 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, taudx, taudy)
           is_grounded = (rhoi_rhow * h_gp - bed_gp > 0.0)
         endif
 
-        if (is_grounded) then
+        if (CS%dg_gl_shared_flot) then
+          ! s = (1 - r) h + max(r h_f - D, 0): the flotation test and the grounded part of s read the
+          ! blended corners h_f, the floating part the transported ones.
+          call dg1_flot_qp(CS%h_flot(i,j,:,:), xquad, iq, jq, a_qp, d_qp, CS%min_h_shelf, &
+                           h_flt, dhfdx, dhfdy)
+          is_grounded = (rhoi_rhow * h_flt - bed_gp > 0.0)
+          if (is_grounded) then
+            dsdx_gp = (((1.0 - rhoi_rhow) * dhdx_gp) + (rhoi_rhow * dhfdx)) - dbdx_gp
+            dsdy_gp = (((1.0 - rhoi_rhow) * dhdy_gp) + (rhoi_rhow * dhfdy)) - dbdy_gp
+          else
+            dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp
+            dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
+          endif
+        elseif (is_grounded) then
           dsdx_gp = dhdx_gp - dbdx_gp
           dsdy_gp = dhdy_gp - dbdy_gp
         else
@@ -12059,12 +12140,17 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, taudx, taudy)
         CS%h_bdry_val(i,j), loc_is_bc, rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, &
         xquad, face_dx_W_A, face_dx_W_B)
     elseif (ISS%hmask(i-1,j) == 1.0) then
+      hf4(:) = 0.0
+      if (CS%dg_gl_shared_flot) then
+        hf4(1) = CS%h_flot(i,j,1,1) ; hf4(2) = CS%h_flot(i,j,1,2)
+        hf4(3) = CS%h_flot(i-1,j,2,1) ; hf4(4) = CS%h_flot(i-1,j,2,2)
+      endif
       call add_taud_edge_correction_DG(G%dyCu(I-1,j), -1.0, &
         CS%h_nodal(i,j,1,1),   CS%h_nodal(i,j,1,2), &
         CS%h_nodal(i-1,j,2,1), CS%h_nodal(i-1,j,2,2), &
         bed_corners(1,1), bed_corners(1,2), &
         rho, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
-        face_dx_W_A, face_dx_W_B)
+        face_dx_W_A, face_dx_W_B, CS%dg_gl_shared_flot, hf4)
     endif
 
     ! East face (n_x = +1).
@@ -12077,12 +12163,17 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, taudx, taudy)
         CS%h_bdry_val(i,j), loc_is_bc, rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, &
         xquad, face_dx_E_A, face_dx_E_B)
     elseif (ISS%hmask(i+1,j) == 1.0) then
+      hf4(:) = 0.0
+      if (CS%dg_gl_shared_flot) then
+        hf4(1) = CS%h_flot(i,j,2,1) ; hf4(2) = CS%h_flot(i,j,2,2)
+        hf4(3) = CS%h_flot(i+1,j,1,1) ; hf4(4) = CS%h_flot(i+1,j,1,2)
+      endif
       call add_taud_edge_correction_DG(G%dyCu(I,j), +1.0, &
         CS%h_nodal(i,j,2,1),   CS%h_nodal(i,j,2,2), &
         CS%h_nodal(i+1,j,1,1), CS%h_nodal(i+1,j,1,2), &
         bed_corners(2,1), bed_corners(2,2), &
         rho, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
-        face_dx_E_A, face_dx_E_B)
+        face_dx_E_A, face_dx_E_B, CS%dg_gl_shared_flot, hf4)
     endif
 
     ! South face (n_y = -1).
@@ -12095,12 +12186,17 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, taudx, taudy)
         CS%h_bdry_val(i,j), loc_is_bc, rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, &
         xquad, face_dy_S_A, face_dy_S_B)
     elseif (ISS%hmask(i,j-1) == 1.0) then
+      hf4(:) = 0.0
+      if (CS%dg_gl_shared_flot) then
+        hf4(1) = CS%h_flot(i,j,1,1) ; hf4(2) = CS%h_flot(i,j,2,1)
+        hf4(3) = CS%h_flot(i,j-1,1,2) ; hf4(4) = CS%h_flot(i,j-1,2,2)
+      endif
       call add_taud_edge_correction_DG(G%dxCv(i,J-1), -1.0, &
         CS%h_nodal(i,j,1,1),   CS%h_nodal(i,j,2,1), &
         CS%h_nodal(i,j-1,1,2), CS%h_nodal(i,j-1,2,2), &
         bed_corners(1,1), bed_corners(2,1), &
         rho, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
-        face_dy_S_A, face_dy_S_B)
+        face_dy_S_A, face_dy_S_B, CS%dg_gl_shared_flot, hf4)
     endif
 
     ! North face (n_y = +1).
@@ -12113,12 +12209,17 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, taudx, taudy)
         CS%h_bdry_val(i,j), loc_is_bc, rho, rhow, rhoi_rhow, grav, CS%min_h_shelf, &
         xquad, face_dy_N_A, face_dy_N_B)
     elseif (ISS%hmask(i,j+1) == 1.0) then
+      hf4(:) = 0.0
+      if (CS%dg_gl_shared_flot) then
+        hf4(1) = CS%h_flot(i,j,1,2) ; hf4(2) = CS%h_flot(i,j,2,2)
+        hf4(3) = CS%h_flot(i,j+1,1,1) ; hf4(4) = CS%h_flot(i,j+1,2,1)
+      endif
       call add_taud_edge_correction_DG(G%dxCv(i,J), +1.0, &
         CS%h_nodal(i,j,1,2),   CS%h_nodal(i,j,2,2), &
         CS%h_nodal(i,j+1,1,1), CS%h_nodal(i,j+1,2,1), &
         bed_corners(1,2), bed_corners(2,2), &
         rho, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
-        face_dy_N_A, face_dy_N_B)
+        face_dy_N_A, face_dy_N_B, CS%dg_gl_shared_flot, hf4)
     endif
 
     cell_dx_node(1,1) = vol_dx(1,1) + face_dx_W_A
@@ -12279,7 +12380,7 @@ end subroutine calc_shelf_driving_stress_DG_subgrid
 !! Each QP lies on one side of the cut and takes that side's grad(s) branch.
 subroutine calc_shelf_driving_stress_DG_sep2(CS, h_nodal_cell, bed_corners, &
     dxCv_S, dxCv_N, dyCu_W, dyCu_E, rho, rhoi_rhow, grav, vol_dx, vol_dy, &
-    sx_shelf, sy_shelf, calc_slope_diag)
+    sx_shelf, sy_shelf, calc_slope_diag, h_flot_cell)
   type(ice_shelf_dyn_CS), intent(in) :: CS    !< Ice shelf control structure
   real, dimension(2,2), intent(in) :: h_nodal_cell !< Q1 nodal thickness at the 4 corners [Z ~> m]
   real, dimension(2,2), intent(in) :: bed_corners  !< Bed depth at the 4 cell corners [Z ~> m]
@@ -12295,8 +12396,12 @@ subroutine calc_shelf_driving_stress_DG_sep2(CS, h_nodal_cell, bed_corners, &
   real, intent(inout) :: sx_shelf    !< Cell-average x surface slope [Z L-1 ~> nondim]
   real, intent(inout) :: sy_shelf    !< Cell-average y surface slope [Z L-1 ~> nondim]
   logical, intent(in) :: calc_slope_diag !< True if slope diagnostics will be calculated
+  real, dimension(2,2), optional, intent(in) :: h_flot_cell !< DG1_GL_SHARED_FLOTATION: the blended corners
+                                     !! that the partition and the grounded part of the surface read [Z ~> m]
 
   real, dimension(4)     :: hc, bedc  ! Corner thickness and bed, flattened SW,SE,NW,NE [Z ~> m]
+  real, dimension(4)     :: hfc       ! Blended corners of h_flot_cell, flattened [Z ~> m]
+  real, dimension(4)     :: dhfxi, dhfeta ! Per-triangle P1 gradient of hfc in reference space [Z ~> m]
   real, dimension(4)     :: fls       ! Corner flotation deficit r*h - bed [Z ~> m]
   integer, dimension(4)  :: nqp       ! QPs per parent triangle
   real, dimension(4,SEP2_MAXQP,4) :: beta      ! Corner-basis weights per (corner, QP, triangle) [nondim]
@@ -12328,6 +12433,13 @@ subroutine calc_shelf_driving_stress_DG_sep2(CS, h_nodal_cell, bed_corners, &
   bedc(3) = bed_corners(1,2) ; bedc(4) = bed_corners(2,2)
 
   fls(:) = (rhoi_rhow * hc(:)) - bedc(:)
+  if (present(h_flot_cell)) then
+    ! s = (1 - r) h + max(r h_f - D, 0): the partition and the grounded part of s read h_f.
+    hfc(1) = h_flot_cell(1,1) ; hfc(2) = h_flot_cell(2,1)
+    hfc(3) = h_flot_cell(1,2) ; hfc(4) = h_flot_cell(2,2)
+    fls(:) = (rhoi_rhow * hfc(:)) - bedc(:)
+    call sep2_fan_gradient(hfc, dhfxi, dhfeta)
+  endif
   call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
 
   ! P1 fan gradients, the same interpolant sep2_cell_qps cut on.
@@ -12347,7 +12459,10 @@ subroutine calc_shelf_driving_stress_DG_sep2(CS, h_nodal_cell, bed_corners, &
       dhdx_gp = dhxi(t) / a ; dhdy_gp = dheta(t) / d
       dbdx_gp = dbxi(t) / a ; dbdy_gp = dbeta(t) / d
 
-      if (qpg(k,t)) then
+      if (qpg(k,t) .and. present(h_flot_cell)) then
+        dsdx_gp = (((1.0 - rhoi_rhow) * dhdx_gp) + (rhoi_rhow * (dhfxi(t) / a))) - dbdx_gp
+        dsdy_gp = (((1.0 - rhoi_rhow) * dhdy_gp) + (rhoi_rhow * (dhfeta(t) / d))) - dbdy_gp
+      elseif (qpg(k,t)) then
         dsdx_gp = dhdx_gp - dbdx_gp
         dsdy_gp = dhdy_gp - dbdy_gp
       else
@@ -13564,6 +13679,53 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  units="nondim", default=1.0, do_not_log=.not.CS%dg_gl_shared_h)
   if (CS%dg_gl_shared_h .and. (.not.CS%use_DG_thickness)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics: DG1_GL_SHARED_H needs USE_DG_THICKNESS.")
+  call get_param(param_file, mdl, "DG1_GL_SHARED_FLOTATION", CS%dg_gl_shared_flot, &
+                 "If true, every flotation test of the velocity solve (the grounded fraction, the SEP2 "//&
+                 "partition and the per-point tests of the friction and the driving stress) reads the "//&
+                 "blended corners of DG1_GL_SHARED_H, with the reach DG1_GL_SHARED_H_REACH, while the "//&
+                 "thickness that the driving stress, the viscosity and the friction multiply by stays the "//&
+                 "transported one.  The surface is s = (1 - r) h + max(r h_f - D, 0), with h the transported "//&
+                 "and h_f the blended thickness, r the density ratio and D the bed depth, so s is "//&
+                 "continuous and its kink lies on the contour where the friction stops; the Coulomb "//&
+                 "effective pressure also reads h_f.  So a jump at a "//&
+                 "face cannot hold the line on that face, and the transport sees the grounded fraction "//&
+                 "of the solve.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
+  if (CS%dg_gl_shared_flot) then
+    call get_param(param_file, mdl, "DG1_GL_SHARED_H_REACH", CS%dg_gl_shared_h_reach, &
+                   "The reach of the blend of DG1_GL_SHARED_H, in jumps of the corner thickness at the node.", &
+                   units="nondim", default=1.0, do_not_log=CS%dg_gl_shared_h)
+    call get_param(param_file, mdl, "DG1_GL_SHARED_FLOTATION_BAND", CS%dg_gl_flot_band, &
+                   "If zero or positive, DG1_GL_SHARED_FLOTATION also blends in full every node within this "//&
+                   "chessboard distance, in nodes, of the grounding-line nodes, and the blend falls linearly "//&
+                   "to 0 over DG1_GL_SHARED_FLOTATION_BAND_RAMP more nodes.  The grounding-line nodes are the "//&
+                   "corners of the cells whose own corners straddle flotation and the nodes whose corners "//&
+                   "straddle it.  A node that is not a grounding-line node and has no corner at or above "//&
+                   "flotation takes no band weight, so floating ice reads its own thickness except near "//&
+                   "flotation.  The weight of a node is the larger of this one and the one of "//&
+                   "DG1_GL_SHARED_H_REACH.  So a jump on a grounded face next to the line cannot hold the "//&
+                   "line inside a cell, while the grounded interior and the floating ice keep their own "//&
+                   "surface.  Negative turns it off.", &
+                   units="nondim", default=-1)
+    call get_param(param_file, mdl, "DG1_GL_SHARED_FLOTATION_BAND_RAMP", CS%dg_gl_flot_band_ramp, &
+                   "The width in nodes of the ramp of DG1_GL_SHARED_FLOTATION_BAND over which the blend "//&
+                   "falls from 1 to 0.", &
+                   units="nondim", default=1.0, do_not_log=(CS%dg_gl_flot_band < 0))
+    if ((CS%dg_gl_flot_band >= 0) .and. (CS%dg_gl_flot_band_ramp <= 0.0)) call MOM_error(FATAL, &
+        "MOM_ice_shelf_dynamics, read_DG_params: DG1_GL_SHARED_FLOTATION_BAND_RAMP must be positive.")
+    if (.not.CS%use_DG_thickness) call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: "//&
+        "DG1_GL_SHARED_FLOTATION needs USE_DG_THICKNESS.")
+    if (CS%dg_gl_shared_h) call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: "//&
+        "DG1_GL_SHARED_FLOTATION and DG1_GL_SHARED_H cannot both be true.")
+    if (.not.(CS%GL_regularize .and. CS%use_sep2)) call MOM_error(FATAL, "MOM_ice_shelf_dynamics, "//&
+        "read_DG_params: DG1_GL_SHARED_FLOTATION needs GROUNDING_LINE_INTERPOLATE and "//&
+        "GROUNDING_LINE_SUBGRID_SCHEME = SEP2.")
+    if (CS%gl_quad_friction .or. CS%i2n_friction .or. CS%i2n_taud .or. &
+        CS%local_basal_friction .or. (CS%cism_taud /= CISM_OFF)) call MOM_error(FATAL, &
+        "MOM_ice_shelf_dynamics, read_DG_params: DG1_GL_SHARED_FLOTATION supports only the DG element "//&
+        "friction and driving stress (no LOCAL_BASAL_FRICTION, I2N_FRICTION or I2N_TAUD, and CISM_FRICTION "//&
+        "and CISM_TAUD 'off').")
+  endif
   call get_param(param_file, mdl, "DG1_POST_BUBBLE", CS%dg_post_bubble, &
                  "If true, after each velocity solve every ice cell gets one bubble 16 xi (1 - xi) "//&
                  "eta (1 - eta) for u and one for v, with coefficients from the force that the bilinear "//&
@@ -13594,6 +13756,8 @@ subroutine read_DG_params(param_file, mdl, CS, US)
         "MOM_ice_shelf_dynamics, read_DG_params: DG1_POST_BUBBLE supports only the DG element friction "//&
         "and driving "//&
         "stress (CISM_FRICTION and CISM_TAUD 'off', I2N_FRICTION False).")
+    if (CS%dg_gl_shared_flot) call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: "//&
+        "DG1_POST_BUBBLE and DG1_GL_SHARED_FLOTATION cannot both be true.")
   endif
   call get_param(param_file, mdl, "DG1_COUPLED_BUBBLE", CS%dg_coupled, &
                  "If true, the velocity has one bubble 16 xi (1 - xi) eta (1 - eta) per ice cell for u "//&
@@ -13617,6 +13781,17 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "symmetric bubble cannot carry the velocity kink at the grounding line, and in those cells it "//&
                  "moves ice between the two halves of the cell.", &
                  default=.true., do_not_log=.not.(CS%dg_coupled .and. CS%dg_cpl_crossed))
+  call get_param(param_file, mdl, "DG1_COUPLED_BUBBLE_TRANSPORT_RAMP", CS%dg_cpl_tr_ramp, &
+                 "If true, and DG1_COUPLED_BUBBLE_TRANSPORT_CROSSED is false, the bubble velocity enters the "//&
+                 "DG(1) volume term of every cell with the weight (1 - 2 f)**2, with f the grounded fraction "//&
+                 "of the cell, in place of the switch that takes it out of every cell with sub-cell "//&
+                 "quadrature.  So the weight is 1 in wholly grounded and wholly floating cells and 0 where "//&
+                 "the line is in the middle of the cell, and it does not change in a step when the line "//&
+                 "enters or leaves a cell.", &
+                 default=.false., do_not_log=.not.(CS%dg_coupled .and. .not.CS%dg_cpl_tr_crossed))
+  if (CS%dg_cpl_tr_ramp .and. ((.not.CS%dg_coupled) .or. CS%dg_cpl_tr_crossed)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics, read_DG_params: DG1_COUPLED_BUBBLE_TRANSPORT_RAMP needs DG1_COUPLED_BUBBLE and "//&
+      "DG1_COUPLED_BUBBLE_TRANSPORT_CROSSED = False.")
   call get_param(param_file, mdl, "DG1_COUPLED_BUBBLE_QUAD", CS%dg_cpl_quad, &
                  "The points per direction of the Gauss rule of the DG1_COUPLED_BUBBLE bubble terms: 2 (as "//&
                  "the rest of the velocity solve) or 3.  The 2-point rule makes the viscous part of the bubble "//&
@@ -14092,11 +14267,14 @@ end subroutine pass_corner_field
 !! not, the corners move toward that mean by a weight that falls linearly from 1 to 0 as the corner nearest
 !! flotation moves from 0 to DG1_GL_SHARED_H_REACH times the jump (largest minus smallest corner) away from it.
 !! Sums pair diagonally opposite corners, so the result does not depend on the orientation of the grid.
-subroutine dg1_gl_shared_h(CS, G, hmask, h_ssa)
+!! With w_node, the weight of a node is the larger of this one and w_node.
+subroutine dg1_gl_shared_h(CS, G, hmask, h_ssa, w_node)
   type(ice_shelf_dyn_CS), intent(in)    :: CS    !< The ice shelf dynamics control structure
-  type(ocean_grid_type),  intent(inout) :: G     !< The grid structure
+  type(ocean_grid_type),  intent(in)    :: G     !< The grid structure
   real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
   real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out) :: h_ssa !< Corner thicknesses for the solve [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)), optional, intent(in) :: w_node !< A lower bound of the blend weight
+                                                                       !! of each node [nondim]
 
   real, dimension(2,2) :: hc  ! Corner thicknesses at the node, by the corner index of each cell [Z ~> m]
   real, dimension(2,2) :: wc  ! Their cell_mean_w weights, 0 for a cell without ice [L2 ~> m2]
@@ -14137,6 +14315,7 @@ subroutine dg1_gl_shared_h(CS, G, hmask, h_ssa)
       dmin = min(abs(hmin - hf), abs(hmax - hf))
       wn = max(0.0, 1.0 - dmin / (CS%dg_gl_shared_h_reach * (hmax - hmin)))
     endif
+    if (present(w_node)) wn = max(wn, w_node(In,Jn))
     if (wn <= 0.0) cycle
     hm = (((wc(1,1)*hc(1,1)) + (wc(2,2)*hc(2,2))) + ((wc(1,2)*hc(1,2)) + (wc(2,1)*hc(2,1)))) / wsum
     do b = 1, 2 ; do a = 1, 2
@@ -14148,6 +14327,176 @@ subroutine dg1_gl_shared_h(CS, G, hmask, h_ssa)
   enddo ; enddo
   call pass_corner_field(h_ssa, G)
 end subroutine dg1_gl_shared_h
+
+!> DG1_GL_SHARED_FLOTATION: set CS%h_flot, the corners that every flotation test of the velocity solve reads,
+!! from the current transported corners, with the blend of DG1_GL_SHARED_H and, with
+!! DG1_GL_SHARED_FLOTATION_BAND, the band weight of dg1_flot_band_weight.
+subroutine dg1_set_h_flot(CS, G, hmask)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS    !< The ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in)    :: G     !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
+
+  real, allocatable, dimension(:,:,:,:) :: h_bl ! The blended corners [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: w_band ! The band weight of each node [nondim]
+
+  if (.not.allocated(CS%h_flot)) allocate(CS%h_flot(G%isd:G%ied,G%jsd:G%jed,2,2), source=0.0)
+  allocate(h_bl(G%isd:G%ied,G%jsd:G%jed,2,2))
+  if (CS%dg_gl_flot_band >= 0) then
+    call dg1_flot_band_weight(CS, G, hmask, w_band)
+    call dg1_gl_shared_h(CS, G, hmask, h_bl, w_band)
+  else
+    call dg1_gl_shared_h(CS, G, hmask, h_bl)
+  endif
+  CS%h_flot(:,:,:,:) = h_bl(:,:,:,:)
+  deallocate(h_bl)
+end subroutine dg1_set_h_flot
+
+!> DG1_GL_SHARED_FLOTATION_BAND: the band weight of each node, valid in the halo, from the transported
+!! corners only (not from the grounded fraction, which reads h_flot).  The grounding-line nodes are the
+!! four corners of every ice cell whose own corners straddle the flotation thickness of their nodes, and
+!! every node where the corners of the ice cells that share it straddle the flotation thickness of the
+!! node.  The distance d of a node is its chessboard distance in nodes to the nearest grounding-line node,
+!! found by repeated sweeps as in dg1_band_distance, so a quarter turn leaves it exact.  Then
+!! w = min(1, max(0, (N + R - d)/R)) at the grounding-line nodes and at the nodes with at least one corner
+!! at or above flotation, and w = 0 at the other nodes, where every corner floats.
+subroutine dg1_flot_band_weight(CS, G, hmask, w_band)
+  type(ice_shelf_dyn_CS), intent(in)    :: CS    !< The ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in)    :: G     !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)), intent(out) :: w_band !< The band weight of each node [nondim]
+
+  real, parameter :: d_far = 1.0e30 ! Distance of a node with no grounding-line node in reach [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: dd ! Distance to the nearest grounding-line node [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: dn ! Distance after a sweep [nondim]
+  logical, dimension(SZDIB_(G),SZDJB_(G)) :: gnd ! A node with an ice corner at or above flotation
+  logical, dimension(SZDIB_(G),SZDJB_(G)) :: src ! A grounding-line node
+  real :: rr      ! Ratio of the ice and ocean densities [nondim]
+  real :: hf      ! Flotation thickness at a node [Z ~> m]
+  real :: dc      ! Corner thickness minus the flotation thickness of its node [Z ~> m]
+  real :: hmin, hmax ! Smallest and largest corner deficit of a cell, or corner of a node [Z ~> m]
+  real :: dmin    ! Smallest neighbour distance [nondim]
+  real :: d_end   ! Distance at which the weight reaches 0, N + R [nondim]
+  integer :: i, j, a, b, In, Jn, n, k, it, n_it, n_sw, n_halo
+
+  rr = CS%density_ice / CS%density_ocean_avg
+  src(:,:) = .false. ; gnd(:,:) = .false.
+  ! Cells whose own corners straddle flotation: all four of their nodes are grounding-line nodes.
+  do j = G%jsd+1, G%jed ; do i = G%isd+1, G%ied
+    if ((hmask(i,j) == 1.0) .or. (hmask(i,j) == 3.0)) then
+      do b = 1, 2 ; do a = 1, 2
+        dc = CS%h_nodal(i,j,a,b) - CS%bed_node(i+a-2,j+b-2) / rr
+        if ((a == 1) .and. (b == 1)) then
+          hmin = dc ; hmax = dc
+        else
+          hmin = min(hmin, dc) ; hmax = max(hmax, dc)
+        endif
+      enddo ; enddo
+      if ((hmin < 0.0) .and. (hmax > 0.0)) then
+        do b = 1, 2 ; do a = 1, 2
+          src(i+a-2,j+b-2) = .true.
+        enddo ; enddo
+      endif
+    endif
+  enddo ; enddo
+  ! Nodes whose corners straddle flotation, and nodes with a corner at or above it.
+  do Jn = G%jsd, G%jed-1 ; do In = G%isd, G%ied-1
+    hf = CS%bed_node(In,Jn) / rr
+    n = 0 ; hmin = 0.0 ; hmax = 0.0
+    do b = 1, 2 ; do a = 1, 2
+      i = In + 2 - a ; j = Jn + 2 - b
+      if ((hmask(i,j) == 1.0) .or. (hmask(i,j) == 3.0)) then
+        if (n == 0) then
+          hmin = CS%h_nodal(i,j,a,b) ; hmax = CS%h_nodal(i,j,a,b)
+        else
+          hmin = min(hmin, CS%h_nodal(i,j,a,b)) ; hmax = max(hmax, CS%h_nodal(i,j,a,b))
+        endif
+        n = n + 1
+      endif
+    enddo ; enddo
+    if (n > 0) then
+      if (hmax >= hf) gnd(In,Jn) = .true.
+      if ((hmin < hf) .and. (hmax > hf)) src(In,Jn) = .true.
+    endif
+  enddo ; enddo
+  dd(:,:) = d_far
+  do Jn = G%JsdB, G%JedB ; do In = G%IsdB, G%IedB
+    if (src(In,Jn)) dd(In,Jn) = 0.0
+  enddo ; enddo
+  ! Beyond N + R the weight is 0, so the sweeps can stop there.  As in dg1_band_distance, up to n_halo
+  ! sweeps between halo updates, sweep k over a region k nodes inside the data domain.
+  d_end = real(CS%dg_gl_flot_band) + CS%dg_gl_flot_band_ramp
+  n_it = ceiling(d_end) + 1
+  n_halo = min(G%isc - G%isd, G%jsc - G%jsd)
+  call pass_var(dd, G%domain, position=CORNER)
+  it = 0
+  do while (it < n_it)
+    n_sw = min(n_halo, n_it - it)
+    do k = 1, n_sw
+      dn(:,:) = dd(:,:)
+      do Jn = G%JsdB+k, G%JedB-k ; do In = G%IsdB+k, G%IedB-k
+        dmin = min(min(min(dd(In-1,Jn-1), dd(In+1,Jn+1)), min(dd(In+1,Jn-1), dd(In-1,Jn+1))), &
+                   min(min(dd(In-1,Jn), dd(In+1,Jn)), min(dd(In,Jn-1), dd(In,Jn+1))))
+        dn(In,Jn) = min(dd(In,Jn), dmin + 1.0)
+      enddo ; enddo
+      dd(:,:) = dn(:,:)
+    enddo
+    it = it + n_sw
+    call pass_var(dd, G%domain, position=CORNER)
+  enddo
+  w_band(:,:) = 0.0
+  do Jn = G%JscB, G%JecB ; do In = G%IscB, G%IecB
+    if (src(In,Jn) .or. gnd(In,Jn)) &
+      w_band(In,Jn) = min(1.0, max(0.0, (d_end - dd(In,Jn)) / CS%dg_gl_flot_band_ramp))
+  enddo ; enddo
+  call pass_var(w_band, G%domain, position=CORNER)
+end subroutine dg1_flot_band_weight
+
+!> The bilinear value of four corner values at the 2x2 Gauss point (iq, jq), with the diagonal pairing
+!! of the DG driving stress and friction, so that a quarter turn of the grid gives the same rounding.
+pure real function dg1_qp_bilinear(hc, xquad, iq, jq)
+  real, dimension(2,2), intent(in) :: hc    !< The corner values, by the corner index of the cell [A]
+  real, dimension(2),   intent(in) :: xquad !< The 2-point Gauss abscissae on [0,1] [nondim]
+  integer,              intent(in) :: iq    !< The x-index of the Gauss point
+  integer,              intent(in) :: jq    !< The y-index of the Gauss point
+
+  dg1_qp_bilinear = ((hc(1,1) * (xquad(3-iq) * xquad(3-jq))) + (hc(2,2) * (xquad(iq) * xquad(jq)))) + &
+                    ((hc(2,1) * (xquad(iq) * xquad(3-jq))) + (hc(1,2) * (xquad(3-iq) * xquad(jq))))
+end function dg1_qp_bilinear
+
+!> DG1_GL_SHARED_FLOTATION: the blended thickness and its gradient at the 2x2 Gauss point (iq, jq) of a
+!! cell, with the arithmetic of the transported thickness in calc_shelf_driving_stress_DG.
+subroutine dg1_flot_qp(hc, xquad, iq, jq, a_qp, d_qp, min_h, h_f, dhdx, dhdy)
+  real, dimension(2,2), intent(in)  :: hc    !< The blended corners of the cell [Z ~> m]
+  real, dimension(2),   intent(in)  :: xquad !< The 2-point Gauss abscissae on [0,1] [nondim]
+  integer,              intent(in)  :: iq    !< The x-index of the Gauss point
+  integer,              intent(in)  :: jq    !< The y-index of the Gauss point
+  real,                 intent(in)  :: a_qp  !< The cell width at the Gauss point [L ~> m]
+  real,                 intent(in)  :: d_qp  !< The cell height at the Gauss point [L ~> m]
+  real,                 intent(in)  :: min_h !< The lower clamp on the thickness [Z ~> m]
+  real,                 intent(out) :: h_f   !< The clamped blended thickness [Z ~> m]
+  real,                 intent(out) :: dhdx  !< Its x-gradient [Z L-1 ~> nondim]
+  real,                 intent(out) :: dhdy  !< Its y-gradient [Z L-1 ~> nondim]
+
+  h_f = max(dg1_qp_bilinear(hc, xquad, iq, jq), min_h)
+  dhdx = ( (((-xquad(3-jq))*hc(1,1)) + (( xquad(jq))  *hc(2,2))) + &
+           ((( xquad(3-jq))*hc(2,1)) + ((-xquad(jq))  *hc(1,2))) ) / a_qp
+  dhdy = ( (((-xquad(3-iq))*hc(1,1)) + (( xquad(iq))  *hc(2,2))) + &
+           (((-xquad(iq))  *hc(2,1)) + (( xquad(3-iq))*hc(1,2))) ) / d_qp
+end subroutine dg1_flot_qp
+
+!> DG1_GL_SHARED_FLOTATION: the flotation deficit r h_f - D of the four corners of cell (i, j), flattened
+!! SW, SE, NW, NE, from the blended corners h_f of the velocity solve.
+subroutine dg1_flot_deficit(CS, i, j, rr, bedc, fls)
+  type(ice_shelf_dyn_CS), intent(in)  :: CS   !< The ice shelf dynamics control structure
+  integer,                intent(in)  :: i    !< The i-index of the cell
+  integer,                intent(in)  :: j    !< The j-index of the cell
+  real,                   intent(in)  :: rr   !< The ratio of the ice and ocean densities [nondim]
+  real, dimension(4),     intent(in)  :: bedc !< The bed depth at the corners, SW, SE, NW, NE [Z ~> m]
+  real, dimension(4),     intent(out) :: fls  !< The flotation deficit at the corners [Z ~> m]
+
+  fls(1) = (rr * CS%h_flot(i,j,1,1)) - bedc(1) ; fls(2) = (rr * CS%h_flot(i,j,2,1)) - bedc(2)
+  fls(3) = (rr * CS%h_flot(i,j,1,2)) - bedc(3) ; fls(4) = (rr * CS%h_flot(i,j,2,2)) - bedc(4)
+end subroutine dg1_flot_deficit
 
 !> DG1_POST_BUBBLE: after a velocity solve, the bubble velocity of each ice cell.  The bubble
 !! b = 16 xi (1 - xi) eta (1 - eta) is zero on the faces.  Its coefficients c = (c_u, c_v) solve the 2x2
@@ -14581,6 +14930,10 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
   real, dimension(SEP2_MAXQP,4)   :: wref ! Reference measure per (QP, triangle) [nondim]
   logical, dimension(SEP2_MAXQP,4) :: qpg ! Grounded state per (QP, triangle)
   real, dimension(4) :: dhxi, dheta, dbxi, dbeta ! P1 fan gradients of h and bed per triangle [Z ~> m]
+  real, dimension(4) :: hf4, dhfxi, dhfeta ! DG1_GL_SHARED_FLOTATION: blended corners, SW, SE, NW, NE, and
+                                           ! their P1 fan gradients per triangle [Z ~> m]
+  real :: h_flt, dhfdx, dhfdy ! DG1_GL_SHARED_FLOTATION: blended thickness [Z ~> m] and its gradients at a
+                              ! Gauss point [Z L-1 ~> nondim]
   real, dimension(CPL_NWK,SEP2_MAXQP) :: val ! The block values at the QPs of one triangle [various]
   real, dimension(CPL_NWK,4) :: ptri  ! The block values summed over each triangle [various]
   real :: b1, b2, b3, b4         ! Corner-basis weights at a QP [nondim]
@@ -14716,7 +15069,18 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
         else
           is_grounded = (rhoi_rhow * h_gp - bed_gp > 0.0)
         endif
-        if (is_grounded) then
+        if (CS%dg_gl_shared_flot) then
+          ! As in calc_shelf_driving_stress_DG: s = (1 - r) h + max(r h_f - D, 0).
+          call dg1_flot_qp(CS%h_flot(i,j,:,:), xquad, iq, jq, a_qp, d_qp, CS%min_h_shelf, &
+                           h_flt, dhfdx, dhfdy)
+          is_grounded = (rhoi_rhow * h_flt - bed_gp > 0.0)
+          if (is_grounded) then
+            dsdx_gp = (((1.0 - rhoi_rhow) * dhdx_gp) + (rhoi_rhow * dhfdx)) - dbdx_gp
+            dsdy_gp = (((1.0 - rhoi_rhow) * dhdy_gp) + (rhoi_rhow * dhfdy)) - dbdy_gp
+          else
+            dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp ; dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
+          endif
+        elseif (is_grounded) then
           dsdx_gp = dhdx_gp - dbdx_gp ; dsdy_gp = dhdy_gp - dbdy_gp
         else
           dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp ; dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
@@ -14740,6 +15104,12 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
       uc4(1) = Uc(1,1) ; uc4(2) = Uc(2,1) ; uc4(3) = Uc(1,2) ; uc4(4) = Uc(2,2)
       vc4(1) = Vc(1,1) ; vc4(2) = Vc(2,1) ; vc4(3) = Vc(1,2) ; vc4(4) = Vc(2,2)
       fls(:) = (rhoi_rhow * hc4(:)) - bc4(:)
+      if (CS%dg_gl_shared_flot) then
+        hf4(1) = CS%h_flot(i,j,1,1) ; hf4(2) = CS%h_flot(i,j,2,1)
+        hf4(3) = CS%h_flot(i,j,1,2) ; hf4(4) = CS%h_flot(i,j,2,2)
+        fls(:) = (rhoi_rhow * hf4(:)) - bc4(:)
+        call sep2_fan_gradient(hf4, dhfxi, dhfeta)
+      endif
       call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
       call sep2_fan_gradient(hc4, dhxi, dheta)
       call sep2_fan_gradient(bc4, dbxi, dbeta)
@@ -14756,7 +15126,10 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
           h_gp = max(h_gp, CS%min_h_shelf)
           dhdx_gp = dhxi(t) / a_qp ; dhdy_gp = dheta(t) / d_qp
           dbdx_gp = dbxi(t) / a_qp ; dbdy_gp = dbeta(t) / d_qp
-          if (qpg(kq,t)) then
+          if (qpg(kq,t) .and. CS%dg_gl_shared_flot) then
+            dsdx_gp = (((1.0 - rhoi_rhow) * dhdx_gp) + (rhoi_rhow * (dhfxi(t) / a_qp))) - dbdx_gp
+            dsdy_gp = (((1.0 - rhoi_rhow) * dhdy_gp) + (rhoi_rhow * (dhfeta(t) / d_qp))) - dbdy_gp
+          elseif (qpg(kq,t)) then
             dsdx_gp = dhdx_gp - dbdx_gp ; dsdy_gp = dhdy_gp - dbdy_gp
           else
             dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp ; dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
@@ -14772,7 +15145,13 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
             cur(2) = (((b1 * vc4(1)) + (b4 * vc4(4))) + ((b2 * vc4(2)) + (b3 * vc4(3)))) + &
                      (bt * CS%dg_post_vb(i,j))
             unorm2 = ((cur(1)**2) + (cur(2)**2)) + eps_vel2_e
-            if (CS%CoulombFriction) then
+            if (CS%CoulombFriction .and. CS%dg_gl_shared_flot) then
+              ! DG1_GL_SHARED_FLOTATION: the effective pressure reads the thickness of the partition.
+              h_flt = max(((b1 * hf4(1)) + (b4 * hf4(4))) + ((b2 * hf4(2)) + (b3 * hf4(3))), CS%min_h_shelf)
+              fB_local = compute_fB_local(h_flt, bed_gp, rho_oi_ratio, rho_ice_g_LtoZ, &
+                  CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
+                  CS%CF_PostPeak, CS%n_basal_fric)
+            elseif (CS%CoulombFriction) then
               fB_local = compute_fB_local(h_gp, bed_gp, rho_oi_ratio, rho_ice_g_LtoZ, &
                   CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
                   CS%CF_PostPeak, CS%n_basal_fric)
@@ -14970,6 +15349,9 @@ subroutine dg1_cpl_bb3(CS, G, US, i, j, Hc, Bc, Uc, Vc, sub_cell, use_newton, wi
   real, dimension(2) :: cur ! The total velocity at the point [L T-1 ~> m s-1]
   real :: bcf, dnw    ! Picard [R L2 Z T-1 ~> kg s-1] and Newton [R Z T ~> kg m-2 s] friction coefficients
   real :: dhdx, dhdy, dbdx, dbdy, dsdx, dsdy ! Thickness, bed and surface gradients [Z L-1 ~> nondim]
+  real :: h_fp, dhfdx, dhfdy ! DG1_GL_SHARED_FLOTATION: blended thickness at the point [Z ~> m] and its
+                             ! gradients [Z L-1 ~> nondim]
+  real, dimension(2,2) :: hfq ! DG1_GL_SHARED_FLOTATION: the blended corners of the cell [Z ~> m]
   real :: wf          ! Driving-stress weight of the point [L2 ~> m2]
   real :: n_g         ! Glen's exponent [nondim]
   logical :: gr_cell, gr_p ! The cell and the point carry friction
@@ -15050,7 +15432,24 @@ subroutine dg1_cpl_bb3(CS, G, US, i, j, Hc, Bc, Uc, Vc, sub_cell, use_newton, wi
       else
         gr_p = (rhoi_rhow * h_p - bed_p > 0.0)
       endif
-      if (gr_p) then
+      if (CS%dg_gl_shared_flot) then
+        ! DG1_GL_SHARED_FLOTATION: s = (1 - r) h + max(r h_f - D, 0), as in calc_shelf_driving_stress_DG.
+        hfq(:,:) = CS%h_flot(i,j,:,:)
+        h_fp = ((hfq(1,1) * ((1.0 - xi) * (1.0 - eta))) + (hfq(2,2) * (xi * eta))) + &
+               ((hfq(2,1) * (xi * (1.0 - eta))) + (hfq(1,2) * ((1.0 - xi) * eta)))
+        h_fp = max(h_fp, CS%min_h_shelf)
+        gr_p = (rhoi_rhow * h_fp - bed_p > 0.0)
+        if (gr_p) then
+          dhfdx = ((((-(1.0 - eta)) * hfq(1,1)) + (eta * hfq(2,2))) + &
+                   (((1.0 - eta) * hfq(2,1)) + ((-eta) * hfq(1,2)))) / a_f
+          dhfdy = ((((-(1.0 - xi)) * hfq(1,1)) + (xi * hfq(2,2))) + &
+                   (((-xi) * hfq(2,1)) + ((1.0 - xi) * hfq(1,2)))) / d_f
+          dsdx = (((1.0 - rhoi_rhow) * dhdx) + (rhoi_rhow * dhfdx)) - dbdx
+          dsdy = (((1.0 - rhoi_rhow) * dhdy) + (rhoi_rhow * dhfdy)) - dbdy
+        else
+          dsdx = (1.0 - rhoi_rhow) * dhdx ; dsdy = (1.0 - rhoi_rhow) * dhdy
+        endif
+      elseif (gr_p) then
         dsdx = dhdx - dbdx ; dsdy = dhdy - dbdy
       else
         dsdx = (1.0 - rhoi_rhow) * dhdx ; dsdy = (1.0 - rhoi_rhow) * dhdy
@@ -15147,6 +15546,7 @@ subroutine dg1_q3_point(CS, G, US, i, j, xi, eta, Hc, Bc, Uc, Vc, ub, vb, gr_cel
   real :: ux, uy, vx, vy ! The strain of the total velocity [T-1 ~> s-1]
   real :: e2          ! The squared effective strain rate with its floor [T-2 ~> s-2]
   real :: bed_p       ! The bed depth at the point [Z ~> m]
+  real :: h_fp        ! The thickness of the flotation test at the point [Z ~> m]
   real :: fB_local    ! Coulomb fB at the point [(T L-1)^CF_PostPeak]
   real :: n_g         ! Glen's exponent [nondim]
 
@@ -15185,10 +15585,18 @@ subroutine dg1_q3_point(CS, G, US, i, j, xi, eta, Hc, Bc, Uc, Vc, ub, vb, gr_cel
   if (gr_cell) then
     bed_p = ((Bc(1,1) * ((1.0 - xi) * (1.0 - eta))) + (Bc(2,2) * (xi * eta))) + &
             ((Bc(2,1) * (xi * (1.0 - eta))) + (Bc(1,2) * ((1.0 - xi) * eta)))
-    gr_p = (rhoi_rhow * h_p - bed_p > 0.0)
+    if (CS%dg_gl_shared_flot) then
+      ! DG1_GL_SHARED_FLOTATION: the flotation test and the effective pressure read the blended corners.
+      h_fp = ((CS%h_flot(i,j,1,1) * ((1.0 - xi) * (1.0 - eta))) + (CS%h_flot(i,j,2,2) * (xi * eta))) + &
+             ((CS%h_flot(i,j,2,1) * (xi * (1.0 - eta))) + (CS%h_flot(i,j,1,2) * ((1.0 - xi) * eta)))
+      h_fp = max(h_fp, CS%min_h_shelf)
+    else
+      h_fp = h_p
+    endif
+    gr_p = (rhoi_rhow * h_fp - bed_p > 0.0)
     if (gr_p) then
       fB_local = 0.0
-      if (CS%CoulombFriction) fB_local = compute_fB_local(h_p, bed_p, rho_oi_ratio, rho_ice_g_LtoZ, &
+      if (CS%CoulombFriction) fB_local = compute_fB_local(h_fp, bed_p, rho_oi_ratio, rho_ice_g_LtoZ, &
           CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, CS%CF_PostPeak, CS%n_basal_fric)
       cur(1) = (((Uc(1,1) * ((1.0 - xi) * (1.0 - eta))) + (Uc(2,2) * (xi * eta))) + &
                 ((Uc(2,1) * (xi * (1.0 - eta))) + (Uc(1,2) * ((1.0 - xi) * eta)))) + (bt * ub)
@@ -18556,6 +18964,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: h_qp, u_qp, v_qp
   logical :: q3_tr  ! DG1_COUPLED_BUBBLE_QUAD = 3: the bubble part of the volume term uses 3x3 Gauss points
   logical :: bub_tr ! The bubble velocity enters the volume term of this cell
+  real :: ub_c, vb_c ! The bubble velocity of the volume term of this cell [L T-1 ~> m s-1]
+  real :: f_c, w_c   ! DG1_COUPLED_BUBBLE_TRANSPORT_RAMP: grounded fraction and bubble weight of the cell [nondim]
   real, dimension(3) :: x3, w3 ! The 3-point Gauss abscissae on [0,1] and their weights [nondim]
   real, dimension(3,3,2,2) :: qb9 ! The bubble part of the volume term at the 3x3 points [Z L2 T-1 ~> m3 s-1]
   real :: bb_t, bt_t ! The product of the 2-point Gauss abscissae and the bubble at a point [nondim]
@@ -18712,6 +19122,17 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     ! DG1_COUPLED_BUBBLE_TRANSPORT_CROSSED = False: no bubble in the volume term of a cell with sub-cell quadrature.
     bub_tr = .true.
     if (CS%dg_coupled .and. .not.CS%dg_cpl_tr_crossed) bub_tr = .not.gl_subgrid_cell(CS, i, j)
+    ub_c = 0.0 ; vb_c = 0.0
+    if (CS%dg_post_bubble .or. CS%dg_coupled) then
+      ub_c = CS%dg_post_ub(i,j) ; vb_c = CS%dg_post_vb(i,j)
+    endif
+    if (CS%dg_cpl_tr_ramp) then
+      ! DG1_COUPLED_BUBBLE_TRANSPORT_RAMP: the weight (1 - 2 f)**2 in place of the switch.
+      f_c = min(max(CS%ground_frac(i,j), 0.0), 1.0)
+      w_c = (1.0 - (2.0 * f_c))**2
+      bub_tr = (w_c > 0.0)
+      ub_c = w_c * CS%dg_post_ub(i,j) ; vb_c = w_c * CS%dg_post_vb(i,j)
+    endif
     dxCv_S = G%dxCv(i,j-1) ; dxCv_N = G%dxCv(i,j)
     dyCu_W = G%dyCu(i-1,j) ; dyCu_E = G%dyCu(i,j)
 
@@ -18737,8 +19158,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       if ((CS%dg_post_bubble .or. CS%dg_coupled) .and. .not.q3_tr .and. bub_tr) then
         ! DG1_POST_BUBBLE or DG1_COUPLED_BUBBLE: the bubble is the same at the four Gauss points and
         ! zero on the faces.
-        u_qp = u_qp + CS%dg_post_ub(i,j)
-        v_qp = v_qp + CS%dg_post_vb(i,j)
+        u_qp = u_qp + ub_c
+        v_qp = v_qp + vb_c
       endif
 
       ! Volume contribution at this qp for each test function N(a,b):
@@ -18764,7 +19185,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         h_qp = (((((1.0-xi_q)*(1.0-eta_q))*h_nodal_in(i,j,1,1)) + ((xi_q*eta_q)*h_nodal_in(i,j,2,2))) + &
                 (((xi_q*(1.0-eta_q))*h_nodal_in(i,j,2,1)) + (((1.0-xi_q)*eta_q)*h_nodal_in(i,j,1,2))))
         bt_t = ((xi_q * (1.0 - xi_q)) * (eta_q * (1.0 - eta_q))) / (bb_t * bb_t)
-        u_qp = bt_t * CS%dg_post_ub(i,j) ; v_qp = bt_t * CS%dg_post_vb(i,j)
+        u_qp = bt_t * ub_c ; v_qp = bt_t * vb_c
         qb9(ia,ja,1,1) = w_t * h_qp * (((u_qp * (-(1.0 - eta_q))) * d_qp) + ((v_qp * (-(1.0 - xi_q))) * a_qp))
         qb9(ia,ja,2,1) = w_t * h_qp * (((u_qp * (1.0 - eta_q)) * d_qp) + ((v_qp * (-xi_q)) * a_qp))
         qb9(ia,ja,1,2) = w_t * h_qp * (((u_qp * (-eta_q)) * d_qp) + ((v_qp * (1.0 - xi_q)) * a_qp))
