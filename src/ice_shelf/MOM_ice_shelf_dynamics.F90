@@ -789,6 +789,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! grounding line crosses, with corner bounds mapped from the surface.
   logical :: dg_lim_crossed_only  !< If true, the face and vertex passes of the grounded limiter skip the wholly
                                   !! grounded and wholly floating cells, so only the crossed cells are limited.
+  logical :: dg_lim_crossed_union !< If true, dg_lim_crossed also treats every ice cell that the last velocity
+                                  !! solve found crossed (0 < ground_frac < 1).
   logical :: dg_lim_edge_mirror   !< If true, the face pass of the grounded limiter takes the cell means beyond a
                                   !! domain edge that is not reentrant as the mirror image of the cells inside.
   integer :: dg_lim_twist_fb = 0  !< DG1_LIMITER_CROSSED_TWIST_FALLBACK: 0 remove the twist, 1 the least largest
@@ -14060,6 +14062,16 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  default=.false., do_not_log=.not.CS%dg_lim_crossed)
   if (CS%dg_lim_crossed_only .and. (.not.CS%dg_lim_crossed)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CROSSED_ONLY needs DG1_LIMITER_CROSSED.")
+  call get_param(param_file, mdl, "DG1_LIMITER_CROSSED_UNION", CS%dg_lim_crossed_union, &
+                 "If true, with DG1_LIMITER_CROSSED, the cells that the crossed-cell limit treats are the "//&
+                 "cells the grounding line crosses by their own corners and also every ice cell that the "//&
+                 "last velocity solve found crossed (0 < ground_frac < 1).  With DG1_GL_SHARED_FLOTATION the "//&
+                 "solve tests the blended corners, so a cell can be crossed for the solve and not by its own "//&
+                 "corners.  The velocity kink and the coupled bubble transport then act in that cell, and "//&
+                 "without this flag DG1_LIMITER_CROSSED_ONLY leaves it without a limit.", &
+                 default=.false., do_not_log=.not.CS%dg_lim_crossed)
+  if (CS%dg_lim_crossed_union .and. (.not.CS%dg_lim_crossed)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CROSSED_UNION needs DG1_LIMITER_CROSSED.")
   call get_param(param_file, mdl, "DG1_LIMITER_EDGE_MIRROR", CS%dg_lim_edge_mirror, &
                  "If true, the face pass of DG1_GROUNDED_LIMITER (DG1_LIMITER_FACE_BOUNDS) takes the "//&
                  "cell-mean surface of a cell beyond a domain edge that is not reentrant as the mirror image "//&
@@ -17639,6 +17651,13 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
             (rr * CS%h_nodal(i,j+1,a,1) >= CS%bed_node(i-2+a,j))) str = .true.
       enddo
       if (str) then ; trb(i,j) = .true. ; trb(i,j+1) = .true. ; endif
+    enddo ; enddo
+  endif
+  ! DG1_LIMITER_CROSSED_UNION: also the cells the last velocity solve found crossed, as gl_subgrid_cell tests them.
+  if (CS%dg_lim_crossed .and. CS%dg_lim_crossed_union) then
+    do j = jsd, jed ; do i = isd, ied
+      if ((hmask(i,j) /= 1.0) .or. (.not.in_dom(i,j))) cycle
+      if ((CS%ground_frac(i,j) > 0.0) .and. (CS%ground_frac(i,j) < 1.0)) trb(i,j) = .true.
     enddo ; enddo
   endif
 
