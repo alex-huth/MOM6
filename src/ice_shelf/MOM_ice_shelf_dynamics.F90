@@ -41,6 +41,7 @@ implicit none ; private
 public register_ice_shelf_dyn_restarts, initialize_ice_shelf_dyn, update_ice_shelf, IS_dynamics_post_data
 public ice_time_step_CFL, ice_shelf_dyn_end, change_in_draft, write_ice_shelf_energy
 public shelf_advance_front, ice_shelf_min_thickness_calve, calve_to_mask, volume_above_floatation
+public volume_above_floatation_gl
 public reset_DG_to_cellmean_at_cell, zero_DG_h_nodal
 public DG_nodal_thickness_ptr
 public accumulate_DG_source_rate
@@ -952,6 +953,7 @@ type, public :: ice_shelf_dyn_CS ; private
              id_visc_shelf = -1, id_taub = -1, &
              id_bed_node = -1, &
              id_h_nodal_SW = -1, id_h_nodal_SE = -1, id_h_nodal_NW = -1, id_h_nodal_NE = -1, &
+             id_h_flot_SW = -1, id_h_flot_SE = -1, id_h_flot_NW = -1, id_h_flot_NE = -1, &
              id_h_jump_node = -1, id_h_jump_node_rel = -1, &
              id_h_node_max = -1, id_h_node_min = -1, &
              id_h_source_rate = -1, &
@@ -2298,6 +2300,18 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
          'DG(1) thickness at NW cell corner', 'm', conversion=US%Z_to_m)
       CS%id_h_nodal_NE = register_diag_field('ice_shelf_model','h_nodal_NE',CS%diag%axesT1, Time, &
          'DG(1) thickness at NE cell corner', 'm', conversion=US%Z_to_m)
+      CS%id_h_flot_SW = register_diag_field('ice_shelf_model','h_flot_SW',CS%diag%axesT1, Time, &
+         'Thickness at SW cell corner that the flotation tests read (DG1_GL_SHARED_FLOTATION blend, '//&
+         'else h_nodal), from the current thickness', 'm', conversion=US%Z_to_m)
+      CS%id_h_flot_SE = register_diag_field('ice_shelf_model','h_flot_SE',CS%diag%axesT1, Time, &
+         'Thickness at SE cell corner that the flotation tests read (DG1_GL_SHARED_FLOTATION blend, '//&
+         'else h_nodal), from the current thickness', 'm', conversion=US%Z_to_m)
+      CS%id_h_flot_NW = register_diag_field('ice_shelf_model','h_flot_NW',CS%diag%axesT1, Time, &
+         'Thickness at NW cell corner that the flotation tests read (DG1_GL_SHARED_FLOTATION blend, '//&
+         'else h_nodal), from the current thickness', 'm', conversion=US%Z_to_m)
+      CS%id_h_flot_NE = register_diag_field('ice_shelf_model','h_flot_NE',CS%diag%axesT1, Time, &
+         'Thickness at NE cell corner that the flotation tests read (DG1_GL_SHARED_FLOTATION blend, '//&
+         'else h_nodal), from the current thickness', 'm', conversion=US%Z_to_m)
       CS%id_h_jump_node = register_diag_field('ice_shelf_model','h_jump_node',CS%diag%axesB1, Time, &
          'DG(1) max minus min corner thickness of the ice cells at a B-grid node', &
          'm', conversion=US%Z_to_m)
@@ -2773,6 +2787,127 @@ subroutine volume_above_floatation(CS, G, ISS, vaf, hemisphere)
   vaf = reproducing_sum(vaf_cell, unscale=G%US%Z_to_m*G%US%L_to_m**2)
 end subroutine volume_above_floatation
 
+!> The volume above floatation on the grounding-line partition of the velocity solve: with the DG(1) thickness
+!! and GROUNDING_LINE_INTERPOLATE, the integral over each ice cell of max(h_f - max(D, 0)/r, 0), with h_f the
+!! corners that the flotation tests read (the blend of DG1_GL_SHARED_FLOTATION, or the transported corners), D
+!! the bed depth and r the density ratio, on the SEP2 sub-elements or at the SEP3 sub-points, as the grounded
+!! fraction.  The integrand is positive where the partition is grounded.  The corners are built from the
+!! current thickness, so they can differ from those of the last solve by one velocity step.  Cells with hmask 2,
+!! and every cell without the DG(1) thickness or GROUNDING_LINE_INTERPOLATE, take the cell-mean value of
+!! volume_above_floatation.
+subroutine volume_above_floatation_gl(CS, G, ISS, vaf)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS !< The ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in)    :: G  !< The grid structure used by the ice shelf.
+  type(ice_shelf_state),  intent(in)    :: ISS !< A structure with elements that describe
+                                               !! the ice-shelf state
+  real, intent(out) :: vaf !< area integrated volume above floatation [Z L2 ~> m3]
+
+  real, dimension(SZI_(G),SZJ_(G)) :: vaf_cell ! Cell-wise volume above floatation [Z L2 ~> m3]
+  real, allocatable, dimension(:,:,:,:) :: hfl ! The corners the flotation tests read [Z ~> m]
+  real, allocatable, dimension(:,:) :: qs      ! SEP3: the sum over the 4 points of each sub-cell [Z L2 ~> m3]
+  real, dimension(4) :: fls0    ! Flotation deficit r h_f - D at the corners, SW, SE, NW, NE, as in the solve [Z ~> m]
+  real, dimension(4) :: fls     ! The same with D taken as 0 above sea level [Z ~> m]
+  real, dimension(4) :: dc0     ! Bed depth at the corners, SW, SE, NW, NE [Z ~> m]
+  real, dimension(4) :: dc      ! Bed depth at the corners, 0 above sea level [Z ~> m]
+  real :: bed0_p                ! Bed depth at a SEP3 point, as the solve has it [Z ~> m]
+  real, dimension(2,2) :: q4    ! SEP3: the integrand times the weight at the 4 points of a sub-cell [Z L2 ~> m3]
+  integer, dimension(4) :: nqp  ! SEP2: quadrature points per triangle
+  real, dimension(4,SEP2_MAXQP,4) :: beta ! SEP2: corner-basis weights per (corner, point, triangle) [nondim]
+  real, dimension(SEP2_MAXQP,4) :: wref   ! SEP2: reference measure per (point, triangle) [nondim]
+  logical, dimension(SEP2_MAXQP,4) :: qpg ! SEP2: grounded state per (point, triangle)
+  real, dimension(SEP2_MAXQP) :: vq       ! SEP2: the integrand times the weight at each point [Z L2 ~> m3]
+  real, dimension(4) :: pt      ! SEP2: the sum over each triangle [Z L2 ~> m3]
+  real :: rr                    ! Ratio of the ice and ocean densities [nondim]
+  real :: rhow_rhoi             ! Ratio of the ocean and ice densities [nondim]
+  real :: g_p                   ! Thickness above flotation at a point [Z ~> m]
+  real :: h_p, bed_p            ! Thickness and bed depth at a SEP3 point [Z ~> m]
+  real :: a, d                  ! Cell-edge spacings interpolated to a point [L ~> m]
+  real :: ym1, ym2, xm1, xm2    ! Marginal sums of the SEP3 point weights [nondim]
+  real :: b1, b2, b3, b4        ! SEP2 corner-basis weights at a point [nondim]
+  real :: subarea               ! SEP3: fractional sub-cell area [nondim]
+  integer :: is, ie, js, je, i, j, t, k, nsub, isub, jsub, iq, jq
+
+  if (.not.(CS%use_DG_thickness .and. CS%GL_regularize)) then
+    call volume_above_floatation(CS, G, ISS, vaf)
+    return
+  endif
+  rr = CS%density_ice / CS%density_ocean_avg
+  rhow_rhoi = CS%density_ocean_avg / CS%density_ice
+  is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
+  allocate(hfl(G%isd:G%ied,G%jsd:G%jed,2,2))
+  call dg1_flot_corners(CS, G, ISS%hmask, hfl)
+  nsub = CS%n_sub_regularize
+  if (.not.CS%use_sep2) allocate(qs(nsub,nsub))
+  subarea = 1.0 / real(max(nsub, 1))**2
+
+  vaf_cell(:,:) = 0.0
+  do j = js,je ; do i = is,ie
+    if (ISS%hmask(i,j) == 2.0) then
+      if (CS%bed_elev(i,j) <= 0) then
+        vaf_cell(i,j) = ISS%h_shelf(i,j) * ISS%area_shelf_h(i,j)
+      else
+        vaf_cell(i,j) = max(ISS%h_shelf(i,j) - rhow_rhoi * CS%bed_elev(i,j), 0.0) * ISS%area_shelf_h(i,j)
+      endif
+      cycle
+    endif
+    if ((ISS%hmask(i,j) /= 1.0) .and. (ISS%hmask(i,j) /= 3.0)) cycle
+    ! The partition reads the bed depth as the solve does; in the integrand the depth is taken as 0 above sea
+    ! level, where the bed does not lift the ice.
+    dc0(1) = CS%bed_node(i-1,j-1) ; dc0(2) = CS%bed_node(i,j-1)
+    dc0(3) = CS%bed_node(i-1,j)   ; dc0(4) = CS%bed_node(i,j)
+    dc(:) = max(dc0(:), 0.0)
+    fls0(1) = (rr * hfl(i,j,1,1)) - dc0(1) ; fls0(2) = (rr * hfl(i,j,2,1)) - dc0(2)
+    fls0(3) = (rr * hfl(i,j,1,2)) - dc0(3) ; fls0(4) = (rr * hfl(i,j,2,2)) - dc0(4)
+    fls(1) = (rr * hfl(i,j,1,1)) - dc(1) ; fls(2) = (rr * hfl(i,j,2,1)) - dc(2)
+    fls(3) = (rr * hfl(i,j,1,2)) - dc(3) ; fls(4) = (rr * hfl(i,j,2,2)) - dc(4)
+    if (max(max(fls0(1), fls0(4)), max(fls0(2), fls0(3))) <= 0.0) cycle
+    if (CS%use_sep2) then
+      ! The partition of compute_ground_frac; the deficit is linear on each grounded piece.
+      call sep2_cell_qps(fls0, nqp, beta, wref, qpg, high_order=CS%gl_band)
+      do t=1,4
+        vq(1:nqp(t)) = 0.0
+        do k=1,nqp(t)
+          if (.not. qpg(k,t)) cycle
+          b1 = beta(1,k,t) ; b2 = beta(2,k,t) ; b3 = beta(3,k,t) ; b4 = beta(4,k,t)
+          a = (G%dxCv(i,j-1) * (b1 + b2)) + (G%dxCv(i,j) * (b3 + b4))
+          d = (G%dyCu(i-1,j) * (b1 + b3)) + (G%dyCu(i,j) * (b2 + b4))
+          g_p = (((b1 * fls(1)) + (b4 * fls(4))) + ((b2 * fls(2)) + (b3 * fls(3)))) * rhow_rhoi
+          vq(k) = (wref(k,t) * (a * d)) * max(g_p, 0.0)
+        enddo
+        pt(t) = sep2_qp_sum(vq(1:nqp(t)), nqp(t))
+      enddo
+      vaf_cell(i,j) = (pt(1) + pt(3)) + (pt(2) + pt(4))
+    else
+      ! The SEP3 sub-points of compute_ground_frac, weighted by their area.
+      do jsub=1,nsub ; do isub=1,nsub
+        do jq=1,2 ; do iq=1,2
+          h_p = ((CS%Phisub(iq,jq,isub,jsub,1,1)*hfl(i,j,1,1)) + (CS%Phisub(iq,jq,isub,jsub,2,2)*hfl(i,j,2,2))) + &
+                ((CS%Phisub(iq,jq,isub,jsub,2,1)*hfl(i,j,2,1)) + (CS%Phisub(iq,jq,isub,jsub,1,2)*hfl(i,j,1,2)))
+          h_p = max(h_p, CS%min_h_shelf)
+          bed0_p = ((CS%Phisub(iq,jq,isub,jsub,1,1)*dc0(1)) + (CS%Phisub(iq,jq,isub,jsub,2,2)*dc0(4))) + &
+                   ((CS%Phisub(iq,jq,isub,jsub,2,1)*dc0(2)) + (CS%Phisub(iq,jq,isub,jsub,1,2)*dc0(3)))
+          bed_p = ((CS%Phisub(iq,jq,isub,jsub,1,1)*dc(1)) + (CS%Phisub(iq,jq,isub,jsub,2,2)*dc(4))) + &
+                  ((CS%Phisub(iq,jq,isub,jsub,2,1)*dc(2)) + (CS%Phisub(iq,jq,isub,jsub,1,2)*dc(3)))
+          ym1 = CS%Phisub(iq,jq,isub,jsub,1,1) + CS%Phisub(iq,jq,isub,jsub,2,1)
+          ym2 = CS%Phisub(iq,jq,isub,jsub,1,2) + CS%Phisub(iq,jq,isub,jsub,2,2)
+          xm1 = CS%Phisub(iq,jq,isub,jsub,1,1) + CS%Phisub(iq,jq,isub,jsub,1,2)
+          xm2 = CS%Phisub(iq,jq,isub,jsub,2,1) + CS%Phisub(iq,jq,isub,jsub,2,2)
+          a = (G%dxCv(i,j-1) * ym1) + (G%dxCv(i,j) * ym2)
+          d = (G%dyCu(i-1,j) * xm1) + (G%dyCu(i,j) * xm2)
+          q4(iq,jq) = 0.0
+          if (rr * h_p - bed0_p > 0.0) q4(iq,jq) = (0.25 * subarea * (a * d)) * (h_p - rhow_rhoi * bed_p)
+        enddo ; enddo
+        qs(isub,jsub) = (q4(1,1) + q4(2,2)) + (q4(1,2) + q4(2,1))
+      enddo ; enddo
+      call sum_square_matrix(vaf_cell(i,j), qs, nsub)
+    endif
+  enddo ; enddo
+  deallocate(hfl)
+  if (allocated(qs)) deallocate(qs)
+
+  vaf = reproducing_sum(vaf_cell, unscale=G%US%Z_to_m*G%US%L_to_m**2)
+end subroutine volume_above_floatation_gl
+
 !> multiplies a variable with the ice sheet grounding fraction
 subroutine masked_var_grounded(G,CS,var,varout)
   type(ocean_grid_type), intent(in) :: G !< The grid structure used by the ice shelf.
@@ -2803,6 +2938,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
   ! DG(1) jump diagnostics. B-node quantities gather the co-located corners of the touching
   ! hmask=1 cells; face quantities compare the two sides at the face's endpoint nodes.
   real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_n     ! Max-min corner thickness at a B-node [Z ~> m]
+  real, allocatable, dimension(:,:,:,:) :: h_flot_d    ! The corners the flotation tests read [Z ~> m]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: h_node_mx   ! Max corner thickness at a B-node [Z ~> m]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: h_node_mn   ! Min corner thickness at a B-node [Z ~> m]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: h_jump_n_rel ! h_jump_n over the mean cell thickness [nondim]
@@ -2953,6 +3089,15 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
     if (CS%id_h_nodal_SE > 0) call post_data(CS%id_h_nodal_SE, CS%h_nodal(:,:,2,1), CS%diag)
     if (CS%id_h_nodal_NW > 0) call post_data(CS%id_h_nodal_NW, CS%h_nodal(:,:,1,2), CS%diag)
     if (CS%id_h_nodal_NE > 0) call post_data(CS%id_h_nodal_NE, CS%h_nodal(:,:,2,2), CS%diag)
+    if ((CS%id_h_flot_SW > 0) .or. (CS%id_h_flot_SE > 0) .or. (CS%id_h_flot_NW > 0) .or. (CS%id_h_flot_NE > 0)) then
+      allocate(h_flot_d(G%isd:G%ied,G%jsd:G%jed,2,2))
+      call dg1_flot_corners(CS, G, ISS%hmask, h_flot_d)
+      if (CS%id_h_flot_SW > 0) call post_data(CS%id_h_flot_SW, h_flot_d(:,:,1,1), CS%diag)
+      if (CS%id_h_flot_SE > 0) call post_data(CS%id_h_flot_SE, h_flot_d(:,:,2,1), CS%diag)
+      if (CS%id_h_flot_NW > 0) call post_data(CS%id_h_flot_NW, h_flot_d(:,:,1,2), CS%diag)
+      if (CS%id_h_flot_NE > 0) call post_data(CS%id_h_flot_NE, h_flot_d(:,:,2,2), CS%diag)
+      deallocate(h_flot_d)
+    endif
     if ((CS%id_h_jump_node > 0 .or. CS%id_h_jump_node_rel > 0 .or. &
          CS%id_h_node_max > 0 .or. CS%id_h_node_min > 0) .and. associated(CS%h_nodal)) then
       call pass_corner_field(CS%h_nodal, G)
@@ -14401,6 +14546,28 @@ subroutine dg1_set_h_flot(CS, G, hmask)
   CS%h_flot(:,:,:,:) = h_bl(:,:,:,:)
   deallocate(h_bl)
 end subroutine dg1_set_h_flot
+
+!> For diagnostics: the corners that the flotation tests of the velocity solve would read now, built from the
+!! current transported corners as in dg1_set_h_flot with DG1_GL_SHARED_FLOTATION, and the transported corners
+!! without it.  CS%h_flot is not changed; the halo of CS%h_nodal is updated first.
+subroutine dg1_flot_corners(CS, G, hmask, h_out)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS    !< The ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in)    :: G     !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out) :: h_out !< The corners the flotation tests read [Z ~> m]
+
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: w_band ! The band weight of each node [nondim]
+
+  call pass_corner_field(CS%h_nodal, G)
+  if (.not.CS%dg_gl_shared_flot) then
+    h_out(:,:,:,:) = CS%h_nodal(:,:,:,:)
+  elseif (CS%dg_gl_flot_band >= 0) then
+    call dg1_flot_band_weight(CS, G, hmask, w_band)
+    call dg1_gl_shared_h(CS, G, hmask, h_out, w_band)
+  else
+    call dg1_gl_shared_h(CS, G, hmask, h_out)
+  endif
+end subroutine dg1_flot_corners
 
 !> DG1_GL_SHARED_FLOTATION_BAND: the band weight of each node, valid in the halo, from the transported
 !! corners only (not from the grounded fraction, which reads h_flot).  The grounding-line nodes are the

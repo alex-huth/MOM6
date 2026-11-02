@@ -61,7 +61,7 @@ use MOM_ice_shelf_dynamics, only : calc_prescribed_basal_melt
 use MOM_ice_shelf_dynamics, only : register_ice_shelf_dyn_restarts, initialize_ice_shelf_dyn
 use MOM_ice_shelf_dynamics, only : ice_shelf_min_thickness_calve, change_in_draft
 use MOM_ice_shelf_dynamics, only : ice_time_step_CFL, ice_shelf_dyn_end, IS_dynamics_post_data
-use MOM_ice_shelf_dynamics, only : volume_above_floatation, masked_var_grounded
+use MOM_ice_shelf_dynamics, only : volume_above_floatation, masked_var_grounded, volume_above_floatation_gl
 use MOM_ice_shelf_dynamics, only : DG_nodal_thickness_ptr
 use MOM_ice_shelf_initialize, only : initialize_ice_thickness
 !MJH use MOM_ice_shelf_initialize, only : initialize_ice_shelf_boundary
@@ -227,7 +227,7 @@ type, public :: ice_shelf_CS ; private
              id_area_shelf_h = -1, id_smb_rate = -1, id_bmb_rate = -1, &
              id_ustar_shelf = -1, id_shelf_mass = -1, id_mass_flux = -1, &
              id_shelf_sfc_mass_flux = -1, &
-             id_vaf = -1, id_g_adott = -1, id_f_adott = -1, id_adott = -1, &
+             id_vaf = -1, id_vaf_gl = -1, id_g_adott = -1, id_f_adott = -1, id_adott = -1, &
              id_bdott_melt = -1, id_bdott_accum = -1, id_bdott = -1, &
              id_dvafdt = -1, id_g_adot = -1, id_f_adot = -1, id_adot = -1, &
              id_bdot_melt = -1, id_bdot_accum = -1, id_bdot = -1, &
@@ -2388,6 +2388,10 @@ subroutine initialize_ice_shelf(param_file, ocn_grid, Time, CS, diag, Time_init,
   ! Scalars (area integrated over all ice sheets)
   CS%id_vaf = register_scalar_field('ice_shelf_model', 'int_vaf', CS%diag%axesT1, CS%Time, &
       'Area integrated ice sheet volume above floatation', 'm3', conversion=US%Z_to_m*US%L_to_m**2)
+  CS%id_vaf_gl = register_scalar_field('ice_shelf_model', 'int_vaf_gl', CS%diag%axesT1, CS%Time, &
+      'Area integrated ice sheet volume above floatation on the grounding-line partition of the velocity '//&
+      'solve (SEP2 sub-elements or SEP3 sub-points, with the DG1_GL_SHARED_FLOTATION corners); the cell-mean '//&
+      'int_vaf without the DG(1) thickness or GROUNDING_LINE_INTERPOLATE', 'm3', conversion=US%Z_to_m*US%L_to_m**2)
   CS%id_adott = register_scalar_field('ice_shelf_model', 'int_a', CS%diag%axesT1, CS%Time, &
       'Area integrated change in ice-sheet thickness ' //&
       'due to surface accum+melt during a DT_THERM time step', 'm3', conversion=US%Z_to_m*US%L_to_m**2)
@@ -3143,6 +3147,10 @@ subroutine process_and_post_scalar_data(CS, vaf0, vaf0_A, vaf0_G, Itime_step, dh
   if (CS%id_vaf > 0 .or. CS%id_dvafdt > 0) &  !calculate current volume above floatation (vaf)
     call volume_above_floatation(CS%dCS, G, ISS, vaf)
   if (CS%id_vaf    > 0) call post_scalar_data(CS%id_vaf   ,vaf                  ,CS%diag) !current vaf
+  if (CS%id_vaf_gl > 0) then !current vaf on the grounding-line partition
+    call volume_above_floatation_gl(CS%dCS, G, ISS, val)
+    call post_scalar_data(CS%id_vaf_gl, val, CS%diag)
+  endif
   if (CS%id_dvafdt > 0) call post_scalar_data(CS%id_dvafdt,(vaf-vaf0)*Itime_step,CS%diag) !d(vaf)/dt
   if (CS%id_adott > 0 .or. CS%id_adot > 0) then !surface accumulation - surface melt
     val = integrate_over_ice_sheet_area(G, ISS, dh_adott, unscale=US%Z_to_m)
