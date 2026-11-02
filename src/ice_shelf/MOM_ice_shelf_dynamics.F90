@@ -7302,6 +7302,9 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
   logical :: do_fvsub    ! Local flag for the FV sub-element mode (fls_cell supplied)
   real :: fls_loc        ! Flotation deficit r*h - bed at sub-qp [Z ~> m]
   real :: rho_ocean_g_LtoZ ! US%L_to_Z * density_ocean_avg * g_Earth [R L Z-1 T-2]
+  real, dimension(2,2) :: hn ! DG mode: the corners that the sub-point flotation test and the effective
+                             ! pressure read, h_nodal_cell or with DG1_GL_SHARED_FLOTATION the blended
+                             ! corners [Z ~> m]
   real, dimension(2,2,10,4) :: KQ ! Per-qp matrix contributions (qx,qy,pair,blk) [R L2 Z T-1 ~> kg s-1]
   real, allocatable, dimension(:,:,:,:) :: Ksub ! Per-sub-cell matrix sums (i,j,pair,blk) [R L2 Z T-1 ~> kg s-1]
   real :: Kp               ! One reduced matrix entry [R L2 Z T-1 ~> kg s-1]
@@ -7330,6 +7333,13 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
   elseif (do_DG) then
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
     rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
+    ! DG1_GL_SHARED_FLOTATION: the flotation test and the effective pressure read the blended corners,
+    ! as in CG_action_sep2_basal.
+    if (CS%dg_gl_shared_flot) then
+      hn(:,:) = CS%h_flot(i_elem,j_elem,:,:)
+    else
+      hn(:,:) = h_nodal_cell(:,:)
+    endif
   endif
 
   Ucontr_sub(:,:,:,:) = 0.0 ; Vcontr_sub(:,:,:,:) = 0.0
@@ -7356,8 +7366,8 @@ subroutine CG_action_subgrid_basal(CS, G, US, Phisub, H, U_curr, V_curr, U_delta
         xi_sub  = (Phisub(qx,qy,i,j,2,1) + Phisub(qx,qy,i,j,2,2)) - 0.5
         eta_sub = (Phisub(qx,qy,i,j,1,2) + Phisub(qx,qy,i,j,2,2)) - 0.5
         ! Nodal Q1 evaluation at the sub-QP via the Phisub corner-basis weights.
-        hloc = ((Phisub(qx,qy,i,j,1,1)*h_nodal_cell(1,1)) + (Phisub(qx,qy,i,j,2,2)*h_nodal_cell(2,2))) + &
-               ((Phisub(qx,qy,i,j,1,2)*h_nodal_cell(1,2)) + (Phisub(qx,qy,i,j,2,1)*h_nodal_cell(2,1)))
+        hloc = ((Phisub(qx,qy,i,j,1,1)*hn(1,1)) + (Phisub(qx,qy,i,j,2,2)*hn(2,2))) + &
+               ((Phisub(qx,qy,i,j,1,2)*hn(1,2)) + (Phisub(qx,qy,i,j,2,1)*hn(2,1)))
         hloc = max(hloc, CS%min_h_shelf)
         bed_sub = ((Phisub(qx,qy,i,j,1,1)*bed_corners(1,1)) + (Phisub(qx,qy,i,j,2,2)*bed_corners(2,2))) + &
                   ((Phisub(qx,qy,i,j,1,2)*bed_corners(1,2)) + (Phisub(qx,qy,i,j,2,1)*bed_corners(2,1)))
@@ -8289,6 +8299,9 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
   logical :: do_fvsub    ! Local flag for the FV sub-element mode (fls_cell supplied)
   real :: fls_loc        ! Flotation deficit r*h - bed at sub-qp [Z ~> m]
   real :: rho_ocean_g_LtoZ ! US%L_to_Z * density_ocean_avg * g_Earth [R L Z-1 T-2]
+  real, dimension(2,2) :: hn ! DG mode: the corners that the sub-point flotation test and the effective
+                             ! pressure read, h_nodal_cell or with DG1_GL_SHARED_FLOTATION the blended
+                             ! corners [Z ~> m]
   integer :: nsub, i, j, qx, qy, m, n
 
   nsub    = size(Phisub, 3)
@@ -8307,6 +8320,12 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
   elseif (do_DG) then
     rho_oi_ratio   = CS%density_ocean_avg / CS%density_ice
     rho_ice_g_LtoZ = US%L_to_Z * CS%density_ice * CS%g_Earth
+    ! DG1_GL_SHARED_FLOTATION: as in CG_action_subgrid_basal.
+    if (CS%dg_gl_shared_flot) then
+      hn(:,:) = CS%h_flot(i_elem,j_elem,:,:)
+    else
+      hn(:,:) = h_nodal_cell(:,:)
+    endif
   endif
 
   u_diag_sub(:,:,:,:) = 0.0 ; v_diag_sub(:,:,:,:) = 0.0
@@ -8317,8 +8336,8 @@ subroutine CG_diagonal_subgrid_basal(CS, G, US, Phisub, H_node, U_curr, V_curr, 
     do qy=1,2 ; do qx=1,2
       if (do_DG) then
         ! Nodal Q1 evaluation at the sub-QP via Phisub corner-basis weights.
-        hloc = ((Phisub(qx,qy,i,j,1,1)*h_nodal_cell(1,1)) + (Phisub(qx,qy,i,j,2,2)*h_nodal_cell(2,2))) + &
-               ((Phisub(qx,qy,i,j,1,2)*h_nodal_cell(1,2)) + (Phisub(qx,qy,i,j,2,1)*h_nodal_cell(2,1)))
+        hloc = ((Phisub(qx,qy,i,j,1,1)*hn(1,1)) + (Phisub(qx,qy,i,j,2,2)*hn(2,2))) + &
+               ((Phisub(qx,qy,i,j,1,2)*hn(1,2)) + (Phisub(qx,qy,i,j,2,1)*hn(2,1)))
         hloc = max(hloc, CS%min_h_shelf)
         bed_sub = ((Phisub(qx,qy,i,j,1,1)*bed_corners(1,1)) + (Phisub(qx,qy,i,j,2,2)*bed_corners(2,2))) + &
                   ((Phisub(qx,qy,i,j,1,2)*bed_corners(1,2)) + (Phisub(qx,qy,i,j,2,1)*bed_corners(2,1)))
@@ -9941,7 +9960,14 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
                  ((CS%Phisub(iq,jq,isub,jsub,2,1)*fls_corners(2,1)) + &
                   (CS%Phisub(iq,jq,isub,jsub,1,2)*fls_corners(1,2)))
         else
-          if (CS%use_DG_thickness) then
+          if (CS%use_DG_thickness .and. CS%dg_gl_shared_flot) then
+            ! DG1_GL_SHARED_FLOTATION: the sub-points test the blended corners.
+            h_ip = ((CS%Phisub(iq,jq,isub,jsub,1,1)*CS%h_flot(i,j,1,1)) + &
+                    (CS%Phisub(iq,jq,isub,jsub,2,2)*CS%h_flot(i,j,2,2))) + &
+                   ((CS%Phisub(iq,jq,isub,jsub,2,1)*CS%h_flot(i,j,2,1)) + &
+                    (CS%Phisub(iq,jq,isub,jsub,1,2)*CS%h_flot(i,j,1,2)))
+            h_ip = max(h_ip, CS%min_h_shelf)
+          elseif (CS%use_DG_thickness) then
             h_ip = ((CS%Phisub(iq,jq,isub,jsub,1,1)*CS%h_nodal(i,j,1,1)) + &
                     (CS%Phisub(iq,jq,isub,jsub,2,2)*CS%h_nodal(i,j,2,2))) + &
                    ((CS%Phisub(iq,jq,isub,jsub,2,1)*CS%h_nodal(i,j,2,1)) + &
@@ -12028,6 +12054,12 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, taudx, taudy)
               dxCv_S, dxCv_N, dyCu_W, dyCu_E, rho, rhoi_rhow, grav, vol_dx, vol_dy, &
               CS%sx_shelf(i,j), CS%sy_shelf(i,j), calc_slope_diag)
         endif
+      elseif (CS%dg_gl_shared_flot) then
+        call calc_shelf_driving_stress_DG_subgrid(CS, CS%Phisub, &
+            CS%h_nodal(i,j,:,:), bed_corners, &
+            dxCv_S, dxCv_N, dyCu_W, dyCu_E, &
+            rho, rhoi_rhow, grav, vol_dx, vol_dy, &
+            CS%sx_shelf(i,j), CS%sy_shelf(i,j), calc_slope_diag, h_flot_cell=CS%h_flot(i,j,:,:))
       else
         call calc_shelf_driving_stress_DG_subgrid(CS, CS%Phisub, &
             CS%h_nodal(i,j,:,:), bed_corners, &
@@ -12253,7 +12285,7 @@ end subroutine calc_shelf_driving_stress_DG
 subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
     h_nodal_cell, bed_corners, &
     dxCv_S, dxCv_N, dyCu_W, dyCu_E, &
-    rho, rhoi_rhow, grav, vol_dx, vol_dy, sx_shelf, sy_shelf, calc_slope_diag)
+    rho, rhoi_rhow, grav, vol_dx, vol_dy, sx_shelf, sy_shelf, calc_slope_diag, h_flot_cell)
   type(ice_shelf_dyn_CS), intent(in) :: CS    !< Ice shelf control structure
   real, dimension(:,:,:,:,:,:), intent(in) :: Phisub !< Sub-grid quadrature weights [nondim]
   real, dimension(2,2), intent(in) :: h_nodal_cell !< Q1 nodal thickness at the 4 corners [Z ~> m]
@@ -12270,6 +12302,9 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
   real, intent(inout) :: sx_shelf !< Cell-average x surface slope [Z L-1 ~> nondim]
   real, intent(inout) :: sy_shelf !< Cell-average y surface slope [Z L-1 ~> nondim]
   logical :: calc_slope_diag !< True if slope diagnostics will be calculated
+  real, dimension(2,2), optional, intent(in) :: h_flot_cell !< DG1_GL_SHARED_FLOTATION: the blended corners
+                                     !! that the sub-point flotation test and the grounded part of the
+                                     !! surface read [Z ~> m]
 
   real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: contr_sub_dx, contr_sub_dy
   real, dimension(SIZE(Phisub,3),SIZE(Phisub,3),2,2) :: slope_x_gp, slope_y_gp
@@ -12279,6 +12314,8 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
   real :: slope_w_total
   real, dimension(2,2,2,2) :: qp_dx, qp_dy
   real :: h_gp, dhdx_gp, dhdy_gp
+  real :: hf_gp      ! DG1_GL_SHARED_FLOTATION: blended thickness at the sub-point [Z ~> m]
+  real :: dhfdx_gp, dhfdy_gp ! DG1_GL_SHARED_FLOTATION: blended thickness gradients [Z L-1 ~> nondim]
   real :: bed_gp, dbdx_gp, dbdy_gp
   real :: dbdx_ref, dbdy_ref
   real :: dsdx_gp, dsdy_gp
@@ -12328,8 +12365,22 @@ subroutine calc_shelf_driving_stress_DG_subgrid(CS, Phisub, &
 
       ! Local flotation test, even with GL_couple.
       is_grounded = (rhoi_rhow * h_gp - bed_gp > 0.0)
+      if (present(h_flot_cell)) then
+        ! DG1_GL_SHARED_FLOTATION: s = (1 - r) h + max(r h_f - D, 0), as in calc_shelf_driving_stress_DG_sep2.
+        hf_gp = ((Phisub(qx,qy,i,j,1,1)*h_flot_cell(1,1)) + (Phisub(qx,qy,i,j,2,2)*h_flot_cell(2,2))) + &
+                ((Phisub(qx,qy,i,j,1,2)*h_flot_cell(1,2)) + (Phisub(qx,qy,i,j,2,1)*h_flot_cell(2,1)))
+        hf_gp = max(hf_gp, CS%min_h_shelf)
+        dhfdx_gp = ( (((-y_marginal_1) * h_flot_cell(1,1)) + (( y_marginal_2) * h_flot_cell(2,2))) + &
+                     ((( y_marginal_1) * h_flot_cell(2,1)) + ((-y_marginal_2) * h_flot_cell(1,2))) ) / a
+        dhfdy_gp = ( (((-x_marginal_1) * h_flot_cell(1,1)) + (( x_marginal_2) * h_flot_cell(2,2))) + &
+                     (((-x_marginal_2) * h_flot_cell(2,1)) + (( x_marginal_1) * h_flot_cell(1,2))) ) / d
+        is_grounded = (rhoi_rhow * hf_gp - bed_gp > 0.0)
+      endif
 
-      if (is_grounded) then
+      if (is_grounded .and. present(h_flot_cell)) then
+        dsdx_gp = (((1.0 - rhoi_rhow) * dhdx_gp) + (rhoi_rhow * dhfdx_gp)) - dbdx_gp
+        dsdy_gp = (((1.0 - rhoi_rhow) * dhdy_gp) + (rhoi_rhow * dhfdy_gp)) - dbdy_gp
+      elseif (is_grounded) then
         dsdx_gp = dhdx_gp - dbdx_gp
         dsdy_gp = dhdy_gp - dbdy_gp
       else
@@ -13681,7 +13732,8 @@ subroutine read_DG_params(param_file, mdl, CS, US)
       "MOM_ice_shelf_dynamics: DG1_GL_SHARED_H needs USE_DG_THICKNESS.")
   call get_param(param_file, mdl, "DG1_GL_SHARED_FLOTATION", CS%dg_gl_shared_flot, &
                  "If true, every flotation test of the velocity solve (the grounded fraction, the SEP2 "//&
-                 "partition and the per-point tests of the friction and the driving stress) reads the "//&
+                 "partition or the SEP3 sub-points, and the per-point tests of the friction and the driving "//&
+                 "stress) reads the "//&
                  "blended corners of DG1_GL_SHARED_H, with the reach DG1_GL_SHARED_H_REACH, while the "//&
                  "thickness that the driving stress, the viscosity and the friction multiply by stays the "//&
                  "transported one.  The surface is s = (1 - r) h + max(r h_f - D, 0), with h the transported "//&
@@ -13717,9 +13769,8 @@ subroutine read_DG_params(param_file, mdl, CS, US)
         "DG1_GL_SHARED_FLOTATION needs USE_DG_THICKNESS.")
     if (CS%dg_gl_shared_h) call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: "//&
         "DG1_GL_SHARED_FLOTATION and DG1_GL_SHARED_H cannot both be true.")
-    if (.not.(CS%GL_regularize .and. CS%use_sep2)) call MOM_error(FATAL, "MOM_ice_shelf_dynamics, "//&
-        "read_DG_params: DG1_GL_SHARED_FLOTATION needs GROUNDING_LINE_INTERPOLATE and "//&
-        "GROUNDING_LINE_SUBGRID_SCHEME = SEP2.")
+    if (.not.CS%GL_regularize) call MOM_error(FATAL, "MOM_ice_shelf_dynamics, "//&
+        "read_DG_params: DG1_GL_SHARED_FLOTATION needs GROUNDING_LINE_INTERPOLATE.")
     if (CS%gl_quad_friction .or. CS%i2n_friction .or. CS%i2n_taud .or. &
         CS%local_basal_friction .or. (CS%cism_taud /= CISM_OFF)) call MOM_error(FATAL, &
         "MOM_ice_shelf_dynamics, read_DG_params: DG1_GL_SHARED_FLOTATION supports only the DG element "//&
@@ -15202,7 +15253,23 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
           dbdy_gp = (((Bc(1,1) * (-xm1)) + (Bc(2,2) * ( xm2))) + ((Bc(2,1) * (-xm2)) + (Bc(1,2) * ( xm1)))) / d_qp
           ! The local flotation test, even with GL_couple, as in the velocity solve.
           is_grounded = (rhoi_rhow * h_gp - bed_gp > 0.0)
-          if (is_grounded) then
+          if (CS%dg_gl_shared_flot) then
+            ! DG1_GL_SHARED_FLOTATION: as in calc_shelf_driving_stress_DG_subgrid.
+            h_flt = ((CS%Phisub(iq,jq,isub,jsub,1,1)*CS%h_flot(i,j,1,1)) + &
+                     (CS%Phisub(iq,jq,isub,jsub,2,2)*CS%h_flot(i,j,2,2))) + &
+                    ((CS%Phisub(iq,jq,isub,jsub,1,2)*CS%h_flot(i,j,1,2)) + &
+                     (CS%Phisub(iq,jq,isub,jsub,2,1)*CS%h_flot(i,j,2,1)))
+            h_flt = max(h_flt, CS%min_h_shelf)
+            dhfdx = ( (((-ym1) * CS%h_flot(i,j,1,1)) + (( ym2) * CS%h_flot(i,j,2,2))) + &
+                      ((( ym1) * CS%h_flot(i,j,2,1)) + ((-ym2) * CS%h_flot(i,j,1,2))) ) / a_qp
+            dhfdy = ( (((-xm1) * CS%h_flot(i,j,1,1)) + (( xm2) * CS%h_flot(i,j,2,2))) + &
+                      (((-xm2) * CS%h_flot(i,j,2,1)) + (( xm1) * CS%h_flot(i,j,1,2))) ) / d_qp
+            is_grounded = (rhoi_rhow * h_flt - bed_gp > 0.0)
+          endif
+          if (is_grounded .and. CS%dg_gl_shared_flot) then
+            dsdx_gp = (((1.0 - rhoi_rhow) * dhdx_gp) + (rhoi_rhow * dhfdx)) - dbdx_gp
+            dsdy_gp = (((1.0 - rhoi_rhow) * dhdy_gp) + (rhoi_rhow * dhfdy)) - dbdy_gp
+          elseif (is_grounded) then
             dsdx_gp = dhdx_gp - dbdx_gp ; dsdy_gp = dhdy_gp - dbdy_gp
           else
             dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp ; dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
@@ -15219,7 +15286,12 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
                       ((CS%Phisub(iq,jq,isub,jsub,1,2)*Vc(1,2)) + (CS%Phisub(iq,jq,isub,jsub,2,1)*Vc(2,1)))) + &
                      (bt * CS%dg_post_vb(i,j))
             unorm2 = ((cur(1)**2) + (cur(2)**2)) + eps_vel2_e
-            if (CS%CoulombFriction) then
+            if (CS%CoulombFriction .and. CS%dg_gl_shared_flot) then
+              ! DG1_GL_SHARED_FLOTATION: the effective pressure reads the blended thickness.
+              fB_local = compute_fB_local(h_flt, bed_gp, rho_oi_ratio, rho_ice_g_LtoZ, &
+                  CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
+                  CS%CF_PostPeak, CS%n_basal_fric)
+            elseif (CS%CoulombFriction) then
               fB_local = compute_fB_local(h_gp, bed_gp, rho_oi_ratio, rho_ice_g_LtoZ, &
                   CS%C_basal_friction(i,j), CS%alpha_coulomb, CS%CF_Max, CS%CF_MinN, &
                   CS%CF_PostPeak, CS%n_basal_fric)
