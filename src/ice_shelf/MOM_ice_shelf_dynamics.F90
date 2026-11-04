@@ -8822,6 +8822,13 @@ end function sep2_qp_sum
 !! exact, with the jump identically zero. It also matches the friction, which evaluates fields at a
 !! QP as sum(beta*f) -- the beta are barycentric coordinates on the parent triangle, so that sum is
 !! already the P1 interpolant.
+!!
+!! A quarter turn maps each triangle onto another with its corners A and B in the same roles, but a
+!! reflection reverses the orientation and swaps A and B.  So the gradient is solved from the base
+!! edge A->B and the median M->C from the base midpoint, whose increments fB - fA and
+!! fC - (fA + fB)/2 a swap of A and B leaves exact (the first changes sign, the second does not).
+!! A solve from the edges A->B and A->C is equal in exact arithmetic, but its rounding depends on
+!! which base corner is A, and that broke the mirror symmetry of MISMIP+.
 subroutine sep2_fan_gradient(f, gxi, geta)
   real, dimension(4), intent(in)  :: f    !< Corner values, ordered SW, SE, NW, NE [Z ~> m]
   real, dimension(4), intent(out) :: gxi  !< d/dxi of the P1 interpolant per triangle, ordered
@@ -8836,20 +8843,22 @@ subroutine sep2_fan_gradient(f, gxi, geta)
   real, dimension(4), parameter :: yref = (/ 0.0, 0.0, 1.0, 1.0 /) ! Corner eta [nondim]
   real :: fC          ! Field value at the cell center, the corner mean [Z ~> m]
   real :: abx, aby    ! Reference-space edge vector A->B [nondim]
-  real :: acx, acy    ! Reference-space edge vector A->C [nondim]
-  real :: u, v        ! Field increments along A->B and A->C [Z ~> m]
-  real :: Idet        ! Inverse reference-space determinant of (AB, AC) [nondim]
+  real :: mcx, mcy    ! Reference-space median vector M->C, M the midpoint of A and B [nondim]
+  real :: u, v        ! Field increments along A->B and M->C [Z ~> m]
+  real :: Idet        ! Inverse reference-space determinant of (AB, MC) [nondim]
   integer :: t
 
   fC = 0.5 * ((0.5 * (f(1) + f(4))) + (0.5 * (f(2) + f(3))))
   do t=1,4
     abx = xref(iB(t)) - xref(iA(t)) ; aby = yref(iB(t)) - yref(iA(t))
-    acx = 0.5 - xref(iA(t))         ; acy = 0.5 - yref(iA(t))
-    u = f(iB(t)) - f(iA(t))         ; v = fC - f(iA(t))
-    ! Cramer solve of g.AB = u, g.AC = v for the constant gradient g on this triangle.
-    Idet = 1.0 / ((abx * acy) - (acx * aby))
-    gxi(t)  = ((u * acy) - (v * aby)) * Idet
-    geta(t) = ((v * abx) - (u * acx)) * Idet
+    mcx = 0.5 - (0.5 * (xref(iA(t)) + xref(iB(t))))
+    mcy = 0.5 - (0.5 * (yref(iA(t)) + yref(iB(t))))
+    u = f(iB(t)) - f(iA(t))
+    v = fC - (0.5 * (f(iA(t)) + f(iB(t))))
+    ! Cramer solve of g.AB = u, g.MC = v for the constant gradient g on this triangle.
+    Idet = 1.0 / ((abx * mcy) - (mcx * aby))
+    gxi(t)  = ((u * mcy) - (v * aby)) * Idet
+    geta(t) = ((v * abx) - (u * mcx)) * Idet
   enddo
 
 end subroutine sep2_fan_gradient
@@ -11047,7 +11056,7 @@ subroutine calc_shelf_driving_stress_i2n(CS, ISS, G, US, taudx, taudy)
     ! Per-triangle P1 gradients of BOTH corner fields. Both terms of S must use the same operator
     ! or the grounded branch does not telescope to grad(h) - grad(bed); see sep2_fan_gradient.
     call sep2_fan_gradient(fls, dfxi, dfeta)
-    call sep2_fan_gradient(hc,  dhxi, dheta)
+    call sep2_fan_gradient(hc, dhxi, dheta)
 
     do t=1,4
       do k=1,nqp(t)
@@ -12660,7 +12669,7 @@ subroutine calc_shelf_driving_stress_DG_sep2(CS, h_nodal_cell, bed_corners, &
   call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
 
   ! P1 fan gradients, the same interpolant sep2_cell_qps cut on.
-  call sep2_fan_gradient(hc,   dhxi, dheta)
+  call sep2_fan_gradient(hc, dhxi, dheta)
   call sep2_fan_gradient(bedc, dbxi, dbeta)
 
   do t=1,4
