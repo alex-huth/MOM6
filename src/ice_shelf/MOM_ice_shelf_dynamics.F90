@@ -17502,6 +17502,9 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   real :: tau_b     ! DG1_LIMITER_BRANCH_RULE = PARTIAL: the part of a change that brings the first corner to
                     ! flotation [nondim]
   logical :: part_c ! DG1_LIMITER_BRANCH_RULE = PARTIAL cut a pass of this cell short
+  real :: tau_f     ! The part of a change of the face or vertex pass that keeps every corner at or above
+                    ! MIN_H_SHELF, or where it already is if below [nondim]
+  real, dimension(2,2) :: dh_f ! Change of the corner thicknesses by the face bounds [Z ~> m]
   real, dimension(2,2) :: dh_v ! Change of the corner thicknesses by the vertex pass [Z ~> m]
   logical :: flt_c  ! The cell is wholly floating
   real, dimension(2,2) :: ds_f   ! Change of the corner surfaces by the face bounds [Z ~> m]
@@ -18010,13 +18013,23 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
             if (CS%dg_lim_corner_class .and. CS%dg_lim_crossed) trb(i,j) = .true.
           endif
           if (ok_br) then
+            ! The bounds are on the surface and know nothing of MIN_H_SHELF, so on a bed high beside ice-free
+            ! or thin cells they can ask for a corner below it, which the positivity limit then undoes.  Take
+            ! only the part of the change that keeps every corner at or above the floor.
+            do b = 1, 2 ; do a = 1, 2
+              dh_f(a,b) = ds_f(a,b)
+              if (flt_c) dh_f(a,b) = ds_f(a,b) / (1.0 - rr)
+            enddo ; enddo
+            tau_f = dg1_lim_floor_step(CS%h_nodal(i,j,:,:), dh_f, CS%min_h_shelf)
+            if (tau_f < 1.0) then
+              do b = 1, 2 ; do a = 1, 2
+                ds_f(a,b) = tau_f * ds_f(a,b) ; dh_f(a,b) = tau_f * dh_f(a,b)
+              enddo ; enddo
+              phi_x = 1.0 - tau_f*(1.0 - phi_x) ; phi_y = 1.0 - tau_f*(1.0 - phi_y)
+            endif
             if (do_bud) h_bud(:,:) = CS%h_nodal(i,j,:,:)
             do b = 1, 2 ; do a = 1, 2
-              if (flt_c) then
-                CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + ds_f(a,b) / (1.0 - rr)
-              else
-                CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + ds_f(a,b)
-              endif
+              CS%h_nodal(i,j,a,b) = CS%h_nodal(i,j,a,b) + dh_f(a,b)
               s_c(a,b) = s_c(a,b) + ds_f(a,b)
             enddo ; enddo
             if (do_bud) call dg1_bud_add(CS, i, j, 7, bud_w, CS%h_nodal(i,j,:,:) - h_bud(:,:))
@@ -18177,6 +18190,14 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
       if (do_st) CS%dg_lim_stat(i,j,8) = CS%dg_lim_stat(i,j,8) + 1.0
       if (CS%dg_lim_corner_class .and. CS%dg_lim_crossed) trb(i,j) = .true.
       cycle
+    endif
+    ! As in the face pass: only the part of the change that keeps every corner at or above MIN_H_SHELF.
+    tau_f = dg1_lim_floor_step(CS%h_nodal(i,j,:,:), dh_v, CS%min_h_shelf)
+    if (tau_f < 1.0) then
+      do b = 1, 2 ; do a = 1, 2
+        dh_v(a,b) = tau_f * dh_v(a,b)
+      enddo ; enddo
+      phi_t = 1.0 - tau_f*(1.0 - phi_t) ; phi_w = 1.0 - tau_f*(1.0 - phi_w)
     endif
     if (do_bud) h_bud(:,:) = CS%h_nodal(i,j,:,:)
     do b = 1, 2 ; do a = 1, 2
@@ -19280,6 +19301,24 @@ pure real function dg1_lim_face_factor(t_m, k_m, use_m, lo_m, hi_m, t_p, k_p, us
   dg1_lim_face_factor = 1.0
   if (feas .and. (q_lo <= q_hi)) dg1_lim_face_factor = 1.0 + q_hi
 end function dg1_lim_face_factor
+
+!> The largest part tau in [0, 1] of a change dh of the corner thicknesses h that keeps every corner at or above
+!! h_min, or at or above its value now where it is already below h_min.  A corner that the change does not
+!! lower sets no limit.
+pure real function dg1_lim_floor_step(h, dh, h_min)
+  real, dimension(2,2), intent(in) :: h     !< Corner thicknesses [Z ~> m]
+  real, dimension(2,2), intent(in) :: dh    !< Change of the corner thicknesses [Z ~> m]
+  real,                 intent(in) :: h_min !< The floor of the corner thicknesses [Z ~> m]
+  real :: hf        ! The floor of one corner [Z ~> m]
+  integer :: a, b
+
+  dg1_lim_floor_step = 1.0
+  do b = 1, 2 ; do a = 1, 2
+    hf = min(h_min, h(a,b))
+    if ((dh(a,b) < 0.0) .and. (h(a,b) + dh(a,b) < hf)) &
+      dg1_lim_floor_step = min(dg1_lim_floor_step, max(0.0, (h(a,b) - hf) / (-dh(a,b))))
+  enddo ; enddo
+end function dg1_lim_floor_step
 
 !> Narrow the feasible interval of dg1_lim_face_factor to the factors that keep one face in [lo, hi].
 pure subroutine dg1_lim_face_room(t, k, lo, hi, q_lo, q_hi, feas)
