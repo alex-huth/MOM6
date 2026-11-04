@@ -761,6 +761,9 @@ type, public :: ice_shelf_dyn_CS ; private
                              !! quadrature keep their bubble in the velocity solve but not in the DG(1) volume term
   logical :: dg_cpl_tr_ramp = .false. !< If true (DG1_COUPLED_BUBBLE_TRANSPORT_RAMP), the bubble velocity in the
                                   !! transport takes the weight (1 - 2 f)**2 of the grounded fraction f of the cell.
+  logical :: dg_cpl_own_surf = .false. !< If true (DG1_COUPLED_BUBBLE_OWN_SURFACE, with DG1_GL_SHARED_FLOTATION),
+                                  !! the driving stress against the bubbles reads the surface of the transported
+                                  !! thickness with its own flotation test, not the blended corners.
   integer :: dg_cpl_quad = 2 !< DG1_COUPLED_BUBBLE_QUAD: the points per direction of the Gauss rule of the bubble
                              !! terms (2, as the rest of the solve, or 3)
   logical :: dg_cpl_crossed = .true. !< If true, DG1_COUPLED_BUBBLE also has a bubble in the grounding-line
@@ -14006,6 +14009,19 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   if (CS%dg_cpl_tr_ramp .and. ((.not.CS%dg_coupled) .or. CS%dg_cpl_tr_crossed)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics, read_DG_params: DG1_COUPLED_BUBBLE_TRANSPORT_RAMP needs DG1_COUPLED_BUBBLE and "//&
       "DG1_COUPLED_BUBBLE_TRANSPORT_CROSSED = False.")
+  call get_param(param_file, mdl, "DG1_COUPLED_BUBBLE_OWN_SURFACE", CS%dg_cpl_own_surf, &
+                 "If true, with DG1_COUPLED_BUBBLE and DG1_GL_SHARED_FLOTATION, the driving stress against the "//&
+                 "bubbles reads the surface of the transported thickness, h - D where r h > D and (1 - r) h "//&
+                 "elsewhere, with its own flotation test (in a cell with sub-cell quadrature, the SEP2 "//&
+                 "partition of the transported corners or the test at each SEP3 sub-point), in every cell.  "//&
+                 "The driving stress against the nodes, its face term, the friction and the Coulomb effective "//&
+                 "pressure keep the blended corners.  So the bubbles feel the in-cell slope of the transported "//&
+                 "thickness that the blend hides from the nodes, and the velocity can damp a jump at a "//&
+                 "grounding-line node.  Where the blended corners equal the transported ones, nothing changes.", &
+                 default=.false., do_not_log=.not.(CS%dg_coupled .and. CS%dg_gl_shared_flot))
+  if (CS%dg_cpl_own_surf .and. .not.(CS%dg_coupled .and. CS%dg_gl_shared_flot)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics, read_DG_params: DG1_COUPLED_BUBBLE_OWN_SURFACE needs DG1_COUPLED_BUBBLE and "//&
+      "DG1_GL_SHARED_FLOTATION.")
   call get_param(param_file, mdl, "DG1_COUPLED_BUBBLE_QUAD", CS%dg_cpl_quad, &
                  "The points per direction of the Gauss rule of the DG1_COUPLED_BUBBLE bubble terms: 2 (as "//&
                  "the rest of the velocity solve) or 3.  The 2-point rule makes the viscous part of the bubble "//&
@@ -15161,6 +15177,8 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
   real :: detp, detn   ! Determinants of the two bubble blocks [R2 L4 Z2 T-2 ~> kg2 s-2]
   logical :: sub_cell, is_grounded, ok
   logical :: fallback  ! The linear-solve blocks of the cell are the Picard blocks
+  logical :: own_fb    ! DG1_COUPLED_BUBBLE_OWN_SURFACE: the driving stress against the bubbles reads the
+                       ! surface of the transported thickness
   real, dimension(2) :: fb_keep  ! The stored driving stress against the bubbles [R L3 Z T-2 ~> kg m s-2]
   real, dimension(2*CPL_NSET) :: t2 ! DG1_COUPLED_BUBBLE_QUAD = 3: the Picard and linear-solve block values of the
                                     ! 2x2 points [R L2 Z T-1 ~> kg s-1]
@@ -15199,6 +15217,7 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
   subarea = 1.0 / real(nsub)**2
   allocate(qs(nsub,nsub,CPL_NWK), source=0.0)
   do_newton_visc = use_newton .and. trim(CS%ice_viscosity_compute) == "MODEL"
+  own_fb = with_fb .and. CS%dg_gl_shared_flot .and. CS%dg_cpl_own_surf
   qpv = 1
 
   do j=js,je ; do i=is,ie
@@ -15331,6 +15350,14 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
         else
           dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp ; dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
         endif
+        if (own_fb) then
+          ! DG1_COUPLED_BUBBLE_OWN_SURFACE: the surface of the transported thickness, with its own test.
+          if (rhoi_rhow * h_gp - bed_gp > 0.0) then
+            dsdx_gp = dhdx_gp - dbdx_gp ; dsdy_gp = dhdy_gp - dbdy_gp
+          else
+            dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp ; dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
+          endif
+        endif
         qv(CPL_FB+1,iq,jq) = weight * (-rho * grav * h_gp * dsdx_gp)
         qv(CPL_FB+2,iq,jq) = weight * (-rho * grav * h_gp * dsdy_gp)
       endif
@@ -15380,7 +15407,7 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
           else
             dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp ; dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
           endif
-          if (with_fb) then
+          if (with_fb .and. .not.own_fb) then
             val(CPL_FB+1,kq) = (weight * bt) * (-rho * grav * h_gp * dsdx_gp)
             val(CPL_FB+2,kq) = (weight * bt) * (-rho * grav * h_gp * dsdy_gp)
           endif
@@ -15420,6 +15447,40 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
         tsub(k) = (ptri(k,1) + ptri(k,3)) + (ptri(k,2) + ptri(k,4))
         tot(k) = tot(k) + tsub(k)
       enddo
+      if (own_fb) then
+        ! DG1_COUPLED_BUBBLE_OWN_SURFACE: the driving stress against the bubbles on the SEP2 partition of the
+        ! transported corners, with the surface of the transported thickness.  The loop above left it out.
+        fls(:) = (rhoi_rhow * hc4(:)) - bc4(:)
+        call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
+        do t=1,4
+          val(CPL_FB+1:CPL_FB+2,1:nqp(t)) = 0.0
+          do kq=1,nqp(t)
+            b1 = beta(1,kq,t) ; b2 = beta(2,kq,t) ; b3 = beta(3,kq,t) ; b4 = beta(4,kq,t)
+            mS = b1 + b2 ; mN = b3 + b4 ; mW = b1 + b3 ; mE = b2 + b4
+            bt = dg1_bubble_tilde(mW, mE, mS, mN)
+            a_qp = (dxCv_S * mS) + (dxCv_N * mN)
+            d_qp = (dyCu_W * mW) + (dyCu_E * mE)
+            weight = wref(kq,t) * (a_qp * d_qp)
+            h_gp = ((b1 * hc4(1)) + (b4 * hc4(4))) + ((b2 * hc4(2)) + (b3 * hc4(3)))
+            h_gp = max(h_gp, CS%min_h_shelf)
+            dhdx_gp = dhxi(t) / a_qp ; dhdy_gp = dheta(t) / d_qp
+            dbdx_gp = dbxi(t) / a_qp ; dbdy_gp = dbeta(t) / d_qp
+            if (qpg(kq,t)) then
+              dsdx_gp = dhdx_gp - dbdx_gp ; dsdy_gp = dhdy_gp - dbdy_gp
+            else
+              dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp ; dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
+            endif
+            val(CPL_FB+1,kq) = (weight * bt) * (-rho * grav * h_gp * dsdx_gp)
+            val(CPL_FB+2,kq) = (weight * bt) * (-rho * grav * h_gp * dsdy_gp)
+          enddo
+          do k=CPL_FB+1,CPL_FB+2
+            ptri(k,t) = sep2_qp_sum(val(k,1:nqp(t)), nqp(t))
+          enddo
+        enddo
+        do k=CPL_FB+1,CPL_FB+2
+          tot(k) = tot(k) + ((ptri(k,1) + ptri(k,3)) + (ptri(k,2) + ptri(k,4)))
+        enddo
+      endif
     elseif (sub_cell) then
       ! The SEP3 sub-points: the driving stress as in calc_shelf_driving_stress_DG_subgrid, the friction
       ! as in the DG branch of CG_action_subgrid_basal.
@@ -15468,6 +15529,15 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
             dsdx_gp = dhdx_gp - dbdx_gp ; dsdy_gp = dhdy_gp - dbdy_gp
           else
             dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp ; dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
+          endif
+          if (own_fb) then
+            ! DG1_COUPLED_BUBBLE_OWN_SURFACE: the surface of the transported thickness, with its own test at
+            ! the sub-point; the friction below keeps the test of the blended corners.
+            if (rhoi_rhow * h_gp - bed_gp > 0.0) then
+              dsdx_gp = dhdx_gp - dbdx_gp ; dsdy_gp = dhdy_gp - dbdy_gp
+            else
+              dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp ; dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
+            endif
           endif
           if (with_fb) then
             qv(CPL_FB+1,iq,jq) = (weight * bt) * (-rho * grav * h_gp * dsdx_gp)
@@ -15699,7 +15769,15 @@ subroutine dg1_cpl_bb3(CS, G, US, i, j, Hc, Bc, Uc, Vc, sub_cell, use_newton, wi
       else
         gr_p = (rhoi_rhow * h_p - bed_p > 0.0)
       endif
-      if (CS%dg_gl_shared_flot) then
+      if (CS%dg_gl_shared_flot .and. CS%dg_cpl_own_surf) then
+        ! DG1_COUPLED_BUBBLE_OWN_SURFACE: the surface of the transported thickness, with its own test.
+        gr_p = (rhoi_rhow * h_p - bed_p > 0.0)
+        if (gr_p) then
+          dsdx = dhdx - dbdx ; dsdy = dhdy - dbdy
+        else
+          dsdx = (1.0 - rhoi_rhow) * dhdx ; dsdy = (1.0 - rhoi_rhow) * dhdy
+        endif
+      elseif (CS%dg_gl_shared_flot) then
         ! DG1_GL_SHARED_FLOTATION: s = (1 - r) h + max(r h_f - D, 0), as in calc_shelf_driving_stress_DG.
         hfq(:,:) = CS%h_flot(i,j,:,:)
         h_fp = ((hfq(1,1) * ((1.0 - xi) * (1.0 - eta))) + (hfq(2,2) * (xi * eta))) + &
