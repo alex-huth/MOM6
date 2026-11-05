@@ -416,6 +416,8 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: gl_band        !< If true, widen gl_sub_float_nbr to every fully grounded cell with a
                             !! neighbour whose ground_frac < 1, and raise the SEP2 rules to a 6-pt
                             !! triangle rule and 3x3 Gauss on quad pieces.
+  logical :: sep2_high_order = .false. !< If true, the SEP2 rules are the 6-pt triangle rule and 3x3 Gauss on quad
+                            !! pieces (GROUNDING_LINE_SUBGRID_HIGH_ORDER or GROUNDING_LINE_SUBGRID_BAND).
   logical :: fric_precompute !< If true (BASAL_FRICTION_PRECOMPUTE), evaluate the basal friction once
                             !! per nonlinear iteration: quadrature-point coefficients for regular cells
                             !! and a corner friction matrix for grounding-line cells, applied by CG_action
@@ -1436,6 +1438,16 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "that varies steeply near flotation, such as the regularized Coulomb law, when "//&
                  "the grounding line changes sub-element branch or a cell becomes fully grounded.", &
                  default=.false., do_not_log=.not.CS%GL_regularize)
+    call get_param(param_file, mdl, "GROUNDING_LINE_SUBGRID_HIGH_ORDER", CS%sep2_high_order, &
+                 "If true, the SEP2 rules are raised from the 3-pt triangle rule and 2x2 Gauss to "//&
+                 "a 6-pt degree-4 triangle rule and 3x3 Gauss on the quadrilateral pieces, as with "//&
+                 "GROUNDING_LINE_SUBGRID_BAND, but the set of cells with sub-element quadrature does "//&
+                 "not change. Every SEP2 term of a cell (the friction, the driving stress, the "//&
+                 "grounded fraction and the DG1_COUPLED_BUBBLE terms) uses the same points. The "//&
+                 "default rules integrate the bubble terms poorly (the bubble squared is degree 8). "//&
+                 "GROUNDING_LINE_SUBGRID_BAND sets this too.", &
+                 default=.false., do_not_log=.not.(CS%GL_regularize .and. CS%use_sep2))
+    CS%sep2_high_order = CS%sep2_high_order .or. CS%gl_band
     call get_param(param_file, mdl, "GROUNDING_LINE_COUPLE", CS%GL_couple, &
                  "If true, let the floatation condition be determined by "//&
                  "ocean column thickness. This means that update_OD_ffrac "//&
@@ -2869,7 +2881,7 @@ subroutine volume_above_floatation_gl(CS, G, ISS, vaf)
     if (max(max(fls0(1), fls0(4)), max(fls0(2), fls0(3))) <= 0.0) cycle
     if (CS%use_sep2) then
       ! The partition of compute_ground_frac; the deficit is linear on each grounded piece.
-      call sep2_cell_qps(fls0, nqp, beta, wref, qpg, high_order=CS%gl_band)
+      call sep2_cell_qps(fls0, nqp, beta, wref, qpg, high_order=CS%sep2_high_order)
       do t=1,4
         vq(1:nqp(t)) = 0.0
         do k=1,nqp(t)
@@ -8994,7 +9006,7 @@ subroutine CG_action_sep2_basal(CS, G, US, H, U_curr, V_curr, U_delta, V_delta, 
       hfc(3) = CS%h_flot(i_elem,j_elem,1,2) ; hfc(4) = CS%h_flot(i_elem,j_elem,2,2)
     endif
   endif
-  call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
+  call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%sep2_high_order)
   build_K = present(Kmat)
 
   do t=1,4
@@ -9218,7 +9230,7 @@ subroutine CG_diagonal_sep2_basal(CS, G, US, H, U_curr, V_curr, &
     hfc(1) = CS%h_flot(i_elem,j_elem,1,1) ; hfc(2) = CS%h_flot(i_elem,j_elem,2,1)
     hfc(3) = CS%h_flot(i_elem,j_elem,1,2) ; hfc(4) = CS%h_flot(i_elem,j_elem,2,2)
   endif
-  call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
+  call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%sep2_high_order)
 
   do t=1,4
     valu(:,1:nqp(t)) = 0.0 ; valv(:,1:nqp(t)) = 0.0
@@ -10063,7 +10075,7 @@ subroutine compute_ground_frac(CS, ISS, G, H_node)
       ! partition, so the diagnostic and gate agree with the friction geometry.
       fls_gf(1) = fls_corners(1,1) ; fls_gf(2) = fls_corners(2,1)
       fls_gf(3) = fls_corners(1,2) ; fls_gf(4) = fls_corners(2,2)
-      call sep2_cell_qps(fls_gf, nqp_gf, beta_gf, wref_gf, qpg_gf, high_order=CS%gl_band)
+      call sep2_cell_qps(fls_gf, nqp_gf, beta_gf, wref_gf, qpg_gf, high_order=CS%sep2_high_order)
       do tq=1,4
         do kq=1,nqp_gf(tq)
           b1_gf = beta_gf(1,kq,tq) ; b2_gf = beta_gf(2,kq,tq)
@@ -11051,7 +11063,7 @@ subroutine calc_shelf_driving_stress_i2n(CS, ISS, G, US, taudx, taudy)
     dxS = G%dxCv(i,j-1) ; dxN = G%dxCv(i,j)
     dyW = G%dyCu(i-1,j) ; dyE = G%dyCu(i,j)
 
-    call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
+    call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%sep2_high_order)
 
     ! Per-triangle P1 gradients of BOTH corner fields. Both terms of S must use the same operator
     ! or the grounded branch does not telescope to grad(h) - grad(bed); see sep2_fan_gradient.
@@ -12666,7 +12678,7 @@ subroutine calc_shelf_driving_stress_DG_sep2(CS, h_nodal_cell, bed_corners, &
     fls(:) = (rhoi_rhow * hfc(:)) - bedc(:)
     call sep2_fan_gradient(hfc, dhfxi, dhfeta)
   endif
-  call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
+  call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%sep2_high_order)
 
   ! P1 fan gradients, the same interpolant sep2_cell_qps cut on.
   call sep2_fan_gradient(hc, dhxi, dheta)
@@ -14963,7 +14975,7 @@ subroutine dg1_post_bubble(CS, ISS, G, US)
       uc4(1) = Uc(1,1) ; uc4(2) = Uc(2,1) ; uc4(3) = Uc(1,2) ; uc4(4) = Uc(2,2)
       vc4(1) = Vc(1,1) ; vc4(2) = Vc(2,1) ; vc4(3) = Vc(1,2) ; vc4(4) = Vc(2,2)
       fls(:) = (rhoi_rhow * hc4(:)) - bc4(:)
-      call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
+      call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%sep2_high_order)
       call sep2_fan_gradient(hc4, dhxi, dheta)
       call sep2_fan_gradient(bc4, dbxi, dbeta)
       do t=1,4
@@ -15392,7 +15404,7 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
         fls(:) = (rhoi_rhow * hf4(:)) - bc4(:)
         call sep2_fan_gradient(hf4, dhfxi, dhfeta)
       endif
-      call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
+      call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%sep2_high_order)
       call sep2_fan_gradient(hc4, dhxi, dheta)
       call sep2_fan_gradient(bc4, dbxi, dbeta)
       do t=1,4
@@ -15460,7 +15472,7 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
         ! DG1_COUPLED_BUBBLE_OWN_SURFACE: the driving stress against the bubbles on the SEP2 partition of the
         ! transported corners, with the surface of the transported thickness.  The loop above left it out.
         fls(:) = (rhoi_rhow * hc4(:)) - bc4(:)
-        call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%gl_band)
+        call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%sep2_high_order)
         do t=1,4
           val(CPL_FB+1:CPL_FB+2,1:nqp(t)) = 0.0
           do kq=1,nqp(t)
