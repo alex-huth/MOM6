@@ -766,6 +766,9 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: dg_cpl_own_surf = .false. !< If true (DG1_COUPLED_BUBBLE_OWN_SURFACE, with DG1_GL_SHARED_FLOTATION),
                                   !! the driving stress against the bubbles reads the surface of the transported
                                   !! thickness with its own flotation test, not the blended corners.
+  logical :: dg_cpl_own_cells = .false. !< If true (DG1_COUPLED_BUBBLE_OWN_SURFACE_CELLS), a cell whose transported
+                                  !! corners straddle flotation takes that driving stress from the sub-cell rule
+                                  !! of its transported corners, also where the blended corners give it none.
   integer :: dg_cpl_quad = 2 !< DG1_COUPLED_BUBBLE_QUAD: the points per direction of the Gauss rule of the bubble
                              !! terms (2, as the rest of the solve, or 3)
   logical :: dg_cpl_crossed = .true. !< If true, DG1_COUPLED_BUBBLE also has a bubble in the grounding-line
@@ -14043,6 +14046,19 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   if (CS%dg_cpl_own_surf .and. .not.(CS%dg_coupled .and. CS%dg_gl_shared_flot)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics, read_DG_params: DG1_COUPLED_BUBBLE_OWN_SURFACE needs DG1_COUPLED_BUBBLE and "//&
       "DG1_GL_SHARED_FLOTATION.")
+  call get_param(param_file, mdl, "DG1_COUPLED_BUBBLE_OWN_SURFACE_CELLS", CS%dg_cpl_own_cells, &
+                 "If true, with DG1_COUPLED_BUBBLE_OWN_SURFACE, a cell whose transported corners straddle "//&
+                 "flotation but whose blended corners give it no sub-cell quadrature (a floating cell, or a "//&
+                 "grounded cell that GROUNDING_LINE_SUBGRID_FLOATING_NEIGHBOR and GROUNDING_LINE_SUBGRID_BAND "//&
+                 "leave out) takes the driving stress against the bubbles from the SEP2 partition of its "//&
+                 "transported corners, or from the own test at the SEP3 sub-points.  Without it, such a cell "//&
+                 "tests flotation at each of its 2x2 or 3x3 points, so that driving stress changes in a step "//&
+                 "each time the contour of the transported thickness crosses a point.  The friction, the matrix "//&
+                 "and the driving stress against the nodes do not change.", &
+                 default=.false., do_not_log=.not.CS%dg_cpl_own_surf)
+  if (CS%dg_cpl_own_cells .and. .not.CS%dg_cpl_own_surf) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics, read_DG_params: DG1_COUPLED_BUBBLE_OWN_SURFACE_CELLS needs "//&
+      "DG1_COUPLED_BUBBLE_OWN_SURFACE.")
   call get_param(param_file, mdl, "DG1_COUPLED_BUBBLE_QUAD", CS%dg_cpl_quad, &
                  "The points per direction of the Gauss rule of the DG1_COUPLED_BUBBLE bubble terms: 2 (as "//&
                  "the rest of the velocity solve) or 3.  The 2-point rule makes the viscous part of the bubble "//&
@@ -15200,7 +15216,12 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
   logical :: fallback  ! The linear-solve blocks of the cell are the Picard blocks
   logical :: own_fb    ! DG1_COUPLED_BUBBLE_OWN_SURFACE: the driving stress against the bubbles reads the
                        ! surface of the transported thickness
+  logical :: own_cell  ! DG1_COUPLED_BUBBLE_OWN_SURFACE_CELLS: the transported corners straddle flotation in a
+                       ! cell without sub-cell quadrature
+  real :: fl_min, fl_max ! The smallest and largest flotation deficit r*h - bed of the transported corners [Z ~> m]
   real, dimension(2) :: fb_keep  ! The stored driving stress against the bubbles [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(2) :: fb_own   ! The driving stress against the bubbles from the sub-cell rule of the transported
+                                 ! corners [R L3 Z T-2 ~> kg m s-2]
   real, dimension(2*CPL_NSET) :: t2 ! DG1_COUPLED_BUBBLE_QUAD = 3: the Picard and linear-solve block values of the
                                     ! 2x2 points [R L2 Z T-1 ~> kg s-1]
   real :: i11, i12, i22, x1, x2  ! The inverse linear-solve bubble block [R-1 L-2 Z-1 T ~> kg-1 s] and
@@ -15258,6 +15279,14 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
 
     Hc(:,:) = CS%h_nodal(i,j,:,:) ; Bc(:,:) = CS%bed_node(I-1:I,J-1:J)
     Uc(:,:) = u_curr(I-1:I,J-1:J) ; Vc(:,:) = v_curr(I-1:I,J-1:J)
+    own_cell = .false.
+    if (own_fb .and. CS%dg_cpl_own_cells .and. .not.sub_cell) then
+      fl_min = min(min((rhoi_rhow * Hc(1,1)) - Bc(1,1), (rhoi_rhow * Hc(2,2)) - Bc(2,2)), &
+                   min((rhoi_rhow * Hc(2,1)) - Bc(2,1), (rhoi_rhow * Hc(1,2)) - Bc(1,2)))
+      fl_max = max(max((rhoi_rhow * Hc(1,1)) - Bc(1,1), (rhoi_rhow * Hc(2,2)) - Bc(2,2)), &
+                   max((rhoi_rhow * Hc(2,1)) - Bc(2,1), (rhoi_rhow * Hc(1,2)) - Bc(1,2)))
+      own_cell = (fl_min <= 0.0) .and. (fl_max > 0.0)
+    endif
     dxCv_S = G%dxCv(i,J-1) ; dxCv_N = G%dxCv(i,J)
     dyCu_W = G%dyCu(I-1,j) ; dyCu_E = G%dyCu(I,j)
     coef_prefactor_e = CS%coef_prefactor(i,j)
@@ -15471,36 +15500,8 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
       if (own_fb) then
         ! DG1_COUPLED_BUBBLE_OWN_SURFACE: the driving stress against the bubbles on the SEP2 partition of the
         ! transported corners, with the surface of the transported thickness.  The loop above left it out.
-        fls(:) = (rhoi_rhow * hc4(:)) - bc4(:)
-        call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%sep2_high_order)
-        do t=1,4
-          val(CPL_FB+1:CPL_FB+2,1:nqp(t)) = 0.0
-          do kq=1,nqp(t)
-            b1 = beta(1,kq,t) ; b2 = beta(2,kq,t) ; b3 = beta(3,kq,t) ; b4 = beta(4,kq,t)
-            mS = b1 + b2 ; mN = b3 + b4 ; mW = b1 + b3 ; mE = b2 + b4
-            bt = dg1_bubble_tilde(mW, mE, mS, mN)
-            a_qp = (dxCv_S * mS) + (dxCv_N * mN)
-            d_qp = (dyCu_W * mW) + (dyCu_E * mE)
-            weight = wref(kq,t) * (a_qp * d_qp)
-            h_gp = ((b1 * hc4(1)) + (b4 * hc4(4))) + ((b2 * hc4(2)) + (b3 * hc4(3)))
-            h_gp = max(h_gp, CS%min_h_shelf)
-            dhdx_gp = dhxi(t) / a_qp ; dhdy_gp = dheta(t) / d_qp
-            dbdx_gp = dbxi(t) / a_qp ; dbdy_gp = dbeta(t) / d_qp
-            if (qpg(kq,t)) then
-              dsdx_gp = dhdx_gp - dbdx_gp ; dsdy_gp = dhdy_gp - dbdy_gp
-            else
-              dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp ; dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
-            endif
-            val(CPL_FB+1,kq) = (weight * bt) * (-rho * grav * h_gp * dsdx_gp)
-            val(CPL_FB+2,kq) = (weight * bt) * (-rho * grav * h_gp * dsdy_gp)
-          enddo
-          do k=CPL_FB+1,CPL_FB+2
-            ptri(k,t) = sep2_qp_sum(val(k,1:nqp(t)), nqp(t))
-          enddo
-        enddo
-        do k=CPL_FB+1,CPL_FB+2
-          tot(k) = tot(k) + ((ptri(k,1) + ptri(k,3)) + (ptri(k,2) + ptri(k,4)))
-        enddo
+        call dg1_own_fb_sep2(CS, hc4, bc4, dxCv_S, dxCv_N, dyCu_W, dyCu_E, rho, grav, rhoi_rhow, fb_own)
+        tot(CPL_FB+1) = tot(CPL_FB+1) + fb_own(1) ; tot(CPL_FB+2) = tot(CPL_FB+2) + fb_own(2)
       endif
     elseif (sub_cell) then
       ! The SEP3 sub-points: the driving stress as in calc_shelf_driving_stress_DG_subgrid, the friction
@@ -15608,6 +15609,19 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
     if (CS%dg_cpl_quad == 3) &
       call dg1_cpl_bb3(CS, G, US, i, j, Hc, Bc, Uc, Vc, sub_cell, use_newton, with_fb, coef_prefactor_e, &
                        min_trac_e, eps_vel2_e, rhoi_rhow, rho_oi_ratio, rho_ice_g_LtoZ, t2, tot)
+    ! DG1_COUPLED_BUBBLE_OWN_SURFACE_CELLS: the contour of the transported corners crosses a cell that has no
+    ! sub-cell quadrature, so the driving stress against the bubbles comes from the sub-cell rule of the
+    ! transported corners in place of the flotation test at the 2x2 or 3x3 points.
+    if (own_cell) then
+      if (CS%use_sep2) then
+        hc4(1) = Hc(1,1) ; hc4(2) = Hc(2,1) ; hc4(3) = Hc(1,2) ; hc4(4) = Hc(2,2)
+        bc4(1) = Bc(1,1) ; bc4(2) = Bc(2,1) ; bc4(3) = Bc(1,2) ; bc4(4) = Bc(2,2)
+        call dg1_own_fb_sep2(CS, hc4, bc4, dxCv_S, dxCv_N, dyCu_W, dyCu_E, rho, grav, rhoi_rhow, fb_own)
+      else
+        call dg1_own_fb_sep3(CS, Hc, Bc, dxCv_S, dxCv_N, dyCu_W, dyCu_E, rho, grav, rhoi_rhow, fb_own)
+      endif
+      tot(CPL_FB+1) = fb_own(1) ; tot(CPL_FB+2) = fb_own(2)
+    endif
     if (.not.with_fb) tot(CPL_FB+1:CPL_FB+2) = fb_keep(:)
     ! The corner friction matrix of the friction cache, summed as in CG_action_subgrid_basal and
     ! CG_action_sep2_basal.
@@ -15855,6 +15869,145 @@ subroutine dg1_cpl_bb3(CS, G, US, i, j, Hc, Bc, Uc, Vc, sub_cell, use_newton, wi
     tot(CPL_FB+1) = sf(1) ; tot(CPL_FB+2) = sf(2)
   endif
 end subroutine dg1_cpl_bb3
+
+!> DG1_COUPLED_BUBBLE_OWN_SURFACE with SEP2: the driving stress against the two bubbles of a cell on the SEP2
+!! partition of its transported corners, with the surface of the transported thickness, h - D where r h > D and
+!! (1 - r) h elsewhere.  The triangles are summed in opposite pairs, as in dg1_cpl_blocks.
+subroutine dg1_own_fb_sep2(CS, hc4, bc4, dxCv_S, dxCv_N, dyCu_W, dyCu_E, rho, grav, rhoi_rhow, fb)
+  type(ice_shelf_dyn_CS), intent(in)  :: CS     !< The ice shelf dynamics control structure
+  real, dimension(4),     intent(in)  :: hc4    !< Transported corner thicknesses, SW, SE, NW, NE [Z ~> m]
+  real, dimension(4),     intent(in)  :: bc4    !< Corner bed depths, SW, SE, NW, NE [Z ~> m]
+  real,                   intent(in)  :: dxCv_S !< The south edge length of the cell [L ~> m]
+  real,                   intent(in)  :: dxCv_N !< The north edge length of the cell [L ~> m]
+  real,                   intent(in)  :: dyCu_W !< The west edge length of the cell [L ~> m]
+  real,                   intent(in)  :: dyCu_E !< The east edge length of the cell [L ~> m]
+  real,                   intent(in)  :: rho    !< The ice density [R ~> kg m-3]
+  real,                   intent(in)  :: grav   !< The gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
+  real,                   intent(in)  :: rhoi_rhow !< Ice to ocean density ratio [nondim]
+  real, dimension(2),     intent(out) :: fb     !< The driving stress against the two bubbles [R L3 Z T-2 ~> kg m s-2]
+
+  real, dimension(4) :: fls      ! Corner flotation deficit r*h - bed [Z ~> m]
+  integer, dimension(4) :: nqp   ! QPs per parent triangle
+  real, dimension(4,SEP2_MAXQP,4) :: beta ! Corner-basis weights per (corner, QP, triangle) [nondim]
+  real, dimension(SEP2_MAXQP,4)   :: wref ! Reference measure per (QP, triangle) [nondim]
+  logical, dimension(SEP2_MAXQP,4) :: qpg ! Grounded state per (QP, triangle)
+  real, dimension(4) :: dhxi, dheta, dbxi, dbeta ! P1 fan gradients of h and bed per triangle [Z ~> m]
+  real, dimension(2,SEP2_MAXQP) :: val ! The driving stress at the QPs of one triangle [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(2,4) :: ptri   ! The driving stress summed over each triangle [R L3 Z T-2 ~> kg m s-2]
+  real :: b1, b2, b3, b4         ! Corner-basis weights at a QP [nondim]
+  real :: mS, mN, mW, mE         ! Marginal sums: 1 - eta, eta, 1 - xi, xi at a QP [nondim]
+  real :: bt                     ! The bubble at a QP [nondim]
+  real :: a_qp, d_qp             ! Cell-edge lengths interpolated to a QP [L ~> m]
+  real :: weight                 ! Driving-stress weight of a QP [L2 ~> m2]
+  real :: h_gp                   ! Thickness at a QP [Z ~> m]
+  real :: dhdx_gp, dhdy_gp, dbdx_gp, dbdy_gp ! Thickness and bed-depth gradients [Z L-1 ~> nondim]
+  real :: dsdx_gp, dsdy_gp       ! Surface gradients [Z L-1 ~> nondim]
+  integer :: t, kq, k
+
+  fls(:) = (rhoi_rhow * hc4(:)) - bc4(:)
+  call sep2_cell_qps(fls, nqp, beta, wref, qpg, high_order=CS%sep2_high_order)
+  call sep2_fan_gradient(hc4, dhxi, dheta)
+  call sep2_fan_gradient(bc4, dbxi, dbeta)
+  do t=1,4
+    val(:,1:nqp(t)) = 0.0
+    do kq=1,nqp(t)
+      b1 = beta(1,kq,t) ; b2 = beta(2,kq,t) ; b3 = beta(3,kq,t) ; b4 = beta(4,kq,t)
+      mS = b1 + b2 ; mN = b3 + b4 ; mW = b1 + b3 ; mE = b2 + b4
+      bt = dg1_bubble_tilde(mW, mE, mS, mN)
+      a_qp = (dxCv_S * mS) + (dxCv_N * mN)
+      d_qp = (dyCu_W * mW) + (dyCu_E * mE)
+      weight = wref(kq,t) * (a_qp * d_qp)
+      h_gp = ((b1 * hc4(1)) + (b4 * hc4(4))) + ((b2 * hc4(2)) + (b3 * hc4(3)))
+      h_gp = max(h_gp, CS%min_h_shelf)
+      dhdx_gp = dhxi(t) / a_qp ; dhdy_gp = dheta(t) / d_qp
+      dbdx_gp = dbxi(t) / a_qp ; dbdy_gp = dbeta(t) / d_qp
+      if (qpg(kq,t)) then
+        dsdx_gp = dhdx_gp - dbdx_gp ; dsdy_gp = dhdy_gp - dbdy_gp
+      else
+        dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp ; dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
+      endif
+      val(1,kq) = (weight * bt) * (-rho * grav * h_gp * dsdx_gp)
+      val(2,kq) = (weight * bt) * (-rho * grav * h_gp * dsdy_gp)
+    enddo
+    do k=1,2
+      ptri(k,t) = sep2_qp_sum(val(k,1:nqp(t)), nqp(t))
+    enddo
+  enddo
+  do k=1,2
+    fb(k) = (ptri(k,1) + ptri(k,3)) + (ptri(k,2) + ptri(k,4))
+  enddo
+end subroutine dg1_own_fb_sep2
+
+!> DG1_COUPLED_BUBBLE_OWN_SURFACE with SEP3: the driving stress against the two bubbles of a cell at its SEP3
+!! sub-points, with the surface of the transported thickness and its own flotation test at each sub-point, as in
+!! the SEP3 branch of dg1_cpl_blocks.  The sub-cells are summed with sum_square_matrix, as there.
+subroutine dg1_own_fb_sep3(CS, Hc, Bc, dxCv_S, dxCv_N, dyCu_W, dyCu_E, rho, grav, rhoi_rhow, fb)
+  type(ice_shelf_dyn_CS), intent(in)  :: CS     !< The ice shelf dynamics control structure
+  real, dimension(2,2),   intent(in)  :: Hc     !< Transported corner thicknesses [Z ~> m]
+  real, dimension(2,2),   intent(in)  :: Bc     !< Corner bed depths [Z ~> m]
+  real,                   intent(in)  :: dxCv_S !< The south edge length of the cell [L ~> m]
+  real,                   intent(in)  :: dxCv_N !< The north edge length of the cell [L ~> m]
+  real,                   intent(in)  :: dyCu_W !< The west edge length of the cell [L ~> m]
+  real,                   intent(in)  :: dyCu_E !< The east edge length of the cell [L ~> m]
+  real,                   intent(in)  :: rho    !< The ice density [R ~> kg m-3]
+  real,                   intent(in)  :: grav   !< The gravitational acceleration [L2 Z-1 T-2 ~> m s-2]
+  real,                   intent(in)  :: rhoi_rhow !< Ice to ocean density ratio [nondim]
+  real, dimension(2),     intent(out) :: fb     !< The driving stress against the two bubbles [R L3 Z T-2 ~> kg m s-2]
+
+  real, allocatable, dimension(:,:,:) :: qf ! The driving stress summed over each sub-cell [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(2,2,2) :: qv   ! The driving stress at the four points of a sub-cell [R L3 Z T-2 ~> kg m s-2]
+  real :: xm1, xm2, ym1, ym2     ! Marginal weights 1 - xi, xi, 1 - eta, eta at a sub-point [nondim]
+  real :: bt                     ! The bubble at a sub-point [nondim]
+  real :: subarea                ! Fractional area of a sub-cell [nondim]
+  real :: a_qp, d_qp             ! Cell-edge lengths interpolated to a sub-point [L ~> m]
+  real :: weight                 ! Driving-stress weight of a sub-point [L2 ~> m2]
+  real :: h_gp, bed_gp           ! Thickness and bed depth at a sub-point [Z ~> m]
+  real :: dhdx_gp, dhdy_gp, dbdx_gp, dbdy_gp ! Thickness and bed-depth gradients [Z L-1 ~> nondim]
+  real :: dsdx_gp, dsdy_gp       ! Surface gradients [Z L-1 ~> nondim]
+  integer :: nsub, isub, jsub, iq, jq, k
+
+  nsub = size(CS%Phisub, 3)
+  subarea = 1.0 / real(nsub)**2
+  allocate(qf(nsub,nsub,2), source=0.0)
+  do jsub=1,nsub ; do isub=1,nsub
+    qv(:,:,:) = 0.0
+    do jq=1,2 ; do iq=1,2
+      ym1 = CS%Phisub(iq,jq,isub,jsub,1,1) + CS%Phisub(iq,jq,isub,jsub,2,1)
+      ym2 = CS%Phisub(iq,jq,isub,jsub,1,2) + CS%Phisub(iq,jq,isub,jsub,2,2)
+      xm1 = CS%Phisub(iq,jq,isub,jsub,1,1) + CS%Phisub(iq,jq,isub,jsub,1,2)
+      xm2 = CS%Phisub(iq,jq,isub,jsub,2,1) + CS%Phisub(iq,jq,isub,jsub,2,2)
+      bt = dg1_bubble_tilde(xm1, xm2, ym1, ym2)
+      a_qp = (dxCv_S * ym1) + (dxCv_N * ym2)
+      d_qp = (dyCu_W * xm1) + (dyCu_E * xm2)
+      weight = 0.25 * subarea * (a_qp * d_qp)
+      h_gp = ((CS%Phisub(iq,jq,isub,jsub,1,1)*Hc(1,1)) + (CS%Phisub(iq,jq,isub,jsub,2,2)*Hc(2,2))) + &
+             ((CS%Phisub(iq,jq,isub,jsub,1,2)*Hc(1,2)) + (CS%Phisub(iq,jq,isub,jsub,2,1)*Hc(2,1)))
+      h_gp = max(h_gp, CS%min_h_shelf)
+      bed_gp = ((CS%Phisub(iq,jq,isub,jsub,1,1)*Bc(1,1)) + (CS%Phisub(iq,jq,isub,jsub,2,2)*Bc(2,2))) + &
+               ((CS%Phisub(iq,jq,isub,jsub,1,2)*Bc(1,2)) + (CS%Phisub(iq,jq,isub,jsub,2,1)*Bc(2,1)))
+      dhdx_gp = ( (((-ym1) * Hc(1,1)) + (( ym2) * Hc(2,2))) + &
+                  ((( ym1) * Hc(2,1)) + ((-ym2) * Hc(1,2))) ) / a_qp
+      dhdy_gp = ( (((-xm1) * Hc(1,1)) + (( xm2) * Hc(2,2))) + &
+                  (((-xm2) * Hc(2,1)) + (( xm1) * Hc(1,2))) ) / d_qp
+      dbdx_gp = (((Bc(1,1) * (-ym1)) + (Bc(2,2) * ( ym2))) + ((Bc(2,1) * ( ym1)) + (Bc(1,2) * (-ym2)))) / a_qp
+      dbdy_gp = (((Bc(1,1) * (-xm1)) + (Bc(2,2) * ( xm2))) + ((Bc(2,1) * (-xm2)) + (Bc(1,2) * ( xm1)))) / d_qp
+      if (rhoi_rhow * h_gp - bed_gp > 0.0) then
+        dsdx_gp = dhdx_gp - dbdx_gp ; dsdy_gp = dhdy_gp - dbdy_gp
+      else
+        dsdx_gp = (1.0 - rhoi_rhow) * dhdx_gp ; dsdy_gp = (1.0 - rhoi_rhow) * dhdy_gp
+      endif
+      qv(1,iq,jq) = (weight * bt) * (-rho * grav * h_gp * dsdx_gp)
+      qv(2,iq,jq) = (weight * bt) * (-rho * grav * h_gp * dsdy_gp)
+    enddo ; enddo
+    do k=1,2
+      qf(isub,jsub,k) = (qv(k,1,1) + qv(k,2,2)) + (qv(k,1,2) + qv(k,2,1))
+    enddo
+  enddo ; enddo
+  do k=1,2
+    call sum_square_matrix(fb(k), qf(:,:,k), nsub)
+  enddo
+  deallocate(qf)
+end subroutine dg1_own_fb_sep3
 
 !> DG1_COUPLED_BUBBLE_QUAD = 3: the coefficients of a cell at one point (xi, eta) of its 3x3 rule, from the corner
 !! velocity (Uc, Vc) and the bubble velocity (ub, vb) of the iterate: the cell-edge lengths and |J|/areaT at the
