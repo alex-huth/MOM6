@@ -803,6 +803,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! domain edge that is not reentrant as the mirror image of the cells inside.
   integer :: dg_lim_twist_fb = 0  !< DG1_LIMITER_CROSSED_TWIST_FALLBACK: 0 remove the twist, 1 the least largest
                                   !! violation.
+  logical :: dg_lim_gup_face = .true. !< DG1_LIMITER_GROUNDED_UPPER_FACE_PASS: the corner upper bounds of
+                                  !! DG1_LIMITER_GROUNDED_UPPER also bound the tilt shifts of the crossed face pass.
   logical :: dg_lim_crossed_straddle !< If true, dg_lim_crossed also treats the two cells of a face the
                                   !! grounding line lies on: a grounded and a floating corner at one node, neither
                                   !! cell crossed.
@@ -14243,6 +14245,14 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   if (CS%dg_lim_grounded_upper .and. ((.not.CS%dg_lim_corner_class) .or. (.not.CS%dg_lim_face))) &
     call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG1_LIMITER_GROUNDED_UPPER needs DG1_LIMITER_CORNER_CLASS "//&
                    "and DG1_LIMITER_FACE_BOUNDS.")
+  call get_param(param_file, mdl, "DG1_LIMITER_GROUNDED_UPPER_FACE_PASS", CS%dg_lim_gup_face, &
+                 "If true, the corner upper bounds (2) of DG1_LIMITER_GROUNDED_UPPER also bound the tilt shifts of "//&
+                 "the face pass of a crossed cell, together with the face bounds.  Where the two cannot both be "//&
+                 "met, the pass takes the shift nearest 0 that meets the corner upper bounds, so it can stop "//&
+                 "acting on a tilt over a small conflict and cut the whole excess when the conflict ends.  If "//&
+                 "false, the corner upper bounds bound only the twist, in the vertex pass, so they cannot conflict "//&
+                 "with the face bounds on a tilt; the grounded face allowance (1) still acts.", &
+                 default=.true., do_not_log=.not.CS%dg_lim_grounded_upper)
   call get_param(param_file, mdl, "DG1_LIMITER_FACE_INVERSION", CS%dg_lim_face_inv, &
                  "If true, with DG1_LIMITER_GROUNDED_UPPER, a face between an ice cell A and its face "//&
                  "neighbour B, one of them not wholly grounded, whose thickness traces are in the reverse "//&
@@ -18553,7 +18563,8 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
           if (gr_ent(i,j,2,1) .and. gr_ent(i,j,2,2)) hi_p = (hi_p - dp_x) + min(dp_x, ag(i,j,2))
           ! The corner upper bounds as bounds on the shift: corner (a,b) moves by (a - 3/2 - m_x) per unit shift.
           ga_x = pl_x ; gb_x = ph_x
-          if (.not.smooth_c) call dg1_lim_cshift_upper(CS%h_nodal(i,j,:,:), hmx, -0.5 - m_x, 0.5 - m_x, 1, ga_x, gb_x)
+          if ((.not.smooth_c) .and. CS%dg_lim_gup_face) &
+            call dg1_lim_cshift_upper(CS%h_nodal(i,j,:,:), hmx, -0.5 - m_x, 0.5 - m_x, 1, ga_x, gb_x)
           ! DG1_LIMITER_FACE_INVERSION: the face bounds of this axis, with the grounded corners kept grounded.
           if (finv) call dg1_lim_face_inv_shift(CS%h_nodal(i,j,:,:), d_n, gr_ent(i,j,:,:), &
                            fhas(i,j,1), fr(i,j,1), fhas(i,j,2), fr(i,j,2), -0.5 - m_x, 0.5 - m_x, 1, rr, &
@@ -18581,7 +18592,8 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
           if (gr_ent(i,j,1,1) .and. gr_ent(i,j,2,1)) hi_m = (hi_m - dm_y) + min(dm_y, ag(i,j,3))
           if (gr_ent(i,j,1,2) .and. gr_ent(i,j,2,2)) hi_p = (hi_p - dp_y) + min(dp_y, ag(i,j,4))
           ga_y = pl_y ; gb_y = ph_y
-          if (.not.smooth_c) call dg1_lim_cshift_upper(CS%h_nodal(i,j,:,:), hmx, -0.5 - m_y, 0.5 - m_y, 2, ga_y, gb_y)
+          if ((.not.smooth_c) .and. CS%dg_lim_gup_face) &
+            call dg1_lim_cshift_upper(CS%h_nodal(i,j,:,:), hmx, -0.5 - m_y, 0.5 - m_y, 2, ga_y, gb_y)
           if (finv) call dg1_lim_face_inv_shift(CS%h_nodal(i,j,:,:), d_n, gr_ent(i,j,:,:), &
                            fhas(i,j,3), fr(i,j,3), fhas(i,j,4), fr(i,j,4), -0.5 - m_y, 0.5 - m_y, 2, rr, &
                            pl_y, ph_y, ga_y, gb_y)
