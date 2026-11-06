@@ -843,9 +843,11 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! excess a twist-only vertex pass would leave [Z ~> m]; 5 steps where that
                                   !! excess is above the trigger; 6, 7, 8 cells skipped by the branch check on
                                   !! entry, in the face pass and in the vertex pass [nondim]; 9 faces given a bound
-                                  !! by DG1_LIMITER_FACE_INVERSION [nondim], 10 the cuts those bounds ask [Z ~> m].
+                                  !! by DG1_LIMITER_FACE_INVERSION [nondim], 10 the cuts those bounds ask [Z ~> m];
+                                  !! 11 cut short by DG1_LIMITER_BRANCH_RULE = PARTIAL; 12 axes of the crossed face
+                                  !! pass with no shift that meets every bound [nondim].
   real :: dg_lim_nstage = 0.0     !< Limiter calls since the last post of dg_lim_stat [nondim]
-  integer, dimension(11) :: id_dg_lim_stat = -1 !< Diagnostic ids of the 11 fields of dg_lim_stat
+  integer, dimension(12) :: id_dg_lim_stat = -1 !< Diagnostic ids of the 12 fields of dg_lim_stat
   logical :: dg_art_visc_node_weight !< Artificial viscosity: the band weight of a face QP is interpolated along
                                   !! the face from the node weights, each the largest weight of the 4 cells there.
   real :: dg_art_visc_lump_frac  !< Artificial viscosity: the lumped fraction theta of the mass matrix whose
@@ -2438,7 +2440,12 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         CS%id_dg_lim_stat(11) = register_diag_field('ice_shelf_model', 'dg_lim_brpart', CS%diag%axesT1, &
            Time, 'DG(1) grounded limiter: fraction of limiter calls in which DG1_LIMITER_BRANCH_RULE = PARTIAL '//&
            'cut the face or vertex pass of a grounded or floating cell short at flotation', 'nondim')
-        if (any(CS%id_dg_lim_stat(:) > 0)) allocate(CS%dg_lim_stat(G%isd:G%ied,G%jsd:G%jed,11), source=0.0)
+        CS%id_dg_lim_stat(12) = register_diag_field('ice_shelf_model', 'dg_lim_face_infeas', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: axes of the face pass of DG1_LIMITER_CROSSED in which no tilt shift '//&
+           'meets every bound, so that the pass leaves the tilt of that axis (or, with '//&
+           'DG1_LIMITER_GROUNDED_UPPER, takes the shift nearest 0 that meets the corner upper bounds), per '//&
+           'limiter call', 'nondim')
+        if (any(CS%id_dg_lim_stat(:) > 0)) allocate(CS%dg_lim_stat(G%isd:G%ied,G%jsd:G%jed,12), source=0.0)
       endif
       if (CS%dg_source_positive) then
         allocate(CS%dg_src_cut_smb(G%isd:G%ied,G%jsd:G%jed), source=0.0)
@@ -3335,7 +3342,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_lim_phi_w, CS%dg_lim_phi(:,:,2), CS%diag)
     if (associated(CS%dg_lim_stat)) then
       if (CS%dg_lim_nstage > 0.0) then
-        do k = 1, 11
+        do k = 1, 12
           if (CS%id_dg_lim_stat(k) > 0) then
             lim_st(:,:) = CS%dg_lim_stat(:,:,k) / CS%dg_lim_nstage
             call post_data(CS%id_dg_lim_stat(k), lim_st, CS%diag)
@@ -18566,7 +18573,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
                       -0.5 - m_x, f_use(i-1,j), lo_m, hi_m, &
                       CS%h_nodal(i,j,2,1), CS%h_nodal(i,j,2,2), d_n(2,1), d_n(2,2), &
                       0.5 - m_x, f_use(i+1,j), lo_p, hi_p, rr, pl_x, ph_x, &
-                      p_x, fl_x, fh_x)
+                      p_x, fl_x, fh_x, ok=ok_x)
         endif
         call dg1_lim_face_bounds(sbar_f(i,j), dm_y, f_use(i,j-1), f_ice(i,j-1), sbar_f(i,j-1), trc(i,j-1,4), lo_m, hi_m)
         call dg1_lim_face_bounds(sbar_f(i,j), dp_y, f_use(i,j+1), f_ice(i,j+1), sbar_f(i,j+1), trc(i,j+1,3), lo_p, hi_p)
@@ -18592,7 +18599,11 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
                       -0.5 - m_y, f_use(i,j-1), lo_m, hi_m, &
                       CS%h_nodal(i,j,1,2), CS%h_nodal(i,j,2,2), d_n(1,2), d_n(2,2), &
                       0.5 - m_y, f_use(i,j+1), lo_p, hi_p, rr, pl_y, ph_y, &
-                      p_y, fl_y, fh_y)
+                      p_y, fl_y, fh_y, ok=ok_y)
+        endif
+        if (do_st) then
+          if (.not.ok_x) CS%dg_lim_stat(i,j,12) = CS%dg_lim_stat(i,j,12) + 1.0
+          if (.not.ok_y) CS%dg_lim_stat(i,j,12) = CS%dg_lim_stat(i,j,12) + 1.0
         endif
         ! The shifts the sweep may still take, from the state after this pass.
         sw_lo(i,j,1) = fl_x - p_x ; sw_hi(i,j,1) = fh_x - p_x
