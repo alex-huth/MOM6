@@ -850,9 +850,12 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! by DG1_LIMITER_FACE_INVERSION [nondim], 10 the cuts those bounds ask [Z ~> m];
                                   !! 11 cut short by DG1_LIMITER_BRANCH_RULE = PARTIAL; 12 axes of the crossed face
                                   !! pass with no shift that meets every bound [nondim]; 13 crossed cells changed by
-                                  !! DG1_LIMITER_CROSSED_CORNER_CLIP [nondim], 14 their largest corner change [Z ~> m].
+                                  !! DG1_LIMITER_CROSSED_CORNER_CLIP [nondim], 14 their largest corner change [Z ~> m];
+                                  !! 15 ice cells the limiter changed whose corners were in the neighbour bounds on
+                                  !! entry [nondim], 16 their largest corner change [Z ~> m]; 17 and 18 the same for
+                                  !! cells with a corner out of those bounds.
   real :: dg_lim_nstage = 0.0     !< Limiter calls since the last post of dg_lim_stat [nondim]
-  integer, dimension(14) :: id_dg_lim_stat = -1 !< Diagnostic ids of the 14 fields of dg_lim_stat
+  integer, dimension(18) :: id_dg_lim_stat = -1 !< Diagnostic ids of the 18 fields of dg_lim_stat
   logical :: dg_art_visc_node_weight !< Artificial viscosity: the band weight of a face QP is interpolated along
                                   !! the face from the node weights, each the largest weight of the 4 cells there.
   real :: dg_art_visc_lump_frac  !< Artificial viscosity: the lumped fraction theta of the mass matrix whose
@@ -2456,7 +2459,22 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         CS%id_dg_lim_stat(14) = register_diag_field('ice_shelf_model', 'dg_lim_ccl_dh', CS%diag%axesT1, &
            Time, 'DG(1) grounded limiter: largest corner thickness change of DG1_LIMITER_CROSSED_CORNER_CLIP, '//&
            'summed over its changes, per limiter call', 'm', conversion=US%Z_to_m)
-        if (any(CS%id_dg_lim_stat(:) > 0)) allocate(CS%dg_lim_stat(G%isd:G%ied,G%jsd:G%jed,14), source=0.0)
+        CS%id_dg_lim_stat(15) = register_diag_field('ice_shelf_model', 'dg_lim_agree_act', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: fraction of limiter calls that changed the ice cell while every corner '//&
+           'surface was, on entry, within the tolerance of the neighbour bounds: the cell means at its node and '//&
+           'the corners of the other ice cells there.  Such a change removes structure that the neighbours '//&
+           'agree with.', 'nondim')
+        CS%id_dg_lim_stat(16) = register_diag_field('ice_shelf_model', 'dg_lim_agree_dh', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: largest corner thickness change of the changes of dg_lim_agree_act, '//&
+           'summed over them, per limiter call', 'm', conversion=US%Z_to_m)
+        CS%id_dg_lim_stat(17) = register_diag_field('ice_shelf_model', 'dg_lim_disagree_act', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: fraction of limiter calls that changed the ice cell while a corner '//&
+           'surface was, on entry, out of the neighbour bounds of dg_lim_agree_act by more than the tolerance', &
+           'nondim')
+        CS%id_dg_lim_stat(18) = register_diag_field('ice_shelf_model', 'dg_lim_disagree_dh', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: largest corner thickness change of the changes of dg_lim_disagree_act, '//&
+           'summed over them, per limiter call', 'm', conversion=US%Z_to_m)
+        if (any(CS%id_dg_lim_stat(:) > 0)) allocate(CS%dg_lim_stat(G%isd:G%ied,G%jsd:G%jed,18), source=0.0)
       endif
       if (CS%dg_source_positive) then
         allocate(CS%dg_src_cut_smb(G%isd:G%ied,G%jsd:G%jed), source=0.0)
@@ -3353,7 +3371,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_lim_phi_w, CS%dg_lim_phi(:,:,2), CS%diag)
     if (associated(CS%dg_lim_stat)) then
       if (CS%dg_lim_nstage > 0.0) then
-        do k = 1, 14
+        do k = 1, 18
           if (CS%id_dg_lim_stat(k) > 0) then
             lim_st(:,:) = CS%dg_lim_stat(:,:,k) / CS%dg_lim_nstage
             call post_data(CS%id_dg_lim_stat(k), lim_st, CS%diag)
@@ -17771,6 +17789,15 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   real, dimension(2,2) :: ccl_lo, ccl_hi ! DG1_LIMITER_CROSSED_CORNER_CLIP: corner surface bounds [Z ~> m]
   real, dimension(2,2) :: ccl_d, ccl_h   ! DG1_LIMITER_CROSSED_CORNER_CLIP: corner beds and new corners [Z ~> m]
   logical :: ccl_act  ! DG1_LIMITER_CROSSED_CORNER_CLIP changed the cell
+  logical :: do_agr   ! Accumulate dg_lim_agree_* and dg_lim_disagree_*
+  real, allocatable, dimension(:,:,:,:) :: h_ent ! Corner thicknesses on entry, for dg_lim_agree_* [Z ~> m]
+  real, allocatable, dimension(:,:) :: e_agr     ! Largest excess of a corner surface over the neighbour bounds,
+                                                 ! less the tolerance, on entry [Z ~> m]
+  real :: u_m, l_m   ! Largest and smallest cell-mean surface at a node [Z ~> m]
+  real :: u_n, l_n   ! Largest and smallest corner surface of the other ice cells at a node [Z ~> m]
+  real :: s_o        ! A corner surface of another ice cell at a node [Z ~> m]
+  real :: dhm        ! Largest corner thickness change of a cell over the limiter [Z ~> m]
+  integer :: a2, b2  ! Corner indices of another cell at a node, for dg_lim_agree_*
   logical :: ok_x, ok_y ! A shift meets every bound of the face pass along x and y
   logical :: finv    ! DG1_LIMITER_FACE_INVERSION is in use
   logical :: use_ngc ! The cells are classified by their corners (DG1_LIMITER_CORNER_CLASS or DG1_GROUND_FRAC_CORNERS)
@@ -17904,6 +17931,37 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
     enddo ; enddo
   enddo ; enddo
   if (.not.CS%dg_lim_edge_mirror) sbar_f(:,:) = sbar(:,:)
+
+  ! dg_lim_agree_*: on entry, how far each ice cell is out of the neighbour bounds, the cell-mean surfaces at the
+  ! node of each corner and the corners of the other ice cells there.  A continuous state is in them, so a change
+  ! of a cell that is in them removes structure its neighbours agree with.
+  do_agr = .false.
+  if (do_st) do_agr = any(CS%id_dg_lim_stat(15:18) > 0)
+  if (do_agr) then
+    allocate(h_ent, source=CS%h_nodal)
+    allocate(e_agr(isd:ied,jsd:jed), source=0.0)
+    do j = jsc, jec ; do i = isc, iec
+      if (hmask(i,j) /= 1.0) cycle
+      e_agr(i,j) = -huge(1.0)
+      do b = 1, 2 ; do a = 1, 2
+        u_m = -huge(1.0) ; l_m = huge(1.0) ; u_n = -huge(1.0) ; l_n = huge(1.0)
+        do jj = j+b-2, j+b-1 ; do ii = i+a-2, i+a-1
+          if (have(ii,jj)) then
+            u_m = max(u_m, sbar(ii,jj)) ; l_m = min(l_m, sbar(ii,jj))
+          endif
+          if (((ii /= i) .or. (jj /= j)) .and. ((hmask(ii,jj) == 1.0) .or. (hmask(ii,jj) == 3.0))) then
+            a2 = 2 ; if (ii == i+a-1) a2 = 1
+            b2 = 2 ; if (jj == j+b-1) b2 = 1
+            s_o = max(CS%h_nodal(ii,jj,a2,b2) - CS%bed_node(i-2+a,j-2+b), (1.0 - rr) * CS%h_nodal(ii,jj,a2,b2))
+            u_n = max(u_n, s_o) ; l_n = min(l_n, s_o)
+          endif
+        enddo ; enddo
+        s_o = max(CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b), (1.0 - rr) * CS%h_nodal(i,j,a,b))
+        e_agr(i,j) = max(e_agr(i,j), max(s_o - max(u_m, u_n), min(l_m, l_n) - s_o) - &
+                                     max(CS%dg_lim_d0, lim_eps * (u_m - l_m)))
+      enddo ; enddo
+    enddo ; enddo
+  endif
 
   ! DG1_LIMITER_FACE_BOUNDS: the face-midpoint surfaces of every ice cell on entry, so that the bounds
   ! do not depend on the order in which the loop below changes the cells.
@@ -18830,6 +18888,25 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
         call dg1_bud_add(CS, i, j, 9, bud_w, CS%h_nodal(i,j,:,:) - h_c(i,j,:,:))
       enddo ; enddo
     endif
+  endif
+
+  ! dg_lim_agree_*: the changes of this call, split by the neighbour bounds on entry.  A change below 1e-3 d0 is
+  ! taken as round-off.
+  if (do_agr) then
+    do j = jsc, jec ; do i = isc, iec
+      if (hmask(i,j) /= 1.0) cycle
+      dhm = max(max(abs(CS%h_nodal(i,j,1,1) - h_ent(i,j,1,1)), abs(CS%h_nodal(i,j,2,2) - h_ent(i,j,2,2))), &
+                max(abs(CS%h_nodal(i,j,1,2) - h_ent(i,j,1,2)), abs(CS%h_nodal(i,j,2,1) - h_ent(i,j,2,1))))
+      if (dhm <= 1.0e-3 * CS%dg_lim_d0) cycle
+      if (e_agr(i,j) <= 0.0) then
+        CS%dg_lim_stat(i,j,15) = CS%dg_lim_stat(i,j,15) + 1.0
+        CS%dg_lim_stat(i,j,16) = CS%dg_lim_stat(i,j,16) + dhm
+      else
+        CS%dg_lim_stat(i,j,17) = CS%dg_lim_stat(i,j,17) + 1.0
+        CS%dg_lim_stat(i,j,18) = CS%dg_lim_stat(i,j,18) + dhm
+      endif
+    enddo ; enddo
+    deallocate(h_ent, e_agr)
   endif
 end subroutine dg1_grounded_limiter
 
