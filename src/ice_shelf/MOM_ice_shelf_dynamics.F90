@@ -14327,17 +14327,21 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "too).  Needs DG1_LIMITER_FACE_BOUNDS.", &
                  default=.false., do_not_log=.not.CS%dg_lim_crossed)
   call get_param(param_file, mdl, "DG1_LIMITER_CROSSED_CORNER_CLIP", ccl_str, &
-                 "A one-sided corner clip for the cells of DG1_LIMITER_CROSSED.  The upper surface bound of each "//&
-                 "corner (that of the vertex pass: the largest cell mean at its node and the surface of the flat "//&
-                 "cell, or the cap of DG1_LIMITER_GROUNDED_UPPER) is widened to hold the flat surface whose corner "//&
-                 "thicknesses, on the bed of each corner and at or above 0, have the mean thickness of the cell, "//&
-                 "and becomes a thickness bound on the branch of the corner; the lower bound is 0, so thinning is "//&
-                 "not limited.  Where a corner surface is above its bound by more than the tolerance (the larger "//&
-                 "of DG1_LIMITER_D0 and 2% of the surface range of the bounds, so it falls with the grid "//&
-                 "spacing), every corner is clipped to its bound and the mass of the clip is given back to the "//&
-                 "other corners in proportion to their room below the bound; the flat surface shows the room is "//&
-                 "enough, so the mean is kept, every corner ends in its bound, and the change is continuous in the "//&
-                 "state (it fades in between one and two tolerances).  'OFF': not used.  'REPLACE': in place of "//&
+                 "A corner clip for the cells of DG1_LIMITER_CROSSED.  Each corner has the floor "//&
+                 "min(MIN_H_SHELF, cell mean).  The upper surface bound of each corner (that of the vertex pass: "//&
+                 "the largest cell mean at its node and the surface of the flat cell, or the cap of "//&
+                 "DG1_LIMITER_GROUNDED_UPPER) is widened to hold the flat surface whose corner thicknesses, on the "//&
+                 "bed of each corner and at or above 0, have the mean thickness of the cell, and the surface of "//&
+                 "the corner at its floor, and becomes a thickness bound on the branch of the corner; thinning "//&
+                 "above the floor is not limited.  Where a corner surface is above its bound by more than the "//&
+                 "tolerance (the larger of DG1_LIMITER_D0 and 2% of the surface range of the bounds, so it falls "//&
+                 "with the grid spacing), every corner is clipped to its bound and the mass of the clip is given "//&
+                 "back to the other corners in proportion to their room below the bound; the flat surface shows "//&
+                 "the room is enough (this fades in between one and two tolerances).  Then a corner below its "//&
+                 "floor is lifted to it and the mass is taken from every corner in proportion to its room above "//&
+                 "the floor, which only lowers corners.  So the mean is kept, every corner ends in its bounds, "//&
+                 "the positivity limit has nothing left to do in the cell, and the change is continuous in the "//&
+                 "state.  'OFF': not used.  'REPLACE': in place of "//&
                  "the face pass and the vertex pass of a crossed cell, so it is the only limit there; "//&
                  "DG1_LIMITER_GROUNDED_UPPER then sets the upper bound only, and "//&
                  "DG1_LIMITER_GROUNDED_UPPER_FACE_PASS has no effect.", &
@@ -18508,7 +18512,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
           if (gup) ccl_hi(a,b) = ucor(a,b)
         enddo ; enddo
         call dg1_lim_corner_clip(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:), ccl_d, ccl_lo, ccl_hi, rr, &
-                                 CS%dg_lim_d0, lim_eps, pi_lim, ccl_h, ccl_act)
+                                 CS%dg_lim_d0, lim_eps, pi_lim, CS%min_h_shelf, ccl_h, ccl_act)
         if (ccl_act) then
           if (do_st) then
             CS%dg_lim_stat(i,j,13) = CS%dg_lim_stat(i,j,13) + 1.0
@@ -19125,15 +19129,18 @@ pure real function dg1_lim_flat_surface(hb, wc, dn, rr)
   if (slm > 0.0) dg1_lim_flat_surface = p + (hb - fp) / slm
 end function dg1_lim_flat_surface
 
-!> DG1_LIMITER_CROSSED_CORNER_CLIP: the one-sided corner clip of a crossed cell.  The upper surface bound shi of each
-!! corner is widened to hold the flat surface of dg1_lim_flat_surface and becomes the thickness bound b on the branch
-!! of the corner, at or above 0; the lower bound is 0.  Where a corner surface is above its bound by more than the
-!! tolerance, every corner is clipped to its bound, and the mass that the clip removes is given back to the corners in
-!! proportion to their room below the bound, which the flat surface shows is enough.  So the mean is kept, every
-!! corner ends in its bound, and the change is continuous in the state; it fades in between one and two tolerances,
-!! as in the vertex pass.  The tolerance is the larger of d0 and eps times the largest surface range of the bounds
+!> DG1_LIMITER_CROSSED_CORNER_CLIP: the corner clip of a crossed cell.  Each corner has the floor min(h_min, hb), with
+!! hb the cell mean.  The upper surface bound shi of each corner is widened to hold the flat surface of
+!! dg1_lim_flat_surface and the surface of the corner at its floor, and becomes the thickness bound on the branch of
+!! the corner.  First, where a corner surface is above its bound by more than the tolerance, every corner is clipped
+!! to its bound, and the mass that the clip removes is given back to the corners in proportion to their room below
+!! the bound, which the flat surface shows is enough; this fades in between one and two tolerances, as in the vertex
+!! pass.  Then a corner below its floor is lifted to it, and the mass is taken from the corners in proportion to their
+!! room above the floor, which the mean shows is enough; this only lowers corners, so the upper bounds still hold.
+!! So the mean is kept, no corner ends below its floor or (past the fade-in) above its bound, and the change is
+!! continuous in the state.  The tolerance is the larger of d0 and eps times the largest surface range of the bounds
 !! (from slo, widened to the flat surface), so it falls with the grid spacing and the bed does not widen it.
-pure subroutine dg1_lim_corner_clip(hn, wc, dn, slo, shi, rr, d0, eps, pi_c, hout, acted)
+pure subroutine dg1_lim_corner_clip(hn, wc, dn, slo, shi, rr, d0, eps, pi_c, h_min, hout, acted)
   real, dimension(2,2), intent(in)  :: hn   !< Corner thicknesses [Z ~> m]
   real, dimension(2,2), intent(in)  :: wc   !< Corner weights of the cell mean [L2 ~> m2]
   real, dimension(2,2), intent(in)  :: dn   !< Bed depths at the corners, positive down [Z ~> m]
@@ -19143,10 +19150,14 @@ pure subroutine dg1_lim_corner_clip(hn, wc, dn, slo, shi, rr, d0, eps, pi_c, hou
   real,                 intent(in)  :: d0   !< The smallest tolerance [Z ~> m]
   real,                 intent(in)  :: eps  !< The tolerance as a fraction of the largest surface range [nondim]
   real,                 intent(in)  :: pi_c !< Pi, for the fade-in [nondim]
+  real,                 intent(in)  :: h_min !< The floor of the corner thicknesses, MIN_H_SHELF [Z ~> m]
   real, dimension(2,2), intent(out) :: hout !< The new corner thicknesses [Z ~> m]
   logical,              intent(out) :: acted !< The corners changed
 
   real, dimension(2,2) :: hi_t       ! Corner thickness upper bounds [Z ~> m]
+  real :: lo_t    ! The floor of every corner [Z ~> m]
+  real :: s_lo    ! The surface of a corner at its floor [Z ~> m]
+  logical :: low  ! A corner is below its floor
   real, dimension(2,2) :: hc, rm     ! Clipped corners, and their room below the bound [Z ~> m]
   real :: hb      ! The mean thickness [Z ~> m]
   real :: s_ref   ! The flat surface [Z ~> m]
@@ -19164,35 +19175,54 @@ pure subroutine dg1_lim_corner_clip(hn, wc, dn, slo, shi, rr, d0, eps, pi_c, hou
   hout(:,:) = hn(:,:) ; acted = .false.
   hb = nodal_cell_mean(hn, wc)
   s_ref = dg1_lim_flat_surface(hb, wc, dn, rr)
-  e_max = 0.0 ; r_max = 0.0
+  lo_t = min(h_min, hb)
+  e_max = 0.0 ; r_max = 0.0 ; low = .false.
   do b = 1, 2 ; do a = 1, 2
-    s_hi = max(shi(a,b), s_ref)
-    hi_t(a,b) = max(dg1_lim_h_from_s(s_hi, dn(a,b), rr), 0.0)
+    ! A bound below the floor would ask for a corner below MIN_H_SHELF, as on a bed high beside ice-free cells.
     if (dn(a,b) > 0.0) then
-      s_c = max(hn(a,b) - dn(a,b), (1.0 - rr) * hn(a,b))
+      s_c = max(hn(a,b) - dn(a,b), (1.0 - rr) * hn(a,b)) ; s_lo = max(lo_t - dn(a,b), (1.0 - rr) * lo_t)
     else
-      s_c = hn(a,b) - dn(a,b)
+      s_c = hn(a,b) - dn(a,b) ; s_lo = lo_t - dn(a,b)
     endif
+    s_hi = max(max(shi(a,b), s_ref), s_lo)
+    hi_t(a,b) = max(dg1_lim_h_from_s(s_hi, dn(a,b), rr), lo_t)
     e_max = max(e_max, s_c - s_hi)
     r_max = max(r_max, s_hi - min(slo(a,b), s_ref))
+    if (hn(a,b) < lo_t) low = .true.
   enddo ; enddo
   delta = max(d0, eps * r_max)
-  if (e_max <= delta) return
-  do b = 1, 2 ; do a = 1, 2
-    hc(a,b) = min(hn(a,b), hi_t(a,b))
-  enddo ; enddo
-  em = hb - nodal_cell_mean(hc, wc)
-  if (em > 0.0) then
-    do b = 1, 2 ; do a = 1, 2 ; rm(a,b) = hi_t(a,b) - hc(a,b) ; enddo ; enddo
-    rs = nodal_cell_mean(rm, wc) ; lam = 0.0
-    if (rs > 0.0) lam = min(1.0, em / rs)
-    do b = 1, 2 ; do a = 1, 2 ; hc(a,b) = hc(a,b) + lam * rm(a,b) ; enddo ; enddo
+  if ((e_max <= delta) .and. (.not.low)) return
+  if (e_max > delta) then
+    do b = 1, 2 ; do a = 1, 2
+      hc(a,b) = min(hn(a,b), hi_t(a,b))
+    enddo ; enddo
+    em = hb - nodal_cell_mean(hc, wc)
+    if (em > 0.0) then
+      do b = 1, 2 ; do a = 1, 2 ; rm(a,b) = hi_t(a,b) - hc(a,b) ; enddo ; enddo
+      rs = nodal_cell_mean(rm, wc) ; lam = 0.0
+      if (rs > 0.0) lam = min(1.0, em / rs)
+      do b = 1, 2 ; do a = 1, 2 ; hc(a,b) = hc(a,b) + lam * rm(a,b) ; enddo ; enddo
+    endif
+    xf = min(1.0, max(0.0, e_max / delta - 1.0))
+    g_f = 0.5*(1.0 + cos(pi_c*xf))
+    do b = 1, 2 ; do a = 1, 2
+      hout(a,b) = hn(a,b) + (1.0 - g_f) * (hc(a,b) - hn(a,b))
+    enddo ; enddo
   endif
-  xf = min(1.0, max(0.0, e_max / delta - 1.0))
-  g_f = 0.5*(1.0 + cos(pi_c*xf))
+  ! The floor: lift the corners below it, and take the mass from the room of every corner above it.
+  low = .false.
   do b = 1, 2 ; do a = 1, 2
-    hout(a,b) = hn(a,b) + (1.0 - g_f) * (hc(a,b) - hn(a,b))
+    if (hout(a,b) < lo_t) low = .true.
   enddo ; enddo
+  if (low) then
+    do b = 1, 2 ; do a = 1, 2
+      hc(a,b) = max(hout(a,b), lo_t) ; rm(a,b) = hc(a,b) - lo_t
+    enddo ; enddo
+    em = nodal_cell_mean(hc, wc) - hb
+    rs = nodal_cell_mean(rm, wc) ; lam = 0.0
+    if ((em > 0.0) .and. (rs > 0.0)) lam = min(1.0, em / rs)
+    do b = 1, 2 ; do a = 1, 2 ; hout(a,b) = hc(a,b) - lam * rm(a,b) ; enddo ; enddo
+  endif
   acted = .true.
 end subroutine dg1_lim_corner_clip
 
