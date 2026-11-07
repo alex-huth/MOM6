@@ -19457,7 +19457,14 @@ pure subroutine dg1_lim_corner_project(hn, wc, dn, slo, shi, one_sided, rr, h_mi
   enddo ; enddo
   if (inb) return
 
-  p_lo = -huge(1.0) ; g_lo = -huge(1.0) ; p_hi = huge(1.0) ; g_hi = huge(1.0)
+  ! At the smallest break every corner is at its lower bound and the mean is at most hb; at the largest every
+  ! corner is at its upper bound and the mean is at least hb.  The scaling of the lower bounds and the raise of
+  ! the upper bounds above meet hb only to round-off, so these ends start the search with the sign they have
+  ! in exact arithmetic; otherwise an end just past hb would be missed and the shift lost.
+  p_lo = min(min(hl(1,1) - hn(1,1), hl(2,2) - hn(2,2)), min(hl(1,2) - hn(1,2), hl(2,1) - hn(2,1)))
+  p_hi = max(max(hu(1,1) - hn(1,1), hu(2,2) - hn(2,2)), max(hu(1,2) - hn(1,2), hu(2,1) - hn(2,1)))
+  g_lo = min(nodal_cell_mean(hl, wc) - hb, 0.0)
+  g_hi = max(nodal_cell_mean(hu, wc) - hb, 0.0)
   do k = 1, 2 ; do b = 1, 2 ; do a = 1, 2
     if (k == 1) then
       x = hl(a,b) - hn(a,b)
@@ -19473,8 +19480,7 @@ pure subroutine dg1_lim_corner_project(hn, wc, dn, slo, shi, one_sided, rr, h_mi
       p_hi = x ; g_hi = gx
     endif
   enddo ; enddo ; enddo
-  ! The mean is hb - ml <= 0 at the smallest break and mu_u - hb >= 0 at the largest, so both ends are found, and
-  ! no break lies between them, so the mean is linear there.
+  ! No break lies between p_lo and p_hi, so the mean is linear there.
   if (g_lo == 0.0) then
     mu = p_lo
   elseif ((g_hi == 0.0) .or. (p_hi <= p_lo)) then
