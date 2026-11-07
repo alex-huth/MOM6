@@ -813,6 +813,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! passes of a crossed cell.
   integer :: dg_lim_cp = 0        !< DG1_LIMITER_CORNER_PROJECT: 0 off, 1 in place of the passes of the crossed
                                   !! cells, 2 in place of every pass of every ice cell.
+  logical :: dg_lim_cp_all = .false. !< DG1_LIMITER_CORNER_PROJECT_ENDORSE = ALL: the corners of the other ice
+                                  !! cells at a node widen the bounds of a corner only as far as all of them agree.
   logical :: dg_lim_crossed_float !< If true, with dg_lim_crossed and dg_lim_face, a floating corner of a crossed
                                   !! cell on a face with a wholly floating cell is bounded in thickness by that cell.
   logical :: dg_lim_float_d0_thick !< If true, the grounded limiter takes dg_lim_d0 as a thickness on wholly
@@ -13303,6 +13305,7 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   character(len=40) :: twist_fb_str ! DG1_LIMITER_CROSSED_TWIST_FALLBACK
   character(len=40) :: ccl_str      ! DG1_LIMITER_CROSSED_CORNER_CLIP
   character(len=40) :: cp_str       ! DG1_LIMITER_CORNER_PROJECT
+  character(len=40) :: cpe_str      ! DG1_LIMITER_CORNER_PROJECT_ENDORSE
   character(len=16) :: br_rule      ! DG1_LIMITER_BRANCH_RULE
 
 
@@ -14377,8 +14380,9 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "A corner projection in place of the passes of DG1_GROUNDED_LIMITER.  Each corner of an ice cell "//&
                  "has the floor min(MIN_H_SHELF, cell mean) and surface bounds from the state on entry: the "//&
                  "smallest and largest of the cell-mean surfaces at its node and of the corner surfaces of the "//&
-                 "other ice cells there, widened by the allowance max(DG1_LIMITER_D0, 2% of the cell-mean range at "//&
-                 "the node) and to hold the flat surface of the cell, which has its mean thickness.  A crossed "//&
+                 "other ice cells there (DG1_LIMITER_CORNER_PROJECT_ENDORSE), widened by the allowance "//&
+                 "max(DG1_LIMITER_D0, 2% of the cell-mean range at the node) and to hold the flat surface of "//&
+                 "the cell, which has its mean thickness.  A crossed "//&
                  "cell of DG1_LIMITER_CROSSED has no lower surface bound.  The bounds become thickness bounds on "//&
                  "the branch of each corner, at or above the floor; where the lower bounds ask for more than the "//&
                  "mean, "//&
@@ -14395,6 +14399,20 @@ subroutine read_DG_params(param_file, mdl, CS, US)
     case ("ALL") ; CS%dg_lim_cp = 2
     case default ; call MOM_error(FATAL, "read_DG_params: DG1_LIMITER_CORNER_PROJECT must be OFF, CROSSED or "//&
                                   "ALL, not "//trim(cp_str)//".")
+  end select
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_ENDORSE", cpe_str, &
+                 "How the corners of the other ice cells at a node widen the surface bounds of a corner of "//&
+                 "DG1_LIMITER_CORNER_PROJECT (and the neighbour bounds of dg_lim_agree_*) past the cell-mean "//&
+                 "surfaces there.  'ANY': up to the largest and down to the smallest of these corners, so that one "//&
+                 "other cell that agrees is enough.  'ALL': up to the smallest and down to the largest of them, so "//&
+                 "that all the other ice cells at the node must agree; two cells that share an overshoot at a node "//&
+                 "then do not hold each other in bounds.  A continuous state is in the bounds of both.", &
+                 default="ANY", do_not_log=(CS%dg_lim_cp == 0))
+  select case (trim(cpe_str))
+    case ("ANY") ; CS%dg_lim_cp_all = .false.
+    case ("ALL") ; CS%dg_lim_cp_all = .true.
+    case default ; call MOM_error(FATAL, "read_DG_params: DG1_LIMITER_CORNER_PROJECT_ENDORSE must be ANY or "//&
+                                  "ALL, not "//trim(cpe_str)//".")
   end select
   if ((CS%dg_lim_cp == 1) .and. (.not.CS%dg_lim_crossed)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT = CROSSED needs DG1_LIMITER_CROSSED.")
@@ -17827,7 +17845,10 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   real, allocatable, dimension(:,:) :: e_agr     ! Largest excess of a corner surface over the neighbour bounds,
                                                  ! less the tolerance, on entry [Z ~> m]
   real :: u_m, l_m   ! Largest and smallest cell-mean surface at a node [Z ~> m]
-  real :: u_n, l_n   ! Largest and smallest corner surface of the other ice cells at a node [Z ~> m]
+  real :: u_n, l_n   ! Upper and lower surface bounds from the corners of the other ice cells at a node: the
+                     ! largest and smallest of them, or with DG1_LIMITER_CORNER_PROJECT_ENDORSE = ALL the
+                     ! smallest and largest [Z ~> m]
+  real :: o_hi, o_lo ! Largest and smallest corner surface of the other ice cells at a node [Z ~> m]
   real :: s_o        ! A corner surface of another ice cell at a node [Z ~> m]
   real :: dhm        ! Largest corner thickness change of a cell over the limiter [Z ~> m]
   integer :: a2, b2  ! Corner indices of another cell at a node, for dg_lim_agree_* and the projection
@@ -17983,7 +18004,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
       if (hmask(i,j) /= 1.0) cycle
       e_agr(i,j) = -huge(1.0)
       do b = 1, 2 ; do a = 1, 2
-        u_m = -huge(1.0) ; l_m = huge(1.0) ; u_n = -huge(1.0) ; l_n = huge(1.0)
+        u_m = -huge(1.0) ; l_m = huge(1.0) ; o_hi = -huge(1.0) ; o_lo = huge(1.0)
         do jj = j+b-2, j+b-1 ; do ii = i+a-2, i+a-1
           if (have(ii,jj)) then
             u_m = max(u_m, sbar(ii,jj)) ; l_m = min(l_m, sbar(ii,jj))
@@ -17992,9 +18013,11 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
             a2 = 2 ; if (ii == i+a-1) a2 = 1
             b2 = 2 ; if (jj == j+b-1) b2 = 1
             s_o = max(CS%h_nodal(ii,jj,a2,b2) - CS%bed_node(i-2+a,j-2+b), (1.0 - rr) * CS%h_nodal(ii,jj,a2,b2))
-            u_n = max(u_n, s_o) ; l_n = min(l_n, s_o)
+            o_hi = max(o_hi, s_o) ; o_lo = min(o_lo, s_o)
           endif
         enddo ; enddo
+        u_n = o_hi ; l_n = o_lo
+        if (CS%dg_lim_cp_all .and. (o_hi >= o_lo)) then ; u_n = o_lo ; l_n = o_hi ; endif
         s_o = max(CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b), (1.0 - rr) * CS%h_nodal(i,j,a,b))
         e_agr(i,j) = max(e_agr(i,j), max(s_o - max(u_m, u_n), min(l_m, l_n) - s_o) - &
                                      max(CS%dg_lim_d0, lim_eps * (u_m - l_m)))
@@ -18941,7 +18964,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
               (CS%cell_mean_w(i,j,1,2) + CS%cell_mean_w(i,j,2,1)))
       if (area <= 0.0) cycle
       do b = 1, 2 ; do a = 1, 2
-        u_m = -huge(1.0) ; l_m = huge(1.0) ; u_n = -huge(1.0) ; l_n = huge(1.0)
+        u_m = -huge(1.0) ; l_m = huge(1.0) ; o_hi = -huge(1.0) ; o_lo = huge(1.0)
         do jj = j+b-2, j+b-1 ; do ii = i+a-2, i+a-1
           if (have(ii,jj)) then
             u_m = max(u_m, sbar(ii,jj)) ; l_m = min(l_m, sbar(ii,jj))
@@ -18951,9 +18974,12 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
             a2 = 2 ; if (ii == i+a-1) a2 = 1
             b2 = 2 ; if (jj == j+b-1) b2 = 1
             s_o = max(h_pe(ii,jj,a2,b2) - CS%bed_node(i-2+a,j-2+b), (1.0 - rr) * h_pe(ii,jj,a2,b2))
-            u_n = max(u_n, s_o) ; l_n = min(l_n, s_o)
+            o_hi = max(o_hi, s_o) ; o_lo = min(o_lo, s_o)
           endif
         enddo ; enddo
+        ! DG1_LIMITER_CORNER_PROJECT_ENDORSE = ALL: the bounds widen only as far as every other ice cell agrees.
+        u_n = o_hi ; l_n = o_lo
+        if (CS%dg_lim_cp_all .and. (o_hi >= o_lo)) then ; u_n = o_lo ; l_n = o_hi ; endif
         cp_d(a,b) = CS%bed_node(i-2+a,j-2+b)
         cp_hi(a,b) = max(u_m, u_n) + max(CS%dg_lim_d0, lim_eps * (u_m - l_m))
         cp_lo(a,b) = min(l_m, l_n) - max(CS%dg_lim_d0, lim_eps * (u_m - l_m))
