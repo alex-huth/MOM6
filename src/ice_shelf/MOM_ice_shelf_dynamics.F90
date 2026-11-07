@@ -809,6 +809,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! grounding line lies on: a grounded and a floating corner at one node, neither
                                   !! cell crossed.
   logical :: dg_lim_crossed_sweep !< If true, dg_lim_crossed ends with the troubled-cell sweep of the tilts.
+  integer :: dg_lim_ccl = 0       !< DG1_LIMITER_CROSSED_CORNER_CLIP: 0 off, 2 in place of the face and vertex
+                                  !! passes of a crossed cell.
   logical :: dg_lim_crossed_float !< If true, with dg_lim_crossed and dg_lim_face, a floating corner of a crossed
                                   !! cell on a face with a wholly floating cell is bounded in thickness by that cell.
   logical :: dg_lim_float_d0_thick !< If true, the grounded limiter takes dg_lim_d0 as a thickness on wholly
@@ -847,9 +849,10 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! entry, in the face pass and in the vertex pass [nondim]; 9 faces given a bound
                                   !! by DG1_LIMITER_FACE_INVERSION [nondim], 10 the cuts those bounds ask [Z ~> m];
                                   !! 11 cut short by DG1_LIMITER_BRANCH_RULE = PARTIAL; 12 axes of the crossed face
-                                  !! pass with no shift that meets every bound [nondim].
+                                  !! pass with no shift that meets every bound [nondim]; 13 crossed cells changed by
+                                  !! DG1_LIMITER_CROSSED_CORNER_CLIP [nondim], 14 their largest corner change [Z ~> m].
   real :: dg_lim_nstage = 0.0     !< Limiter calls since the last post of dg_lim_stat [nondim]
-  integer, dimension(12) :: id_dg_lim_stat = -1 !< Diagnostic ids of the 12 fields of dg_lim_stat
+  integer, dimension(14) :: id_dg_lim_stat = -1 !< Diagnostic ids of the 14 fields of dg_lim_stat
   logical :: dg_art_visc_node_weight !< Artificial viscosity: the band weight of a face QP is interpolated along
                                   !! the face from the node weights, each the largest weight of the 4 cells there.
   real :: dg_art_visc_lump_frac  !< Artificial viscosity: the lumped fraction theta of the mass matrix whose
@@ -2447,7 +2450,13 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
            'meets every bound, so that the pass leaves the tilt of that axis (or, with '//&
            'DG1_LIMITER_GROUNDED_UPPER, takes the shift nearest 0 that meets the corner upper bounds), per '//&
            'limiter call', 'nondim')
-        if (any(CS%id_dg_lim_stat(:) > 0)) allocate(CS%dg_lim_stat(G%isd:G%ied,G%jsd:G%jed,12), source=0.0)
+        CS%id_dg_lim_stat(13) = register_diag_field('ice_shelf_model', 'dg_lim_ccl_act', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: fraction of limiter calls in which DG1_LIMITER_CROSSED_CORNER_CLIP '//&
+           'changed the crossed cell', 'nondim')
+        CS%id_dg_lim_stat(14) = register_diag_field('ice_shelf_model', 'dg_lim_ccl_dh', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: largest corner thickness change of DG1_LIMITER_CROSSED_CORNER_CLIP, '//&
+           'summed over its changes, per limiter call', 'm', conversion=US%Z_to_m)
+        if (any(CS%id_dg_lim_stat(:) > 0)) allocate(CS%dg_lim_stat(G%isd:G%ied,G%jsd:G%jed,14), source=0.0)
       endif
       if (CS%dg_source_positive) then
         allocate(CS%dg_src_cut_smb(G%isd:G%ied,G%jsd:G%jed), source=0.0)
@@ -3344,7 +3353,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_lim_phi_w, CS%dg_lim_phi(:,:,2), CS%diag)
     if (associated(CS%dg_lim_stat)) then
       if (CS%dg_lim_nstage > 0.0) then
-        do k = 1, 12
+        do k = 1, 14
           if (CS%id_dg_lim_stat(k) > 0) then
             lim_st(:,:) = CS%dg_lim_stat(:,:,k) / CS%dg_lim_nstage
             call post_data(CS%id_dg_lim_stat(k), lim_st, CS%diag)
@@ -13272,6 +13281,7 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   character(len=16) :: bounded_mean_str ! DG1_TILT_RELAX_BOUNDED_MEAN
   character(len=16) :: kink_allow_str   ! DG1_ART_VISC_KINK_ALLOW
   character(len=40) :: twist_fb_str ! DG1_LIMITER_CROSSED_TWIST_FALLBACK
+  character(len=40) :: ccl_str      ! DG1_LIMITER_CROSSED_CORNER_CLIP
   character(len=16) :: br_rule      ! DG1_LIMITER_BRANCH_RULE
 
 
@@ -14316,6 +14326,31 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "least squares, to that of the neighbour (the mean of the two where the neighbour is treated "//&
                  "too).  Needs DG1_LIMITER_FACE_BOUNDS.", &
                  default=.false., do_not_log=.not.CS%dg_lim_crossed)
+  call get_param(param_file, mdl, "DG1_LIMITER_CROSSED_CORNER_CLIP", ccl_str, &
+                 "A one-sided corner clip for the cells of DG1_LIMITER_CROSSED.  The upper surface bound of each "//&
+                 "corner (that of the vertex pass: the largest cell mean at its node and the surface of the flat "//&
+                 "cell, or the cap of DG1_LIMITER_GROUNDED_UPPER) is widened to hold the flat surface whose corner "//&
+                 "thicknesses, on the bed of each corner and at or above 0, have the mean thickness of the cell, "//&
+                 "and becomes a thickness bound on the branch of the corner; the lower bound is 0, so thinning is "//&
+                 "not limited.  Where a corner surface is above its bound by more than the tolerance (the larger "//&
+                 "of DG1_LIMITER_D0 and 2% of the surface range of the bounds, so it falls with the grid "//&
+                 "spacing), every corner is clipped to its bound and the mass of the clip is given back to the "//&
+                 "other corners in proportion to their room below the bound; the flat surface shows the room is "//&
+                 "enough, so the mean is kept, every corner ends in its bound, and the change is continuous in the "//&
+                 "state (it fades in between one and two tolerances).  'OFF': not used.  'REPLACE': in place of "//&
+                 "the face pass and the vertex pass of a crossed cell, so it is the only limit there; "//&
+                 "DG1_LIMITER_GROUNDED_UPPER then sets the upper bound only, and "//&
+                 "DG1_LIMITER_GROUNDED_UPPER_FACE_PASS has no effect.", &
+                 default="OFF", do_not_log=.not.CS%dg_lim_crossed)
+  select case (trim(ccl_str))
+    case ("OFF") ; CS%dg_lim_ccl = 0
+    case ("REPLACE") ; CS%dg_lim_ccl = 2
+    case default ; call MOM_error(FATAL, "read_DG_params: DG1_LIMITER_CROSSED_CORNER_CLIP must be OFF or "//&
+                                  "REPLACE, not "//trim(ccl_str)//".")
+  end select
+  if ((CS%dg_lim_ccl > 0) .and. CS%dg_lim_crossed_sweep) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CROSSED_CORNER_CLIP needs DG1_LIMITER_CROSSED_SWEEP = "//&
+      "False (the sweep reads intervals of the face pass that the clip makes stale).")
   if (CS%dg_lim_no_band .and. (.not.CS%dg_grounded_limiter)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics: DG1_LIMITER_NO_BAND needs DG1_GROUNDED_LIMITER.")
   if ((CS%dg_band_diff_time > 0.0) .and. (CS%dg_band_width < 0)) then
@@ -17729,6 +17764,9 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   real :: ga_x, gb_x, ga_y, gb_y ! Shifts allowed by the corner upper bounds along x and y [Z ~> m]
   real :: s_fl       ! Flotation surface at a node [Z ~> m]
   logical :: smooth_c ! The crossed cell mean is a smooth extremum
+  real, dimension(2,2) :: ccl_lo, ccl_hi ! DG1_LIMITER_CROSSED_CORNER_CLIP: corner surface bounds [Z ~> m]
+  real, dimension(2,2) :: ccl_d, ccl_h   ! DG1_LIMITER_CROSSED_CORNER_CLIP: corner beds and new corners [Z ~> m]
+  logical :: ccl_act  ! DG1_LIMITER_CROSSED_CORNER_CLIP changed the cell
   logical :: ok_x, ok_y ! A shift meets every bound of the face pass along x and y
   logical :: finv    ! DG1_LIMITER_FACE_INVERSION is in use
   logical :: use_ngc ! The cells are classified by their corners (DG1_LIMITER_CORNER_CLASS or DG1_GROUND_FRAC_CORNERS)
@@ -18461,6 +18499,29 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
         enddo ; enddo
       endif
 
+      ! DG1_LIMITER_CROSSED_CORNER_CLIP = REPLACE: the corner clip is the only limit of the cell.
+      if (CS%dg_lim_ccl == 2) then
+        do b = 1, 2 ; do a = 1, 2
+          d_c = CS%bed_node(i-2+a,j-2+b) ; ccl_d(a,b) = d_c
+          s_f = max(hb - d_c, (1.0 - rr) * hb)
+          ccl_lo(a,b) = min(nmin(i-2+a,j-2+b), s_f) ; ccl_hi(a,b) = max(nmax(i-2+a,j-2+b), s_f)
+          if (gup) ccl_hi(a,b) = ucor(a,b)
+        enddo ; enddo
+        call dg1_lim_corner_clip(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:), ccl_d, ccl_lo, ccl_hi, rr, &
+                                 CS%dg_lim_d0, lim_eps, pi_lim, ccl_h, ccl_act)
+        if (ccl_act) then
+          if (do_st) then
+            CS%dg_lim_stat(i,j,13) = CS%dg_lim_stat(i,j,13) + 1.0
+            CS%dg_lim_stat(i,j,14) = CS%dg_lim_stat(i,j,14) + &
+                max(max(abs(ccl_h(1,1) - CS%h_nodal(i,j,1,1)), abs(ccl_h(2,2) - CS%h_nodal(i,j,2,2))), &
+                    max(abs(ccl_h(1,2) - CS%h_nodal(i,j,1,2)), abs(ccl_h(2,1) - CS%h_nodal(i,j,2,1))))
+          endif
+          CS%h_nodal(i,j,:,:) = ccl_h(:,:)
+          CS%dg_lim_phi(i,j,2) = 0.0
+        endif
+        cycle
+      endif
+
       ! The face pass on the thickness tilts, with the bounds of the face pass above.  Along each axis the
       ! two corners of a face move together as the tilt shifts, so the surface at the middle of the face is
       ! monotone and piecewise linear in the shift, and the shift nearest to 0 that holds both faces of the
@@ -19015,6 +19076,125 @@ pure real function dg1_lim_h_from_s(s, d, rr)
     dg1_lim_h_from_s = s / (1.0 - rr)
   endif
 end function dg1_lim_h_from_s
+
+!> DG1_LIMITER_CROSSED_CORNER_CLIP: the flat surface s whose corner thicknesses max(h(s, D_c), 0), on the bed of
+!! each corner (dg1_lim_h_from_s), have the mean thickness hb with the weights wc.  That mean is continuous,
+!! nondecreasing and piecewise linear in s, 0 at s = 0, with breaks at the flotation surfaces of the corners and
+!! where a corner on a bed above sea level gets ice, so the largest break at which it is at most hb is found with
+!! max (no sort, so the result does not depend on the order of the corners) and s follows from its slope there.
+pure real function dg1_lim_flat_surface(hb, wc, dn, rr)
+  real,                 intent(in) :: hb  !< The mean thickness of the cell [Z ~> m]
+  real, dimension(2,2), intent(in) :: wc  !< The corner weights of the cell mean [L2 ~> m2]
+  real, dimension(2,2), intent(in) :: dn  !< Bed depths at the corners, positive down [Z ~> m]
+  real,                 intent(in) :: rr  !< Ice to ocean density ratio [nondim]
+
+  real, dimension(2,2) :: hq   ! Corner thicknesses at a surface [Z ~> m]
+  real, dimension(2,2) :: sl   ! Corner slopes of the thickness against the surface just above p [nondim]
+  real :: q      ! A break [Z ~> m]
+  real :: p      ! The largest break at which the mean thickness is at most hb [Z ~> m]
+  real :: fp     ! The mean thickness at p [Z ~> m]
+  real :: slm    ! The mean slope just above p [nondim]
+  integer :: a, b, a2, b2
+
+  p = 0.0
+  do b2 = 1, 2 ; do a2 = 1, 2
+    if (dn(a2,b2) > 0.0) then
+      q = (1.0 - rr) * (dn(a2,b2) / rr)
+    else
+      q = -dn(a2,b2)
+    endif
+    if (q > p) then
+      do b = 1, 2 ; do a = 1, 2
+        hq(a,b) = max(dg1_lim_h_from_s(q, dn(a,b), rr), 0.0)
+      enddo ; enddo
+      if (nodal_cell_mean(hq, wc) <= hb) p = q
+    endif
+  enddo ; enddo
+  do b = 1, 2 ; do a = 1, 2
+    hq(a,b) = max(dg1_lim_h_from_s(p, dn(a,b), rr), 0.0)
+    if (dn(a,b) > 0.0) then
+      sl(a,b) = 1.0 / (1.0 - rr)
+      if (p >= (1.0 - rr) * (dn(a,b) / rr)) sl(a,b) = 1.0
+    else
+      sl(a,b) = 0.0
+      if (p >= -dn(a,b)) sl(a,b) = 1.0
+    endif
+  enddo ; enddo
+  fp = nodal_cell_mean(hq, wc) ; slm = nodal_cell_mean(sl, wc)
+  dg1_lim_flat_surface = p
+  if (slm > 0.0) dg1_lim_flat_surface = p + (hb - fp) / slm
+end function dg1_lim_flat_surface
+
+!> DG1_LIMITER_CROSSED_CORNER_CLIP: the one-sided corner clip of a crossed cell.  The upper surface bound shi of each
+!! corner is widened to hold the flat surface of dg1_lim_flat_surface and becomes the thickness bound b on the branch
+!! of the corner, at or above 0; the lower bound is 0.  Where a corner surface is above its bound by more than the
+!! tolerance, every corner is clipped to its bound, and the mass that the clip removes is given back to the corners in
+!! proportion to their room below the bound, which the flat surface shows is enough.  So the mean is kept, every
+!! corner ends in its bound, and the change is continuous in the state; it fades in between one and two tolerances,
+!! as in the vertex pass.  The tolerance is the larger of d0 and eps times the largest surface range of the bounds
+!! (from slo, widened to the flat surface), so it falls with the grid spacing and the bed does not widen it.
+pure subroutine dg1_lim_corner_clip(hn, wc, dn, slo, shi, rr, d0, eps, pi_c, hout, acted)
+  real, dimension(2,2), intent(in)  :: hn   !< Corner thicknesses [Z ~> m]
+  real, dimension(2,2), intent(in)  :: wc   !< Corner weights of the cell mean [L2 ~> m2]
+  real, dimension(2,2), intent(in)  :: dn   !< Bed depths at the corners, positive down [Z ~> m]
+  real, dimension(2,2), intent(in)  :: slo  !< Lower surface bounds of the corners, for the tolerance [Z ~> m]
+  real, dimension(2,2), intent(in)  :: shi  !< Upper surface bounds of the corners [Z ~> m]
+  real,                 intent(in)  :: rr   !< Ice to ocean density ratio [nondim]
+  real,                 intent(in)  :: d0   !< The smallest tolerance [Z ~> m]
+  real,                 intent(in)  :: eps  !< The tolerance as a fraction of the largest surface range [nondim]
+  real,                 intent(in)  :: pi_c !< Pi, for the fade-in [nondim]
+  real, dimension(2,2), intent(out) :: hout !< The new corner thicknesses [Z ~> m]
+  logical,              intent(out) :: acted !< The corners changed
+
+  real, dimension(2,2) :: hi_t       ! Corner thickness upper bounds [Z ~> m]
+  real, dimension(2,2) :: hc, rm     ! Clipped corners, and their room below the bound [Z ~> m]
+  real :: hb      ! The mean thickness [Z ~> m]
+  real :: s_ref   ! The flat surface [Z ~> m]
+  real :: s_c     ! A corner surface [Z ~> m]
+  real :: s_hi    ! A widened upper surface bound [Z ~> m]
+  real :: e_max   ! The largest excess of a corner surface over its bound [Z ~> m]
+  real :: r_max   ! The largest surface range of a bound [Z ~> m]
+  real :: delta   ! The tolerance [Z ~> m]
+  real :: em      ! The mean thickness that the clip removed [Z ~> m]
+  real :: rs      ! The mean room below the bound [Z ~> m]
+  real :: lam     ! The share of the room given back [nondim]
+  real :: xf, g_f ! Fade-in position and weight [nondim]
+  integer :: a, b
+
+  hout(:,:) = hn(:,:) ; acted = .false.
+  hb = nodal_cell_mean(hn, wc)
+  s_ref = dg1_lim_flat_surface(hb, wc, dn, rr)
+  e_max = 0.0 ; r_max = 0.0
+  do b = 1, 2 ; do a = 1, 2
+    s_hi = max(shi(a,b), s_ref)
+    hi_t(a,b) = max(dg1_lim_h_from_s(s_hi, dn(a,b), rr), 0.0)
+    if (dn(a,b) > 0.0) then
+      s_c = max(hn(a,b) - dn(a,b), (1.0 - rr) * hn(a,b))
+    else
+      s_c = hn(a,b) - dn(a,b)
+    endif
+    e_max = max(e_max, s_c - s_hi)
+    r_max = max(r_max, s_hi - min(slo(a,b), s_ref))
+  enddo ; enddo
+  delta = max(d0, eps * r_max)
+  if (e_max <= delta) return
+  do b = 1, 2 ; do a = 1, 2
+    hc(a,b) = min(hn(a,b), hi_t(a,b))
+  enddo ; enddo
+  em = hb - nodal_cell_mean(hc, wc)
+  if (em > 0.0) then
+    do b = 1, 2 ; do a = 1, 2 ; rm(a,b) = hi_t(a,b) - hc(a,b) ; enddo ; enddo
+    rs = nodal_cell_mean(rm, wc) ; lam = 0.0
+    if (rs > 0.0) lam = min(1.0, em / rs)
+    do b = 1, 2 ; do a = 1, 2 ; hc(a,b) = hc(a,b) + lam * rm(a,b) ; enddo ; enddo
+  endif
+  xf = min(1.0, max(0.0, e_max / delta - 1.0))
+  g_f = 0.5*(1.0 + cos(pi_c*xf))
+  do b = 1, 2 ; do a = 1, 2
+    hout(a,b) = hn(a,b) + (1.0 - g_f) * (hc(a,b) - hn(a,b))
+  enddo ; enddo
+  acted = .true.
+end subroutine dg1_lim_corner_clip
 
 !> DG1_LIMITER_CROSSED, face pass along one axis of a crossed cell: the shift p of the thickness tilt of the axis,
 !! in [p_min, p_max] and nearest to 0, that keeps the surface at the middle of both faces of the axis in the bounds
