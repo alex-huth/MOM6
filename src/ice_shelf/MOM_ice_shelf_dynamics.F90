@@ -815,6 +815,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! cells, 2 in place of every pass of every ice cell.
   logical :: dg_lim_cp_all = .false. !< DG1_LIMITER_CORNER_PROJECT_ENDORSE = ALL: the corners of the other ice
                                   !! cells at a node widen the bounds of a corner only as far as all of them agree.
+  integer :: dg_lim_cp_face = 0   !< DG1_LIMITER_CORNER_PROJECT_FACE: 0 off, 1 the face bounds of
+                                  !! DG1_LIMITER_FACE_BOUNDS hold the crossed cells in the projection, 2 every ice cell.
   logical :: dg_lim_crossed_float !< If true, with dg_lim_crossed and dg_lim_face, a floating corner of a crossed
                                   !! cell on a face with a wholly floating cell is bounded in thickness by that cell.
   logical :: dg_lim_float_d0_thick !< If true, the grounded limiter takes dg_lim_d0 as a thickness on wholly
@@ -859,7 +861,7 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! entry [nondim], 16 their largest corner change [Z ~> m]; 17 and 18 the same for
                                   !! cells with a corner out of those bounds.
   real :: dg_lim_nstage = 0.0     !< Limiter calls since the last post of dg_lim_stat [nondim]
-  integer, dimension(18) :: id_dg_lim_stat = -1 !< Diagnostic ids of the 18 fields of dg_lim_stat
+  integer, dimension(20) :: id_dg_lim_stat = -1 !< Diagnostic ids of the 20 fields of dg_lim_stat
   logical :: dg_art_visc_node_weight !< Artificial viscosity: the band weight of a face QP is interpolated along
                                   !! the face from the node weights, each the largest weight of the 4 cells there.
   real :: dg_art_visc_lump_frac  !< Artificial viscosity: the lumped fraction theta of the mass matrix whose
@@ -2478,7 +2480,13 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         CS%id_dg_lim_stat(18) = register_diag_field('ice_shelf_model', 'dg_lim_disagree_dh', CS%diag%axesT1, &
            Time, 'DG(1) grounded limiter: largest corner thickness change of the changes of dg_lim_disagree_act, '//&
            'summed over them, per limiter call', 'm', conversion=US%Z_to_m)
-        if (any(CS%id_dg_lim_stat(:) > 0)) allocate(CS%dg_lim_stat(G%isd:G%ied,G%jsd:G%jed,18), source=0.0)
+        CS%id_dg_lim_stat(19) = register_diag_field('ice_shelf_model', 'dg_lim_cpf_act', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: fraction of limiter calls in which a face of the ice cell was out of '//&
+           'the face bounds of DG1_LIMITER_CORNER_PROJECT_FACE, so that its corners took face bounds', 'nondim')
+        CS%id_dg_lim_stat(20) = register_diag_field('ice_shelf_model', 'dg_lim_cpf_dh', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: largest corner thickness change of DG1_LIMITER_CORNER_PROJECT in the '//&
+           'calls of dg_lim_cpf_act, summed over them, per limiter call', 'm', conversion=US%Z_to_m)
+        if (any(CS%id_dg_lim_stat(:) > 0)) allocate(CS%dg_lim_stat(G%isd:G%ied,G%jsd:G%jed,20), source=0.0)
       endif
       if (CS%dg_source_positive) then
         allocate(CS%dg_src_cut_smb(G%isd:G%ied,G%jsd:G%jed), source=0.0)
@@ -3375,7 +3383,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_lim_phi_w, CS%dg_lim_phi(:,:,2), CS%diag)
     if (associated(CS%dg_lim_stat)) then
       if (CS%dg_lim_nstage > 0.0) then
-        do k = 1, 18
+        do k = 1, 20
           if (CS%id_dg_lim_stat(k) > 0) then
             lim_st(:,:) = CS%dg_lim_stat(:,:,k) / CS%dg_lim_nstage
             call post_data(CS%id_dg_lim_stat(k), lim_st, CS%diag)
@@ -13306,6 +13314,7 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   character(len=40) :: ccl_str      ! DG1_LIMITER_CROSSED_CORNER_CLIP
   character(len=40) :: cp_str       ! DG1_LIMITER_CORNER_PROJECT
   character(len=40) :: cpe_str      ! DG1_LIMITER_CORNER_PROJECT_ENDORSE
+  character(len=40) :: cpf_str      ! DG1_LIMITER_CORNER_PROJECT_FACE
   character(len=16) :: br_rule      ! DG1_LIMITER_BRANCH_RULE
 
 
@@ -14414,6 +14423,30 @@ subroutine read_DG_params(param_file, mdl, CS, US)
     case default ; call MOM_error(FATAL, "read_DG_params: DG1_LIMITER_CORNER_PROJECT_ENDORSE must be ANY or "//&
                                   "ALL, not "//trim(cpe_str)//".")
   end select
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FACE", cpf_str, &
+                 "Which cells of DG1_LIMITER_CORNER_PROJECT also take the face bounds of DG1_LIMITER_FACE_BOUNDS, "//&
+                 "in the same projection.  The surface at the middle of each face, the mean of its two corner "//&
+                 "surfaces, must lie between the smallest and the largest of the cell mean, the cell mean across "//&
+                 "the face and the surface of the cell across at the middle of the face, widened by the allowance "//&
+                 "max(DG1_LIMITER_D0, DG1_LIMITER_FACE_CURV times the second difference of the cell means along "//&
+                 "the axis).  A face out of these bounds gives its two corners thickness bounds: the change of each "//&
+                 "corner that moves the face onto its bound with the least sum of squares, on the branch of each "//&
+                 "corner, so a grounded corner moves more than a floating one.  The vertex bounds see each node "//&
+                 "with the cells of both axes, so a tilt along one axis over flat means, with a jump back at each "//&
+                 "face, can stay inside them where the means change a lot along the other axis; the face bounds see "//&
+                 "one axis at a time.  A continuous state is in these bounds.  'OFF': not used.  'CROSSED': in the "//&
+                 "crossed cells of DG1_LIMITER_CROSSED, which otherwise have no lower bound.  'ALL': in every ice "//&
+                 "cell that the projection limits.", &
+                 default="OFF", do_not_log=(CS%dg_lim_cp == 0))
+  select case (trim(cpf_str))
+    case ("OFF") ; CS%dg_lim_cp_face = 0
+    case ("CROSSED") ; CS%dg_lim_cp_face = 1
+    case ("ALL") ; CS%dg_lim_cp_face = 2
+    case default ; call MOM_error(FATAL, "read_DG_params: DG1_LIMITER_CORNER_PROJECT_FACE must be OFF, "//&
+                                  "CROSSED or ALL, not "//trim(cpf_str)//".")
+  end select
+  if ((CS%dg_lim_cp_face > 0) .and. (CS%dg_lim_cp == 0)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT_FACE needs DG1_LIMITER_CORNER_PROJECT.")
   if ((CS%dg_lim_cp == 1) .and. (.not.CS%dg_lim_crossed)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT = CROSSED needs DG1_LIMITER_CROSSED.")
   if ((CS%dg_lim_cp > 0) .and. (CS%dg_lim_ccl > 0)) call MOM_error(FATAL, &
@@ -17857,6 +17890,16 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   real, dimension(2,2) :: cp_d, cp_h   ! DG1_LIMITER_CORNER_PROJECT: corner beds and new corners [Z ~> m]
   logical, dimension(2,2) :: cp_one    ! DG1_LIMITER_CORNER_PROJECT: the corner has no lower surface bound
   logical :: cp_act  ! DG1_LIMITER_CORNER_PROJECT changed the cell
+  logical :: cpf     ! DG1_LIMITER_CORNER_PROJECT_FACE bounds this cell
+  integer :: cf_n    ! DG1_LIMITER_CORNER_PROJECT_FACE: faces of the cell out of their bounds
+  real, dimension(4) :: cf_al ! DG1_LIMITER_CORNER_PROJECT_FACE: allowances of the west, east, south and north
+                              ! faces [Z ~> m]
+  real, dimension(4) :: cf_sb ! DG1_LIMITER_CORNER_PROJECT_FACE: cell-mean surfaces across those faces [Z ~> m]
+  real, dimension(4) :: cf_tr ! DG1_LIMITER_CORNER_PROJECT_FACE: surfaces of the cells across at the middle of
+                              ! those faces [Z ~> m]
+  logical, dimension(4) :: cf_use ! DG1_LIMITER_CORNER_PROJECT_FACE: the cell across the face sets a bound
+  logical, dimension(4) :: cf_ice ! DG1_LIMITER_CORNER_PROJECT_FACE: the cell across the face is an ice cell
+  real, dimension(2,2) :: cf_lo, cf_hi ! DG1_LIMITER_CORNER_PROJECT_FACE: corner thickness bounds [Z ~> m]
   logical :: ok_x, ok_y ! A shift meets every bound of the face pass along x and y
   logical :: finv    ! DG1_LIMITER_FACE_INVERSION is in use
   logical :: use_ngc ! The cells are classified by their corners (DG1_LIMITER_CORNER_CLASS or DG1_GROUND_FRAC_CORNERS)
@@ -18026,8 +18069,9 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   endif
 
   ! DG1_LIMITER_FACE_BOUNDS: the face-midpoint surfaces of every ice cell on entry, so that the bounds
-  ! do not depend on the order in which the loop below changes the cells.
-  if (CS%dg_lim_face) then
+  ! do not depend on the order in which the loop below changes the cells.  DG1_LIMITER_CORNER_PROJECT_FACE
+  ! reads them too.
+  if (CS%dg_lim_face .or. (CS%dg_lim_cp_face > 0)) then
     trc(:,:,:) = 0.0 ; f_ice(:,:) = .false. ; f_use(:,:) = .false.
     do j = jsd+1, jed ; do i = isd+1, ied
       if (.not.in_dom(i,j)) then
@@ -18985,12 +19029,40 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
         cp_lo(a,b) = min(l_m, l_n) - max(CS%dg_lim_d0, lim_eps * (u_m - l_m))
         cp_one(a,b) = trb(i,j)
       enddo ; enddo
-      call dg1_lim_corner_project(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:), cp_d, cp_lo, cp_hi, cp_one, rr, &
-                                  CS%min_h_shelf, cp_h, cp_act)
+      ! DG1_LIMITER_CORNER_PROJECT_FACE: the face bounds of DG1_LIMITER_FACE_BOUNDS, from the state on entry, as
+      ! thickness bounds on the corners of the faces that are out of them.
+      cpf = (CS%dg_lim_cp_face == 2)
+      if (CS%dg_lim_cp_face == 1) cpf = trb(i,j)
+      cf_n = 0
+      if (cpf) then
+        al_x = CS%dg_lim_d0 ; al_y = CS%dg_lim_d0
+        if (f_use(i-1,j) .and. f_use(i+1,j)) &
+          al_x = max(al_x, CS%dg_lim_face_curv * abs((sbar_f(i-1,j) + sbar_f(i+1,j)) - 2.0*sbar_f(i,j)))
+        if (f_use(i,j-1) .and. f_use(i,j+1)) &
+          al_y = max(al_y, CS%dg_lim_face_curv * abs((sbar_f(i,j-1) + sbar_f(i,j+1)) - 2.0*sbar_f(i,j)))
+        cf_al(:) = (/ al_x, al_x, al_y, al_y /)
+        cf_use(:) = (/ f_use(i-1,j), f_use(i+1,j), f_use(i,j-1), f_use(i,j+1) /)
+        cf_ice(:) = (/ f_ice(i-1,j), f_ice(i+1,j), f_ice(i,j-1), f_ice(i,j+1) /)
+        cf_sb(:) = (/ sbar_f(i-1,j), sbar_f(i+1,j), sbar_f(i,j-1), sbar_f(i,j+1) /)
+        cf_tr(:) = (/ trc(i-1,j,2), trc(i+1,j,1), trc(i,j-1,4), trc(i,j+1,3) /)
+        call dg1_lim_cp_face_bounds(CS%h_nodal(i,j,:,:), cp_d, rr, sbar_f(i,j), cf_al, cf_use, cf_ice, cf_sb, &
+                                    cf_tr, cf_lo, cf_hi, cf_n)
+      endif
+      if (cf_n > 0) then
+        call dg1_lim_corner_project(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:), cp_d, cp_lo, cp_hi, cp_one, rr, &
+                                    CS%min_h_shelf, cp_h, cp_act, cf_lo, cf_hi)
+        if (do_st) CS%dg_lim_stat(i,j,19) = CS%dg_lim_stat(i,j,19) + 1.0
+      else
+        call dg1_lim_corner_project(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:), cp_d, cp_lo, cp_hi, cp_one, rr, &
+                                    CS%min_h_shelf, cp_h, cp_act)
+      endif
       if (cp_act) then
         if (do_st) then
           CS%dg_lim_stat(i,j,13) = CS%dg_lim_stat(i,j,13) + 1.0
           CS%dg_lim_stat(i,j,14) = CS%dg_lim_stat(i,j,14) + &
+              max(max(abs(cp_h(1,1) - CS%h_nodal(i,j,1,1)), abs(cp_h(2,2) - CS%h_nodal(i,j,2,2))), &
+                  max(abs(cp_h(1,2) - CS%h_nodal(i,j,1,2)), abs(cp_h(2,1) - CS%h_nodal(i,j,2,1))))
+          if (cf_n > 0) CS%dg_lim_stat(i,j,20) = CS%dg_lim_stat(i,j,20) + &
               max(max(abs(cp_h(1,1) - CS%h_nodal(i,j,1,1)), abs(cp_h(2,2) - CS%h_nodal(i,j,2,2))), &
                   max(abs(cp_h(1,2) - CS%h_nodal(i,j,1,2)), abs(cp_h(2,1) - CS%h_nodal(i,j,2,1))))
         endif
@@ -19430,7 +19502,7 @@ end subroutine dg1_lim_corner_clip
 !! keeps the mean.  That mean is nondecreasing and piecewise linear in mu with its breaks where a corner reaches a
 !! bound, so mu is found exactly between the two breaks around the root; these are chosen by max and min only, so
 !! the result does not depend on the order of the corners.  A cell already in its bounds is left as it is.
-pure subroutine dg1_lim_corner_project(hn, wc, dn, slo, shi, one_sided, rr, h_min, hout, acted)
+pure subroutine dg1_lim_corner_project(hn, wc, dn, slo, shi, one_sided, rr, h_min, hout, acted, hlo_x, hhi_x)
   real, dimension(2,2), intent(in)  :: hn   !< Corner thicknesses [Z ~> m]
   real, dimension(2,2), intent(in)  :: wc   !< Corner weights of the cell mean [L2 ~> m2]
   real, dimension(2,2), intent(in)  :: dn   !< Bed depths at the corners, positive down [Z ~> m]
@@ -19441,6 +19513,10 @@ pure subroutine dg1_lim_corner_project(hn, wc, dn, slo, shi, one_sided, rr, h_mi
   real,                 intent(in)  :: h_min !< The floor of the corner thicknesses, MIN_H_SHELF [Z ~> m]
   real, dimension(2,2), intent(out) :: hout !< The new corner thicknesses [Z ~> m]
   logical,              intent(out) :: acted !< The corners changed
+  real, dimension(2,2), optional, intent(in) :: hlo_x !< Further lower thickness bounds of the corners, not held
+                                            !! below the flat surface (DG1_LIMITER_CORNER_PROJECT_FACE) [Z ~> m]
+  real, dimension(2,2), optional, intent(in) :: hhi_x !< Further upper thickness bounds of the corners
+                                            !! (DG1_LIMITER_CORNER_PROJECT_FACE) [Z ~> m]
 
   real, dimension(2,2) :: hl, hu  ! Lower and upper corner thickness bounds [Z ~> m]
   real, dimension(2,2) :: hc      ! Corners at a trial shift [Z ~> m]
@@ -19467,6 +19543,14 @@ pure subroutine dg1_lim_corner_project(hn, wc, dn, slo, shi, one_sided, rr, h_mi
       hl(a,b) = min(max(dg1_lim_h_from_s(min(slo(a,b), s_ref), dn(a,b), rr), lo_t), hu(a,b))
     endif
   enddo ; enddo
+  ! The face bounds: the upper bounds first, so that where the two cannot both hold the upper bound wins.
+  if (present(hhi_x)) then
+    do b = 1, 2 ; do a = 1, 2 ; hu(a,b) = max(min(hu(a,b), hhi_x(a,b)), lo_t) ; enddo ; enddo
+    do b = 1, 2 ; do a = 1, 2 ; hl(a,b) = min(hl(a,b), hu(a,b)) ; enddo ; enddo
+  endif
+  if (present(hlo_x)) then
+    do b = 1, 2 ; do a = 1, 2 ; hl(a,b) = min(max(hl(a,b), hlo_x(a,b)), hu(a,b)) ; enddo ; enddo
+  endif
   ml = nodal_cell_mean(hl, wc)
   if (ml > hb) then
     th = (hb - lo_t) / (ml - lo_t)
@@ -19517,6 +19601,64 @@ pure subroutine dg1_lim_corner_project(hn, wc, dn, slo, shi, one_sided, rr, h_mi
   hout(:,:) = min(max(hn(:,:) + mu, hl(:,:)), hu(:,:))
   acted = .true.
 end subroutine dg1_lim_corner_project
+
+!> DG1_LIMITER_CORNER_PROJECT_FACE: thickness bounds on the corners of each face of a cell whose surface at the
+!! middle, the mean of its two corner surfaces, is out of the face bounds of DG1_LIMITER_FACE_BOUNDS.  The two
+!! corners of the face take the changes dh1, dh2 with the least dh1^2 + dh2^2 that move the middle of the face
+!! onto its bound, k1 dh1 + k2 dh2 = 2 d, with k the slope of the surface in the thickness on the branch of the
+!! corner (1 grounded, 1 - r floating): dh = 2 d k / (k1^2 + k2^2).  A grounded corner so moves about 9 times as
+!! far as a floating one.  The bounds are the corner thickness plus or minus that change; a corner of two faces
+!! out of bounds takes the tighter bound of the two.  The faces are west, east, south and north.
+pure subroutine dg1_lim_cp_face_bounds(hn, dn, rr, sb, al, use_nb, ice_nb, sb_nb, tr_nb, hlo, hhi, nset)
+  real, dimension(2,2), intent(in)  :: hn     !< Corner thicknesses [Z ~> m]
+  real, dimension(2,2), intent(in)  :: dn     !< Bed depths at the corners, positive down [Z ~> m]
+  real,                 intent(in)  :: rr     !< Ice to ocean density ratio [nondim]
+  real,                 intent(in)  :: sb     !< Cell-mean surface of the cell [Z ~> m]
+  real, dimension(4),   intent(in)  :: al     !< Allowances of the face bounds [Z ~> m]
+  logical, dimension(4), intent(in) :: use_nb !< The cell across the face sets a bound
+  logical, dimension(4), intent(in) :: ice_nb !< The cell across the face is an ice cell, so tr_nb is set
+  real, dimension(4),   intent(in)  :: sb_nb  !< Cell-mean surfaces across the faces [Z ~> m]
+  real, dimension(4),   intent(in)  :: tr_nb  !< Surfaces of the cells across at the middle of the faces [Z ~> m]
+  real, dimension(2,2), intent(out) :: hlo    !< Lower thickness bounds of the corners, -huge where none [Z ~> m]
+  real, dimension(2,2), intent(out) :: hhi    !< Upper thickness bounds of the corners, huge where none [Z ~> m]
+  integer,              intent(out) :: nset   !< The number of faces out of their bounds
+
+  real, dimension(2,2) :: s_c ! Corner surfaces [Z ~> m]
+  real, dimension(2,2) :: k_c ! Slopes of the corner surfaces in the thickness [nondim]
+  real :: lo, hi  ! Bounds of the middle of a face [Z ~> m]
+  real :: sm      ! Surface at the middle of a face [Z ~> m]
+  real :: d       ! Distance of the middle of a face past its bound [Z ~> m]
+  real :: q       ! k1^2 + k2^2 [nondim]
+  integer :: f, a, b, a1, b1, a2, b2
+
+  hlo(:,:) = -huge(1.0) ; hhi(:,:) = huge(1.0) ; nset = 0
+  do b = 1, 2 ; do a = 1, 2
+    s_c(a,b) = max(hn(a,b) - dn(a,b), (1.0 - rr) * hn(a,b))
+    k_c(a,b) = 1.0 - rr
+    if (rr * hn(a,b) > dn(a,b)) k_c(a,b) = 1.0
+  enddo ; enddo
+  do f = 1, 4
+    if (.not.use_nb(f)) cycle
+    select case (f)
+      case (1) ; a1 = 1 ; b1 = 1 ; a2 = 1 ; b2 = 2
+      case (2) ; a1 = 2 ; b1 = 1 ; a2 = 2 ; b2 = 2
+      case (3) ; a1 = 1 ; b1 = 1 ; a2 = 2 ; b2 = 1
+      case default ; a1 = 1 ; b1 = 2 ; a2 = 2 ; b2 = 2
+    end select
+    call dg1_lim_face_bounds(sb, al(f), use_nb(f), ice_nb(f), sb_nb(f), tr_nb(f), lo, hi)
+    sm = 0.5*(s_c(a1,b1) + s_c(a2,b2))
+    q = k_c(a1,b1)*k_c(a1,b1) + k_c(a2,b2)*k_c(a2,b2)
+    if (sm < lo) then
+      d = lo - sm ; nset = nset + 1
+      hlo(a1,b1) = max(hlo(a1,b1), hn(a1,b1) + (2.0*d) * (k_c(a1,b1) / q))
+      hlo(a2,b2) = max(hlo(a2,b2), hn(a2,b2) + (2.0*d) * (k_c(a2,b2) / q))
+    elseif (sm > hi) then
+      d = sm - hi ; nset = nset + 1
+      hhi(a1,b1) = min(hhi(a1,b1), hn(a1,b1) - (2.0*d) * (k_c(a1,b1) / q))
+      hhi(a2,b2) = min(hhi(a2,b2), hn(a2,b2) - (2.0*d) * (k_c(a2,b2) / q))
+    endif
+  enddo
+end subroutine dg1_lim_cp_face_bounds
 
 !> DG1_LIMITER_CROSSED, face pass along one axis of a crossed cell: the shift p of the thickness tilt of the axis,
 !! in [p_min, p_max] and nearest to 0, that keeps the surface at the middle of both faces of the axis in the bounds
