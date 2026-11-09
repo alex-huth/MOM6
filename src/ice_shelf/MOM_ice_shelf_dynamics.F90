@@ -818,6 +818,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! surfaces, as thickness bounds.
   real :: dg_lim_cp_face_pt_d0    !< DG1_LIMITER_CORNER_PROJECT_FACE_POINT_D0: the tolerance of those bounds
                                   !! [Z ~> m], a thickness.
+  logical :: dg_lim_cp_d0_thick = .false. !< DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS: the tolerance of the vertex
+                                  !! bounds of DG1_LIMITER_CORNER_PROJECT is a thickness on both branches.
   logical :: dg_lim_bwe = .false. !< DG1_LIMITER_BACKWARD_EDGE: the projection first moves the backward edges of the
                                   !! cells that are not crossed toward their neighbours.
   logical :: dg_lim_cp_all = .false. !< DG1_LIMITER_CORNER_PROJECT_ENDORSE = ALL: the corners of the other ice
@@ -14436,6 +14438,14 @@ subroutine read_DG_params(param_file, mdl, CS, US)
     case default ; call MOM_error(FATAL, "read_DG_params: DG1_LIMITER_CORNER_PROJECT_ENDORSE must be ANY or "//&
                                   "ALL, not "//trim(cpe_str)//".")
   end select
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS", CS%dg_lim_cp_d0_thick, &
+                 "If true, the tolerance of the vertex bounds of DG1_LIMITER_CORNER_PROJECT is a thickness on "//&
+                 "both branches.  Each bound becomes a thickness at the corner through the exact inverse of the "//&
+                 "surface at its bed, widened by the larger of DG1_LIMITER_D0 and the 2% of the range of the "//&
+                 "cell-mean surfaces there, as a thickness through the same inverse.  If false, DG1_LIMITER_D0 is a "//&
+                 "surface height, which is 1 / (1 - rho_i/rho_w), about 9, times as wide in the thickness of a "//&
+                 "floating corner as of a grounded one.", &
+                 default=.false., do_not_log=(CS%dg_lim_cp == 0))
   call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FACE", cpf_str, &
                  "Which cells of DG1_LIMITER_CORNER_PROJECT also take the face bounds of DG1_LIMITER_FACE_BOUNDS, "//&
                  "in the same projection.  The surface at the middle of each face, the mean of its two corner "//&
@@ -17908,6 +17918,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   real, dimension(4) :: cf_ca, cf_cb ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT: allowances of the a and b bounds
                                ! of each face [Z ~> m]
   real :: ca_x, ca_y, cb_x, cb_y ! Allowances of the a = h - D and b = (1 - r) h bounds along x and y [Z ~> m]
+  real :: h_b    ! DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS: a vertex bound as a corner thickness [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G),4) :: trc ! Surface at the middle of the west, east, south and north
                                  ! faces of each ice cell on entry [Z ~> m]
   logical, dimension(SZDI_(G),SZDJ_(G)) :: f_ice ! The cell is an ice cell inside the domain, so trc is set
@@ -19072,8 +19083,18 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
         u_n = o_hi ; l_n = o_lo
         if (CS%dg_lim_cp_all .and. (o_hi >= o_lo)) then ; u_n = o_lo ; l_n = o_hi ; endif
         cp_d(a,b) = CS%bed_node(i-2+a,j-2+b)
-        cp_hi(a,b) = max(u_m, u_n) + max(CS%dg_lim_d0, lim_eps * (u_m - l_m))
-        cp_lo(a,b) = min(l_m, l_n) - max(CS%dg_lim_d0, lim_eps * (u_m - l_m))
+        if (CS%dg_lim_cp_d0_thick) then
+          ! DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS: the bounds widen as thicknesses at the corner bed.
+          h_b = max(dg1_lim_h_from_s(max(u_m, u_n) + lim_eps * (u_m - l_m), cp_d(a,b), rr), &
+                    dg1_lim_h_from_s(max(u_m, u_n), cp_d(a,b), rr) + CS%dg_lim_d0)
+          cp_hi(a,b) = max(h_b - cp_d(a,b), (1.0 - rr) * h_b)
+          h_b = min(dg1_lim_h_from_s(min(l_m, l_n) - lim_eps * (u_m - l_m), cp_d(a,b), rr), &
+                    dg1_lim_h_from_s(min(l_m, l_n), cp_d(a,b), rr) - CS%dg_lim_d0)
+          cp_lo(a,b) = max(h_b - cp_d(a,b), (1.0 - rr) * h_b)
+        else
+          cp_hi(a,b) = max(u_m, u_n) + max(CS%dg_lim_d0, lim_eps * (u_m - l_m))
+          cp_lo(a,b) = min(l_m, l_n) - max(CS%dg_lim_d0, lim_eps * (u_m - l_m))
+        endif
         cp_one(a,b) = trb(i,j)
       enddo ; enddo
       ! DG1_LIMITER_CORNER_PROJECT_FACE: the face bounds of DG1_LIMITER_FACE_BOUNDS, from the state on entry, as
