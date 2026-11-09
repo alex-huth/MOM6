@@ -813,6 +813,11 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! passes of a crossed cell.
   integer :: dg_lim_cp = 0        !< DG1_LIMITER_CORNER_PROJECT: 0 off, 1 in place of the passes of the crossed
                                   !! cells, 2 in place of every pass of every ice cell.
+  logical :: dg_lim_cp_face_pt = .false. !< DG1_LIMITER_CORNER_PROJECT_FACE_POINT: the face bounds of
+                                  !! DG1_LIMITER_CORNER_PROJECT_FACE come from point values of the two branch
+                                  !! surfaces, as thickness bounds.
+  real :: dg_lim_cp_face_pt_d0    !< DG1_LIMITER_CORNER_PROJECT_FACE_POINT_D0: the tolerance of those bounds
+                                  !! [Z ~> m], a thickness.
   logical :: dg_lim_bwe = .false. !< DG1_LIMITER_BACKWARD_EDGE: the projection first moves the backward edges of the
                                   !! cells that are not crossed toward their neighbours.
   logical :: dg_lim_cp_all = .false. !< DG1_LIMITER_CORNER_PROJECT_ENDORSE = ALL: the corners of the other ice
@@ -14455,6 +14460,32 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   end select
   if ((CS%dg_lim_cp_face > 0) .and. (CS%dg_lim_cp == 0)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT_FACE needs DG1_LIMITER_CORNER_PROJECT.")
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FACE_POINT", CS%dg_lim_cp_face_pt, &
+                 "If true, the face bounds of DG1_LIMITER_CORNER_PROJECT_FACE come from point values of the two "//&
+                 "branch surfaces a = h - D and b = (1 - r) h, which are linear in h and D: at the centre of the "//&
+                 "cell and of the cell across, from the cell means of the thickness and of the bed, and at the "//&
+                 "middle of the face in the cell across.  Each point gives both a and b, on whichever branch it "//&
+                 "lies.  If a and b at the middle of the face each lie between the smallest and the largest of "//&
+                 "these values, widened by DG1_LIMITER_FACE_CURV times the second difference of the centre values "//&
+                 "of a or of b along the axis, then the surface there, max(a, b), lies between max(lowest a, "//&
+                 "lowest b) and max(highest a, highest b); these are the bounds.  They hold no kink: in a cell that "//&
+                 "the grounding line crosses, the mean of the corner surfaces lies above the surface at the "//&
+                 "centre, and a second difference of the surface across the grounding line holds the slope "//&
+                 "change there.  The bounds become thickness bounds at the middle of the face through the exact "//&
+                 "inverse of the surface at its bed, widened by at least DG1_LIMITER_CORNER_PROJECT_FACE_POINT_D0, "//&
+                 "and a face out of them moves its two corners by the one thickness change that puts its middle "//&
+                 "on its bound.  The bounds and the change are continuous in the state.", &
+                 default=.false., do_not_log=(CS%dg_lim_cp_face == 0))
+  if (CS%dg_lim_cp_face_pt .and. (CS%dg_lim_cp_face == 0)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT_FACE_POINT needs "//&
+      "DG1_LIMITER_CORNER_PROJECT_FACE.")
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FACE_POINT_D0", CS%dg_lim_cp_face_pt_d0, &
+                 "The least widening of the thickness bounds of DG1_LIMITER_CORNER_PROJECT_FACE_POINT, a "//&
+                 "thickness on both branches.  It must be above 0: a continuous state lies on these bounds, "//&
+                 "where round-off would otherwise move its faces.", &
+                 units="m", default=CS%dg_lim_d0*US%Z_to_m, scale=US%m_to_Z, do_not_log=(.not.CS%dg_lim_cp_face_pt))
+  if (CS%dg_lim_cp_face_pt .and. (CS%dg_lim_cp_face_pt_d0 <= 0.0)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT_FACE_POINT_D0 must be above 0.")
   call get_param(param_file, mdl, "DG1_LIMITER_BACKWARD_EDGE", CS%dg_lim_bwe, &
                  "If true, with DG1_LIMITER_CORNER_PROJECT = ALL, the projection first moves the backward edges of "//&
                  "the ice cells that are not crossed toward their neighbours.  An edge is the two corners on one "//&
@@ -17860,6 +17891,23 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   real :: m_x, m_y  ! Weighted cell means of the corner patterns (a - 3/2) and (b - 3/2) [nondim]
   real :: al_x, al_y ! Allowances of the face bounds along x and y [Z ~> m]
   real :: phi_x, phi_y ! Face-bound factors on the tilts along x and y [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: hpt, hpt_f ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT: the thickness at the
+                                              ! centre of a cell (its cell mean, 0 in a cell without ice), as
+                                              ! sbar and sbar_f [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: dpt, dpt_f ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT: the bed at the centre
+                                              ! of a cell, as sbar and sbar_f [Z ~> m]
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: have_p, have_q ! hpt and dpt are set
+  real, dimension(SZDI_(G),SZDJ_(G),4) :: trh ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT: the thickness at the
+                                              ! middle of the west, east, south and north faces, the mean of
+                                              ! the two corners there [Z ~> m]
+  real, dimension(2,2) :: dpt_c  ! Corner beds of a cell, for DG1_LIMITER_CORNER_PROJECT_FACE_POINT [Z ~> m]
+  real, dimension(4) :: cf_hc  ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT: centre thicknesses across the faces [Z ~> m]
+  real, dimension(4) :: cf_dc  ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT: centre beds across the faces [Z ~> m]
+  real, dimension(4) :: cf_ht  ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT: thicknesses of the cells across at the
+                               ! middle of the faces [Z ~> m]
+  real, dimension(4) :: cf_ca, cf_cb ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT: allowances of the a and b bounds
+                               ! of each face [Z ~> m]
+  real :: ca_x, ca_y, cb_x, cb_y ! Allowances of the a = h - D and b = (1 - r) h bounds along x and y [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G),4) :: trc ! Surface at the middle of the west, east, south and north
                                  ! faces of each ice cell on entry [Z ~> m]
   logical, dimension(SZDI_(G),SZDJ_(G)) :: f_ice ! The cell is an ice cell inside the domain, so trc is set
@@ -17986,16 +18034,23 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
     if ((.not.CS%reentrant_x) .and. ((ig < G%isg) .or. (ig > G%ieg))) in_dom(i,j) = .false.
     if ((.not.CS%reentrant_y) .and. (jg < G%jsg)) in_dom(i,j) = .false.
     if ((.not.CS%reentrant_y) .and. (.not.north_open) .and. (jg > G%jeg)) in_dom(i,j) = .false.
-    have(i,j) = .false. ; sbar(i,j) = 0.0
+    have(i,j) = .false. ; sbar(i,j) = 0.0 ; hpt(i,j) = 0.0 ; dpt(i,j) = 0.0
     if ((.not.in_dom(i,j)) .or. (i == isd) .or. (j == jsd)) cycle
     if ((hmask(i,j) == 1.0) .or. (hmask(i,j) == 3.0)) then
       do b = 1, 2 ; do a = 1, 2
         s_c(a,b) = max(CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b), (1.0 - rr) * CS%h_nodal(i,j,a,b))
       enddo ; enddo
       sbar(i,j) = nodal_cell_mean(s_c, CS%cell_mean_w(i,j,:,:))
+      if (CS%dg_lim_cp_face_pt) then
+        do b = 1, 2 ; do a = 1, 2 ; dpt_c(a,b) = CS%bed_node(i-2+a,j-2+b) ; enddo ; enddo
+        hpt(i,j) = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
+        dpt(i,j) = nodal_cell_mean(dpt_c, CS%cell_mean_w(i,j,:,:))
+      endif
     else
       dmean = 0.25*((CS%bed_node(i-1,j-1) + CS%bed_node(i,j)) + (CS%bed_node(i,j-1) + CS%bed_node(i-1,j)))
       sbar(i,j) = max(-dmean, 0.0)
+      ! No ice: h = 0, so the two branch surfaces are -D and 0 and their larger one is sbar.
+      hpt(i,j) = 0.0 ; dpt(i,j) = dmean
     endif
     have(i,j) = .true.
   enddo ; enddo
@@ -18007,62 +18062,12 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   ! velocity) with zero normal velocity at both its nodes.  Across any other edge face, such as a calving front
   ! at the domain edge, it keeps the extrapolation; beyond a corner of the domain both edge faces must pass.
   ! Both are found (sbar the extrapolation, sbar_f the face-pass value), from cells inside the domain only.
-  sbar_f(:,:) = sbar(:,:)
-  do j = jsd+1, jed-1 ; do i = isd+1, ied-1
-    if (in_dom(i,j)) cycle
-    do k = 1, 2
-      if (have(i,j)) exit
-      if (i+k+1 <= ied) then ; if (in_dom(i+k,j) .and. have(i+k,j) .and. have(i+k+1,j) .and. &
-                                   (.not.in_dom(i+k-1,j))) then
-        sbar(i,j) = sbar(i+k,j) + real(k)*(sbar(i+k,j) - sbar(i+k+1,j))
-        sbar_f(i,j) = sbar(i,j)
-        if (dg1_lim_wall_face(CS%u_face_mask_bdry(i+k-1,j), CS%u_bdry_val(i+k-1,j-1), CS%u_bdry_val(i+k-1,j))) &
-          sbar_f(i,j) = sbar(i+2*k-1,j)
-        have(i,j) = .true. ; cycle
-      endif ; endif
-      if (i-k-1 >= isd) then ; if (in_dom(i-k,j) .and. have(i-k,j) .and. have(i-k-1,j) .and. &
-                                   (.not.in_dom(i-k+1,j))) then
-        sbar(i,j) = sbar(i-k,j) + real(k)*(sbar(i-k,j) - sbar(i-k-1,j))
-        sbar_f(i,j) = sbar(i,j)
-        if (dg1_lim_wall_face(CS%u_face_mask_bdry(i-k,j), CS%u_bdry_val(i-k,j-1), CS%u_bdry_val(i-k,j))) &
-          sbar_f(i,j) = sbar(i-2*k+1,j)
-        have(i,j) = .true. ; cycle
-      endif ; endif
-      if (j+k+1 <= jed) then ; if (in_dom(i,j+k) .and. have(i,j+k) .and. have(i,j+k+1) .and. &
-                                   (.not.in_dom(i,j+k-1))) then
-        sbar(i,j) = sbar(i,j+k) + real(k)*(sbar(i,j+k) - sbar(i,j+k+1))
-        sbar_f(i,j) = sbar(i,j)
-        if (dg1_lim_wall_face(CS%v_face_mask_bdry(i,j+k-1), CS%v_bdry_val(i-1,j+k-1), CS%v_bdry_val(i,j+k-1))) &
-          sbar_f(i,j) = sbar(i,j+2*k-1)
-        have(i,j) = .true. ; cycle
-      endif ; endif
-      if (j-k-1 >= jsd) then ; if (in_dom(i,j-k) .and. have(i,j-k) .and. have(i,j-k-1) .and. &
-                                   (.not.in_dom(i,j-k+1))) then
-        sbar(i,j) = sbar(i,j-k) + real(k)*(sbar(i,j-k) - sbar(i,j-k-1))
-        sbar_f(i,j) = sbar(i,j)
-        if (dg1_lim_wall_face(CS%v_face_mask_bdry(i,j-k), CS%v_bdry_val(i-1,j-k), CS%v_bdry_val(i,j-k))) &
-          sbar_f(i,j) = sbar(i,j-2*k+1)
-        have(i,j) = .true. ; cycle
-      endif ; endif
-    enddo
-    if (have(i,j)) cycle
-    do n = -1, 1, 2 ; do m = -1, 1, 2
-      if (have(i,j)) cycle
-      if ((i+2*m < isd) .or. (i+2*m > ied) .or. (j+2*n < jsd) .or. (j+2*n > jed)) cycle
-      if (in_dom(i+m,j+n) .and. have(i+m,j+n) .and. have(i+2*m,j+2*n) .and. &
-          (.not.in_dom(i+m,j)) .and. (.not.in_dom(i,j+n))) then
-        sbar(i,j) = sbar(i+m,j+n) + (sbar(i+m,j+n) - sbar(i+2*m,j+2*n))
-        sbar_f(i,j) = sbar(i,j)
-        ! The edge faces of the inside cell (i+m, j+n) toward this cell: x face Ix, y face Jy.
-        ix = i - (1 - m)/2 ; jy = j - (1 - n)/2
-        if (dg1_lim_wall_face(CS%u_face_mask_bdry(ix,j+n), CS%u_bdry_val(ix,j+n-1), CS%u_bdry_val(ix,j+n)) .and. &
-            dg1_lim_wall_face(CS%v_face_mask_bdry(i+m,jy), CS%v_bdry_val(i+m-1,jy), CS%v_bdry_val(i+m,jy))) &
-          sbar_f(i,j) = sbar(i+m,j+n)
-        have(i,j) = .true.
-      endif
-    enddo ; enddo
-  enddo ; enddo
-  if (.not.CS%dg_lim_edge_mirror) sbar_f(:,:) = sbar(:,:)
+  if (CS%dg_lim_cp_face_pt) then ; have_p(:,:) = have(:,:) ; have_q(:,:) = have(:,:) ; endif
+  call dg1_lim_extend_beyond(CS, G, in_dom, have, sbar, sbar_f)
+  if (CS%dg_lim_cp_face_pt) then
+    call dg1_lim_extend_beyond(CS, G, in_dom, have_p, hpt, hpt_f)
+    call dg1_lim_extend_beyond(CS, G, in_dom, have_q, dpt, dpt_f)
+  endif
 
   ! dg_lim_agree_*: on entry, how far each ice cell is out of the neighbour bounds, the cell-mean surfaces at the
   ! node of each corner and the corners of the other ice cells there.  A continuous state is in them, so a change
@@ -18103,6 +18108,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   ! reads them too.
   if (CS%dg_lim_face .or. (CS%dg_lim_cp_face > 0)) then
     trc(:,:,:) = 0.0 ; f_ice(:,:) = .false. ; f_use(:,:) = .false.
+    if (CS%dg_lim_cp_face_pt) trh(:,:,:) = 0.0
     do j = jsd+1, jed ; do i = isd+1, ied
       if (.not.in_dom(i,j)) then
         f_use(i,j) = have(i,j)
@@ -18114,6 +18120,12 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
       enddo ; enddo
       trc(i,j,1) = 0.5*(s_n(1,1) + s_n(1,2)) ; trc(i,j,2) = 0.5*(s_n(2,1) + s_n(2,2))
       trc(i,j,3) = 0.5*(s_n(1,1) + s_n(2,1)) ; trc(i,j,4) = 0.5*(s_n(1,2) + s_n(2,2))
+      if (CS%dg_lim_cp_face_pt) then
+        trh(i,j,1) = 0.5*(CS%h_nodal(i,j,1,1) + CS%h_nodal(i,j,1,2))
+        trh(i,j,2) = 0.5*(CS%h_nodal(i,j,2,1) + CS%h_nodal(i,j,2,2))
+        trh(i,j,3) = 0.5*(CS%h_nodal(i,j,1,1) + CS%h_nodal(i,j,2,1))
+        trh(i,j,4) = 0.5*(CS%h_nodal(i,j,1,2) + CS%h_nodal(i,j,2,2))
+      endif
       f_ice(i,j) = .true. ; f_use(i,j) = .true.
     enddo ; enddo
   endif
@@ -19069,7 +19081,30 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
       cpf = (CS%dg_lim_cp_face == 2)
       if (CS%dg_lim_cp_face == 1) cpf = trb(i,j)
       cf_n = 0
-      if (cpf) then
+      if (cpf .and. CS%dg_lim_cp_face_pt) then
+        ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT: the bounds from point values of the two branch surfaces, each
+        ! with the second difference of its own centre values along the axis.
+        ca_x = 0.0 ; cb_x = 0.0 ; ca_y = 0.0 ; cb_y = 0.0
+        if (f_use(i-1,j) .and. f_use(i+1,j)) then
+          ca_x = CS%dg_lim_face_curv * abs(((hpt_f(i-1,j) - dpt_f(i-1,j)) + (hpt_f(i+1,j) - dpt_f(i+1,j))) - &
+                                           2.0*(hpt_f(i,j) - dpt_f(i,j)))
+          cb_x = CS%dg_lim_face_curv * (1.0 - rr) * abs((hpt_f(i-1,j) + hpt_f(i+1,j)) - 2.0*hpt_f(i,j))
+        endif
+        if (f_use(i,j-1) .and. f_use(i,j+1)) then
+          ca_y = CS%dg_lim_face_curv * abs(((hpt_f(i,j-1) - dpt_f(i,j-1)) + (hpt_f(i,j+1) - dpt_f(i,j+1))) - &
+                                           2.0*(hpt_f(i,j) - dpt_f(i,j)))
+          cb_y = CS%dg_lim_face_curv * (1.0 - rr) * abs((hpt_f(i,j-1) + hpt_f(i,j+1)) - 2.0*hpt_f(i,j))
+        endif
+        cf_ca(:) = (/ ca_x, ca_x, ca_y, ca_y /) ; cf_cb(:) = (/ cb_x, cb_x, cb_y, cb_y /)
+        cf_use(:) = (/ f_use(i-1,j), f_use(i+1,j), f_use(i,j-1), f_use(i,j+1) /)
+        cf_ice(:) = (/ f_ice(i-1,j), f_ice(i+1,j), f_ice(i,j-1), f_ice(i,j+1) /)
+        cf_hc(:) = (/ hpt_f(i-1,j), hpt_f(i+1,j), hpt_f(i,j-1), hpt_f(i,j+1) /)
+        cf_dc(:) = (/ dpt_f(i-1,j), dpt_f(i+1,j), dpt_f(i,j-1), dpt_f(i,j+1) /)
+        cf_ht(:) = (/ trh(i-1,j,2), trh(i+1,j,1), trh(i,j-1,4), trh(i,j+1,3) /)
+        call dg1_lim_cp_face_bounds_pt(CS%h_nodal(i,j,:,:), cp_d, rr, hpt_f(i,j), dpt_f(i,j), cf_ca, cf_cb, &
+                                       CS%dg_lim_cp_face_pt_d0, cf_use, cf_ice, cf_hc, cf_dc, cf_ht, &
+                                       cf_lo, cf_hi, cf_n)
+      elseif (cpf) then
         al_x = CS%dg_lim_d0 ; al_y = CS%dg_lim_d0
         if (f_use(i-1,j) .and. f_use(i+1,j)) &
           al_x = max(al_x, CS%dg_lim_face_curv * abs((sbar_f(i-1,j) + sbar_f(i+1,j)) - 2.0*sbar_f(i,j)))
@@ -19731,6 +19766,72 @@ pure subroutine dg1_lim_cp_face_bounds(hn, dn, rr, sb, al, use_nb, ice_nb, sb_nb
   enddo
 end subroutine dg1_lim_cp_face_bounds
 
+!> DG1_LIMITER_CORNER_PROJECT_FACE_POINT: thickness bounds on the corners of each face of a cell whose middle is out
+!! of the face bounds of the two branch surfaces a = h - D and b = (1 - r) h.  The points are the centre of the cell,
+!! the centre of the cell across and, if that is an ice cell, the middle of the face in it, each with its thickness
+!! and bed; every point gives both a and b, whichever branch it lies on.  If a and b at the middle of the face lie
+!! in [min a - ca, max a + ca] and [min b - cb, max b + cb], the surface max(a, b) there lies in [max(min a - ca,
+!! min b - cb), max(max a + ca, max b + cb)].  These bounds, and the same bounds without ca and cb, become thickness
+!! bounds at the middle of the face through the exact inverse of the surface at its bed, and the latter widen by at
+!! least d0: the lower bound is min(h(lo with ca, cb), h(lo without) - d0) and the upper one likewise.  A face out of
+!! them moves both of its corners by the one thickness change that puts its middle on its bound.  Where all points
+!! and the face lie on one branch, these are the bounds of that branch surface.  The faces are west, east, south
+!! and north.
+pure subroutine dg1_lim_cp_face_bounds_pt(hn, dn, rr, hc, dc, ca, cb, d0, use_nb, ice_nb, hc_nb, dc_nb, ht_nb, &
+                                          hlo, hhi, nset)
+  real, dimension(2,2), intent(in)  :: hn     !< Corner thicknesses [Z ~> m]
+  real, dimension(2,2), intent(in)  :: dn     !< Bed depths at the corners, positive down [Z ~> m]
+  real,                 intent(in)  :: rr     !< Ice to ocean density ratio [nondim]
+  real,                 intent(in)  :: hc     !< Thickness at the centre of the cell, its cell mean [Z ~> m]
+  real,                 intent(in)  :: dc     !< Bed at the centre of the cell, its cell mean [Z ~> m]
+  real, dimension(4),   intent(in)  :: ca     !< Allowances of the a bounds of the faces [Z ~> m]
+  real, dimension(4),   intent(in)  :: cb     !< Allowances of the b bounds of the faces [Z ~> m]
+  real,                 intent(in)  :: d0     !< Least widening of the thickness bounds [Z ~> m]
+  logical, dimension(4), intent(in) :: use_nb !< The cell across the face sets a bound
+  logical, dimension(4), intent(in) :: ice_nb !< The cell across the face is an ice cell, so ht_nb is set
+  real, dimension(4),   intent(in)  :: hc_nb  !< Thicknesses at the centres of the cells across [Z ~> m]
+  real, dimension(4),   intent(in)  :: dc_nb  !< Beds at the centres of the cells across [Z ~> m]
+  real, dimension(4),   intent(in)  :: ht_nb  !< Thicknesses of the cells across at the middle of the faces [Z ~> m]
+  real, dimension(2,2), intent(out) :: hlo    !< Lower thickness bounds of the corners, -huge where none [Z ~> m]
+  real, dimension(2,2), intent(out) :: hhi    !< Upper thickness bounds of the corners, huge where none [Z ~> m]
+  integer,              intent(out) :: nset   !< The number of faces out of their bounds
+
+  real :: hm, dm  ! Mean thickness and bed of the two corners of a face [Z ~> m]
+  real :: a_lo, a_hi, b_lo, b_hi ! Smallest and largest a and b of the points [Z ~> m]
+  real :: h_lo, h_hi ! Thickness bounds of the middle of a face [Z ~> m]
+  real :: dh      ! The thickness change of both corners of a face [Z ~> m]
+  integer :: f, a1, b1, a2, b2
+
+  hlo(:,:) = -huge(1.0) ; hhi(:,:) = huge(1.0) ; nset = 0
+  do f = 1, 4
+    if (.not.use_nb(f)) cycle
+    select case (f)
+      case (1) ; a1 = 1 ; b1 = 1 ; a2 = 1 ; b2 = 2
+      case (2) ; a1 = 2 ; b1 = 1 ; a2 = 2 ; b2 = 2
+      case (3) ; a1 = 1 ; b1 = 1 ; a2 = 2 ; b2 = 1
+      case default ; a1 = 1 ; b1 = 2 ; a2 = 2 ; b2 = 2
+    end select
+    hm = 0.5*(hn(a1,b1) + hn(a2,b2)) ; dm = 0.5*(dn(a1,b1) + dn(a2,b2))
+    a_lo = min(hc - dc, hc_nb(f) - dc_nb(f)) ; a_hi = max(hc - dc, hc_nb(f) - dc_nb(f))
+    b_lo = (1.0 - rr) * min(hc, hc_nb(f)) ; b_hi = (1.0 - rr) * max(hc, hc_nb(f))
+    if (ice_nb(f)) then
+      a_lo = min(a_lo, ht_nb(f) - dm) ; a_hi = max(a_hi, ht_nb(f) - dm)
+      b_lo = min(b_lo, (1.0 - rr) * ht_nb(f)) ; b_hi = max(b_hi, (1.0 - rr) * ht_nb(f))
+    endif
+    h_lo = min(dg1_lim_h_from_s(max(a_lo - ca(f), b_lo - cb(f)), dm, rr), &
+               dg1_lim_h_from_s(max(a_lo, b_lo), dm, rr) - d0)
+    h_hi = max(dg1_lim_h_from_s(max(a_hi + ca(f), b_hi + cb(f)), dm, rr), &
+               dg1_lim_h_from_s(max(a_hi, b_hi), dm, rr) + d0)
+    if (hm < h_lo) then
+      dh = h_lo - hm ; nset = nset + 1
+      hlo(a1,b1) = max(hlo(a1,b1), hn(a1,b1) + dh) ; hlo(a2,b2) = max(hlo(a2,b2), hn(a2,b2) + dh)
+    elseif (hm > h_hi) then
+      dh = hm - h_hi ; nset = nset + 1
+      hhi(a1,b1) = min(hhi(a1,b1), hn(a1,b1) - dh) ; hhi(a2,b2) = min(hhi(a2,b2), hn(a2,b2) - dh)
+    endif
+  enddo
+end subroutine dg1_lim_cp_face_bounds_pt
+
 !> DG1_LIMITER_BACKWARD_EDGE: in each ice cell that the projection limits and that is not crossed, an edge (the two
 !! corners on one side of the cell, along one axis) whose surface points against the trend of the cell means along
 !! that line is moved toward its neighbours.  The surface of each corner is on its own branch, s = h - D grounded and
@@ -19950,6 +20051,80 @@ subroutine dg1_lim_backward_edges(CS, G, hmask, h_in, trb, in_dom, hlo, hhi, pn,
     if (do_bud) call dg1_bud_add(CS, i, j, 8, bud_w, CS%h_nodal(i,j,:,:) - h_in(i,j,:,:))
   enddo ; enddo
 end subroutine dg1_lim_backward_edges
+
+!> The grounded limiter: the values v of the cells beyond a domain edge, from the cells inside (have), and v_f, as
+!! the face pass reads them, as in dg1_grounded_limiter: the linear extrapolation along the axis normal to the edge,
+!! or along the diagonal beyond a corner of the domain; with DG1_LIMITER_EDGE_MIRROR, v_f takes the mirror image
+!! across a wall or a divide.  have is set where v is set.
+subroutine dg1_lim_extend_beyond(CS, G, in_dom, have, v, v_f)
+  type(ice_shelf_dyn_CS), intent(in)    :: CS  !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in)    :: G   !< The grid structure
+  logical, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: in_dom !< The cell lies inside the domain
+  logical, dimension(SZDI_(G),SZDJ_(G)), intent(inout) :: have !< v is set
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(inout) :: v   !< Cell values, extended beyond the domain edges [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(out)   :: v_f !< v as the face pass reads it [Z ~> m]
+
+  integer :: i, j, m, n, k, isd, ied, jsd, jed
+  integer :: ix, jy ! Edge faces of a cell beyond a corner of the domain
+
+  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+  v_f(:,:) = v(:,:)
+  do j = jsd+1, jed-1 ; do i = isd+1, ied-1
+    if (in_dom(i,j)) cycle
+    do k = 1, 2
+      if (have(i,j)) exit
+      if (i+k+1 <= ied) then ; if (in_dom(i+k,j) .and. have(i+k,j) .and. have(i+k+1,j) .and. &
+                                   (.not.in_dom(i+k-1,j))) then
+        v(i,j) = v(i+k,j) + real(k)*(v(i+k,j) - v(i+k+1,j))
+        v_f(i,j) = v(i,j)
+        if (dg1_lim_wall_face(CS%u_face_mask_bdry(i+k-1,j), CS%u_bdry_val(i+k-1,j-1), CS%u_bdry_val(i+k-1,j))) &
+          v_f(i,j) = v(i+2*k-1,j)
+        have(i,j) = .true. ; cycle
+      endif ; endif
+      if (i-k-1 >= isd) then ; if (in_dom(i-k,j) .and. have(i-k,j) .and. have(i-k-1,j) .and. &
+                                   (.not.in_dom(i-k+1,j))) then
+        v(i,j) = v(i-k,j) + real(k)*(v(i-k,j) - v(i-k-1,j))
+        v_f(i,j) = v(i,j)
+        if (dg1_lim_wall_face(CS%u_face_mask_bdry(i-k,j), CS%u_bdry_val(i-k,j-1), CS%u_bdry_val(i-k,j))) &
+          v_f(i,j) = v(i-2*k+1,j)
+        have(i,j) = .true. ; cycle
+      endif ; endif
+      if (j+k+1 <= jed) then ; if (in_dom(i,j+k) .and. have(i,j+k) .and. have(i,j+k+1) .and. &
+                                   (.not.in_dom(i,j+k-1))) then
+        v(i,j) = v(i,j+k) + real(k)*(v(i,j+k) - v(i,j+k+1))
+        v_f(i,j) = v(i,j)
+        if (dg1_lim_wall_face(CS%v_face_mask_bdry(i,j+k-1), CS%v_bdry_val(i-1,j+k-1), CS%v_bdry_val(i,j+k-1))) &
+          v_f(i,j) = v(i,j+2*k-1)
+        have(i,j) = .true. ; cycle
+      endif ; endif
+      if (j-k-1 >= jsd) then ; if (in_dom(i,j-k) .and. have(i,j-k) .and. have(i,j-k-1) .and. &
+                                   (.not.in_dom(i,j-k+1))) then
+        v(i,j) = v(i,j-k) + real(k)*(v(i,j-k) - v(i,j-k-1))
+        v_f(i,j) = v(i,j)
+        if (dg1_lim_wall_face(CS%v_face_mask_bdry(i,j-k), CS%v_bdry_val(i-1,j-k), CS%v_bdry_val(i,j-k))) &
+          v_f(i,j) = v(i,j-2*k+1)
+        have(i,j) = .true. ; cycle
+      endif ; endif
+    enddo
+    if (have(i,j)) cycle
+    do n = -1, 1, 2 ; do m = -1, 1, 2
+      if (have(i,j)) cycle
+      if ((i+2*m < isd) .or. (i+2*m > ied) .or. (j+2*n < jsd) .or. (j+2*n > jed)) cycle
+      if (in_dom(i+m,j+n) .and. have(i+m,j+n) .and. have(i+2*m,j+2*n) .and. &
+          (.not.in_dom(i+m,j)) .and. (.not.in_dom(i,j+n))) then
+        v(i,j) = v(i+m,j+n) + (v(i+m,j+n) - v(i+2*m,j+2*n))
+        v_f(i,j) = v(i,j)
+        ! The edge faces of the inside cell (i+m, j+n) toward this cell: x face Ix, y face Jy.
+        ix = i - (1 - m)/2 ; jy = j - (1 - n)/2
+        if (dg1_lim_wall_face(CS%u_face_mask_bdry(ix,j+n), CS%u_bdry_val(ix,j+n-1), CS%u_bdry_val(ix,j+n)) .and. &
+            dg1_lim_wall_face(CS%v_face_mask_bdry(i+m,jy), CS%v_bdry_val(i+m-1,jy), CS%v_bdry_val(i+m,jy))) &
+          v_f(i,j) = v(i+m,j+n)
+        have(i,j) = .true.
+      endif
+    enddo ; enddo
+  enddo ; enddo
+  if (.not.CS%dg_lim_edge_mirror) v_f(:,:) = v(:,:)
+end subroutine dg1_lim_extend_beyond
 
 !> DG1_LIMITER_CROSSED, face pass along one axis of a crossed cell: the shift p of the thickness tilt of the axis,
 !! in [p_min, p_max] and nearest to 0, that keeps the surface at the middle of both faces of the axis in the bounds
