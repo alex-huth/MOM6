@@ -818,8 +818,9 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! surfaces, as thickness bounds.
   real :: dg_lim_cp_face_pt_d0    !< DG1_LIMITER_CORNER_PROJECT_FACE_POINT_D0: the tolerance of those bounds
                                   !! [Z ~> m], a thickness.
-  logical :: dg_lim_cp_d0_thick = .false. !< DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS: the tolerance of the vertex
-                                  !! bounds of DG1_LIMITER_CORNER_PROJECT is a thickness on both branches.
+  logical :: dg_lim_cp_d0_thick = .false. !< DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS: the fixed tolerance of
+                                  !! DG1_LIMITER_CORNER_PROJECT (its vertex and face bounds and
+                                  !! DG1_LIMITER_BACKWARD_EDGE) is a thickness on both branches.
   logical :: dg_lim_bwe = .false. !< DG1_LIMITER_BACKWARD_EDGE: the projection first moves the backward edges of the
                                   !! cells that are not crossed toward their neighbours.
   logical :: dg_lim_cp_all = .false. !< DG1_LIMITER_CORNER_PROJECT_ENDORSE = ALL: the corners of the other ice
@@ -14439,12 +14440,19 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                                   "ALL, not "//trim(cpe_str)//".")
   end select
   call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS", CS%dg_lim_cp_d0_thick, &
-                 "If true, the tolerance of the vertex bounds of DG1_LIMITER_CORNER_PROJECT is a thickness on "//&
-                 "both branches.  Each bound becomes a thickness at the corner through the exact inverse of the "//&
-                 "surface at its bed, widened by the larger of DG1_LIMITER_D0 and the 2% of the range of the "//&
-                 "cell-mean surfaces there, as a thickness through the same inverse.  If false, DG1_LIMITER_D0 is a "//&
-                 "surface height, which is 1 / (1 - rho_i/rho_w), about 9, times as wide in the thickness of a "//&
-                 "floating corner as of a grounded one.", &
+                 "If true, the fixed tolerance DG1_LIMITER_D0 of DG1_LIMITER_CORNER_PROJECT is a thickness on "//&
+                 "both branches, so grounded, floating and crossed corners take the same tolerance.  Each vertex "//&
+                 "bound becomes a thickness at the corner through the exact inverse of the surface at its bed, "//&
+                 "widened by the larger of DG1_LIMITER_D0 and the 2% of the range of the cell-mean surfaces there, "//&
+                 "as a thickness through the same inverse.  The mean face bounds of "//&
+                 "DG1_LIMITER_CORNER_PROJECT_FACE take an allowance of at least DG1_LIMITER_D0 (k1 + k2) / 2 at "//&
+                 "each face, with k the change of the surface of each of its corners per change of the thickness "//&
+                 "(1 grounded, 1 - rho_i/rho_w floating): the change of the surface at the middle of the face when "//&
+                 "both corners change by DG1_LIMITER_D0.  The tests and the limit of DG1_LIMITER_BACKWARD_EDGE "//&
+                 "take DG1_LIMITER_D0 times k of the branch of the edge.  The bounds of "//&
+                 "DG1_LIMITER_CORNER_PROJECT_FACE_POINT are thickness bounds already.  If false, DG1_LIMITER_D0 "//&
+                 "is a surface height, which is 1 / (1 - rho_i/rho_w), about 9, times as wide in the thickness of "//&
+                 "a floating corner as of a grounded one.", &
                  default=.false., do_not_log=(CS%dg_lim_cp == 0))
   call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FACE", cpf_str, &
                  "Which cells of DG1_LIMITER_CORNER_PROJECT also take the face bounds of DG1_LIMITER_FACE_BOUNDS, "//&
@@ -17918,7 +17926,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   real, dimension(4) :: cf_ca, cf_cb ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT: allowances of the a and b bounds
                                ! of each face [Z ~> m]
   real :: ca_x, ca_y, cb_x, cb_y ! Allowances of the a = h - D and b = (1 - r) h bounds along x and y [Z ~> m]
-  real :: h_b    ! DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS: a vertex bound as a corner thickness [Z ~> m]
+  real :: agr_hi, agr_lo ! DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS: the widened vertex bounds of a corner [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G),4) :: trc ! Surface at the middle of the west, east, south and north
                                  ! faces of each ice cell on entry [Z ~> m]
   logical, dimension(SZDI_(G),SZDJ_(G)) :: f_ice ! The cell is an ice cell inside the domain, so trc is set
@@ -18108,8 +18116,16 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
         u_n = o_hi ; l_n = o_lo
         if (CS%dg_lim_cp_all .and. (o_hi >= o_lo)) then ; u_n = o_lo ; l_n = o_hi ; endif
         s_o = max(CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b), (1.0 - rr) * CS%h_nodal(i,j,a,b))
-        e_agr(i,j) = max(e_agr(i,j), max(s_o - max(u_m, u_n), min(l_m, l_n) - s_o) - &
-                                     max(CS%dg_lim_d0, lim_eps * (u_m - l_m)))
+        if (CS%dg_lim_cp_d0_thick) then
+          ! As the vertex bounds of DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS below.
+          agr_hi = dg1_lim_s_widen(max(u_m, u_n), lim_eps * (u_m - l_m), CS%dg_lim_d0, CS%bed_node(i-2+a,j-2+b), rr)
+          agr_lo = dg1_lim_s_widen(min(l_m, l_n), -(lim_eps * (u_m - l_m)), -CS%dg_lim_d0, &
+                                   CS%bed_node(i-2+a,j-2+b), rr)
+          e_agr(i,j) = max(e_agr(i,j), max(s_o - agr_hi, agr_lo - s_o))
+        else
+          e_agr(i,j) = max(e_agr(i,j), max(s_o - max(u_m, u_n), min(l_m, l_n) - s_o) - &
+                                       max(CS%dg_lim_d0, lim_eps * (u_m - l_m)))
+        endif
       enddo ; enddo
     enddo ; enddo
   endif
@@ -19085,12 +19101,8 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
         cp_d(a,b) = CS%bed_node(i-2+a,j-2+b)
         if (CS%dg_lim_cp_d0_thick) then
           ! DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS: the bounds widen as thicknesses at the corner bed.
-          h_b = max(dg1_lim_h_from_s(max(u_m, u_n) + lim_eps * (u_m - l_m), cp_d(a,b), rr), &
-                    dg1_lim_h_from_s(max(u_m, u_n), cp_d(a,b), rr) + CS%dg_lim_d0)
-          cp_hi(a,b) = max(h_b - cp_d(a,b), (1.0 - rr) * h_b)
-          h_b = min(dg1_lim_h_from_s(min(l_m, l_n) - lim_eps * (u_m - l_m), cp_d(a,b), rr), &
-                    dg1_lim_h_from_s(min(l_m, l_n), cp_d(a,b), rr) - CS%dg_lim_d0)
-          cp_lo(a,b) = max(h_b - cp_d(a,b), (1.0 - rr) * h_b)
+          cp_hi(a,b) = dg1_lim_s_widen(max(u_m, u_n), lim_eps * (u_m - l_m), CS%dg_lim_d0, cp_d(a,b), rr)
+          cp_lo(a,b) = dg1_lim_s_widen(min(l_m, l_n), -(lim_eps * (u_m - l_m)), -CS%dg_lim_d0, cp_d(a,b), rr)
         else
           cp_hi(a,b) = max(u_m, u_n) + max(CS%dg_lim_d0, lim_eps * (u_m - l_m))
           cp_lo(a,b) = min(l_m, l_n) - max(CS%dg_lim_d0, lim_eps * (u_m - l_m))
@@ -19127,6 +19139,8 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
                                        cf_lo, cf_hi, cf_n)
       elseif (cpf) then
         al_x = CS%dg_lim_d0 ; al_y = CS%dg_lim_d0
+        ! DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS: the floor of the allowance is set at each face, from its corners.
+        if (CS%dg_lim_cp_d0_thick) then ; al_x = 0.0 ; al_y = 0.0 ; endif
         if (f_use(i-1,j) .and. f_use(i+1,j)) &
           al_x = max(al_x, CS%dg_lim_face_curv * abs((sbar_f(i-1,j) + sbar_f(i+1,j)) - 2.0*sbar_f(i,j)))
         if (f_use(i,j-1) .and. f_use(i,j+1)) &
@@ -19136,8 +19150,13 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
         cf_ice(:) = (/ f_ice(i-1,j), f_ice(i+1,j), f_ice(i,j-1), f_ice(i,j+1) /)
         cf_sb(:) = (/ sbar_f(i-1,j), sbar_f(i+1,j), sbar_f(i,j-1), sbar_f(i,j+1) /)
         cf_tr(:) = (/ trc(i-1,j,2), trc(i+1,j,1), trc(i,j-1,4), trc(i,j+1,3) /)
-        call dg1_lim_cp_face_bounds(CS%h_nodal(i,j,:,:), cp_d, rr, sbar_f(i,j), cf_al, cf_use, cf_ice, cf_sb, &
-                                    cf_tr, cf_lo, cf_hi, cf_n)
+        if (CS%dg_lim_cp_d0_thick) then
+          call dg1_lim_cp_face_bounds(CS%h_nodal(i,j,:,:), cp_d, rr, sbar_f(i,j), cf_al, cf_use, cf_ice, cf_sb, &
+                                      cf_tr, cf_lo, cf_hi, cf_n, d0=CS%dg_lim_d0)
+        else
+          call dg1_lim_cp_face_bounds(CS%h_nodal(i,j,:,:), cp_d, rr, sbar_f(i,j), cf_al, cf_use, cf_ice, cf_sb, &
+                                      cf_tr, cf_lo, cf_hi, cf_n)
+        endif
       endif
       if (cf_n > 0) then
         call dg1_lim_corner_project(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:), cp_d, cp_lo, cp_hi, cp_one, rr, &
@@ -19452,6 +19471,26 @@ pure real function dg1_lim_h_from_s(s, d, rr)
   endif
 end function dg1_lim_h_from_s
 
+!> DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS: a corner surface s widened by ds as a surface or by d0 as a thickness
+!! at the corner bed d, whichever is wider, through the exact inverse of the surface (dg1_lim_h_from_s).  ds and d0
+!! take the sign of the widening, positive for an upper bound and negative for a lower one.
+pure real function dg1_lim_s_widen(s, ds, d0, d, rr)
+  real, intent(in) :: s  !< Corner surface [Z ~> m]
+  real, intent(in) :: ds !< The widening as a surface [Z ~> m]
+  real, intent(in) :: d0 !< The widening as a thickness [Z ~> m]
+  real, intent(in) :: d  !< Bed depth at the corner, positive down [Z ~> m]
+  real, intent(in) :: rr !< Ice to ocean density ratio [nondim]
+
+  real :: h_b  ! The widened bound as a corner thickness [Z ~> m]
+
+  if (d0 >= 0.0) then
+    h_b = max(dg1_lim_h_from_s(s + ds, d, rr), dg1_lim_h_from_s(s, d, rr) + d0)
+  else
+    h_b = min(dg1_lim_h_from_s(s + ds, d, rr), dg1_lim_h_from_s(s, d, rr) + d0)
+  endif
+  dg1_lim_s_widen = max(h_b - d, (1.0 - rr) * h_b)
+end function dg1_lim_s_widen
+
 !> DG1_LIMITER_CROSSED_CORNER_CLIP: the flat surface s whose corner thicknesses max(h(s, D_c), 0), on the bed of
 !! each corner (dg1_lim_h_from_s), have the mean thickness hb with the weights wc.  That mean is continuous,
 !! nondecreasing and piecewise linear in s, 0 at s = 0, with breaks at the flotation surfaces of the corners and
@@ -19735,8 +19774,10 @@ end subroutine dg1_lim_cp_apply
 !! onto its bound, k1 dh1 + k2 dh2 = 2 d, with k the slope of the surface in the thickness on the branch of the
 !! corner (1 grounded, 1 - r floating): dh = 2 d k / (k1^2 + k2^2).  A grounded corner so moves about 9 times as
 !! far as a floating one.  The bounds are the corner thickness plus or minus that change; a corner of two faces
-!! out of bounds takes the tighter bound of the two.  The faces are west, east, south and north.
-pure subroutine dg1_lim_cp_face_bounds(hn, dn, rr, sb, al, use_nb, ice_nb, sb_nb, tr_nb, hlo, hhi, nset)
+!! out of bounds takes the tighter bound of the two.  With d0 (DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS), the
+!! allowance of a face is at least d0 (k1 + k2) / 2, the change of the surface at its middle when both of its
+!! corners change by d0 in thickness.  The faces are west, east, south and north.
+pure subroutine dg1_lim_cp_face_bounds(hn, dn, rr, sb, al, use_nb, ice_nb, sb_nb, tr_nb, hlo, hhi, nset, d0)
   real, dimension(2,2), intent(in)  :: hn     !< Corner thicknesses [Z ~> m]
   real, dimension(2,2), intent(in)  :: dn     !< Bed depths at the corners, positive down [Z ~> m]
   real,                 intent(in)  :: rr     !< Ice to ocean density ratio [nondim]
@@ -19749,10 +19790,12 @@ pure subroutine dg1_lim_cp_face_bounds(hn, dn, rr, sb, al, use_nb, ice_nb, sb_nb
   real, dimension(2,2), intent(out) :: hlo    !< Lower thickness bounds of the corners, -huge where none [Z ~> m]
   real, dimension(2,2), intent(out) :: hhi    !< Upper thickness bounds of the corners, huge where none [Z ~> m]
   integer,              intent(out) :: nset   !< The number of faces out of their bounds
+  real,       optional, intent(in)  :: d0     !< The least allowance as a thickness of both corners of a face [Z ~> m]
 
   real, dimension(2,2) :: s_c ! Corner surfaces [Z ~> m]
   real, dimension(2,2) :: k_c ! Slopes of the corner surfaces in the thickness [nondim]
   real :: lo, hi  ! Bounds of the middle of a face [Z ~> m]
+  real :: al_f    ! The allowance of a face [Z ~> m]
   real :: sm      ! Surface at the middle of a face [Z ~> m]
   real :: d       ! Distance of the middle of a face past its bound [Z ~> m]
   real :: q       ! k1^2 + k2^2 [nondim]
@@ -19772,7 +19815,9 @@ pure subroutine dg1_lim_cp_face_bounds(hn, dn, rr, sb, al, use_nb, ice_nb, sb_nb
       case (3) ; a1 = 1 ; b1 = 1 ; a2 = 2 ; b2 = 1
       case default ; a1 = 1 ; b1 = 2 ; a2 = 2 ; b2 = 2
     end select
-    call dg1_lim_face_bounds(sb, al(f), use_nb(f), ice_nb(f), sb_nb(f), tr_nb(f), lo, hi)
+    al_f = al(f)
+    if (present(d0)) al_f = max(al_f, d0 * (0.5*(k_c(a1,b1) + k_c(a2,b2))))
+    call dg1_lim_face_bounds(sb, al_f, use_nb(f), ice_nb(f), sb_nb(f), tr_nb(f), lo, hi)
     sm = 0.5*(s_c(a1,b1) + s_c(a2,b2))
     q = k_c(a1,b1)*k_c(a1,b1) + k_c(a2,b2)*k_c(a2,b2)
     if (sm < lo) then
@@ -19862,11 +19907,12 @@ end subroutine dg1_lim_cp_face_bounds_pt
 !! axis; a cell with no ice gives no step, and a cell beyond a wall or a divide is the mirror image, whose step of 0
 !! stops the test.  An edge is backward if every step it has (at least one) has one sign, its own difference has the
 !! other sign by more than 2 DG1_LIMITER_D0, and one of its corners is more than DG1_LIMITER_D0 from the mean of the
-!! corners on its branch at its node.  Each corner of the edge then moves to that node mean, and both shift by one
-!! amount so that the cell mean does not change.  The part of the change kept is the largest that takes neither
-!! corner further from the mean of the other corners at its node, and, for the cell, that keeps every corner at or
-!! above min(MIN_H_SHELF, now), on its branch and inside the bounds lo and hi of the projection.  The state on entry
-!! is read throughout, so the result does not depend on the order of the loop.
+!! corners on its branch at its node; with DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS, DG1_LIMITER_D0 is a thickness
+!! here, kz DG1_LIMITER_D0 of the surface of the branch.  Each corner of the edge then moves to that node mean, and
+!! both shift by one amount so that the cell mean does not change.  The part of the change kept is the largest that
+!! takes neither corner further from the mean of the other corners at its node, and, for the cell, that keeps every
+!! corner at or above min(MIN_H_SHELF, now), on its branch and inside the bounds lo and hi of the projection.  The
+!! state on entry is read throughout, so the result does not depend on the order of the loop.
 subroutine dg1_lim_backward_edges(CS, G, hmask, h_in, trb, in_dom, hlo, hhi, pn, rr, do_st, do_bud, bud_w)
   type(ice_shelf_dyn_CS), intent(inout) :: CS  !< Ice shelf dynamics control structure
   type(ocean_grid_type),  intent(in)    :: G   !< The grid structure
@@ -19904,6 +19950,8 @@ subroutine dg1_lim_backward_edges(CS, G, hmask, h_in, trb, in_dom, hlo, hhi, pn,
   real :: te, tq  ! Parts of the change kept [nondim]
   real :: lim, g_ ! A distance from the other corners at a node and its allowed size [Z ~> m]
   real :: kz      ! Change of the surface per change of the thickness on the branch of the edge [nondim]
+  real :: d0z     ! d0 on the branch of the edge, as a surface: d0, or kz d0 with
+                  ! DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS [Z ~> m]
   real :: tau, dmax ! The part of the cell's change kept [nondim] and its largest corner change [Z ~> m]
   real :: hg      ! The flotation thickness of a corner [Z ~> m]
   real :: d0      ! DG1_LIMITER_D0 [Z ~> m]
@@ -19961,8 +20009,10 @@ subroutine dg1_lim_backward_edges(CS, G, hmask, h_in, trb, in_dom, hlo, hhi, pn,
       else ; a0 = e ; b0 = 1 ; a1 = e ; b1 = 2 ; endif
       if (gc(i,j,a0,b0) .neqv. gc(i,j,a1,b1)) cycle
       br = gc(i,j,a0,b0)
+      kz = 1.0 - rr ; if (br) kz = 1.0
+      d0z = d0 ; if (CS%dg_lim_cp_d0_thick) d0z = kz * d0
       dz = sc(i,j,a1,b1) - sc(i,j,a0,b0)
-      if (abs(dz) <= 2.0*d0) cycle
+      if (abs(dz) <= 2.0*d0z) cycle
       ! The branch means along the line, in the cell's own row (r = 1) and the row across the line (r = 2).
       lok(:,:) = .false. ; lv(:,:) = 0.0
       do r = 1, 2 ; do k = -1, 1
@@ -20024,7 +20074,7 @@ subroutine dg1_lim_backward_edges(CS, G, hmask, h_in, trb, in_dom, hlo, hhi, pn,
         s_e(q) = sc(i,j,a,b) ; w_e(q) = CS%cell_mean_w(i,j,a,b)
         if (br) then ; t_e(q) = sum_g(iN,jN) / max(n_g(iN,jN), 1.0)
         else ; t_e(q) = sum_f(iN,jN) / max(n_f(iN,jN), 1.0) ; endif
-        if (abs(s_e(q) - t_e(q)) > d0) mis = .true.
+        if (abs(s_e(q) - t_e(q)) > d0z) mis = .true.
         o_ok(q) = (n_a(iN,jN) > 1.0)
         o_e(q) = 0.0 ; if (o_ok(q)) o_e(q) = (sum_a(iN,jN) - s_e(q)) / (n_a(iN,jN) - 1.0)
       enddo
@@ -20032,17 +20082,16 @@ subroutine dg1_lim_backward_edges(CS, G, hmask, h_in, trb, in_dom, hlo, hhi, pn,
       if ((w_e(1) + w_e(2)) <= 0.0) cycle
       cs_ = -((w_e(1) * (t_e(1) - s_e(1))) + (w_e(2) * (t_e(2) - s_e(2)))) / (w_e(1) + w_e(2))
       d_e(1) = (t_e(1) + cs_) - s_e(1) ; d_e(2) = (t_e(2) + cs_) - s_e(2)
-      ! Do no harm: no corner of the edge ends further from the other corners at its node than now (or than d0).
+      ! Do no harm: no corner of the edge ends further from the other corners at its node than now (or than d0z).
       te = 1.0
       do q = 1, 2
         if (.not.o_ok(q)) cycle
-        g_ = s_e(q) - o_e(q) ; lim = max(abs(g_), d0)
+        g_ = s_e(q) - o_e(q) ; lim = max(abs(g_), d0z)
         if (d_e(q) > 0.0) then ; tq = (lim - g_) / d_e(q)
         elseif (d_e(q) < 0.0) then ; tq = (-lim - g_) / d_e(q)
         else ; tq = 1.0 ; endif
         te = min(te, max(0.0, tq))
       enddo
-      kz = 1.0 - rr ; if (br) kz = 1.0
       dh(a0,b0) = dh(a0,b0) + (te * d_e(1)) / kz
       dh(a1,b1) = dh(a1,b1) + (te * d_e(2)) / kz
     enddo ; enddo
