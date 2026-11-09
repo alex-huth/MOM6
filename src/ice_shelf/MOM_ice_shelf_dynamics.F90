@@ -823,6 +823,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! DG1_LIMITER_BACKWARD_EDGE) is a thickness on both branches.
   logical :: dg_lim_bwe = .false. !< DG1_LIMITER_BACKWARD_EDGE: the projection first moves the backward edges of the
                                   !! cells that are not crossed toward their neighbours.
+  logical :: dg_lim_bwe_cont = .false. !< DG1_LIMITER_BACKWARD_EDGE_CONTINUOUS: the backward-edge limiter with no
+                                  !! on/off tests, in every ice cell of the projection, crossed cells too.
   logical :: dg_lim_cp_all = .false. !< DG1_LIMITER_CORNER_PROJECT_ENDORSE = ALL: the corners of the other ice
                                   !! cells at a node widen the bounds of a corner only as far as all of them agree.
   integer :: dg_lim_cp_face = 0   !< DG1_LIMITER_CORNER_PROJECT_FACE: 0 off, 1 the face bounds of
@@ -871,7 +873,7 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! entry [nondim], 16 their largest corner change [Z ~> m]; 17 and 18 the same for
                                   !! cells with a corner out of those bounds.
   real :: dg_lim_nstage = 0.0     !< Limiter calls since the last post of dg_lim_stat [nondim]
-  integer, dimension(22) :: id_dg_lim_stat = -1 !< Diagnostic ids of the 22 fields of dg_lim_stat
+  integer, dimension(26) :: id_dg_lim_stat = -1 !< Diagnostic ids of the 26 fields of dg_lim_stat
   logical :: dg_art_visc_node_weight !< Artificial viscosity: the band weight of a face QP is interpolated along
                                   !! the face from the node weights, each the largest weight of the 4 cells there.
   real :: dg_art_visc_lump_frac  !< Artificial viscosity: the lumped fraction theta of the mass matrix whose
@@ -2502,7 +2504,22 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
         CS%id_dg_lim_stat(22) = register_diag_field('ice_shelf_model', 'dg_lim_bwe_dh', CS%diag%axesT1, &
            Time, 'DG(1) grounded limiter: largest corner thickness change of DG1_LIMITER_BACKWARD_EDGE, summed over '//&
            'its changes, per limiter call', 'm', conversion=US%Z_to_m)
-        if (any(CS%id_dg_lim_stat(:) > 0)) allocate(CS%dg_lim_stat(G%isd:G%ied,G%jsd:G%jed,22), source=0.0)
+        CS%id_dg_lim_stat(23) = register_diag_field('ice_shelf_model', 'dg_lim_bwe_back_dh', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: corner thickness change of DG1_LIMITER_BACKWARD_EDGE_CONTINUOUS at edges '//&
+           'that rise against every step of the cell means, summed over the edges, per limiter call', 'm', &
+           conversion=US%Z_to_m)
+        CS%id_dg_lim_stat(24) = register_diag_field('ice_shelf_model', 'dg_lim_bwe_flat_dh', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: corner thickness change of DG1_LIMITER_BACKWARD_EDGE_CONTINUOUS at edges '//&
+           'flatter than its least fall, summed over the edges, per limiter call', 'm', conversion=US%Z_to_m)
+        CS%id_dg_lim_stat(25) = register_diag_field('ice_shelf_model', 'dg_lim_bwe_over_dh', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: corner thickness change of DG1_LIMITER_BACKWARD_EDGE_CONTINUOUS at edges '//&
+           'steeper than 4 times the steepest step, summed over the edges, per limiter call', 'm', &
+           conversion=US%Z_to_m)
+        CS%id_dg_lim_stat(26) = register_diag_field('ice_shelf_model', 'dg_lim_bwe_ext_dh', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: corner thickness change of DG1_LIMITER_BACKWARD_EDGE_CONTINUOUS at edges '//&
+           'at a local high or low of the cell means, summed over the edges, per limiter call', 'm', &
+           conversion=US%Z_to_m)
+        if (any(CS%id_dg_lim_stat(:) > 0)) allocate(CS%dg_lim_stat(G%isd:G%ied,G%jsd:G%jed,26), source=0.0)
       endif
       if (CS%dg_source_positive) then
         allocate(CS%dg_src_cut_smb(G%isd:G%ied,G%jsd:G%jed), source=0.0)
@@ -3399,7 +3416,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_lim_phi_w, CS%dg_lim_phi(:,:,2), CS%diag)
     if (associated(CS%dg_lim_stat)) then
       if (CS%dg_lim_nstage > 0.0) then
-        do k = 1, 22
+        do k = 1, 26
           if (CS%id_dg_lim_stat(k) > 0) then
             lim_st(:,:) = CS%dg_lim_stat(:,:,k) / CS%dg_lim_nstage
             call post_data(CS%id_dg_lim_stat(k), lim_st, CS%diag)
@@ -14521,6 +14538,23 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   if (CS%dg_lim_bwe .and. ((CS%dg_lim_cp /= 2) .or. (.not.CS%dg_lim_crossed))) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_BACKWARD_EDGE needs DG1_LIMITER_CORNER_PROJECT = ALL "//&
       "and DG1_LIMITER_CROSSED.")
+  call get_param(param_file, mdl, "DG1_LIMITER_BACKWARD_EDGE_CONTINUOUS", CS%dg_lim_bwe_cont, &
+                 "If true, DG1_LIMITER_BACKWARD_EDGE has no on/off tests.  Every edge of every ice cell of the "//&
+                 "projection, crossed cells too, may change by an amount outside a range set by the steps of the "//&
+                 "cell means along its line, in the two rows of cells that share the line.  Each step blends "//&
+                 "the steps of the means of h - D and (1 - rho_i/rho_w) h by the grounded fraction of the edge. "//&
+                 "On a line where the means fall, the edge must fall by at least 0.5 times the gentlest step and "//&
+                 "by at most 4 times the steepest, within DG1_LIMITER_D0 of thickness; at a local high or low of "//&
+                 "the means, it may change by up to 4 times the step in its direction.  Only the excess is "//&
+                 "removed, by a tilt of the edge that keeps the cell mean (a corner may cross flotation), and "//&
+                 "only as far as neither corner moves further from the other corners at its node, so a "//&
+                 "continuous state never changes.  The change stays inside the vertex bounds of the projection; "//&
+                 "the face bounds of DG1_LIMITER_CORNER_PROJECT_FACE are found after it, from the corners it "//&
+                 "leaves, so that a face bound, which holds both corners of its face, never stops a tilt along "//&
+                 "the face that keeps its middle.  The result changes continuously with the state.", &
+                 default=.false., do_not_log=.not.CS%dg_lim_bwe)
+  if (CS%dg_lim_bwe_cont .and. (.not.CS%dg_lim_bwe)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_BACKWARD_EDGE_CONTINUOUS needs DG1_LIMITER_BACKWARD_EDGE.")
   if ((CS%dg_lim_cp == 1) .and. (.not.CS%dg_lim_crossed)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT = CROSSED needs DG1_LIMITER_CROSSED.")
   if ((CS%dg_lim_cp > 0) .and. (CS%dg_lim_ccl > 0)) call MOM_error(FATAL, &
@@ -17982,6 +18016,11 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
                                                   ! corner that the projection uses [Z ~> m]
   integer, allocatable, dimension(:,:) :: cpb_n   ! DG1_LIMITER_CORNER_PROJECT: faces out of the face bounds of a
                                                   ! cell that the projection limits, -1 for a cell it does not limit
+  real, allocatable, dimension(:,:,:,:) :: cps_lo, cps_hi ! DG1_LIMITER_BACKWARD_EDGE_CONTINUOUS: the vertex bounds of
+                                                  ! each corner, kept from pass 1, as surfaces [Z ~> m]
+  logical, allocatable, dimension(:,:,:,:) :: cps_one ! The corner has only the floor below, kept from pass 1
+  logical :: cp_late ! DG1_LIMITER_BACKWARD_EDGE_CONTINUOUS: the face bounds follow the backward edges
+  integer :: cpass   ! The pass of the corner projection loop
   real :: bw ! The weight of this call in the tilt budget, for DG1_LIMITER_BACKWARD_EDGE [nondim]
   real, dimension(2,2) :: cp_lo, cp_hi ! DG1_LIMITER_CORNER_PROJECT: corner surface bounds [Z ~> m]
   real, dimension(2,2) :: cp_d, cp_h   ! DG1_LIMITER_CORNER_PROJECT: corner beds and new corners [Z ~> m]
@@ -19075,7 +19114,35 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   if (CS%dg_lim_cp > 0) then
     allocate(cpb_lo(isd:ied,jsd:jed,2,2), source=0.0) ; allocate(cpb_hi(isd:ied,jsd:jed,2,2), source=0.0)
     allocate(cpb_n(isd:ied,jsd:jed), source=-1)
+    ! DG1_LIMITER_BACKWARD_EDGE_CONTINUOUS: the face bounds are found after the backward edges, from the corners they
+    ! leave, so that the backward edges are held by the vertex bounds alone and a face bound never stops a tilt along
+    ! its face.  Pass 1 then finds the vertex bounds only and keeps them; pass 2, after the backward edges, adds the
+    ! face bounds.  Otherwise pass 1 finds both, and the backward edges follow it.
+    cp_late = CS%dg_lim_bwe .and. CS%dg_lim_bwe_cont
+    if (cp_late) then
+      allocate(cps_lo(isd:ied,jsd:jed,2,2), source=0.0) ; allocate(cps_hi(isd:ied,jsd:jed,2,2), source=0.0)
+      allocate(cps_one(isd:ied,jsd:jed,2,2), source=.false.)
+    endif
+    do cpass = 1, 2
+    if (cpass == 2) then
+      ! DG1_LIMITER_BACKWARD_EDGE: the backward edges, held inside the bounds of pass 1.
+      if (CS%dg_lim_bwe) then
+        bw = 0.0 ; if (do_bud) bw = bud_w
+        if (CS%dg_lim_bwe_cont) then
+          call dg1_lim_backward_edges_cont(CS, G, hmask, h_pe, in_dom, cpb_lo, cpb_hi, cpb_n, rr, do_st, do_bud, bw)
+        else
+          call dg1_lim_backward_edges(CS, G, hmask, h_pe, trb, in_dom, cpb_lo, cpb_hi, cpb_n, rr, do_st, do_bud, bw)
+        endif
+      endif
+      if (.not.cp_late) exit
+    endif
     do j = jsc, jec ; do i = isc, iec
+      if (cpass == 2) then
+        ! Pass 2: the vertex bounds of pass 1, and the face bounds from the corners as they are now.
+        if (cpb_n(i,j) < 0) cycle
+        do b = 1, 2 ; do a = 1, 2 ; cp_d(a,b) = CS%bed_node(i-2+a,j-2+b) ; enddo ; enddo
+        cp_lo(:,:) = cps_lo(i,j,:,:) ; cp_hi(:,:) = cps_hi(i,j,:,:) ; cp_one(:,:) = cps_one(i,j,:,:)
+      else
       if (hmask(i,j) /= 1.0) cycle
       if ((CS%dg_lim_cp == 1) .and. (.not.trb(i,j))) cycle
       area = ((CS%cell_mean_w(i,j,1,1) + CS%cell_mean_w(i,j,2,2)) + &
@@ -19109,6 +19176,14 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
         endif
         cp_one(a,b) = trb(i,j)
       enddo ; enddo
+      if (cp_late) then
+        cps_lo(i,j,:,:) = cp_lo(:,:) ; cps_hi(i,j,:,:) = cp_hi(:,:) ; cps_one(i,j,:,:) = cp_one(:,:)
+        call dg1_lim_corner_project(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:), cp_d, cp_lo, cp_hi, cp_one, rr, &
+                                    CS%min_h_shelf, cp_h, cp_act, hl_out=cpb_lo(i,j,:,:), hu_out=cpb_hi(i,j,:,:))
+        cpb_n(i,j) = 0
+        cycle
+      endif
+      endif
       ! DG1_LIMITER_CORNER_PROJECT_FACE: the face bounds of DG1_LIMITER_FACE_BOUNDS, from the state on entry, as
       ! thickness bounds on the corners of the faces that are out of them.
       cpf = (CS%dg_lim_cp_face == 2)
@@ -19168,11 +19243,8 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
       endif
       cpb_n(i,j) = cf_n
     enddo ; enddo
-    ! DG1_LIMITER_BACKWARD_EDGE: the backward edges of the cells that are not crossed, held inside these bounds.
-    if (CS%dg_lim_bwe) then
-      bw = 0.0 ; if (do_bud) bw = bud_w
-      call dg1_lim_backward_edges(CS, G, hmask, h_pe, trb, in_dom, cpb_lo, cpb_hi, cpb_n, rr, do_st, do_bud, bw)
-    endif
+    enddo ! cpass-loop
+    if (cp_late) deallocate(cps_lo, cps_hi, cps_one)
     do j = jsc, jec ; do i = isc, iec
       if (cpb_n(i,j) < 0) cycle
       cf_n = cpb_n(i,j)
@@ -20121,6 +20193,276 @@ subroutine dg1_lim_backward_edges(CS, G, hmask, h_in, trb, in_dom, hlo, hhi, pn,
     if (do_bud) call dg1_bud_add(CS, i, j, 8, bud_w, CS%h_nodal(i,j,:,:) - h_in(i,j,:,:))
   enddo ; enddo
 end subroutine dg1_lim_backward_edges
+
+!> DG1_LIMITER_BACKWARD_EDGE_CONTINUOUS: the backward-edge limiter with no on/off tests.  Every edge of every ice cell
+!! that the projection limits (crossed cells too) gets an allowed range for its surface change dz, from the steps of
+!! the cell means along its line, in the two rows of cells that share the line.  An edge is the two corners on one
+!! side of the cell along one axis; theta is its grounded fraction, from the height above flotation r h - D of its two
+!! corners (linear along the edge), so dz = theta da + (1 - theta) db exactly, with a = h - D and b = (1 - r) h.  Each
+!! step is the same blend of the steps of the cell means of a and b, which are smooth across the grounding line.  With
+!! smax and smin the largest and smallest steps and tau = DG1_LIMITER_D0 (theta + (1 - theta) (1 - r)) (D0 of
+!! thickness as a surface), dz may lie in [L, U], U = fwd smax + tau if smax >= 0 and beta smax + tau if not, and L
+!! likewise: on a monotone line the edge falls by at least beta times the gentlest step and at most fwd times the
+!! steepest.  The part of dz outside the range is removed by a tilt of the edge alone (one corner up, the other down,
+!! the cell mean kept), found exactly piece by piece where a corner crosses flotation on the way.  The tilt is cut so
+!! that neither corner ends further from the mean surface of the other corners at its node than now (no floor, so a
+!! continuous state is never changed); a corner with no other ice corner at its node does not move.  The changes of
+!! the four edges add up, and one factor for the cell keeps every corner at or above min(MIN_H_SHELF, now) and inside
+!! the bounds lo and hi of the projection, which are its vertex bounds only: the face bounds follow this step, from the
+!! corners it leaves.  A corner may change branch.  The state on entry is read throughout, so
+!! the result does not depend on the order of the loop, a turn or a reflection.
+subroutine dg1_lim_backward_edges_cont(CS, G, hmask, h_in, in_dom, hlo, hhi, pn, rr, do_st, do_bud, bud_w)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS  !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in)    :: G   !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in) :: h_in !< Corner thicknesses on entry [Z ~> m]
+  logical, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: in_dom !< The cell lies inside the domain
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in) :: hlo !< Lower thickness bounds of the projection [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in) :: hhi !< Upper thickness bounds of the projection [Z ~> m]
+  integer, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: pn !< Negative for a cell the projection does not limit
+  real,                   intent(in)    :: rr  !< Ice to ocean density ratio [nondim]
+  logical,                intent(in)    :: do_st !< Accumulate the limiter statistics
+  logical,                intent(in)    :: do_bud !< Add the changes to the tilt budget, as the projection
+  real,                   intent(in)    :: bud_w !< The weight of this call in the tilt budget [nondim]
+
+  real, parameter :: beta_e = 0.5 ! The least fall of an edge on a monotone line, as a fraction of the gentlest
+                                  ! step [nondim]
+  real, parameter :: fwd_e = 4.0  ! The largest change of an edge, as a multiple of the steepest step [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: za, zb ! Cell means of h - D and of (1 - r) h [Z ~> m]
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: okc ! An ice cell inside the domain
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: sc ! Corner surfaces on their own branch [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: sum_a ! Sum at a node of the corner surfaces of the ice cells there [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: n_a   ! The number of those corners [nondim]
+  real, dimension(4) :: v_a       ! Corner surfaces of the four cells at a node [Z ~> m]
+  real, dimension(4) :: k_a       ! The counts of those corners [nondim]
+  real, dimension(2,2) :: dn, dh  ! Corner beds [Z ~> m] and the change of the corners [Z ~> m]
+  real, dimension(-1:1,2) :: la, lb ! Cell means of a and b before, at and after the edge, in two rows [Z ~> m]
+  logical, dimension(-1:1,2) :: lok ! Those means are set
+  real, dimension(2) :: h_e, d_e, s_e, o_e ! For the two corners of an edge: thickness, bed, surface and mean
+                                  ! surface of the other corners at the node [Z ~> m]
+  real, dimension(2) :: w_e       ! Their weights in the cell mean [L2 ~> m2]
+  real, dimension(2) :: k_e       ! Change of their surface per change of their thickness [nondim]
+  real, dimension(2) :: m_e       ! Change of their thickness per unit tilt, signed [nondim]
+  real, dimension(2) :: db_e      ! Tilt to their flotation thickness on the way [Z ~> m]
+  logical, dimension(2) :: o_ok   ! The node has other ice corners
+  real, dimension(4) :: kd        ! Largest corner change of the edges of each knd in the cell [Z ~> m]
+  real :: f1, f2  ! Heights above flotation of the two corners [Z ~> m]
+  real :: th      ! Grounded fraction of the edge [nondim]
+  real :: sa, sb, st ! Steps of the cell means of a and b, and their blend [Z ~> m]
+  real :: smax, smin ! The largest and smallest blended steps [Z ~> m]
+  real :: tau_e   ! The tolerance as a surface on the edge [Z ~> m]
+  real :: u_e, l_e ! The upper and lower ends of the allowed range [Z ~> m]
+  real :: dz      ! Surface change of the edge, second corner less first [Z ~> m]
+  real :: ex      ! The excess of dz outside [l_e, u_e], signed [Z ~> m]
+  real :: rem     ! The part of the excess still to remove [Z ~> m]
+  real :: tilt    ! The tilt of the edge: the second corner less the first changes by -tilt [Z ~> m]
+  real :: gsl     ! Fall of dz per unit tilt on the present piece [nondim]
+  real :: stp     ! The tilt that removes rem on the present piece [Z ~> m]
+  real :: dbr     ! The tilt to the first flotation crossing on the way [Z ~> m]
+  real :: sgn     ! The sign of the excess [nondim]
+  real :: w_t     ! Sum of the two weights [L2 ~> m2]
+  real :: hq, dhq ! The thickness of a corner on the way and its change [Z ~> m]
+  real :: s_lim, h_lim ! The surface and thickness a corner may reach under the do-no-harm limit [Z ~> m]
+  real :: te, tq  ! Parts of the tilt kept [nondim]
+  real :: tau, dmax ! The part of the cell's change kept [nondim] and its largest corner change [Z ~> m]
+  real :: d0      ! DG1_LIMITER_D0, a thickness [Z ~> m]
+  integer :: i, j, a, b, ax, e, o, k, r, ic, jc, ii, jj, nst, q, a0, b0, a1, b1, iN, jN, knd, piece
+  integer :: isc, iec, jsc, jec, isd, ied, jsd, jed
+
+  isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
+  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+  d0 = CS%dg_lim_d0
+  okc(:,:) = .false. ; za(:,:) = 0.0 ; zb(:,:) = 0.0 ; sc(:,:,:,:) = 0.0
+  do j = jsd+1, jed ; do i = isd+1, ied
+    if (.not.in_dom(i,j)) cycle
+    if ((hmask(i,j) /= 1.0) .and. (hmask(i,j) /= 3.0)) cycle
+    okc(i,j) = .true.
+    do b = 1, 2 ; do a = 1, 2
+      dn(a,b) = CS%bed_node(i-2+a,j-2+b)
+      sc(i,j,a,b) = max(h_in(i,j,a,b) - dn(a,b), (1.0 - rr) * h_in(i,j,a,b))
+    enddo ; enddo
+    za(i,j) = nodal_cell_mean(h_in(i,j,:,:), CS%cell_mean_w(i,j,:,:)) - nodal_cell_mean(dn, CS%cell_mean_w(i,j,:,:))
+    zb(i,j) = (1.0 - rr) * nodal_cell_mean(h_in(i,j,:,:), CS%cell_mean_w(i,j,:,:))
+  enddo ; enddo
+  ! Node sums, pairing the diagonally opposite cells so that a turn or a reflection of the grid sums the same pairs.
+  sum_a(:,:) = 0.0 ; n_a(:,:) = 0.0
+  do jN = jsd+1, jed-1 ; do iN = isd+1, ied-1
+    ! The cells (iN,jN) NE corner, (iN+1,jN+1) SW, (iN+1,jN) NW, (iN,jN+1) SE share node (iN,jN).
+    do q = 1, 4
+      select case (q)
+        case (1) ; ic = iN ; jc = jN ; a = 2 ; b = 2
+        case (2) ; ic = iN+1 ; jc = jN+1 ; a = 1 ; b = 1
+        case (3) ; ic = iN+1 ; jc = jN ; a = 1 ; b = 2
+        case default ; ic = iN ; jc = jN+1 ; a = 2 ; b = 1
+      end select
+      v_a(q) = 0.0 ; k_a(q) = 0.0
+      if (okc(ic,jc)) then ; v_a(q) = sc(ic,jc,a,b) ; k_a(q) = 1.0 ; endif
+    enddo
+    sum_a(iN,jN) = (v_a(1) + v_a(2)) + (v_a(3) + v_a(4)) ; n_a(iN,jN) = (k_a(1) + k_a(2)) + (k_a(3) + k_a(4))
+  enddo ; enddo
+
+  do j = jsc, jec ; do i = isc, iec
+    if ((hmask(i,j) /= 1.0) .or. (pn(i,j) < 0)) cycle
+    ! A cell that a pass above changed is left to the projection.
+    if (any(CS%h_nodal(i,j,:,:) /= h_in(i,j,:,:))) cycle
+    dh(:,:) = 0.0 ; kd(:) = 0.0
+    do ax = 1, 2 ; do e = 1, 2
+      o = 2*e - 3
+      if (ax == 1) then ; a0 = 1 ; b0 = e ; a1 = 2 ; b1 = e
+      else ; a0 = e ; b0 = 1 ; a1 = e ; b1 = 2 ; endif
+      h_e(1) = h_in(i,j,a0,b0) ; h_e(2) = h_in(i,j,a1,b1)
+      d_e(1) = CS%bed_node(i-2+a0,j-2+b0) ; d_e(2) = CS%bed_node(i-2+a1,j-2+b1)
+      s_e(1) = sc(i,j,a0,b0) ; s_e(2) = sc(i,j,a1,b1)
+      ! The grounded fraction of the edge.
+      f1 = rr * h_e(1) - d_e(1) ; f2 = rr * h_e(2) - d_e(2)
+      if ((f1 > 0.0) .and. (f2 > 0.0)) then ; th = 1.0
+      elseif ((f1 <= 0.0) .and. (f2 <= 0.0)) then ; th = 0.0
+      else ; th = max(f1, f2) / abs(f1 - f2) ; endif
+      ! The cell means of a and b along the line, in the cell's own row (r = 1) and the row across the line (r = 2).
+      lok(:,:) = .false. ; la(:,:) = 0.0 ; lb(:,:) = 0.0
+      do r = 1, 2 ; do k = -1, 1
+        if (ax == 1) then ; ii = i + k ; jj = j + (r-1)*o
+        else ; ii = i + (r-1)*o ; jj = j + k ; endif
+        if (okc(ii,jj)) then ; lok(k,r) = .true. ; la(k,r) = za(ii,jj) ; lb(k,r) = zb(ii,jj) ; endif
+      enddo ; enddo
+      ! Beyond a wall or a divide along the axis the cell is the mirror image of the one inside: a step of 0.
+      do r = 1, 2
+        if (.not.lok(0,r)) cycle
+        if (ax == 1) then ; ii = i ; jj = j + (r-1)*o
+        else ; ii = i + (r-1)*o ; jj = j ; endif
+        do k = -1, 1, 2
+          if (ax == 1) then
+            if (in_dom(ii+k,jj)) cycle
+            if (k == 1) then
+              if (dg1_lim_wall_face(CS%u_face_mask_bdry(ii,jj), CS%u_bdry_val(ii,jj-1), CS%u_bdry_val(ii,jj))) then
+                lok(k,r) = .true. ; la(k,r) = la(0,r) ; lb(k,r) = lb(0,r) ; endif
+            else
+              if (dg1_lim_wall_face(CS%u_face_mask_bdry(ii-1,jj), CS%u_bdry_val(ii-1,jj-1), &
+                                    CS%u_bdry_val(ii-1,jj))) then
+                lok(k,r) = .true. ; la(k,r) = la(0,r) ; lb(k,r) = lb(0,r) ; endif
+            endif
+          else
+            if (in_dom(ii,jj+k)) cycle
+            if (k == 1) then
+              if (dg1_lim_wall_face(CS%v_face_mask_bdry(ii,jj), CS%v_bdry_val(ii-1,jj), CS%v_bdry_val(ii,jj))) then
+                lok(k,r) = .true. ; la(k,r) = la(0,r) ; lb(k,r) = lb(0,r) ; endif
+            else
+              if (dg1_lim_wall_face(CS%v_face_mask_bdry(ii,jj-1), CS%v_bdry_val(ii-1,jj-1), &
+                                    CS%v_bdry_val(ii,jj-1))) then
+                lok(k,r) = .true. ; la(k,r) = la(0,r) ; lb(k,r) = lb(0,r) ; endif
+            endif
+          endif
+        enddo
+      enddo
+      ! The blended steps and the allowed range.
+      nst = 0 ; smax = -huge(1.0) ; smin = huge(1.0)
+      do r = 1, 2
+        if (.not.lok(0,r)) cycle
+        do k = -1, 1, 2
+          if (.not.lok(k,r)) cycle
+          sa = la(k,r) - la(0,r) ; sb = lb(k,r) - lb(0,r)
+          if (k < 0) then ; sa = -sa ; sb = -sb ; endif
+          st = th * sa + (1.0 - th) * sb
+          nst = nst + 1 ; smax = max(smax, st) ; smin = min(smin, st)
+        enddo
+      enddo
+      if (nst == 0) cycle
+      tau_e = d0 * (th + (1.0 - th) * (1.0 - rr))
+      if (smax >= 0.0) then ; u_e = fwd_e * smax + tau_e ; else ; u_e = beta_e * smax + tau_e ; endif
+      if (smin <= 0.0) then ; l_e = fwd_e * smin - tau_e ; else ; l_e = beta_e * smin - tau_e ; endif
+      dz = s_e(2) - s_e(1)
+      if (dz > u_e) then ; ex = dz - u_e
+      elseif (dz < l_e) then ; ex = dz - l_e
+      else ; cycle ; endif
+      w_e(1) = CS%cell_mean_w(i,j,a0,b0) ; w_e(2) = CS%cell_mean_w(i,j,a1,b1)
+      w_t = w_e(1) + w_e(2)
+      if (w_t <= 0.0) cycle
+      ! The tilt that removes the excess: the first corner changes by tilt w2/(w1 + w2), the second by
+      ! -tilt w1/(w1 + w2), so the cell mean stays; dz then falls by (k2 w1 + k1 w2)/(w1 + w2) per unit tilt.  Walk
+      ! in the direction of the excess, piece by piece, switching the slope k of a corner where it crosses flotation.
+      sgn = sign(1.0, ex)
+      m_e(1) = sgn * (w_e(2) / w_t) ; m_e(2) = -sgn * (w_e(1) / w_t)
+      do q = 1, 2
+        k_e(q) = 1.0 - rr
+        if (rr * h_e(q) > d_e(q)) k_e(q) = 1.0
+        if ((rr * h_e(q) == d_e(q)) .and. (m_e(q) > 0.0)) k_e(q) = 1.0
+      enddo
+      rem = abs(ex) ; tilt = 0.0
+      do piece = 1, 3
+        gsl = (k_e(2) * w_e(1) + k_e(1) * w_e(2)) / w_t
+        stp = rem / gsl
+        do q = 1, 2
+          db_e(q) = huge(1.0)
+          if ((d_e(q) <= 0.0) .or. (m_e(q) == 0.0)) cycle
+          hq = h_e(q) + tilt * m_e(q)
+          if ((m_e(q) > 0.0) .and. (k_e(q) < 1.0)) db_e(q) = max(0.0, d_e(q) / rr - hq) / abs(m_e(q))
+          if ((m_e(q) < 0.0) .and. (k_e(q) >= 1.0)) db_e(q) = max(0.0, hq - d_e(q) / rr) / abs(m_e(q))
+        enddo
+        dbr = min(db_e(1), db_e(2))
+        if (stp <= dbr) then ; tilt = tilt + stp ; exit ; endif
+        tilt = tilt + dbr ; rem = rem - dbr * gsl
+        do q = 1, 2
+          if (db_e(q) == dbr) then
+            if (k_e(q) >= 1.0) then ; k_e(q) = 1.0 - rr ; else ; k_e(q) = 1.0 ; endif
+          endif
+        enddo
+      enddo
+      ! Do no harm, without a floor: no corner ends further from the mean of the other corners at its node than now.
+      te = 1.0
+      do q = 1, 2
+        if (q == 1) then ; iN = i - 2 + a0 ; jN = j - 2 + b0 ; else ; iN = i - 2 + a1 ; jN = j - 2 + b1 ; endif
+        o_ok(q) = (n_a(iN,jN) > 1.0)
+        if (.not.o_ok(q)) then ; te = 0.0 ; cycle ; endif
+        o_e(q) = (sum_a(iN,jN) - s_e(q)) / (n_a(iN,jN) - 1.0)
+        dhq = tilt * m_e(q)
+        if (dhq > 0.0) then
+          s_lim = o_e(q) + abs(s_e(q) - o_e(q))
+          h_lim = dg1_lim_h_from_s(s_lim, d_e(q), rr)
+          tq = (h_lim - h_e(q)) / dhq
+        elseif (dhq < 0.0) then
+          s_lim = o_e(q) - abs(s_e(q) - o_e(q))
+          h_lim = dg1_lim_h_from_s(s_lim, d_e(q), rr)
+          tq = (h_e(q) - h_lim) / (-dhq)
+        else
+          tq = 1.0
+        endif
+        te = min(te, max(0.0, tq))
+      enddo
+      if (te <= 0.0) cycle
+      dh(a0,b0) = dh(a0,b0) + (te * tilt) * m_e(1)
+      dh(a1,b1) = dh(a1,b1) + (te * tilt) * m_e(2)
+      ! The knd of the edge, for the statistics: 1 backward, 2 too flat, 3 overshoot, 4 at a local extremum.
+      if (ex > 0.0) then
+        if (smax < 0.0) then ; knd = 2 ; if (dz > 0.0) knd = 1
+        elseif (smin >= 0.0) then ; knd = 3 ; else ; knd = 4 ; endif
+      else
+        if (smin > 0.0) then ; knd = 2 ; if (dz < 0.0) knd = 1
+        elseif (smax <= 0.0) then ; knd = 3 ; else ; knd = 4 ; endif
+      endif
+      kd(knd) = kd(knd) + (te * tilt) * max(abs(m_e(1)), abs(m_e(2)))
+    enddo ; enddo
+    if ((max(max(abs(dh(1,1)), abs(dh(2,2))), max(abs(dh(1,2)), abs(dh(2,1))))) == 0.0) cycle
+    ! One part of the change for the cell: the floor and the bounds of the projection.
+    tau = dg1_lim_floor_step(h_in(i,j,:,:), dh, CS%min_h_shelf)
+    do b = 1, 2 ; do a = 1, 2
+      if ((dh(a,b) > 0.0) .and. (h_in(i,j,a,b) + dh(a,b) > hhi(i,j,a,b))) &
+        tau = min(tau, max(0.0, hhi(i,j,a,b) - h_in(i,j,a,b)) / dh(a,b))
+      if ((dh(a,b) < 0.0) .and. (h_in(i,j,a,b) + dh(a,b) < hlo(i,j,a,b))) &
+        tau = min(tau, max(0.0, h_in(i,j,a,b) - hlo(i,j,a,b)) / (-dh(a,b)))
+    enddo ; enddo
+    if (tau <= 0.0) cycle
+    do b = 1, 2 ; do a = 1, 2
+      CS%h_nodal(i,j,a,b) = h_in(i,j,a,b) + tau * dh(a,b)
+    enddo ; enddo
+    dmax = tau * max(max(abs(dh(1,1)), abs(dh(2,2))), max(abs(dh(1,2)), abs(dh(2,1))))
+    if (do_st) then
+      CS%dg_lim_stat(i,j,21) = CS%dg_lim_stat(i,j,21) + 1.0
+      CS%dg_lim_stat(i,j,22) = CS%dg_lim_stat(i,j,22) + dmax
+      do k = 1, 4 ; CS%dg_lim_stat(i,j,22+k) = CS%dg_lim_stat(i,j,22+k) + tau * kd(k) ; enddo
+    endif
+    if (do_bud) call dg1_bud_add(CS, i, j, 8, bud_w, CS%h_nodal(i,j,:,:) - h_in(i,j,:,:))
+  enddo ; enddo
+end subroutine dg1_lim_backward_edges_cont
 
 !> The grounded limiter: the values v of the cells beyond a domain edge, from the cells inside (have), and v_f, as
 !! the face pass reads them, as in dg1_grounded_limiter: the linear extrapolation along the axis normal to the edge,
