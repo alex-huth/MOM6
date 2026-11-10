@@ -821,6 +821,8 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: dg_lim_cp_d0_thick = .false. !< DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS: the fixed tolerance of
                                   !! DG1_LIMITER_CORNER_PROJECT (its vertex and face bounds and
                                   !! DG1_LIMITER_BACKWARD_EDGE) is a thickness on both branches.
+  logical :: dg_lim_cp_branch = .false. !< DG1_LIMITER_CORNER_PROJECT_BRANCH_MEANS: the cell means in the vertex
+                                  !! bounds of DG1_LIMITER_CORNER_PROJECT are the means of the two branch surfaces.
   logical :: dg_lim_bwe = .false. !< DG1_LIMITER_BACKWARD_EDGE: the projection first moves the backward edges of the
                                   !! cells that are not crossed toward their neighbours.
   logical :: dg_lim_bwe_cont = .false. !< DG1_LIMITER_BACKWARD_EDGE_CONTINUOUS: the backward-edge limiter with no
@@ -14471,6 +14473,17 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "is a surface height, which is 1 / (1 - rho_i/rho_w), about 9, times as wide in the thickness of "//&
                  "a floating corner as of a grounded one.", &
                  default=.false., do_not_log=(CS%dg_lim_cp == 0))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_BRANCH_MEANS", CS%dg_lim_cp_branch, &
+                 "If true, the vertex bounds of DG1_LIMITER_CORNER_PROJECT take the cell means of the two branch "//&
+                 "surfaces, a = h - D and b = (1 - rho_i/rho_w) h, in place of the cell mean of the corner "//&
+                 "surfaces max(a, b).  Both branches are linear in the thickness, so their cell means are exact "//&
+                 "averages of the corner values; the mean of max(a, b) is not, and in a cell whose corners straddle "//&
+                 "flotation it lies above both branch means.  If a and b at a corner lie between the smallest and "//&
+                 "largest of these branch means at its node, its surface lies between max(min a, min b) and "//&
+                 "max(max a, max b), and these are the bounds before the corners of the other ice cells widen "//&
+                 "them.  In a cell whose corners are all on one branch the upper bound is unchanged; the lower "//&
+                 "bound is lower where grounded and floating cells meet at a node.", &
+                 default=.false., do_not_log=(CS%dg_lim_cp == 0))
   call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FACE", cpf_str, &
                  "Which cells of DG1_LIMITER_CORNER_PROJECT also take the face bounds of DG1_LIMITER_FACE_BOUNDS, "//&
                  "in the same projection.  The surface at the middle of each face, the mean of its two corner "//&
@@ -17949,6 +17962,12 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   real, dimension(SZDI_(G),SZDJ_(G)) :: dpt, dpt_f ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT: the bed at the centre
                                               ! of a cell, as sbar and sbar_f [Z ~> m]
   logical, dimension(SZDI_(G),SZDJ_(G)) :: have_p, have_q ! hpt and dpt are set
+  real, dimension(SZDI_(G),SZDJ_(G)) :: abr, bbr, abr_f, bbr_f ! DG1_LIMITER_CORNER_PROJECT_BRANCH_MEANS: the cell
+                                              ! means of the branch surfaces h - D and (1 - r) h, as sbar and
+                                              ! sbar_f [Z ~> m]
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: have_a, have_b ! abr and bbr are set
+  real, dimension(2,2) :: br_c   ! Corner values of one branch surface of a cell [Z ~> m]
+  real :: la, lb  ! Smallest branch means at a node [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G),4) :: trh ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT: the thickness at the
                                               ! middle of the west, east, south and north faces, the mean of
                                               ! the two corners there [Z ~> m]
@@ -18093,12 +18112,20 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
     if ((.not.CS%reentrant_y) .and. (jg < G%jsg)) in_dom(i,j) = .false.
     if ((.not.CS%reentrant_y) .and. (.not.north_open) .and. (jg > G%jeg)) in_dom(i,j) = .false.
     have(i,j) = .false. ; sbar(i,j) = 0.0 ; hpt(i,j) = 0.0 ; dpt(i,j) = 0.0
+    abr(i,j) = 0.0 ; bbr(i,j) = 0.0
     if ((.not.in_dom(i,j)) .or. (i == isd) .or. (j == jsd)) cycle
     if ((hmask(i,j) == 1.0) .or. (hmask(i,j) == 3.0)) then
       do b = 1, 2 ; do a = 1, 2
         s_c(a,b) = max(CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b), (1.0 - rr) * CS%h_nodal(i,j,a,b))
       enddo ; enddo
       sbar(i,j) = nodal_cell_mean(s_c, CS%cell_mean_w(i,j,:,:))
+      if (CS%dg_lim_cp_branch) then
+        ! The same mean of each branch, so in a cell on one branch that branch mean is sbar bitwise.
+        do b = 1, 2 ; do a = 1, 2 ; br_c(a,b) = CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b) ; enddo ; enddo
+        abr(i,j) = nodal_cell_mean(br_c, CS%cell_mean_w(i,j,:,:))
+        do b = 1, 2 ; do a = 1, 2 ; br_c(a,b) = (1.0 - rr) * CS%h_nodal(i,j,a,b) ; enddo ; enddo
+        bbr(i,j) = nodal_cell_mean(br_c, CS%cell_mean_w(i,j,:,:))
+      endif
       if (CS%dg_lim_cp_face_pt) then
         do b = 1, 2 ; do a = 1, 2 ; dpt_c(a,b) = CS%bed_node(i-2+a,j-2+b) ; enddo ; enddo
         hpt(i,j) = nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:))
@@ -18109,6 +18136,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
       sbar(i,j) = max(-dmean, 0.0)
       ! No ice: h = 0, so the two branch surfaces are -D and 0 and their larger one is sbar.
       hpt(i,j) = 0.0 ; dpt(i,j) = dmean
+      abr(i,j) = -dmean ; bbr(i,j) = 0.0
     endif
     have(i,j) = .true.
   enddo ; enddo
@@ -18121,10 +18149,15 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   ! at the domain edge, it keeps the extrapolation; beyond a corner of the domain both edge faces must pass.
   ! Both are found (sbar the extrapolation, sbar_f the face-pass value), from cells inside the domain only.
   if (CS%dg_lim_cp_face_pt) then ; have_p(:,:) = have(:,:) ; have_q(:,:) = have(:,:) ; endif
+  if (CS%dg_lim_cp_branch) then ; have_a(:,:) = have(:,:) ; have_b(:,:) = have(:,:) ; endif
   call dg1_lim_extend_beyond(CS, G, in_dom, have, sbar, sbar_f)
   if (CS%dg_lim_cp_face_pt) then
     call dg1_lim_extend_beyond(CS, G, in_dom, have_p, hpt, hpt_f)
     call dg1_lim_extend_beyond(CS, G, in_dom, have_q, dpt, dpt_f)
+  endif
+  if (CS%dg_lim_cp_branch) then
+    call dg1_lim_extend_beyond(CS, G, in_dom, have_a, abr, abr_f)
+    call dg1_lim_extend_beyond(CS, G, in_dom, have_b, bbr, bbr_f)
   endif
 
   ! dg_lim_agree_*: on entry, how far each ice cell is out of the neighbour bounds, the cell-mean surfaces at the
@@ -18140,10 +18173,14 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
       if (hmask(i,j) /= 1.0) cycle
       e_agr(i,j) = -huge(1.0)
       do b = 1, 2 ; do a = 1, 2
-        u_m = -huge(1.0) ; l_m = huge(1.0) ; o_hi = -huge(1.0) ; o_lo = huge(1.0)
+        u_m = -huge(1.0) ; l_m = huge(1.0) ; o_hi = -huge(1.0) ; o_lo = huge(1.0) ; la = huge(1.0) ; lb = huge(1.0)
         do jj = j+b-2, j+b-1 ; do ii = i+a-2, i+a-1
           if (have(ii,jj)) then
-            u_m = max(u_m, sbar(ii,jj)) ; l_m = min(l_m, sbar(ii,jj))
+            if (CS%dg_lim_cp_branch) then
+              u_m = max(u_m, max(abr(ii,jj), bbr(ii,jj))) ; la = min(la, abr(ii,jj)) ; lb = min(lb, bbr(ii,jj))
+            else
+              u_m = max(u_m, sbar(ii,jj)) ; l_m = min(l_m, sbar(ii,jj))
+            endif
           endif
           if (((ii /= i) .or. (jj /= j)) .and. ((hmask(ii,jj) == 1.0) .or. (hmask(ii,jj) == 3.0))) then
             a2 = 2 ; if (ii == i+a-1) a2 = 1
@@ -18152,6 +18189,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
             o_hi = max(o_hi, s_o) ; o_lo = min(o_lo, s_o)
           endif
         enddo ; enddo
+        if (CS%dg_lim_cp_branch) l_m = max(la, lb)
         u_n = o_hi ; l_n = o_lo
         if (CS%dg_lim_cp_all .and. (o_hi >= o_lo)) then ; u_n = o_lo ; l_n = o_hi ; endif
         s_o = max(CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b), (1.0 - rr) * CS%h_nodal(i,j,a,b))
@@ -19149,10 +19187,16 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
               (CS%cell_mean_w(i,j,1,2) + CS%cell_mean_w(i,j,2,1)))
       if (area <= 0.0) cycle
       do b = 1, 2 ; do a = 1, 2
-        u_m = -huge(1.0) ; l_m = huge(1.0) ; o_hi = -huge(1.0) ; o_lo = huge(1.0)
+        u_m = -huge(1.0) ; l_m = huge(1.0) ; o_hi = -huge(1.0) ; o_lo = huge(1.0) ; la = huge(1.0) ; lb = huge(1.0)
         do jj = j+b-2, j+b-1 ; do ii = i+a-2, i+a-1
           if (have(ii,jj)) then
-            u_m = max(u_m, sbar(ii,jj)) ; l_m = min(l_m, sbar(ii,jj))
+            ! DG1_LIMITER_CORNER_PROJECT_BRANCH_MEANS: each branch between its smallest and largest mean, so the
+            ! surface between max(min a, min b) and max(max a, max b).
+            if (CS%dg_lim_cp_branch) then
+              u_m = max(u_m, max(abr(ii,jj), bbr(ii,jj))) ; la = min(la, abr(ii,jj)) ; lb = min(lb, bbr(ii,jj))
+            else
+              u_m = max(u_m, sbar(ii,jj)) ; l_m = min(l_m, sbar(ii,jj))
+            endif
           endif
           if (((ii /= i) .or. (jj /= j)) .and. in_dom(ii,jj) .and. &
               ((hmask(ii,jj) == 1.0) .or. (hmask(ii,jj) == 3.0))) then
@@ -19162,6 +19206,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
             o_hi = max(o_hi, s_o) ; o_lo = min(o_lo, s_o)
           endif
         enddo ; enddo
+        if (CS%dg_lim_cp_branch) l_m = max(la, lb)
         ! DG1_LIMITER_CORNER_PROJECT_ENDORSE = ALL: the bounds widen only as far as every other ice cell agrees.
         u_n = o_hi ; l_n = o_lo
         if (CS%dg_lim_cp_all .and. (o_hi >= o_lo)) then ; u_n = o_lo ; l_n = o_hi ; endif
