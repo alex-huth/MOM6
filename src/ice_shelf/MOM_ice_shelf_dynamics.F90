@@ -746,6 +746,9 @@ type, public :: ice_shelf_dyn_CS ; private
   integer :: dg_gl_flot_band = -1 !< DG1_GL_SHARED_FLOTATION_BAND: the nodes within this chessboard distance of
                                   !! the grounding-line nodes take the full blend; negative turns it off.
   real :: dg_gl_flot_band_ramp = 1.0 !< DG1_GL_SHARED_FLOTATION_BAND_RAMP: the ramp of the band, in nodes [nondim].
+  real :: dg_gl_flot_deficit_width = 0.0 !< DG1_GL_SHARED_FLOTATION_BAND_DEFICIT_WIDTH: if positive, the band
+                                  !! weight also ramps in the flotation deficit of each cell over this many
+                                  !! jumps of the corner thickness at the node; otherwise the band is binary [nondim].
   logical :: dg_post_bubble = .false. !< If true, the transport volume term adds a bubble velocity per cell that
                                   !! is set after each velocity solve from the in-cell force balance.
   logical :: dg_post_crossed = .true. !< If true, DG1_POST_BUBBLE also acts in the grounding-line cells, with
@@ -14042,6 +14045,22 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                    units="nondim", default=1.0, do_not_log=(CS%dg_gl_flot_band < 0))
     if ((CS%dg_gl_flot_band >= 0) .and. (CS%dg_gl_flot_band_ramp <= 0.0)) call MOM_error(FATAL, &
         "MOM_ice_shelf_dynamics, read_DG_params: DG1_GL_SHARED_FLOTATION_BAND_RAMP must be positive.")
+    call get_param(param_file, mdl, "DG1_GL_SHARED_FLOTATION_BAND_DEFICIT_WIDTH", CS%dg_gl_flot_deficit_width, &
+                   "If positive, the band weight of DG1_GL_SHARED_FLOTATION_BAND = 0 is no longer a step in "//&
+                   "the state.  Each ice cell that has a corner on a node gives the node the weight "//&
+                   "max(0, 1 - e/(W J)), with e the distance from flotation of the corner of that cell "//&
+                   "nearest flotation (0 if the corners of the cell straddle it), J the largest minus the "//&
+                   "smallest corner at the node, and W this width.  The node takes the largest of these and "//&
+                   "of the band weight.  So the weight reaches 1 continuously as a cell approaches "//&
+                   "straddling, it is never less than the band weight, and a change of a corner changes "//&
+                   "h_flot by at most 1/W times as much.  Zero or negative keeps the band weight, which "//&
+                   "jumps from 0 to 1 at all nodes of a cell when one of its corners crosses flotation.  "//&
+                   "Needs DG1_GL_SHARED_FLOTATION_BAND = 0 and DG1_GL_SHARED_FLOTATION_BAND_RAMP <= 1.", &
+                   units="nondim", default=0.0, do_not_log=(CS%dg_gl_flot_band < 0))
+    if ((CS%dg_gl_flot_deficit_width > 0.0) .and. &
+        ((CS%dg_gl_flot_band /= 0) .or. (CS%dg_gl_flot_band_ramp > 1.0))) call MOM_error(FATAL, &
+        "MOM_ice_shelf_dynamics, read_DG_params: DG1_GL_SHARED_FLOTATION_BAND_DEFICIT_WIDTH > 0 needs "//&
+        "DG1_GL_SHARED_FLOTATION_BAND = 0 and DG1_GL_SHARED_FLOTATION_BAND_RAMP <= 1.")
     if (.not.CS%use_DG_thickness) call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: "//&
         "DG1_GL_SHARED_FLOTATION needs USE_DG_THICKNESS.")
     if (CS%dg_gl_shared_h) call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: "//&
@@ -14936,7 +14955,11 @@ end subroutine dg1_flot_corners
 !! node.  The distance d of a node is its chessboard distance in nodes to the nearest grounding-line node,
 !! found by repeated sweeps as in dg1_band_distance, so a quarter turn leaves it exact.  Then
 !! w = min(1, max(0, (N + R - d)/R)) at the grounding-line nodes and at the nodes with at least one corner
-!! at or above flotation, and w = 0 at the other nodes, where every corner floats.
+!! at or above flotation, and w = 0 at the other nodes, where every corner floats.  With
+!! DG1_GL_SHARED_FLOTATION_BAND_DEFICIT_WIDTH = W > 0 (and N = 0), each ice cell with a corner on a node also
+!! gives it max(0, 1 - e/(W J)), with e the distance from flotation of the corner of the cell nearest it (0
+!! where the cell straddles) and J the largest minus the smallest corner at the node, and w is the largest
+!! of these and the band weight, so w is continuous in the corners.
 subroutine dg1_flot_band_weight(CS, G, hmask, w_band)
   type(ice_shelf_dyn_CS), intent(in)    :: CS    !< The ice shelf dynamics control structure
   type(ocean_grid_type),  intent(in)    :: G     !< The grid structure
@@ -14948,7 +14971,12 @@ subroutine dg1_flot_band_weight(CS, G, hmask, w_band)
   real, dimension(SZDIB_(G),SZDJB_(G)) :: dn ! Distance after a sweep [nondim]
   logical, dimension(SZDIB_(G),SZDJB_(G)) :: gnd ! A node with an ice corner at or above flotation
   logical, dimension(SZDIB_(G),SZDJB_(G)) :: src ! A grounding-line node
+  real, dimension(SZDI_(G),SZDJ_(G)) :: e_cell ! With DG1_GL_SHARED_FLOTATION_BAND_DEFICIT_WIDTH, the distance
+                  ! from flotation of the corner of each ice cell nearest it, 0 where its corners straddle
+                  ! flotation, and a negative flag value at cells without ice or not set [Z ~> m]
   real :: rr      ! Ratio of the ice and ocean densities [nondim]
+  real :: jump    ! Largest minus smallest corner at a node [Z ~> m]
+  real :: w_def   ! Largest deficit-ramp weight of the cells at a node [nondim]
   real :: hf      ! Flotation thickness at a node [Z ~> m]
   real :: dc      ! Corner thickness minus the flotation thickness of its node [Z ~> m]
   real :: hmin, hmax ! Smallest and largest corner deficit of a cell, or corner of a node [Z ~> m]
@@ -14958,6 +14986,7 @@ subroutine dg1_flot_band_weight(CS, G, hmask, w_band)
 
   rr = CS%density_ice / CS%density_ocean_avg
   src(:,:) = .false. ; gnd(:,:) = .false.
+  e_cell(:,:) = -1.0
   ! Cells whose own corners straddle flotation: all four of their nodes are grounding-line nodes.
   do j = G%jsd+1, G%jed ; do i = G%isd+1, G%ied
     if ((hmask(i,j) == 1.0) .or. (hmask(i,j) == 3.0)) then
@@ -14973,6 +15002,10 @@ subroutine dg1_flot_band_weight(CS, G, hmask, w_band)
         do b = 1, 2 ; do a = 1, 2
           src(i+a-2,j+b-2) = .true.
         enddo ; enddo
+        e_cell(i,j) = 0.0
+      else
+        ! All the deficits have one sign, so the corner nearest flotation is the smallest in size.
+        e_cell(i,j) = min(abs(hmin), abs(hmax))
       endif
     endif
   enddo ; enddo
@@ -15026,6 +15059,35 @@ subroutine dg1_flot_band_weight(CS, G, hmask, w_band)
     if (src(In,Jn) .or. gnd(In,Jn)) &
       w_band(In,Jn) = min(1.0, max(0.0, (d_end - dd(In,Jn)) / CS%dg_gl_flot_band_ramp))
   enddo ; enddo
+  if (CS%dg_gl_flot_deficit_width > 0.0) then
+    ! Each ice cell with a corner on the node gives max(0, 1 - e/(W J)); the node takes the largest of these
+    ! and of the band weight.  A straddling cell (e = 0) gives 1, as in the band weight.
+    do Jn = G%JscB, G%JecB ; do In = G%IscB, G%IecB
+      n = 0 ; hmin = 0.0 ; hmax = 0.0
+      do b = 1, 2 ; do a = 1, 2
+        i = In + 2 - a ; j = Jn + 2 - b
+        if ((hmask(i,j) == 1.0) .or. (hmask(i,j) == 3.0)) then
+          if (n == 0) then
+            hmin = CS%h_nodal(i,j,a,b) ; hmax = CS%h_nodal(i,j,a,b)
+          else
+            hmin = min(hmin, CS%h_nodal(i,j,a,b)) ; hmax = max(hmax, CS%h_nodal(i,j,a,b))
+          endif
+          n = n + 1
+        endif
+      enddo ; enddo
+      if ((n < 2) .or. (hmax <= hmin)) cycle
+      jump = hmax - hmin
+      w_def = 0.0
+      do b = 1, 2 ; do a = 1, 2
+        i = In + 2 - a ; j = Jn + 2 - b
+        if ((hmask(i,j) == 1.0) .or. (hmask(i,j) == 3.0)) then
+          if (e_cell(i,j) >= 0.0) &
+            w_def = max(w_def, 1.0 - e_cell(i,j) / (CS%dg_gl_flot_deficit_width * jump))
+        endif
+      enddo ; enddo
+      w_band(In,Jn) = max(w_band(In,Jn), min(1.0, w_def))
+    enddo ; enddo
+  endif
   call pass_var(w_band, G%domain, position=CORNER)
 end subroutine dg1_flot_band_weight
 
