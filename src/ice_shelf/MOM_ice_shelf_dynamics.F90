@@ -772,8 +772,9 @@ type, public :: ice_shelf_dyn_CS ; private
                              !! quadrature keep their bubble in the velocity solve but not in the DG(1) volume term
   logical :: dg_cpl_tr_ramp = .false. !< If true (DG1_COUPLED_BUBBLE_TRANSPORT_RAMP), the bubble velocity in the
                                   !! transport takes the weight (1 - 2 f)**2 of the grounded fraction f of the cell.
-  logical :: dg_cpl_tr_shared = .false. !< If true (DG1_COUPLED_BUBBLE_TRANSPORT_SHARED), the part of the bubble
-                                  !! velocity that two face neighbours share crosses their face in the transport.
+  integer :: dg_cpl_tr_share = 0 !< DG1_COUPLED_BUBBLE_TRANSPORT_SHARE: 0 (NONE), 1 (MINMOD) or 2 (MC_FCT), how
+                                  !! much of the bubble velocity that two face neighbours share crosses their face in
+                                  !! the transport.
   logical :: dg_cpl_own_surf = .false. !< If true (DG1_COUPLED_BUBBLE_OWN_SURFACE, with DG1_GL_SHARED_FLOTATION),
                                   !! the driving stress against the bubbles reads the surface of the transported
                                   !! thickness with its own flotation test, not the blended corners.
@@ -1886,6 +1887,10 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     CS%id_clock_emat = cpu_clock_id('  Ice shelf element matrices', grain=CLOCK_ROUTINE)
     ! DG1_LIMITER_GROUNDED_UPPER (and DG1_LIMITER_FACE_INVERSION, which needs it) read cells up to 4 away; stop
     ! here, before the first step, rather than in the first limiter call.
+    if ((CS%dg_cpl_tr_share > 0) .and. &
+        ((G%isc - G%isd < 2 + CS%dg_cpl_tr_share) .or. (G%jsc - G%jsd < 2 + CS%dg_cpl_tr_share))) &
+      call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG1_COUPLED_BUBBLE_TRANSPORT_SHARE needs a halo of at least "//&
+                     "3 cells (MINMOD) or 4 cells (MC_FCT) (NIHALO and NJHALO).")
     if (CS%dg_lim_grounded_upper .and. ((G%isc - G%isd < 4) .or. (G%jsc - G%jsd < 4))) &
       call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG1_LIMITER_GROUNDED_UPPER and DG1_LIMITER_FACE_INVERSION "//&
                      "need a halo of at least 4 cells (NIHALO and NJHALO >= 4).")
@@ -10357,6 +10362,31 @@ subroutine set_gl_subgrid_neighbors(CS, ISS, G)
 
 end subroutine set_gl_subgrid_neighbors
 
+!> The change of a slope across a cell, from its west (south) neighbour to its east (north) one; a neighbour
+!! without ice gives the cell's own slope, so no change on that side.
+pure real function dg1_orient_change(s_m, s_c, s_p, ok_m, ok_p)
+  real,    intent(in) :: s_m  !< The slope in the west or south neighbour [T-1 ~> s-1]
+  real,    intent(in) :: s_c  !< The slope in the cell [T-1 ~> s-1]
+  real,    intent(in) :: s_p  !< The slope in the east or north neighbour [T-1 ~> s-1]
+  logical, intent(in) :: ok_m !< The west or south neighbour has ice
+  logical, intent(in) :: ok_p !< The east or north neighbour has ice
+  real :: a, b ! The slopes on the two sides [T-1 ~> s-1]
+  a = s_c ; if (ok_m) a = s_m
+  b = s_c ; if (ok_p) b = s_p
+  dg1_orient_change = abs(b - a)
+end function dg1_orient_change
+
+!> The monotonized-central value of two values: minmod(2 a, 2 b, (a + b) / 2), 0 if their signs differ.
+pure real function dg1_mc2(a, b)
+  real, intent(in) :: a !< The first value [A]
+  real, intent(in) :: b !< The second value [A]
+  real :: m ! The mean of the two [A]
+  dg1_mc2 = 0.0
+  m = 0.5 * (a + b)
+  if ((a > 0.0) .and. (b > 0.0)) dg1_mc2 = min(m, min(2.0*a, 2.0*b))
+  if ((a < 0.0) .and. (b < 0.0)) dg1_mc2 = max(m, max(2.0*a, 2.0*b))
+end function dg1_mc2
+
 !> The part of two values that both share: the one nearer 0 if they have the same sign, else 0.
 pure real function dg1_minmod2(a, b)
   real, intent(in) :: a !< The first value [A]
@@ -13412,6 +13442,7 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   character(len=40) :: cp_str       ! DG1_LIMITER_CORNER_PROJECT
   character(len=40) :: cpe_str      ! DG1_LIMITER_CORNER_PROJECT_ENDORSE
   character(len=40) :: cpf_str      ! DG1_LIMITER_CORNER_PROJECT_FACE
+  character(len=16) :: share_str    ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARE
   character(len=16) :: br_rule      ! DG1_LIMITER_BRANCH_RULE
 
 
@@ -14195,18 +14226,6 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "the line is in the middle of the cell, and it does not change in a step when the line "//&
                  "enters or leaves a cell.", &
                  default=.false., do_not_log=.not.(CS%dg_coupled .and. .not.CS%dg_cpl_tr_crossed))
-  call get_param(param_file, mdl, "DG1_COUPLED_BUBBLE_TRANSPORT_SHARED", CS%dg_cpl_tr_shared, &
-                 "If true, with DG1_COUPLED_BUBBLE and DG1_COUPLED_BUBBLE_QUAD = 3, the bubble velocity that "//&
-                 "the DG(1) transport uses may cross a face.  The bubble is 0 on the faces, so on its own it "//&
-                 "moves ice only inside a cell: right where the velocity bends along its own component (a "//&
-                 "grounding line across the flow), but wrong where it bends across it (a lateral margin), "//&
-                 "where the same bubble in a row of cells gives each cell the same tilt.  On each face the "//&
-                 "transport takes c = minmod of the bubble velocities of the two cells (u on east faces, v "//&
-                 "on north faces); c crosses the face with the face profile of the bubble, and inside each "//&
-                 "cell the velocity of the volume term goes from c on its faces to the bubble, with the "//&
-                 "cell mean of the bubble kept.  A bubble that its neighbours do not share (one cell at a "//&
-                 "grounding line, or signs that alternate) is transported as before.", &
-                 default=.false., do_not_log=.not.CS%dg_coupled)
   if (CS%dg_cpl_tr_ramp .and. ((.not.CS%dg_coupled) .or. CS%dg_cpl_tr_crossed)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics, read_DG_params: DG1_COUPLED_BUBBLE_TRANSPORT_RAMP needs DG1_COUPLED_BUBBLE and "//&
       "DG1_COUPLED_BUBBLE_TRANSPORT_CROSSED = False.")
@@ -14250,8 +14269,37 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  default=2, do_not_log=.not.CS%dg_coupled)
   if (CS%dg_coupled .and. (CS%dg_cpl_quad /= 2) .and. (CS%dg_cpl_quad /= 3)) call MOM_error(FATAL, &
     "MOM_ice_shelf_dynamics, read_DG_params: DG1_COUPLED_BUBBLE_QUAD must be 2 or 3.")
-  if (CS%dg_cpl_tr_shared .and. ((.not.CS%dg_coupled) .or. (CS%dg_cpl_quad /= 3))) call MOM_error(FATAL, &
-      "MOM_ice_shelf_dynamics, read_DG_params: DG1_COUPLED_BUBBLE_TRANSPORT_SHARED needs DG1_COUPLED_BUBBLE and "//&
+  call get_param(param_file, mdl, "DG1_COUPLED_BUBBLE_TRANSPORT_SHARE", share_str, &
+                 "With DG1_COUPLED_BUBBLE and DG1_COUPLED_BUBBLE_QUAD = 3, how much of the bubble velocity "//&
+                 "that the DG(1) transport uses may cross a face.  The bubble is 0 on the faces, so on its own "//&
+                 "it moves ice only inside a cell.  That is right where the velocity bends along its own "//&
+                 "component (towards a grounding line across the flow, where the true correction to the "//&
+                 "bilinear velocity is 0 on the faces it crosses), but wrong where it bends across it (a "//&
+                 "lateral margin, where the correction is the same along a row and crosses the faces): there "//&
+                 "the same bubble in a row of cells gives every cell the same tilt.  Each cell offers its east "//&
+                 "and west faces the part theta U_b of its x bubble velocity, with theta = Ky**2 / (Kx**2 + "//&
+                 "Ky**2), and its north and south faces the part Kx**2 / (Kx**2 + Ky**2) of its y bubble "//&
+                 "velocity, where for each component Kx = |change of its bilinear x slope from the west to "//&
+                 "the east neighbour| dx / 2 and Ky the same in y (a neighbour without ice gives no change on "//&
+                 "its side).  The shared value c of a face crosses it with the face profile of the bubble, "//&
+                 "and inside each cell the velocity of the volume term goes from c on its faces to the "//&
+                 "bubble, with the cell mean of the bubble kept; where neither face of a cell shares, the "//&
+                 "cell is as with NONE.  'NONE': nothing is shared.  'MINMOD': c is the offer of the two cells "//&
+                 "nearer 0, or 0 if their signs differ.  'MC_FCT': c starts from minmod(2 a, 2 b, (a + b) / "//&
+                 "2) of the two offers a and b, and both faces of a cell are scaled down together where they "//&
+                 "would take more than twice its offer (the flux-corrected-transport limit of Zalesak 1979), "//&
+                 "so that it shares nearer the mean of the two offers but never reverses the tilt of a cell.  "//&
+                 "MINMOD needs a halo of 3 cells, MC_FCT of 4.", &
+                 default="NONE", do_not_log=.not.CS%dg_coupled)
+  select case (trim(share_str))
+    case ("NONE") ; CS%dg_cpl_tr_share = 0
+    case ("MINMOD") ; CS%dg_cpl_tr_share = 1
+    case ("MC_FCT") ; CS%dg_cpl_tr_share = 2
+    case default ; call MOM_error(FATAL, "read_DG_params: DG1_COUPLED_BUBBLE_TRANSPORT_SHARE must be NONE, "//&
+                                  "MINMOD or MC_FCT, not "//trim(share_str)//".")
+  end select
+  if ((CS%dg_cpl_tr_share > 0) .and. ((.not.CS%dg_coupled) .or. (CS%dg_cpl_quad /= 3))) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics, read_DG_params: DG1_COUPLED_BUBBLE_TRANSPORT_SHARE needs DG1_COUPLED_BUBBLE and "//&
       "DG1_COUPLED_BUBBLE_QUAD = 3.")
   if (CS%dg_coupled .and. (CS%dg_cpl_quad == 3)) then
     ! With the node-node terms on the 2-point rule the rows of a cell do not come from one energy, and the
@@ -21724,13 +21772,27 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real, dimension(3) :: x3, w3 ! The 3-point Gauss abscissae on [0,1] and their weights [nondim]
   real, dimension(3,3,2,2) :: qb9 ! The bubble part of the volume term at the 3x3 points [Z L2 T-1 ~> m3 s-1]
   real :: bb_t, bt_t ! The product of the 2-point Gauss abscissae and the bubble at a point [nondim]
-  real, dimension(SZDI_(G),SZDJ_(G)) :: ub_t, vb_t ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARED: the bubble velocity of
+  real, dimension(SZDI_(G),SZDJ_(G)) :: ub_t, vb_t ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARE: the bubble velocity of
                     ! the volume term of each cell [L T-1 ~> m s-1]
-  real, dimension(SZDIB_(G),SZDJ_(G)) :: cu_f ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARED: the shared x bubble velocity
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: cu_f ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARE: the shared x bubble velocity
                     ! of each east face [L T-1 ~> m s-1]
   real, dimension(SZDI_(G),SZDJB_(G)) :: cv_f ! The shared y bubble velocity of each north face [L T-1 ~> m s-1]
-  real :: bx_t, by_t ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARED: the two 1-D factors of the bubble at a point [nondim]
-  logical :: shr_tr ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARED is in use
+  real :: bx_t, by_t ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARE: the two 1-D factors of the bubble at a point [nondim]
+  logical :: shr_tr ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARE is not NONE
+  integer :: n_o    ! The halo width of the offers: 1 (MINMOD) or 2 (MC_FCT)
+  real, dimension(SZDIB_(G),SZDJ_(G)) :: cs_u ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARE = MC_FCT: the target shared x bubble
+                    ! velocity of each east face [L T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJB_(G)) :: cs_v ! The target shared y bubble velocity of each north face [L T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: ru_c, rv_c ! The factors that keep the shares of each cell within twice its
+                    ! offers [nondim]
+  real :: s_sum     ! The sum of the two target shares of a cell [L T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: sxu, syu, sxv, syv ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARE: the
+                    ! bilinear x and y slopes of u and v in each ice cell [T-1 ~> s-1]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: uo_t, vo_t ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARE: the parts of the x
+                    ! and y bubble velocities that each cell offers its faces [L T-1 ~> m s-1]
+  real :: kx_o, ky_o ! The bending of a velocity component along x and y over a cell [L T-1 ~> m s-1]
+  real :: th_u, th_v ! The parts of the x and y bubble velocities a cell offers its faces [nondim]
+  logical :: ou_c, ov_c ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARE: no face of the cell shares a part of u, of v
   real :: w_t       ! The weight of a 3x3 point [nondim]
   integer :: ia, ja ! Indices of a 3x3 point
   real :: N11, N21, N12, N22
@@ -21879,12 +21941,14 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
     w3(1) = 5.0/18.0 ; w3(2) = 8.0/18.0 ; w3(3) = 5.0/18.0
     bb_t = gp1 * gp2
   endif
-  ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARED: the bubble velocity of each cell's volume term, as the loop below sets it,
-  ! and on each face the part of it that the two cells share (0 where one side has no bubble).
-  shr_tr = q3_tr .and. CS%dg_cpl_tr_shared
+  ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARE: the bubble velocity of each cell's volume term, as the loop below sets it,
+  ! the part of it each cell offers its faces, and on each face the part the two cells share (0 where one side has
+  ! no bubble).
+  shr_tr = q3_tr .and. (CS%dg_cpl_tr_share > 0)
   if (shr_tr) then
+    n_o = CS%dg_cpl_tr_share
     ub_t(:,:) = 0.0 ; vb_t(:,:) = 0.0 ; cu_f(:,:) = 0.0 ; cv_f(:,:) = 0.0
-    do j = jsc-1, jec+1 ; do i = isc-1, iec+1
+    do j = jsc-n_o, jec+n_o ; do i = isc-n_o, iec+n_o
       if (hmask(i,j) /= 1.0) cycle
       bub_tr = .true.
       if (.not.CS%dg_cpl_tr_crossed) bub_tr = .not.gl_subgrid_cell(CS, i, j)
@@ -21898,14 +21962,74 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       if (.not.bub_tr) cycle
       ub_t(i,j) = ub_c ; vb_t(i,j) = vb_c
     enddo ; enddo
-    do j = jsc, jec ; do I = isc-1, iec
-      if (CS%u_face_mask(I,j) == 4.0) cycle
-      cu_f(I,j) = dg1_minmod2(ub_t(i,j), ub_t(i+1,j))
+    ! The bilinear slopes of u and v in every ice cell, and then the part of each bubble from bending across its own
+    ! component.  The offers are kept apart from ub_t and vb_t, which the volume term uses whole, and from the
+    ! slopes, which the neighbours still read.
+    sxu(:,:) = 0.0 ; syu(:,:) = 0.0 ; sxv(:,:) = 0.0 ; syv(:,:) = 0.0 ; uo_t(:,:) = 0.0 ; vo_t(:,:) = 0.0
+    do j = jsc-n_o-1, jec+n_o+1 ; do i = isc-n_o-1, iec+n_o+1
+      if (hmask(i,j) /= 1.0) cycle
+      sxu(i,j) = 0.5 * ((CS%u_shelf(i,j-1) - CS%u_shelf(i-1,j-1)) + &
+                        (CS%u_shelf(i,j) - CS%u_shelf(i-1,j))) / G%dxT(i,j)
+      syu(i,j) = 0.5 * ((CS%u_shelf(i-1,j) - CS%u_shelf(i-1,j-1)) + &
+                        (CS%u_shelf(i,j) - CS%u_shelf(i,j-1))) / G%dyT(i,j)
+      sxv(i,j) = 0.5 * ((CS%v_shelf(i,j-1) - CS%v_shelf(i-1,j-1)) + &
+                        (CS%v_shelf(i,j) - CS%v_shelf(i-1,j))) / G%dxT(i,j)
+      syv(i,j) = 0.5 * ((CS%v_shelf(i-1,j) - CS%v_shelf(i-1,j-1)) + &
+                        (CS%v_shelf(i,j) - CS%v_shelf(i,j-1))) / G%dyT(i,j)
     enddo ; enddo
-    do J = jsc-1, jec ; do i = isc, iec
-      if (CS%v_face_mask(i,J) == 4.0) cycle
-      cv_f(i,J) = dg1_minmod2(vb_t(i,j), vb_t(i,j+1))
+    do j = jsc-n_o, jec+n_o ; do i = isc-n_o, iec+n_o
+      if (hmask(i,j) /= 1.0) cycle
+      kx_o = dg1_orient_change(sxu(i-1,j), sxu(i,j), sxu(i+1,j), hmask(i-1,j) == 1.0, hmask(i+1,j) == 1.0) * &
+             (0.5 * G%dxT(i,j))
+      ky_o = dg1_orient_change(syu(i,j-1), syu(i,j), syu(i,j+1), hmask(i,j-1) == 1.0, hmask(i,j+1) == 1.0) * &
+             (0.5 * G%dyT(i,j))
+      th_u = 0.0
+      if ((kx_o*kx_o) + (ky_o*ky_o) > 0.0) th_u = (ky_o*ky_o) / ((kx_o*kx_o) + (ky_o*ky_o))
+      kx_o = dg1_orient_change(sxv(i-1,j), sxv(i,j), sxv(i+1,j), hmask(i-1,j) == 1.0, hmask(i+1,j) == 1.0) * &
+             (0.5 * G%dxT(i,j))
+      ky_o = dg1_orient_change(syv(i,j-1), syv(i,j), syv(i,j+1), hmask(i,j-1) == 1.0, hmask(i,j+1) == 1.0) * &
+             (0.5 * G%dyT(i,j))
+      th_v = 0.0
+      if ((kx_o*kx_o) + (ky_o*ky_o) > 0.0) th_v = (kx_o*kx_o) / ((kx_o*kx_o) + (ky_o*ky_o))
+      uo_t(i,j) = th_u * ub_t(i,j) ; vo_t(i,j) = th_v * vb_t(i,j)
     enddo ; enddo
+    if (CS%dg_cpl_tr_share == 1) then
+      ! MINMOD: the offer nearer 0.
+      do j = jsc, jec ; do I = isc-1, iec
+        if (CS%u_face_mask(I,j) == 4.0) cycle
+        cu_f(I,j) = dg1_minmod2(uo_t(i,j), uo_t(i+1,j))
+      enddo ; enddo
+      do J = jsc-1, jec ; do i = isc, iec
+        if (CS%v_face_mask(i,J) == 4.0) cycle
+        cv_f(i,J) = dg1_minmod2(vo_t(i,j), vo_t(i,j+1))
+      enddo ; enddo
+    else
+      ! MC_FCT: the monotonized-central target of each face, and the factor of each cell that keeps the sum of its
+      ! two shares within twice its offer; each face takes the smaller factor of its two cells.
+      cs_u(:,:) = 0.0 ; cs_v(:,:) = 0.0 ; ru_c(:,:) = 1.0 ; rv_c(:,:) = 1.0
+      do j = jsc, jec ; do I = isc-2, iec+1
+        if (CS%u_face_mask(I,j) == 4.0) cycle
+        cs_u(I,j) = dg1_mc2(uo_t(i,j), uo_t(i+1,j))
+      enddo ; enddo
+      do J = jsc-2, jec+1 ; do i = isc, iec
+        if (CS%v_face_mask(i,J) == 4.0) cycle
+        cs_v(i,J) = dg1_mc2(vo_t(i,j), vo_t(i,j+1))
+      enddo ; enddo
+      do j = jsc, jec ; do i = isc-1, iec+1
+        s_sum = cs_u(I-1,j) + cs_u(I,j)
+        if (abs(s_sum) > 2.0 * abs(uo_t(i,j))) ru_c(i,j) = (2.0 * abs(uo_t(i,j))) / abs(s_sum)
+      enddo ; enddo
+      do j = jsc-1, jec+1 ; do i = isc, iec
+        s_sum = cs_v(i,J-1) + cs_v(i,J)
+        if (abs(s_sum) > 2.0 * abs(vo_t(i,j))) rv_c(i,j) = (2.0 * abs(vo_t(i,j))) / abs(s_sum)
+      enddo ; enddo
+      do j = jsc, jec ; do I = isc-1, iec
+        cu_f(I,j) = min(ru_c(i,j), ru_c(i+1,j)) * cs_u(I,j)
+      enddo ; enddo
+      do J = jsc-1, jec ; do i = isc, iec
+        cv_f(i,J) = min(rv_c(i,j), rv_c(i,j+1)) * cs_v(i,J)
+      enddo ; enddo
+    endif
   endif
   do j = jsc, jec ; do i = isc, iec
     if (hmask(i,j) /= 1.0) cycle
@@ -21977,10 +22101,15 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         bt_t = ((xi_q * (1.0 - xi_q)) * (eta_q * (1.0 - eta_q))) / (bb_t * bb_t)
         u_qp = bt_t * ub_c ; v_qp = bt_t * vb_c
         if (shr_tr) then
-          ! From the shared face values c on the faces to the bubble inside, with the same cell mean.
+          ! From the shared face values c on the faces to the bubble inside, with the same cell mean.  A component
+          ! that no face of the cell shares keeps the expression above.
+          ou_c = (cu_f(i-1,j) == 0.0) .and. (cu_f(i,j) == 0.0)
+          ov_c = (cv_f(i,j-1) == 0.0) .and. (cv_f(i,j) == 0.0)
           bx_t = (xi_q * (1.0 - xi_q)) / bb_t ; by_t = (eta_q * (1.0 - eta_q)) / bb_t
-          u_qp = ((bx_t * ub_c) + ((1.0 - bx_t) * (((1.0 - xi_q) * cu_f(i-1,j)) + (xi_q * cu_f(i,j))))) * by_t
-          v_qp = ((by_t * vb_c) + ((1.0 - by_t) * (((1.0 - eta_q) * cv_f(i,j-1)) + (eta_q * cv_f(i,j))))) * bx_t
+          if (.not.ou_c) &
+            u_qp = ((bx_t * ub_c) + ((1.0 - bx_t) * (((1.0 - xi_q) * cu_f(i-1,j)) + (xi_q * cu_f(i,j))))) * by_t
+          if (.not.ov_c) &
+            v_qp = ((by_t * vb_c) + ((1.0 - by_t) * (((1.0 - eta_q) * cv_f(i,j-1)) + (eta_q * cv_f(i,j))))) * bx_t
         endif
         qb9(ia,ja,1,1) = w_t * h_qp * (((u_qp * (-(1.0 - eta_q))) * d_qp) + ((v_qp * (-(1.0 - xi_q))) * a_qp))
         qb9(ia,ja,2,1) = w_t * h_qp * (((u_qp * (1.0 - eta_q)) * d_qp) + ((v_qp * (-xi_q)) * a_qp))
