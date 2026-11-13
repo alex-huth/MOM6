@@ -437,6 +437,10 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! linear solve apply the stored cell matrices elem_K in place of CG_action.
   logical :: ssa_q3 = .false. !< DG1_COUPLED_BUBBLE_QUAD = 3 with ICE_SSA_ELEMENT_MATRICES: every term of the
                             !! velocity solve of a cell (node and bubble rows) on the 3x3 rule, from one energy.
+  logical :: ssa_metric = .false. !< DG1_SSA_METRIC_TERMS: the strain rates of the 3x3 rule include the metric
+                            !! terms of the orthogonal curvilinear grid.
+  logical :: dg_mass_areat = .false. !< DG1_MASS_AREAT: the measure of the DG(1) transport (mass matrix, cell-mean
+                            !! weights, sources) has the area areaT in each cell.
   real, pointer, dimension(:,:,:,:) :: elem_K => NULL() !< The operator of a linear solve per ice cell,
                             !! elem_K(r,c,i,j) for the node unknowns u then v at SW, SE, NW, NE, with the
                             !! rows of masked nodes zero [R L2 Z T-1 ~> kg s-1]
@@ -827,6 +831,8 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: dg_lim_cp_exact = .false. !< DG1_LIMITER_CORNER_PROJECT_EXACT_MEANS: the cell mean surface of the
                                   !! limiter in a cell whose corners straddle flotation is the mean of the surface
                                   !! over the cell, (1 - r) times the mean thickness plus the mean of max(r h - D, 0).
+  logical :: dg_lim_metric = .false. !< DG1_LIMITER_CELL_METRICS: the grounded limiter reads the shape and size of
+                                  !! each cell where it otherwise takes the cells as equal squares.
   logical :: dg_lim_cp_branch = .false. !< DG1_LIMITER_CORNER_PROJECT_BRANCH_MEANS: the cell means in the vertex
                                   !! bounds of DG1_LIMITER_CORNER_PROJECT are the means of the two branch surfaces.
   logical :: dg_lim_bwe = .false. !< DG1_LIMITER_BACKWARD_EDGE: the projection first moves the backward edges of the
@@ -7176,6 +7182,9 @@ subroutine ssa_q3_cell_matrix(CS, G, US, i, j, Uc, Vc, use_newton, Kc)
   real :: a, d        ! The cell-edge lengths at the point [L ~> m]
   real :: jac_wt      ! |J| / areaT at the point [nondim]
   real :: bt, btx, bty ! The bubble [nondim] and its gradient [L-1 ~> m-1] (not used here)
+  real :: kx, ky      ! DG1_SSA_METRIC_TERMS: the metric factors of the point [L-1 ~> m-1]
+  real, dimension(3,4) :: bu, bv ! DG1_SSA_METRIC_TERMS: the strain rates (e_xx, e_yy, 2 e_xy) of a unit u and
+                      ! a unit v at each corner [L-1 ~> m-1]
   real :: h_p         ! The thickness at the point [Z ~> m]
   real :: visc, nu    ! The viscosity [R L4 Z T-1 ~> kg m2 s-1] and nu = jac_wt * visc
   real :: fnw         ! jac_wt times the Newton viscosity factor [R L4 Z T ~> kg m2 s]
@@ -7210,7 +7219,7 @@ subroutine ssa_q3_cell_matrix(CS, G, US, i, j, Uc, Vc, use_newton, Kc)
     call dg1_q3_point(CS, G, US, i, j, xi, eta, Hc, Bc, Uc, Vc, CS%dg_post_ub(i,j), CS%dg_post_vb(i,j), gr_cell, &
                       use_newton, coef_prefactor_e, min_trac_e, eps_vel2_e, rhoi_rhow, rho_oi_ratio, &
                       rho_ice_g_LtoZ, Visc_coef, a, d, jac_wt, bt, btx, bty, h_p, visc, fnw, g1, g2, g3, &
-                      gr_p, bcf, dnw, cur)
+                      gr_p, bcf, dnw, cur, kx, ky)
     do c=1,4
       mc = 2 - mod(c,2) ; nc = (c+1)/2
       xa = merge(1.0 - xi, xi, mc == 1) ; yb = merge(1.0 - eta, eta, nc == 1)
@@ -7219,12 +7228,27 @@ subroutine ssa_q3_cell_matrix(CS, G, US, i, j, Uc, Vc, use_newton, Kc)
       gu(c) = (g1 * phx(c)) + (g3 * phy(c)) ; gv(c) = (g2 * phy(c)) + (g3 * phx(c))
     enddo
     nu = wq * (jac_wt * visc)
-    do c=1,4 ; do m=1,4
-      Kp(m,c,ia,ja)     = nu * (((4.*phx(c)) * phx(m)) + (phy(c) * phy(m)))
-      Kp(m,c+4,ia,ja)   = nu * (((2.*phy(c)) * phx(m)) + (phx(c) * phy(m)))
-      Kp(m+4,c,ia,ja)   = nu * ((phy(c) * phx(m)) + ((2.*phx(c)) * phy(m)))
-      Kp(m+4,c+4,ia,ja) = nu * ((phx(c) * phx(m)) + ((4.*phy(c)) * phy(m)))
-    enddo ; enddo
+    if ((kx /= 0.0) .or. (ky /= 0.0)) then
+      ! DG1_SSA_METRIC_TERMS: the energy form of the strain rates with the metric terms.
+      do c=1,4
+        call dg1_metric_strain(phi(c), phx(c), phy(c), kx, ky, bu(:,c), bv(:,c))
+        gu(c) = ((g1 * bu(1,c)) + (g2 * bu(2,c))) + (g3 * bu(3,c))
+        gv(c) = ((g1 * bv(1,c)) + (g2 * bv(2,c))) + (g3 * bv(3,c))
+      enddo
+      do c=1,4 ; do m=1,4
+        Kp(m,c,ia,ja)     = nu * dg1_strain_energy(bu(:,m), bu(:,c))
+        Kp(m,c+4,ia,ja)   = nu * dg1_strain_energy(bu(:,m), bv(:,c))
+        Kp(m+4,c,ia,ja)   = nu * dg1_strain_energy(bv(:,m), bu(:,c))
+        Kp(m+4,c+4,ia,ja) = nu * dg1_strain_energy(bv(:,m), bv(:,c))
+      enddo ; enddo
+    else
+      do c=1,4 ; do m=1,4
+        Kp(m,c,ia,ja)     = nu * (((4.*phx(c)) * phx(m)) + (phy(c) * phy(m)))
+        Kp(m,c+4,ia,ja)   = nu * (((2.*phy(c)) * phx(m)) + (phx(c) * phy(m)))
+        Kp(m+4,c,ia,ja)   = nu * ((phy(c) * phx(m)) + ((2.*phx(c)) * phy(m)))
+        Kp(m+4,c+4,ia,ja) = nu * ((phx(c) * phx(m)) + ((4.*phy(c)) * phy(m)))
+      enddo ; enddo
+    endif
     if (fnw /= 0.0) then
       do c=1,4 ; do m=1,4
         Kp(m,c,ia,ja)     = Kp(m,c,ia,ja)     + ((wq * fnw) * gu(c)) * gu(m)
@@ -14191,6 +14215,32 @@ subroutine read_DG_params(param_file, mdl, CS, US)
         "DG1_COUPLED_BUBBLE_QUAD = 3 needs BASAL_FRICTION_PRECOMPUTE = True.")
     CS%ssa_q3 = .true.
   endif
+  call get_param(param_file, mdl, "DG1_SSA_METRIC_TERMS", CS%ssa_metric, &
+                 "If true, the strain rates of the velocity solve on the 3x3 rule (DG1_COUPLED_BUBBLE_QUAD = 3) "//&
+                 "include the metric terms of the orthogonal curvilinear grid.  The cell lengths are "//&
+                 "a(eta) = dxS (1 - eta) + dxN eta along x and d(xi) = dyW (1 - xi) + dyE xi along y, as in the "//&
+                 "area element a d of the velocity solve and of the DG(1) mass matrix.  Then "//&
+                 "e_xx = u_x + v (dxN - dxS)/(a d), e_yy = v_y + u (dyE - dyW)/(a d) and "//&
+                 "2 e_xy = u_y + v_x - (u (dxN - dxS) + v (dyE - dyW))/(a d).  Without them a rigid rotation on a "//&
+                 "grid whose cells narrow toward a pole has a shear strain, and so a viscous stress.  They enter "//&
+                 "the viscosity, the node and bubble stiffness and the Newton terms.  The cell lengths are those "//&
+                 "of the DG(1) transport, also across a reentrant edge.  A cell with equal opposite faces has no "//&
+                 "metric terms, and there the answers are unchanged.", &
+                 default=.false., do_not_log=.not.CS%ssa_q3)
+  call get_param(param_file, mdl, "DG1_MASS_AREAT", CS%dg_mass_areat, &
+                 "If true, the measure of the DG(1) thickness transport has the cell area areaT of the grid, so "//&
+                 "that the transport conserves the ice volume sum(areaT h) that the rest of MOM6 uses, as the "//&
+                 "finite-volume transport does.  Without it the measure is the area of the cell shape built from "//&
+                 "the four face lengths, ((dxS + dxN)/2) ((dyW + dyE)/2), which differs from areaT (by less than "//&
+                 "1e-6 on a 0.25 degree latitude-longitude grid).  The area element of the mass matrix, the corner "//&
+                 "weights of the cell means and of the sources are multiplied by areaT over that area in each "//&
+                 "cell; the flux terms (the volume term and the face fluxes) keep the face lengths, so that they "//&
+                 "still obey the divergence theorem.  The cell means, and so the limiters, are unchanged.  The "//&
+                 "velocity solve is not changed.", &
+                 default=.false., do_not_log=.not.CS%use_DG_thickness)
+  if (CS%ssa_metric .and. (.not.CS%ssa_q3)) call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: "//&
+      "DG1_SSA_METRIC_TERMS needs DG1_COUPLED_BUBBLE = True, DG1_COUPLED_BUBBLE_QUAD = 3 and "//&
+      "ICE_SSA_ELEMENT_MATRICES = True.")
   if (CS%dg_coupled) then
     if (.not.CS%use_DG_thickness) call MOM_error(FATAL, &
         "MOM_ice_shelf_dynamics, read_DG_params: DG1_COUPLED_BUBBLE needs USE_DG_THICKNESS.")
@@ -14521,6 +14571,19 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   if (CS%dg_lim_cp_exact .and. CS%dg_lim_cp_branch) call MOM_error(FATAL, "MOM_ice_shelf_dynamics, "//&
       "read_DG_params: DG1_LIMITER_CORNER_PROJECT_EXACT_MEANS and DG1_LIMITER_CORNER_PROJECT_BRANCH_MEANS "//&
       "cannot both be true.")
+  call get_param(param_file, mdl, "DG1_LIMITER_CELL_METRICS", CS%dg_lim_metric, &
+                 "If true, the grounded limiter reads the shape and size of each cell where it otherwise takes "//&
+                 "the cells as equal squares.  (1) The exact cell means of "//&
+                 "DG1_LIMITER_CORNER_PROJECT_EXACT_MEANS integrate over the four triangles with the area element "//&
+                 "a d of the DG(1) mass matrix, exactly, and the centre value of the triangles is the bilinear "//&
+                 "value there (the mean of the four corners), as in the SEP2 partition.  (2) The steps of the cell "//&
+                 "means in DG1_LIMITER_BACKWARD_EDGE_CONTINUOUS are scaled by the length of the edge over the "//&
+                 "distance between the two cell centres, so that the edge and the steps are compared as slopes.  "//&
+                 "(3) The cell values beyond a domain edge are extrapolated by distance, not by cell count.  "//&
+                 "(4) The mean bed of a cell without ice and the mean of the other corners at a node in "//&
+                 "DG1_LIMITER_BACKWARD_EDGE_CONTINUOUS are area-weighted.  Each part acts only where the cells "//&
+                 "differ: on a grid of equal rectangles the answers are unchanged.", &
+                 default=.false., do_not_log=(CS%dg_lim_cp == 0))
   call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FACE", cpf_str, &
                  "Which cells of DG1_LIMITER_CORNER_PROJECT also take the face bounds of DG1_LIMITER_FACE_BOUNDS, "//&
                  "in the same projection.  The surface at the middle of each face, the mean of its two corner "//&
@@ -14676,6 +14739,8 @@ subroutine init_nodal_DG_metric(CS, G)
   real, dimension(2,2) :: Minv_eta ! Inverse 1D mass matrix along eta [L-1 ~> m-1]
   real, dimension(2,2) :: Lxi, Leta ! Inverse 1D mass matrices blended toward lumped [L-1 ~> m-1]
   real :: th                    ! DG1_ART_VISC_LUMP_FRAC [nondim]
+  real :: area_w                ! The area of the cell shape, the sum of the corner weights [L2 ~> m2]
+  real :: s_a                   ! DG1_MASS_AREAT: areaT over area_w [nondim]
   logical :: lump_on            ! The blended table is built
   integer :: i, j, isd, ied, jsd, jed, a, b, p, q
 
@@ -14727,6 +14792,19 @@ subroutine init_nodal_DG_metric(CS, G)
     endif
 
     call corner_cell_weights(dxS, dxN, dyW, dyE, CS%cell_mean_w(i,j,:,:))
+    if (CS%dg_mass_areat) then
+      ! DG1_MASS_AREAT: the measure of the cell scaled to areaT.  The scale is the same at every point of the cell,
+      ! so the mass matrix stays a tensor product and every weighted cell mean is unchanged.
+      area_w = (CS%cell_mean_w(i,j,1,1) + CS%cell_mean_w(i,j,2,2)) + &
+               (CS%cell_mean_w(i,j,1,2) + CS%cell_mean_w(i,j,2,1))
+      s_a = 1.0
+      if ((area_w > 0.0) .and. (G%areaT(i,j) > 0.0)) s_a = G%areaT(i,j) / area_w
+      if (s_a /= 1.0) then
+        CS%cell_mean_w(i,j,:,:) = s_a * CS%cell_mean_w(i,j,:,:)
+        CS%Minv_nodal(i,j,:,:,:,:) = CS%Minv_nodal(i,j,:,:,:,:) / s_a
+        if (lump_on) CS%Minv_av_nodal(i,j,:,:,:,:) = CS%Minv_av_nodal(i,j,:,:,:,:) / s_a
+      endif
+    endif
   enddo ; enddo
 end subroutine init_nodal_DG_metric
 
@@ -16085,6 +16163,13 @@ subroutine dg1_cpl_bb3(CS, G, US, i, j, Hc, Bc, Uc, Vc, sub_cell, use_newton, wi
   real, dimension(2,2) :: hfq ! DG1_GL_SHARED_FLOTATION: the blended corners of the cell [Z ~> m]
   real :: wf          ! Driving-stress weight of the point [L2 ~> m2]
   real :: n_g         ! Glen's exponent [nondim]
+  real :: kx, ky      ! DG1_SSA_METRIC_TERMS: the metric factors of the point [L-1 ~> m-1]
+  logical :: met      ! DG1_SSA_METRIC_TERMS: the point has metric terms
+  real, dimension(3,2) :: bb_s ! DG1_SSA_METRIC_TERMS: the strain rates (e_xx, e_yy, 2 e_xy) of the u and v
+                      ! bubbles [L-1 ~> m-1]
+  real, dimension(3,2) :: bn_s ! DG1_SSA_METRIC_TERMS: the strain rates of a unit u and v at a corner [L-1 ~> m-1]
+  real, dimension(2) :: gn_s ! DG1_SSA_METRIC_TERMS: the Newton strain products of a unit u and v at a corner
+                      ! [L-1 T-1 ~> m-1 s-1]
   logical :: gr_cell, gr_p ! The cell and the point carry friction
   integer :: ia, ja, k, c, f, aa, mc, nc
 
@@ -16101,14 +16186,19 @@ subroutine dg1_cpl_bb3(CS, G, US, i, j, Hc, Bc, Uc, Vc, sub_cell, use_newton, wi
     call dg1_q3_point(CS, G, US, i, j, xi, eta, Hc, Bc, Uc, Vc, CS%dg_post_ub(i,j), CS%dg_post_vb(i,j), gr_cell, &
                       use_newton, coef_prefactor_e, min_trac_e, eps_vel2_e, rhoi_rhow, rho_oi_ratio, &
                       rho_ice_g_LtoZ, Visc_coef, a, d, jac_wt, bt, btx, bty, h_p, visc, fnw, g1, g2, g3, &
-                      gr_p, bcf, dnw, cur)
+                      gr_p, bcf, dnw, cur, kx, ky)
     nu = jac_wt * visc
+    met = (kx /= 0.0) .or. (ky /= 0.0)
+    if (met) call dg1_metric_strain(bt, btx, bty, kx, ky, bb_s(:,1), bb_s(:,2))
     Sp(1,1,1) = nu * (4.0*btx) ; Sp(1,2,1) = nu * bty ; Sp(2,1,1) = nu * bty ; Sp(2,2,1) = nu * (2.0*btx)
     Sp(1,1,2) = nu * (2.0*bty) ; Sp(1,2,2) = nu * btx ; Sp(2,1,2) = nu * btx ; Sp(2,2,2) = nu * (4.0*bty)
     Sn(:,:,:) = Sp(:,:,:)
     dn_f(:) = 0.0
     if (fnw /= 0.0) then
       dn_f(1) = (g1 * btx) + (g3 * bty) ; dn_f(2) = (g2 * bty) + (g3 * btx)
+      if (met) then ; do f=1,2
+        dn_f(f) = ((g1 * bb_s(1,f)) + (g2 * bb_s(2,f))) + (g3 * bb_s(3,f))
+      enddo ; endif
       do f=1,2
         Sn(1,1,f) = Sn(1,1,f) + ((fnw * dn_f(f)) * g1) ; Sn(1,2,f) = Sn(1,2,f) + ((fnw * dn_f(f)) * g3)
         Sn(2,1,f) = Sn(2,1,f) + ((fnw * dn_f(f)) * g3) ; Sn(2,2,f) = Sn(2,2,f) + ((fnw * dn_f(f)) * g2)
@@ -16128,18 +16218,36 @@ subroutine dg1_cpl_bb3(CS, G, US, i, j, Hc, Bc, Uc, Vc, sub_cell, use_newton, wi
       xa = merge(1.0 - xi, xi, mc == 1) ; yb = merge(1.0 - eta, eta, nc == 1)
       phi_c = xa * yb
       phx = (real(2*mc - 3) * yb) / a ; phy = (real(2*nc - 3) * xa) / d
+      if (met) then
+        call dg1_metric_strain(phi_c, phx, phy, kx, ky, bn_s(:,1), bn_s(:,2))
+        do aa=1,2
+          gn_s(aa) = ((g1 * bn_s(1,aa)) + (g2 * bn_s(2,aa))) + (g3 * bn_s(3,aa))
+        enddo
+      endif
       do f=1,2 ; do aa=1,2
         k = cpl_nb(aa,c,f)
-        pv(k,ia,ja) = wq * ((Sp(aa,1,f) * phx) + (Sp(aa,2,f) * phy))
-        pv(CPL_NSET+k,ia,ja) = wq * ((Sn(aa,1,f) * phx) + (Sn(aa,2,f) * phy))
+        if (met) then
+          ! DG1_SSA_METRIC_TERMS: the energy form of the strain rates with the metric terms.
+          pv(k,ia,ja) = wq * (nu * dg1_strain_energy(bn_s(:,aa), bb_s(:,f)))
+          pv(CPL_NSET+k,ia,ja) = pv(k,ia,ja) + wq * ((fnw * dn_f(f)) * gn_s(aa))
+        else
+          pv(k,ia,ja) = wq * ((Sp(aa,1,f) * phx) + (Sp(aa,2,f) * phy))
+          pv(CPL_NSET+k,ia,ja) = wq * ((Sn(aa,1,f) * phx) + (Sn(aa,2,f) * phy))
+        endif
         pr(k,ia,ja) = wq * (Fp(aa,f) * (bt * phi_c))
         pr(CPL_NSET+k,ia,ja) = wq * (Fk(aa,f) * (bt * phi_c))
       enddo ; enddo
     enddo
     ! The bubble entries 11, 12, 22.
-    pv(CPL_BB+1,ia,ja) = wq * (nu * ((4.0 * (btx*btx)) + (bty*bty)))
-    pv(CPL_BB+2,ia,ja) = wq * (nu * (3.0 * (btx*bty)))
-    pv(CPL_BB+3,ia,ja) = wq * (nu * ((btx*btx) + (4.0 * (bty*bty))))
+    if (met) then
+      pv(CPL_BB+1,ia,ja) = wq * (nu * dg1_strain_energy(bb_s(:,1), bb_s(:,1)))
+      pv(CPL_BB+2,ia,ja) = wq * (nu * dg1_strain_energy(bb_s(:,1), bb_s(:,2)))
+      pv(CPL_BB+3,ia,ja) = wq * (nu * dg1_strain_energy(bb_s(:,2), bb_s(:,2)))
+    else
+      pv(CPL_BB+1,ia,ja) = wq * (nu * ((4.0 * (btx*btx)) + (bty*bty)))
+      pv(CPL_BB+2,ia,ja) = wq * (nu * (3.0 * (btx*bty)))
+      pv(CPL_BB+3,ia,ja) = wq * (nu * ((btx*btx) + (4.0 * (bty*bty))))
+    endif
     pv(CPL_NSET+CPL_BB+1,ia,ja) = pv(CPL_BB+1,ia,ja) + wq * (fnw * (dn_f(1) * dn_f(1)))
     pv(CPL_NSET+CPL_BB+2,ia,ja) = pv(CPL_BB+2,ia,ja) + wq * (fnw * (dn_f(1) * dn_f(2)))
     pv(CPL_NSET+CPL_BB+3,ia,ja) = pv(CPL_BB+3,ia,ja) + wq * (fnw * (dn_f(2) * dn_f(2)))
@@ -16376,7 +16484,7 @@ end subroutine dg1_own_fb_sep3
 !! both take their coefficients from here, so that one energy gives every row of a cell.
 subroutine dg1_q3_point(CS, G, US, i, j, xi, eta, Hc, Bc, Uc, Vc, ub, vb, gr_cell, use_newton, coef_prefactor_e, &
                         min_trac_e, eps_vel2_e, rhoi_rhow, rho_oi_ratio, rho_ice_g_LtoZ, Visc_coef, a, d, jac_wt, &
-                        bt, btx, bty, h_p, visc, fnw, g1, g2, g3, gr_p, bcf, dnw, cur)
+                        bt, btx, bty, h_p, visc, fnw, g1, g2, g3, gr_p, bcf, dnw, cur, kx, ky)
   type(ice_shelf_dyn_CS), intent(in)  :: CS  !< The ice shelf dynamics control structure
   type(ocean_grid_type),  intent(in)  :: G   !< The grid structure used by the ice shelf
   type(unit_scale_type),  intent(in)  :: US  !< A structure containing unit conversion factors
@@ -16409,19 +16517,25 @@ subroutine dg1_q3_point(CS, G, US, i, j, xi, eta, Hc, Bc, Uc, Vc, ub, vb, gr_cel
   real,                   intent(out) :: h_p !< The thickness at the point [Z ~> m]
   real,                   intent(out) :: visc !< The area- and depth-integrated viscosity [R L4 Z T-1 ~> kg m2 s-1]
   real,                   intent(out) :: fnw !< jac_wt times the Newton viscosity factor, or 0 [R L4 Z T ~> kg m2 s]
-  real,                   intent(out) :: g1  !< The Newton strain factor 2 ux + vy [T-1 ~> s-1]
-  real,                   intent(out) :: g2  !< The Newton strain factor 2 vy + ux [T-1 ~> s-1]
-  real,                   intent(out) :: g3  !< The Newton strain factor (uy + vx)/2 [T-1 ~> s-1]
+  real,                   intent(out) :: g1  !< The Newton strain factor 2 ux + vy (2 e_xx + e_yy with
+                                             !! DG1_SSA_METRIC_TERMS) [T-1 ~> s-1]
+  real,                   intent(out) :: g2  !< The Newton strain factor 2 vy + ux (2 e_yy + e_xx) [T-1 ~> s-1]
+  real,                   intent(out) :: g3  !< The Newton strain factor (uy + vx)/2 (e_xy) [T-1 ~> s-1]
   logical,                intent(out) :: gr_p !< The point carries friction
   real,                   intent(out) :: bcf !< The Picard friction coefficient, ground-fraction scaled
                                              !! [R L2 Z T-1 ~> kg s-1]
   real,                   intent(out) :: dnw !< The Newton friction coefficient, ground-fraction scaled
                                              !! [R Z T ~> kg m-2 s]
   real, dimension(2),     intent(out) :: cur !< The total velocity at the point [L T-1 ~> m s-1]
+  real,                   intent(out) :: kx  !< DG1_SSA_METRIC_TERMS: (dxN - dxS) / (a d), 0 without it [L-1 ~> m-1]
+  real,                   intent(out) :: ky  !< DG1_SSA_METRIC_TERMS: (dyE - dyW) / (a d), 0 without it [L-1 ~> m-1]
 
   real :: bb          ! The product of the two 2-point Gauss abscissae [nondim]
   real :: bxi, beta_  ! The two reference derivatives of the bubble [nondim]
   real :: ux, uy, vx, vy ! The strain of the total velocity [T-1 ~> s-1]
+  real :: u_p, v_p    ! DG1_SSA_METRIC_TERMS: the total velocity at the point [L T-1 ~> m s-1]
+  real :: exx, eyy, gxy ! DG1_SSA_METRIC_TERMS: the strain rates e_xx, e_yy and 2 e_xy [T-1 ~> s-1]
+  real :: dxS, dxN, dyW, dyE ! DG1_SSA_METRIC_TERMS: the face lengths of the cell, as in the transport [L ~> m]
   real :: e2          ! The squared effective strain rate with its floor [T-2 ~> s-2]
   real :: bed_p       ! The bed depth at the point [Z ~> m]
   real :: h_fp        ! The thickness of the flotation test at the point [Z ~> m]
@@ -16430,15 +16544,35 @@ subroutine dg1_q3_point(CS, G, US, i, j, xi, eta, Hc, Bc, Uc, Vc, ub, vb, gr_cel
 
   bb = (.5 * (1-sqrt(1./3))) * (.5 * (1+sqrt(1./3)))
   n_g = CS%n_glen
-  if ((J-1 >= G%JsdB) .and. (j + G%jdg_offset > G%jsg)) then
-    a = (G%dxCv(i,J-1) * (1.0 - eta)) + (G%dxCv(i,J) * eta)
+  kx = 0.0 ; ky = 0.0
+  if (CS%ssa_metric) then
+    ! DG1_SSA_METRIC_TERMS: the face lengths of the DG(1) transport (cell_face_lengths), so that the two share one
+    ! cell, also across a reentrant edge, and the metric factors (d a / d eta) / (a d) and (d d / d xi) / (a d).
+    ! At a domain edge that is not reentrant the cell has one length, as without the flag.
+    dxN = G%dxCv(i,J) ; dyE = G%dyCu(I,j)
+    if ((J-1 >= G%JsdB) .and. (CS%reentrant_y .or. (j + G%jdg_offset > G%jsg))) then
+      dxS = G%dxCv(i,J-1) ; a = (dxS * (1.0 - eta)) + (dxN * eta)
+    else
+      dxS = dxN ; a = dxN
+    endif
+    if ((I-1 >= G%IsdB) .and. (CS%reentrant_x .or. (i + G%idg_offset > G%isg))) then
+      dyW = G%dyCu(I-1,j) ; d = (dyW * (1.0 - xi)) + (dyE * xi)
+    else
+      dyW = dyE ; d = dyE
+    endif
+    if (dxN /= dxS) kx = (dxN - dxS) / (a * d)
+    if (dyE /= dyW) ky = (dyE - dyW) / (a * d)
   else
-    a = G%dxCv(i,J)
-  endif
-  if ((I-1 >= G%IsdB) .and. (i + G%idg_offset > G%isg)) then
-    d = (G%dyCu(I-1,j) * (1.0 - xi)) + (G%dyCu(I,j) * xi)
-  else
-    d = G%dyCu(I,j)
+    if ((J-1 >= G%JsdB) .and. (j + G%jdg_offset > G%jsg)) then
+      a = (G%dxCv(i,J-1) * (1.0 - eta)) + (G%dxCv(i,J) * eta)
+    else
+      a = G%dxCv(i,J)
+    endif
+    if ((I-1 >= G%IsdB) .and. (i + G%idg_offset > G%isg)) then
+      d = (G%dyCu(I-1,j) * (1.0 - xi)) + (G%dyCu(I,j) * xi)
+    else
+      d = G%dyCu(I,j)
+    endif
   endif
   jac_wt = (a * d) * G%IareaT(i,j)
   bt = ((xi * (1.0 - xi)) * (eta * (1.0 - eta))) / (bb * bb)
@@ -16452,10 +16586,21 @@ subroutine dg1_q3_point(CS, G, US, i, j, xi, eta, Hc, Bc, Uc, Vc, ub, vb, gr_cel
   h_p = ((Hc(1,1) * ((1.0 - xi) * (1.0 - eta))) + (Hc(2,2) * (xi * eta))) + &
         ((Hc(2,1) * (xi * (1.0 - eta))) + (Hc(1,2) * ((1.0 - xi) * eta)))
   h_p = max(h_p, CS%min_h_shelf)
-  e2 = (((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2))) + CS%eps_glen_min**2
+  if ((kx /= 0.0) .or. (ky /= 0.0)) then
+    ! DG1_SSA_METRIC_TERMS: the strain rates of the orthogonal curvilinear grid.
+    u_p = (((Uc(1,1) * ((1.0 - xi) * (1.0 - eta))) + (Uc(2,2) * (xi * eta))) + &
+           ((Uc(2,1) * (xi * (1.0 - eta))) + (Uc(1,2) * ((1.0 - xi) * eta)))) + (bt * ub)
+    v_p = (((Vc(1,1) * ((1.0 - xi) * (1.0 - eta))) + (Vc(2,2) * (xi * eta))) + &
+           ((Vc(2,1) * (xi * (1.0 - eta))) + (Vc(1,2) * ((1.0 - xi) * eta)))) + (bt * vb)
+    exx = ux + (kx * v_p) ; eyy = vy + (ky * u_p) ; gxy = (uy + vx) - ((kx * u_p) + (ky * v_p))
+    e2 = (((exx**2) + (eyy**2)) + ((exx*eyy) + 0.25*(gxy**2))) + CS%eps_glen_min**2
+    g1 = 2.0*exx + eyy ; g2 = 2.0*eyy + exx ; g3 = 0.5 * gxy
+  else
+    e2 = (((ux**2) + (vy**2)) + ((ux*vy) + 0.25*((uy+vx)**2))) + CS%eps_glen_min**2
+    g1 = 2.0*ux + vy ; g2 = 2.0*vy + ux ; g3 = 0.5 * (uy + vx)
+  endif
   visc = (G%areaT(i,j) * h_p) * max(0.5 * Visc_coef * (US%s_to_T**2 * e2)**((1.-n_g)/(2.*n_g)) * &
          (US%Pa_to_RL2_T2*US%s_to_T), CS%min_ice_visc)
-  g1 = 2.0*ux + vy ; g2 = 2.0*vy + ux ; g3 = 0.5 * (uy + vx)
   fnw = 0.0
   if (use_newton .and. (visc > CS%min_ice_visc * (G%areaT(i,j) * h_p))) &
     fnw = jac_wt * (((1./n_g - 1.) / e2) * visc)
@@ -16901,6 +17046,34 @@ pure real function dg1_bubble_tilde(xm1, xm2, ym1, ym2)
   bb = (.5 * (1-sqrt(1./3))) * (.5 * (1+sqrt(1./3)))
   dg1_bubble_tilde = ((xm1 * xm2) * (ym1 * ym2)) / (bb * bb)
 end function dg1_bubble_tilde
+
+!> DG1_SSA_METRIC_TERMS: the strain rates (e_xx, e_yy, 2 e_xy) of a unit x velocity (su) and of a unit y velocity
+!! (sv) in a shape function of value phi and gradient (phx, phy), on an orthogonal curvilinear grid with the
+!! metric factors kx = (d a / d eta) / (a d) and ky = (d d / d xi) / (a d) of dg1_q3_point:
+!! e_xx = u_x + kx v, e_yy = v_y + ky u and 2 e_xy = u_y + v_x - kx u - ky v.
+pure subroutine dg1_metric_strain(phi, phx, phy, kx, ky, su, sv)
+  real,               intent(in)  :: phi !< The shape function at the point [nondim]
+  real,               intent(in)  :: phx !< Its x gradient [L-1 ~> m-1]
+  real,               intent(in)  :: phy !< Its y gradient [L-1 ~> m-1]
+  real,               intent(in)  :: kx  !< The metric factor of the x length [L-1 ~> m-1]
+  real,               intent(in)  :: ky  !< The metric factor of the y length [L-1 ~> m-1]
+  real, dimension(3), intent(out) :: su  !< The strain rates of a unit x velocity [L-1 ~> m-1]
+  real, dimension(3), intent(out) :: sv  !< The strain rates of a unit y velocity [L-1 ~> m-1]
+
+  su(1) = phx ; su(2) = ky * phi ; su(3) = phy - (kx * phi)
+  sv(1) = kx * phi ; sv(2) = phy ; sv(3) = phx - (ky * phi)
+end subroutine dg1_metric_strain
+
+!> DG1_SSA_METRIC_TERMS: the viscous energy form of two strain vectors p and q = (e_xx, e_yy, 2 e_xy),
+!! 4 p1 q1 + 2 (p1 q2 + p2 q1) + 4 p2 q2 + p3 q3.  It is symmetric, and with the metric factors 0 it gives the
+!! node and bubble terms of ssa_q3_cell_matrix and dg1_cpl_bb3 [L-2 ~> m-2].
+pure real function dg1_strain_energy(p, q)
+  real, dimension(3), intent(in) :: p !< The first strain vector [L-1 ~> m-1]
+  real, dimension(3), intent(in) :: q !< The second strain vector [L-1 ~> m-1]
+
+  dg1_strain_energy = ((4.0 * (p(1) * q(1))) + (4.0 * (p(2) * q(2)))) + &
+                      ((2.0 * ((p(1) * q(2)) + (p(2) * q(1)))) + (p(3) * q(3)))
+end function dg1_strain_energy
 
 !> The gradient of the DG1_COUPLED_BUBBLE bubble (scaled to 1 at the Gauss points) at the 2x2 Gauss point
 !! (iq, jq) of cell (i, j).  grad(b) = b_xi grad(xi) + b_eta grad(eta), with xi = N_SE + N_NE and
@@ -18174,6 +18347,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   real, dimension(2,2) :: h_bud ! Corner thicknesses of a cell before a pass, for the tilt budget [Z ~> m]
   integer :: i, j, a, b, m, n, k, ig, jg, isc, iec, jsc, jec, isd, ied, jsd, jed
   integer :: ix, jy ! Edge faces of a cell beyond a corner of the domain
+  real :: f_dxS, f_dxN, f_dyW, f_dyE ! DG1_LIMITER_CELL_METRICS: the face lengths of a cell [L ~> m]
 
   isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -18205,9 +18379,17 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
           br_c(a,b) = rr * CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b)
         enddo ; enddo
         if ((min(min(br_c(1,1), br_c(2,2)), min(br_c(1,2), br_c(2,1))) < 0.0) .and. &
-            (max(max(br_c(1,1), br_c(2,2)), max(br_c(1,2), br_c(2,1))) > 0.0)) &
-          sbar(i,j) = (1.0 - rr) * nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:)) + &
-                      dg1_lim_pos_mean(br_c, CS%cell_mean_w(i,j,:,:))
+            (max(max(br_c(1,1), br_c(2,2)), max(br_c(1,2), br_c(2,1))) > 0.0)) then
+          if (CS%dg_lim_metric) then
+            ! DG1_LIMITER_CELL_METRICS: the triangles with the area element of the cell.
+            call cell_face_lengths(G, i, j, CS%reentrant_x, CS%reentrant_y, f_dxS, f_dxN, f_dyW, f_dyE)
+            sbar(i,j) = (1.0 - rr) * nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:)) + &
+                        dg1_lim_pos_mean_metric(br_c, CS%cell_mean_w(i,j,:,:), f_dxS, f_dxN, f_dyW, f_dyE)
+          else
+            sbar(i,j) = (1.0 - rr) * nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:)) + &
+                        dg1_lim_pos_mean(br_c, CS%cell_mean_w(i,j,:,:))
+          endif
+        endif
       endif
       if (CS%dg_lim_cp_branch) then
         ! The same mean of each branch, so in a cell on one branch that branch mean is sbar bitwise.
@@ -18223,6 +18405,11 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
       endif
     else
       dmean = 0.25*((CS%bed_node(i-1,j-1) + CS%bed_node(i,j)) + (CS%bed_node(i,j-1) + CS%bed_node(i-1,j)))
+      if (CS%dg_lim_metric) then
+        ! DG1_LIMITER_CELL_METRICS: the area-weighted mean bed, where the corner weights differ.
+        if (.not.dg1_equal_weights(CS%cell_mean_w(i,j,:,:))) &
+          dmean = nodal_cell_mean(CS%bed_node(i-1:i,j-1:j), CS%cell_mean_w(i,j,:,:))
+      endif
       sbar(i,j) = max(-dmean, 0.0)
       ! No ice: h = 0, so the two branch surfaces are -D and 0 and their larger one is sbar.
       hpt(i,j) = 0.0 ; dpt(i,j) = dmean
@@ -20368,6 +20555,14 @@ subroutine dg1_lim_backward_edges_cont(CS, G, hmask, h_in, in_dom, hlo, hhi, pn,
   real, dimension(SZDI_(G),SZDJ_(G),2,2) :: sc ! Corner surfaces on their own branch [Z ~> m]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: sum_a ! Sum at a node of the corner surfaces of the ice cells there [Z ~> m]
   real, dimension(SZDIB_(G),SZDJB_(G)) :: n_a   ! The number of those corners [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: sw_a  ! DG1_LIMITER_CELL_METRICS: the sum of those corner surfaces times
+                                                ! their corner weights [Z L2 ~> m3]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: w_a   ! DG1_LIMITER_CELL_METRICS: the sum of those weights [L2 ~> m2]
+  logical, dimension(SZDIB_(G),SZDJB_(G)) :: eq_a ! DG1_LIMITER_CELL_METRICS: those weights are all equal
+  real, dimension(4) :: vw_a      ! The corner weights of the four cells at a node, 0 without ice [L2 ~> m2]
+  real :: len_e   ! DG1_LIMITER_CELL_METRICS: the length of the edge [L ~> m]
+  real :: dist_s  ! DG1_LIMITER_CELL_METRICS: the distance between the two cell centres of a step [L ~> m]
+  real :: w_q     ! DG1_LIMITER_CELL_METRICS: the corner weight of a corner of the edge [L2 ~> m2]
   real, dimension(4) :: v_a       ! Corner surfaces of the four cells at a node [Z ~> m]
   real, dimension(4) :: k_a       ! The counts of those corners [nondim]
   real, dimension(2,2) :: dn, dh  ! Corner beds [Z ~> m] and the change of the corners [Z ~> m]
@@ -20421,6 +20616,7 @@ subroutine dg1_lim_backward_edges_cont(CS, G, hmask, h_in, in_dom, hlo, hhi, pn,
   enddo ; enddo
   ! Node sums, pairing the diagonally opposite cells so that a turn or a reflection of the grid sums the same pairs.
   sum_a(:,:) = 0.0 ; n_a(:,:) = 0.0
+  sw_a(:,:) = 0.0 ; w_a(:,:) = 0.0 ; eq_a(:,:) = .true.
   do jN = jsd+1, jed-1 ; do iN = isd+1, ied-1
     ! The cells (iN,jN) NE corner, (iN+1,jN+1) SW, (iN+1,jN) NW, (iN,jN+1) SE share node (iN,jN).
     do q = 1, 4
@@ -20430,10 +20626,18 @@ subroutine dg1_lim_backward_edges_cont(CS, G, hmask, h_in, in_dom, hlo, hhi, pn,
         case (3) ; ic = iN+1 ; jc = jN ; a = 1 ; b = 2
         case default ; ic = iN ; jc = jN+1 ; a = 2 ; b = 1
       end select
-      v_a(q) = 0.0 ; k_a(q) = 0.0
-      if (okc(ic,jc)) then ; v_a(q) = sc(ic,jc,a,b) ; k_a(q) = 1.0 ; endif
+      v_a(q) = 0.0 ; k_a(q) = 0.0 ; vw_a(q) = 0.0
+      if (okc(ic,jc)) then ; v_a(q) = sc(ic,jc,a,b) ; k_a(q) = 1.0 ; vw_a(q) = CS%cell_mean_w(ic,jc,a,b) ; endif
     enddo
     sum_a(iN,jN) = (v_a(1) + v_a(2)) + (v_a(3) + v_a(4)) ; n_a(iN,jN) = (k_a(1) + k_a(2)) + (k_a(3) + k_a(4))
+    if (CS%dg_lim_metric) then
+      ! DG1_LIMITER_CELL_METRICS: the weighted sums, used where the weights of the ice corners at the node differ.
+      sw_a(iN,jN) = ((vw_a(1) * v_a(1)) + (vw_a(2) * v_a(2))) + ((vw_a(3) * v_a(3)) + (vw_a(4) * v_a(4)))
+      w_a(iN,jN) = (vw_a(1) + vw_a(2)) + (vw_a(3) + vw_a(4))
+      do q = 1, 4
+        if ((k_a(q) > 0.0) .and. (vw_a(q) /= maxval(vw_a, mask=(k_a > 0.0)))) eq_a(iN,jN) = .false.
+      enddo
+    endif
   enddo ; enddo
 
   do j = jsc, jec ; do i = isc, iec
@@ -20498,6 +20702,18 @@ subroutine dg1_lim_backward_edges_cont(CS, G, hmask, h_in, in_dom, hlo, hhi, pn,
           sa = la(k,r) - la(0,r) ; sb = lb(k,r) - lb(0,r)
           if (k < 0) then ; sa = -sa ; sb = -sb ; endif
           st = th * sa + (1.0 - th) * sb
+          if (CS%dg_lim_metric) then
+            ! DG1_LIMITER_CELL_METRICS: the step as a change over the length of the edge, from the distance between
+            ! the two centres.  A step from a mirror image beyond a wall is 0 and keeps its value.
+            if (ax == 1) then
+              ii = i + k ; jj = j + (r-1)*o
+              len_e = G%dxCv(i,j-2+e) ; dist_s = G%dxCu(min(i, ii),jj)
+            else
+              ii = i + (r-1)*o ; jj = j + k
+              len_e = G%dyCu(i-2+e,j) ; dist_s = G%dyCv(ii,min(j, jj))
+            endif
+            if (in_dom(ii,jj) .and. (dist_s > 0.0)) st = st * (len_e / dist_s)
+          endif
           nst = nst + 1 ; smax = max(smax, st) ; smin = min(smin, st)
         enddo
       enddo
@@ -20549,6 +20765,12 @@ subroutine dg1_lim_backward_edges_cont(CS, G, hmask, h_in, in_dom, hlo, hhi, pn,
         o_ok(q) = (n_a(iN,jN) > 1.0)
         if (.not.o_ok(q)) then ; te = 0.0 ; cycle ; endif
         o_e(q) = (sum_a(iN,jN) - s_e(q)) / (n_a(iN,jN) - 1.0)
+        if (CS%dg_lim_metric) then
+          ! DG1_LIMITER_CELL_METRICS: the weighted mean of the other corners, where their weights differ.
+          if (q == 1) then ; w_q = CS%cell_mean_w(i,j,a0,b0) ; else ; w_q = CS%cell_mean_w(i,j,a1,b1) ; endif
+          if ((.not.eq_a(iN,jN)) .and. (w_a(iN,jN) - w_q > 0.0)) &
+            o_e(q) = (sw_a(iN,jN) - w_q * s_e(q)) / (w_a(iN,jN) - w_q)
+        endif
         dhq = tilt * m_e(q)
         if (dhq > 0.0) then
           s_lim = o_e(q) + abs(s_e(q) - o_e(q))
@@ -20613,6 +20835,8 @@ subroutine dg1_lim_extend_beyond(CS, G, in_dom, have, v, v_f)
 
   integer :: i, j, m, n, k, isd, ied, jsd, jed
   integer :: ix, jy ! Edge faces of a cell beyond a corner of the domain
+  real :: fk        ! The distance to the cell beyond the edge over the distance between the two cells inside, k
+                    ! without DG1_LIMITER_CELL_METRICS [nondim]
 
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
   v_f(:,:) = v(:,:)
@@ -20622,7 +20846,9 @@ subroutine dg1_lim_extend_beyond(CS, G, in_dom, have, v, v_f)
       if (have(i,j)) exit
       if (i+k+1 <= ied) then ; if (in_dom(i+k,j) .and. have(i+k,j) .and. have(i+k+1,j) .and. &
                                    (.not.in_dom(i+k-1,j))) then
-        v(i,j) = v(i+k,j) + real(k)*(v(i+k,j) - v(i+k+1,j))
+        fk = real(k)
+        if (CS%dg_lim_metric) fk = dg1_lim_ext_ratio(k, G%dxT(i+k,j), G%dxCu(i+k,j))
+        v(i,j) = v(i+k,j) + fk*(v(i+k,j) - v(i+k+1,j))
         v_f(i,j) = v(i,j)
         if (dg1_lim_wall_face(CS%u_face_mask_bdry(i+k-1,j), CS%u_bdry_val(i+k-1,j-1), CS%u_bdry_val(i+k-1,j))) &
           v_f(i,j) = v(i+2*k-1,j)
@@ -20630,7 +20856,9 @@ subroutine dg1_lim_extend_beyond(CS, G, in_dom, have, v, v_f)
       endif ; endif
       if (i-k-1 >= isd) then ; if (in_dom(i-k,j) .and. have(i-k,j) .and. have(i-k-1,j) .and. &
                                    (.not.in_dom(i-k+1,j))) then
-        v(i,j) = v(i-k,j) + real(k)*(v(i-k,j) - v(i-k-1,j))
+        fk = real(k)
+        if (CS%dg_lim_metric) fk = dg1_lim_ext_ratio(k, G%dxT(i-k,j), G%dxCu(i-k-1,j))
+        v(i,j) = v(i-k,j) + fk*(v(i-k,j) - v(i-k-1,j))
         v_f(i,j) = v(i,j)
         if (dg1_lim_wall_face(CS%u_face_mask_bdry(i-k,j), CS%u_bdry_val(i-k,j-1), CS%u_bdry_val(i-k,j))) &
           v_f(i,j) = v(i-2*k+1,j)
@@ -20638,7 +20866,9 @@ subroutine dg1_lim_extend_beyond(CS, G, in_dom, have, v, v_f)
       endif ; endif
       if (j+k+1 <= jed) then ; if (in_dom(i,j+k) .and. have(i,j+k) .and. have(i,j+k+1) .and. &
                                    (.not.in_dom(i,j+k-1))) then
-        v(i,j) = v(i,j+k) + real(k)*(v(i,j+k) - v(i,j+k+1))
+        fk = real(k)
+        if (CS%dg_lim_metric) fk = dg1_lim_ext_ratio(k, G%dyT(i,j+k), G%dyCv(i,j+k))
+        v(i,j) = v(i,j+k) + fk*(v(i,j+k) - v(i,j+k+1))
         v_f(i,j) = v(i,j)
         if (dg1_lim_wall_face(CS%v_face_mask_bdry(i,j+k-1), CS%v_bdry_val(i-1,j+k-1), CS%v_bdry_val(i,j+k-1))) &
           v_f(i,j) = v(i,j+2*k-1)
@@ -20646,7 +20876,9 @@ subroutine dg1_lim_extend_beyond(CS, G, in_dom, have, v, v_f)
       endif ; endif
       if (j-k-1 >= jsd) then ; if (in_dom(i,j-k) .and. have(i,j-k) .and. have(i,j-k-1) .and. &
                                    (.not.in_dom(i,j-k+1))) then
-        v(i,j) = v(i,j-k) + real(k)*(v(i,j-k) - v(i,j-k-1))
+        fk = real(k)
+        if (CS%dg_lim_metric) fk = dg1_lim_ext_ratio(k, G%dyT(i,j-k), G%dyCv(i,j-k-1))
+        v(i,j) = v(i,j-k) + fk*(v(i,j-k) - v(i,j-k-1))
         v_f(i,j) = v(i,j)
         if (dg1_lim_wall_face(CS%v_face_mask_bdry(i,j-k), CS%v_bdry_val(i-1,j-k), CS%v_bdry_val(i,j-k))) &
           v_f(i,j) = v(i,j-2*k+1)
@@ -20659,7 +20891,12 @@ subroutine dg1_lim_extend_beyond(CS, G, in_dom, have, v, v_f)
       if ((i+2*m < isd) .or. (i+2*m > ied) .or. (j+2*n < jsd) .or. (j+2*n > jed)) cycle
       if (in_dom(i+m,j+n) .and. have(i+m,j+n) .and. have(i+2*m,j+2*n) .and. &
           (.not.in_dom(i+m,j)) .and. (.not.in_dom(i,j+n))) then
-        v(i,j) = v(i+m,j+n) + (v(i+m,j+n) - v(i+2*m,j+2*n))
+        fk = 1.0
+        ! DG1_LIMITER_CELL_METRICS: the diagonal of the cell inside over the distance to the next one inside.
+        if (CS%dg_lim_metric) &
+          fk = dg1_lim_ext_ratio(1, sqrt((G%dxT(i+m,j+n)**2) + (G%dyT(i+m,j+n)**2)), &
+                                 sqrt((G%dxCu(min(i+m, i+2*m),j+n)**2) + (G%dyCv(i+m,min(j+n, j+2*n))**2)))
+        v(i,j) = v(i+m,j+n) + fk*(v(i+m,j+n) - v(i+2*m,j+2*n))
         v_f(i,j) = v(i,j)
         ! The edge faces of the inside cell (i+m, j+n) toward this cell: x face Ix, y face Jy.
         ix = i - (1 - m)/2 ; jy = j - (1 - n)/2
@@ -20672,6 +20909,19 @@ subroutine dg1_lim_extend_beyond(CS, G, in_dom, have, v, v_f)
   enddo ; enddo
   if (.not.CS%dg_lim_edge_mirror) v_f(:,:) = v(:,:)
 end subroutine dg1_lim_extend_beyond
+
+!> DG1_LIMITER_CELL_METRICS: the factor of the linear extrapolation to the cell k cells beyond a domain edge, the
+!! distance to it over the distance between the first two cells inside.  The cells beyond the edge are taken to
+!! have the length len_in of the first cell inside, so the distance to the k-th is k len_in.  The result is k
+!! where the two lengths are equal, or where the distance inside is not set.
+pure real function dg1_lim_ext_ratio(k, len_in, dist_in)
+  integer, intent(in) :: k       !< The number of cells beyond the edge
+  real,    intent(in) :: len_in  !< The length of the first cell inside, normal to the edge [L ~> m]
+  real,    intent(in) :: dist_in !< The distance between the first two cell centres inside [L ~> m]
+
+  dg1_lim_ext_ratio = real(k)
+  if ((dist_in > 0.0) .and. (len_in /= dist_in)) dg1_lim_ext_ratio = real(k) * (len_in / dist_in)
+end function dg1_lim_ext_ratio
 
 !> DG1_LIMITER_CROSSED, face pass along one axis of a crossed cell: the shift p of the thickness tilt of the axis,
 !! in [p_min, p_max] and nearest to 0, that keeps the surface at the middle of both faces of the axis in the bounds
@@ -21174,6 +21424,157 @@ pure real function dg1_lim_pos_mean(f, wc) result(pm)
   if (pp + nn > 0.0) pm = pp + (f0 - (pp - nn)) * (pp / (pp + nn))
   pm = max(pm, 0.0)
 end function dg1_lim_pos_mean
+
+!> DG1_LIMITER_CORNER_PROJECT_EXACT_MEANS with DG1_LIMITER_CELL_METRICS: as dg1_lim_pos_mean, the mean over a cell
+!! of max(f, 0) on the four triangles that join the corners to the centre, but with the area element
+!! J = (dyW (1 - xi) + dyE xi) (dxS (1 - eta) + dxN eta) of the DG(1) mass matrix.  The centre value of the
+!! triangles is the bilinear value there, the mean of the four corners, as in the SEP2 partition
+!! (sep2_cell_qps).  On each triangle f is linear and J is quadratic, so the integral of f J over the part where
+!! f > 0 is exact on the 6-point rule of dg1_tri_fj_int.  The sum is rescaled as in dg1_lim_pos_mean, so that
+!! where f has one sign at every corner the result is the weighted cell mean of f (or 0).  A cell with equal
+!! opposite faces has a constant J and equal corner weights, and there the result is dg1_lim_pos_mean.
+pure real function dg1_lim_pos_mean_metric(f, wc, dxS, dxN, dyW, dyE) result(pm)
+  real, dimension(2,2), intent(in) :: f  !< Corner values [Z ~> m]
+  real, dimension(2,2), intent(in) :: wc !< Corner weights of the cell mean [L2 ~> m2]
+  real,                 intent(in) :: dxS !< The south face length [L ~> m]
+  real,                 intent(in) :: dxN !< The north face length [L ~> m]
+  real,                 intent(in) :: dyW !< The west face length [L ~> m]
+  real,                 intent(in) :: dyE !< The east face length [L ~> m]
+
+  real :: f0     ! The weighted cell mean of f [Z ~> m]
+  real :: fc     ! The bilinear value of f at the centre [Z ~> m]
+  real :: p1, p2, p3, p4 ! Integrals of max(f, 0) J on the four triangles [Z L2 ~> m3]
+  real :: n1, n2, n3, n4 ! Integrals of max(-f, 0) J on the four triangles [Z L2 ~> m3]
+  real :: area   ! The area of the cell shape, the integral of J [L2 ~> m2]
+  real :: pp, nn ! The means of the positive and negative parts over the cell [Z ~> m]
+
+  if ((dxS == dxN) .and. (dyW == dyE)) then
+    pm = dg1_lim_pos_mean(f, wc)
+    return
+  endif
+  ! The integral of J itself, not the sum of wc, which DG1_MASS_AREAT scales to areaT; f0 does not depend on
+  ! that scale.
+  area = (0.5 * (dxS + dxN)) * (0.5 * (dyW + dyE))
+  pm = 0.0
+  if (area <= 0.0) return
+  f0 = nodal_cell_mean(f, wc)
+  fc = 0.25 * ((f(1,1) + f(2,2)) + (f(2,1) + f(1,2)))
+  ! The triangles south (SW, SE), east (SE, NE), north (NE, NW) and west (NW, SW) of the centre.
+  call dg1_tri_pos_int(fc, f(1,1), f(2,1), 0.5, 0.5, 0.0, 0.0, 1.0, 0.0, dxS, dxN, dyW, dyE, p1, n1)
+  call dg1_tri_pos_int(fc, f(2,1), f(2,2), 0.5, 0.5, 1.0, 0.0, 1.0, 1.0, dxS, dxN, dyW, dyE, p2, n2)
+  call dg1_tri_pos_int(fc, f(2,2), f(1,2), 0.5, 0.5, 1.0, 1.0, 0.0, 1.0, dxS, dxN, dyW, dyE, p3, n3)
+  call dg1_tri_pos_int(fc, f(1,2), f(1,1), 0.5, 0.5, 0.0, 1.0, 0.0, 0.0, dxS, dxN, dyW, dyE, p4, n4)
+  pp = ((p1 + p3) + (p2 + p4)) / area ; nn = ((n1 + n3) + (n2 + n4)) / area
+  if (pp + nn > 0.0) pm = pp + (f0 - (pp - nn)) * (pp / (pp + nn))
+  pm = max(pm, 0.0)
+end function dg1_lim_pos_mean_metric
+
+!> DG1_LIMITER_CELL_METRICS: the integrals of max(f, 0) J and of max(-f, 0) J over a triangle of the reference cell,
+!! for f linear with the vertex values f1, f2 and f3 at (x1, y1), (x2, y2) and (x3, y3), and the area element J of
+!! dg1_lim_pos_mean_metric.  Where the vertices differ in sign, the part cut off by the zero line at the vertex v
+!! whose sign differs from the other two is a triangle, and the other part is the rest of the triangle.
+pure subroutine dg1_tri_pos_int(f1, f2, f3, x1, y1, x2, y2, x3, y3, dxS, dxN, dyW, dyE, pos_i, neg_i)
+  real, intent(in)  :: f1  !< The value at the first vertex [Z ~> m]
+  real, intent(in)  :: f2  !< The value at the second vertex [Z ~> m]
+  real, intent(in)  :: f3  !< The value at the third vertex [Z ~> m]
+  real, intent(in)  :: x1  !< The xi of the first vertex [nondim]
+  real, intent(in)  :: y1  !< The eta of the first vertex [nondim]
+  real, intent(in)  :: x2  !< The xi of the second vertex [nondim]
+  real, intent(in)  :: y2  !< The eta of the second vertex [nondim]
+  real, intent(in)  :: x3  !< The xi of the third vertex [nondim]
+  real, intent(in)  :: y3  !< The eta of the third vertex [nondim]
+  real, intent(in)  :: dxS !< The south face length [L ~> m]
+  real, intent(in)  :: dxN !< The north face length [L ~> m]
+  real, intent(in)  :: dyW !< The west face length [L ~> m]
+  real, intent(in)  :: dyE !< The east face length [L ~> m]
+  real, intent(out) :: pos_i !< The integral of max(f, 0) J [Z L2 ~> m3]
+  real, intent(out) :: neg_i !< The integral of max(-f, 0) J [Z L2 ~> m3]
+
+  real :: tot   ! The integral of f J over the triangle [Z L2 ~> m3]
+  real :: cut   ! The integral of f J over the corner triangle at v [Z L2 ~> m3]
+  real :: fv, fa, fb ! The value at v and at the two other vertices [Z ~> m]
+  real :: xv, yv, xa, ya, xb, yb ! Their positions [nondim]
+  real :: ta, tb ! The positions of the zero crossings on the edges from v [nondim]
+
+  tot = dg1_tri_fj_int(f1, f2, f3, x1, y1, x2, y2, x3, y3, dxS, dxN, dyW, dyE)
+  if ((f1 >= 0.0) .and. (f2 >= 0.0) .and. (f3 >= 0.0)) then
+    pos_i = max(tot, 0.0) ; neg_i = 0.0
+  elseif ((f1 <= 0.0) .and. (f2 <= 0.0) .and. (f3 <= 0.0)) then
+    pos_i = 0.0 ; neg_i = max(-tot, 0.0)
+  else
+    if ((f1 > 0.0) .neqv. (f2 > 0.0)) then
+      if ((f1 > 0.0) .neqv. (f3 > 0.0)) then
+        fv = f1 ; xv = x1 ; yv = y1 ; fa = f2 ; xa = x2 ; ya = y2 ; fb = f3 ; xb = x3 ; yb = y3
+      else
+        fv = f2 ; xv = x2 ; yv = y2 ; fa = f1 ; xa = x1 ; ya = y1 ; fb = f3 ; xb = x3 ; yb = y3
+      endif
+    else
+      fv = f3 ; xv = x3 ; yv = y3 ; fa = f1 ; xa = x1 ; ya = y1 ; fb = f2 ; xb = x2 ; yb = y2
+    endif
+    ta = fv / (fv - fa) ; tb = fv / (fv - fb)
+    cut = dg1_tri_fj_int(fv, 0.0, 0.0, xv, yv, xv + ta*(xa - xv), yv + ta*(ya - yv), &
+                         xv + tb*(xb - xv), yv + tb*(yb - yv), dxS, dxN, dyW, dyE)
+    if (fv > 0.0) then
+      ! Only v is positive: the positive part is the corner triangle at v.
+      pos_i = max(cut, 0.0) ; neg_i = max(pos_i - tot, 0.0)
+    else
+      ! Only v is at or below 0: the negative part is the corner triangle at v.
+      neg_i = max(-cut, 0.0) ; pos_i = max(tot + neg_i, 0.0)
+    endif
+  endif
+end subroutine dg1_tri_pos_int
+
+!> DG1_LIMITER_CELL_METRICS: the integral of f J over a triangle of the reference cell, for f linear with the
+!! vertex values f1, f2 and f3 at (x1, y1), (x2, y2) and (x3, y3), and J the area element of
+!! dg1_lim_pos_mean_metric.  The integrand is a cubic, and the symmetric 6-point rule of Dunavant (1985), exact for
+!! degree 4, gives it exactly.
+pure real function dg1_tri_fj_int(f1, f2, f3, x1, y1, x2, y2, x3, y3, dxS, dxN, dyW, dyE) result(s)
+  real, intent(in) :: f1  !< The value at the first vertex [Z ~> m]
+  real, intent(in) :: f2  !< The value at the second vertex [Z ~> m]
+  real, intent(in) :: f3  !< The value at the third vertex [Z ~> m]
+  real, intent(in) :: x1  !< The xi of the first vertex [nondim]
+  real, intent(in) :: y1  !< The eta of the first vertex [nondim]
+  real, intent(in) :: x2  !< The xi of the second vertex [nondim]
+  real, intent(in) :: y2  !< The eta of the second vertex [nondim]
+  real, intent(in) :: x3  !< The xi of the third vertex [nondim]
+  real, intent(in) :: y3  !< The eta of the third vertex [nondim]
+  real, intent(in) :: dxS !< The south face length [L ~> m]
+  real, intent(in) :: dxN !< The north face length [L ~> m]
+  real, intent(in) :: dyW !< The west face length [L ~> m]
+  real, intent(in) :: dyE !< The east face length [L ~> m]
+
+  real, parameter :: ga = 0.44594849091596488632 ! First barycentric coordinate of the first group [nondim]
+  real, parameter :: gw = 0.22338158967801146570 ! Weight of each point of the first group [nondim]
+  real, parameter :: ha = 0.09157621350977074346 ! First barycentric coordinate of the second group [nondim]
+  real, parameter :: hw = 0.10995174365532186764 ! Weight of each point of the second group [nondim]
+  real, dimension(3,6) :: lam ! The barycentric coordinates of the six points [nondim]
+  real, dimension(6) :: wq    ! Their weights [nondim]
+  real :: ar   ! The area of the triangle in the reference cell [nondim]
+  real :: xq, yq ! A point [nondim]
+  real :: fq, jq ! f [Z ~> m] and J [L2 ~> m2] at the point
+  integer :: k
+
+  lam(:,1) = (/ 1.0 - 2.0*ga, ga, ga /) ; lam(:,2) = (/ ga, 1.0 - 2.0*ga, ga /) ; lam(:,3) = (/ ga, ga, 1.0 - 2.0*ga /)
+  lam(:,4) = (/ 1.0 - 2.0*ha, ha, ha /) ; lam(:,5) = (/ ha, 1.0 - 2.0*ha, ha /) ; lam(:,6) = (/ ha, ha, 1.0 - 2.0*ha /)
+  wq(1:3) = gw ; wq(4:6) = hw
+  ar = 0.5 * abs(((x2 - x1) * (y3 - y1)) - ((x3 - x1) * (y2 - y1)))
+  s = 0.0
+  do k = 1, 6
+    xq = ((lam(1,k) * x1) + (lam(2,k) * x2)) + (lam(3,k) * x3)
+    yq = ((lam(1,k) * y1) + (lam(2,k) * y2)) + (lam(3,k) * y3)
+    fq = ((lam(1,k) * f1) + (lam(2,k) * f2)) + (lam(3,k) * f3)
+    jq = ((dyW * (1.0 - xq)) + (dyE * xq)) * ((dxS * (1.0 - yq)) + (dxN * yq))
+    s = s + wq(k) * (fq * jq)
+  enddo
+  s = ar * s
+end function dg1_tri_fj_int
+
+!> True if the four corner weights of a cell are equal, as on a cell with equal opposite faces.
+pure logical function dg1_equal_weights(wc)
+  real, dimension(2,2), intent(in) :: wc !< Corner weights of the cell mean [L2 ~> m2]
+
+  dg1_equal_weights = (wc(1,1) == wc(2,2)) .and. (wc(1,1) == wc(1,2)) .and. (wc(1,1) == wc(2,1))
+end function dg1_equal_weights
 
 !> The mean over a triangle of max(f, 0), for f linear with the vertex values f1, f2 and f3: the mean of f where
 !! every vertex is at or above 0, 0 where every vertex is at or below 0, and otherwise the exact mean of the part
