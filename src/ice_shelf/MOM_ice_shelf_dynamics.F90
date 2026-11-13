@@ -441,6 +441,8 @@ type, public :: ice_shelf_dyn_CS ; private
                             !! terms of the orthogonal curvilinear grid.
   logical :: dg_mass_areat = .false. !< DG1_MASS_AREAT: the measure of the DG(1) transport (mass matrix, cell-mean
                             !! weights, sources) has the area areaT in each cell.
+  logical :: edge_face_bug = .true. !< ICE_SHELF_EDGE_FACE_BUG: a cell at a south or west domain edge that is not
+                            !! reentrant takes its north (east) face length for its south (west) face too.
   real, pointer, dimension(:,:,:,:) :: elem_K => NULL() !< The operator of a linear solve per ice cell,
                             !! elem_K(r,c,i,j) for the node unknowns u then v at SW, SE, NW, NE, with the
                             !! rows of masked nodes zero [R L2 Z T-1 ~> kg s-1]
@@ -1914,6 +1916,15 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "If true, use directionally inconsistent estimates of the grid spacing when "//&
                  "calculating the ice shelf surface slope, and underestimate slopes near the "//&
                  "edge of the ice shelf by a factor of 2.", default=enable_bugs)
+    call get_param(param_file, mdl, "ICE_SHELF_EDGE_FACE_BUG", CS%edge_face_bug, &
+                 "If true, recover a bug that a cell at a south or west domain edge that is not reentrant "//&
+                 "takes the length of its north (east) face for its south (west) face too, so that it is a "//&
+                 "rectangle in the shape functions of the velocity solve, in the DG(1) mass matrix and cell means "//&
+                 "and in the cell means of the initial thickness and bed, although the face length is set there in "//&
+                 "both memory modes.  If false, those cells take the length of each of their faces, as the driving "//&
+                 "stress and the DG(1) flux terms already do.  One length for both faces is then used only where "//&
+                 "the face lies outside the arrays (the outermost halo cell in non-symmetric memory).", &
+                 default=enable_bugs)
 
     if ((CS%visc_qps/=1) .and. (trim(CS%ice_viscosity_compute) /= "MODEL")) then
       call MOM_error(FATAL, "NUMBER_OF_ICE_VISCOSITY_QUADRATURE_POINTS must be 1 unless ICE_VISCOSITY_COMPUTE==MODEL.")
@@ -2008,7 +2019,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     endif
     allocate(CS%Jac(1:4,isd:ied,jsd:jed), source=0.0)
     do j=G%jsd,G%jed ; do i=G%isd,G%ied
-      call bilinear_shape_fn_grid(G, i, j, CS%Phi(:,:,i,j), CS%Jac(:,i,j))
+      call bilinear_shape_fn_grid(G, i, j, CS%Phi(:,:,i,j), CS%Jac(:,i,j), edge_bug=CS%edge_face_bug)
     enddo ; enddo
 
     ! Per-cell nodal DG(1) metric tables (Minv_nodal, cell_mean_w).
@@ -2027,7 +2038,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       !for calculating viscosity and 1 cell-centered quadrature point per cell
       allocate(CS%PhiC(1:8,G%isc:G%iec,G%jsc:G%jec), source=0.0)
       do j=G%jsc,G%jec ; do i=G%isc,G%iec
-        call bilinear_shape_fn_grid_1qp(G, i, j, CS%PhiC(:,i,j))
+        call bilinear_shape_fn_grid_1qp(G, i, j, CS%PhiC(:,i,j), edge_bug=CS%edge_face_bug)
       enddo ; enddo
     endif
 
@@ -9459,7 +9470,7 @@ subroutine IS_dynamics_post_data_2(CS, ISS, G)
   if (.not. associated(CS%PhiC)) then
     allocate(CS%PhiC(1:8,G%isc:G%iec,G%jsc:G%jec), source=0.0)
     do j=G%jsc,G%jec ; do i=G%isc,G%iec
-      call bilinear_shape_fn_grid_1qp(G, i, j, CS%PhiC(:,i,j))
+      call bilinear_shape_fn_grid_1qp(G, i, j, CS%PhiC(:,i,j), edge_bug=CS%edge_face_bug)
     enddo ; enddo
   endif
 
@@ -10739,7 +10750,7 @@ end subroutine bilinear_shape_functions
 !> This subroutine calculates the gradients of bilinear basis elements that are centered at the
 !! vertices of the cell using a locally orthogoal MOM6 grid.  Values are calculated at
 !! points of gaussian quadrature.
-subroutine bilinear_shape_fn_grid(G, i, j, Phi, Jac)
+subroutine bilinear_shape_fn_grid(G, i, j, Phi, Jac, edge_bug)
   type(ocean_grid_type), intent(in)    :: G  !< The grid structure used by the ice shelf.
   integer,               intent(in)    :: i   !< The i-index in the grid to work on.
   integer,               intent(in)    :: j   !< The j-index in the grid to work on.
@@ -10747,6 +10758,8 @@ subroutine bilinear_shape_fn_grid(G, i, j, Phi, Jac)
                                               !! quadrature points surrounding the cell vertices [L-1 ~> m-1].
   real, dimension(4), optional, intent(out) :: Jac !< Jacobian determinant |J_q| = a_q*d_q at each
                                                    !! Gaussian quadrature point [L2 ~> m2].
+  logical,            optional, intent(in)  :: edge_bug !< ICE_SHELF_EDGE_FACE_BUG (true if absent): a cell at a
+                                                   !! south or west domain edge takes one face length
 
 ! This subroutine calculates the gradients of bilinear basis elements that
 ! that are centered at the vertices of the cell.  The values are calculated at
@@ -10768,7 +10781,12 @@ subroutine bilinear_shape_fn_grid(G, i, j, Phi, Jac)
   real :: a, d       ! Interpolated grid spacings [L ~> m]
   real :: xexp, yexp ! [nondim]
   integer :: node, qpoint, xnode, ynode
+  logical :: e_bug   ! ICE_SHELF_EDGE_FACE_BUG
+  logical :: use_s, use_w ! The south and west face lengths are used
 
+  e_bug = .true. ; if (present(edge_bug)) e_bug = edge_bug
+  use_s = (J-1 >= G%JsdB) .and. ((.not.e_bug) .or. (j + G%jdg_offset > G%jsg))
+  use_w = (I-1 >= G%IsdB) .and. ((.not.e_bug) .or. (i + G%idg_offset > G%isg))
   xquad(1:3:2) = .5 * (1-sqrt(1./3)) ; yquad(1:2) = .5 * (1-sqrt(1./3))
   xquad(2:4:2) = .5 * (1+sqrt(1./3)) ; yquad(3:4) = .5 * (1+sqrt(1./3))
 
@@ -10777,15 +10795,14 @@ subroutine bilinear_shape_fn_grid(G, i, j, Phi, Jac)
   yquad_m(1) = yquad(3) ; yquad_m(2) = yquad(4) ; yquad_m(3) = yquad(1) ; yquad_m(4) = yquad(2)
 
   do qpoint=1,4
-    ! Fallback uses the single available face length when at the global
-    ! south/west edge (no neighbor to interpolate against) or when J-1 / I-1
-    ! falls outside q-axis array bounds (nonsymmetric mode in deepest halo).
-    if ((J-1 >= G%JsdB) .and. (j + G%jdg_offset > G%jsg)) then
+    ! Fallback uses the single available face length when J-1 / I-1 falls outside the q-axis array bounds
+    ! (nonsymmetric mode in deepest halo), and with ICE_SHELF_EDGE_FACE_BUG also at the global south/west edge.
+    if (use_s) then
       a = (G%dxCv(i,J-1) * yquad_m(qpoint)) + (G%dxCv(i,J) * yquad(qpoint)) ! d(x)/d(x*)
     else
       a = G%dxCv(i,J) !* yquad(qpoint) ! d(x)/d(x*)
     endif
-    if ((I-1 >= G%IsdB) .and. (i + G%idg_offset > G%isg)) then
+    if (use_w) then
       d = (G%dyCu(I-1,j) * xquad_m(qpoint)) + (G%dyCu(I,j) * xquad(qpoint)) ! d(y)/d(y*)
     else
       d = G%dyCu(I,j) !* xquad(qpoint)
@@ -10818,12 +10835,14 @@ end subroutine bilinear_shape_fn_grid
 !> This subroutine calculates the gradients of bilinear basis elements that are centered at the
 !! vertices of the cell using a locally orthogoal MOM6 grid.  Values are calculated at
 !! a sinlge cell-centered quadrature point, which should match the grid cell h-point
-subroutine bilinear_shape_fn_grid_1qp(G, i, j, Phi)
+subroutine bilinear_shape_fn_grid_1qp(G, i, j, Phi, edge_bug)
   type(ocean_grid_type), intent(in)    :: G  !< The grid structure used by the ice shelf.
   integer,               intent(in)    :: i   !< The i-index in the grid to work on.
   integer,               intent(in)    :: j   !< The j-index in the grid to work on.
   real, dimension(8),    intent(inout) :: Phi !< The gradients of bilinear basis elements at Gaussian
                                               !! quadrature points surrounding the cell vertices [L-1 ~> m-1].
+  logical,     optional, intent(in)    :: edge_bug !< ICE_SHELF_EDGE_FACE_BUG (true if absent): a cell at a
+                                              !! south or west domain edge takes one face length
 
 ! This subroutine calculates the gradients of bilinear basis elements that
 ! that are centered at the vertices of the cell.  The values are calculated at
@@ -10837,18 +10856,20 @@ subroutine bilinear_shape_fn_grid_1qp(G, i, j, Phi)
   real :: a, d       ! Interpolated grid spacings [L ~> m]
   real :: xexp=0.5, yexp=0.5 ! [nondim]
   integer :: node, qpoint, xnode, ynode
+  logical :: e_bug   ! ICE_SHELF_EDGE_FACE_BUG
 
     ! d(x)/d(x*). Fallback to the single available face length at the global
     ! southern edge or when J-1 falls outside the q-axis array bounds (JsdB),
     ! which can happen in the deepest south halo on a nonsymmetric grid.
-    if ((J-1 >= G%JsdB) .and. (j + G%jdg_offset > G%jsg)) then
+    e_bug = .true. ; if (present(edge_bug)) e_bug = edge_bug
+    if ((J-1 >= G%JsdB) .and. ((.not.e_bug) .or. (j + G%jdg_offset > G%jsg))) then
       a = 0.5 * (G%dxCv(i,J-1) + G%dxCv(i,J))
     else
       a = G%dxCv(i,J)
     endif
 
     ! d(y)/d(y*). Same logic as above on the western edge / IsdB bound.
-    if ((I-1 >= G%IsdB) .and. (i + G%idg_offset > G%isg)) then
+    if ((I-1 >= G%IsdB) .and. ((.not.e_bug) .or. (i + G%idg_offset > G%isg))) then
       d = 0.5 * (G%dyCu(I-1,j) + G%dyCu(I,j))
     else
       d = G%dyCu(I,j)
@@ -14751,7 +14772,8 @@ subroutine init_nodal_DG_metric(CS, G)
     allocate(CS%Minv_av_nodal(isd:ied,jsd:jed,1:2,1:2,1:2,1:2), source=0.0)
 
   do j = jsd, jed ; do i = isd, ied
-    call cell_face_lengths(G, i, j, CS%reentrant_x, CS%reentrant_y, dxS, dxN, dyW, dyE)
+    call cell_face_lengths(G, i, j, CS%reentrant_x, CS%reentrant_y, dxS, dxN, dyW, dyE, &
+                           true_edges=(.not.CS%edge_face_bug))
 
     !M_xi: int_0^1 N_a*N_a'*d(xi) dxi where d(xi) = dyW*(1-xi) + dyE*xi.
     ! Closed-form: M11 = dyW/4 + dyE/12, M22 = dyW/12 + dyE/4, M12 = dyW/12 + dyE/12.
@@ -16548,14 +16570,14 @@ subroutine dg1_q3_point(CS, G, US, i, j, xi, eta, Hc, Bc, Uc, Vc, ub, vb, gr_cel
   if (CS%ssa_metric) then
     ! DG1_SSA_METRIC_TERMS: the face lengths of the DG(1) transport (cell_face_lengths), so that the two share one
     ! cell, also across a reentrant edge, and the metric factors (d a / d eta) / (a d) and (d d / d xi) / (a d).
-    ! At a domain edge that is not reentrant the cell has one length, as without the flag.
+    ! With ICE_SHELF_EDGE_FACE_BUG a cell at a domain edge that is not reentrant has one length, as without the flag.
     dxN = G%dxCv(i,J) ; dyE = G%dyCu(I,j)
-    if ((J-1 >= G%JsdB) .and. (CS%reentrant_y .or. (j + G%jdg_offset > G%jsg))) then
+    if ((J-1 >= G%JsdB) .and. ((.not.CS%edge_face_bug) .or. CS%reentrant_y .or. (j + G%jdg_offset > G%jsg))) then
       dxS = G%dxCv(i,J-1) ; a = (dxS * (1.0 - eta)) + (dxN * eta)
     else
       dxS = dxN ; a = dxN
     endif
-    if ((I-1 >= G%IsdB) .and. (CS%reentrant_x .or. (i + G%idg_offset > G%isg))) then
+    if ((I-1 >= G%IsdB) .and. ((.not.CS%edge_face_bug) .or. CS%reentrant_x .or. (i + G%idg_offset > G%isg))) then
       dyW = G%dyCu(I-1,j) ; d = (dyW * (1.0 - xi)) + (dyE * xi)
     else
       dyW = dyE ; d = dyE
@@ -16563,12 +16585,12 @@ subroutine dg1_q3_point(CS, G, US, i, j, xi, eta, Hc, Bc, Uc, Vc, ub, vb, gr_cel
     if (dxN /= dxS) kx = (dxN - dxS) / (a * d)
     if (dyE /= dyW) ky = (dyE - dyW) / (a * d)
   else
-    if ((J-1 >= G%JsdB) .and. (j + G%jdg_offset > G%jsg)) then
+    if ((J-1 >= G%JsdB) .and. ((.not.CS%edge_face_bug) .or. (j + G%jdg_offset > G%jsg))) then
       a = (G%dxCv(i,J-1) * (1.0 - eta)) + (G%dxCv(i,J) * eta)
     else
       a = G%dxCv(i,J)
     endif
-    if ((I-1 >= G%IsdB) .and. (i + G%idg_offset > G%isg)) then
+    if ((I-1 >= G%IsdB) .and. ((.not.CS%edge_face_bug) .or. (i + G%idg_offset > G%isg))) then
       d = (G%dyCu(I-1,j) * (1.0 - xi)) + (G%dyCu(I,j) * xi)
     else
       d = G%dyCu(I,j)
@@ -18382,7 +18404,8 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
             (max(max(br_c(1,1), br_c(2,2)), max(br_c(1,2), br_c(2,1))) > 0.0)) then
           if (CS%dg_lim_metric) then
             ! DG1_LIMITER_CELL_METRICS: the triangles with the area element of the cell.
-            call cell_face_lengths(G, i, j, CS%reentrant_x, CS%reentrant_y, f_dxS, f_dxN, f_dyW, f_dyE)
+            call cell_face_lengths(G, i, j, CS%reentrant_x, CS%reentrant_y, f_dxS, f_dxN, f_dyW, f_dyE, &
+                                   true_edges=(.not.CS%edge_face_bug))
             sbar(i,j) = (1.0 - rr) * nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:)) + &
                         dg1_lim_pos_mean_metric(br_c, CS%cell_mean_w(i,j,:,:), f_dxS, f_dxN, f_dyW, f_dyE)
           else

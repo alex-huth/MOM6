@@ -133,6 +133,8 @@ subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, melt
   logical :: hmask_set
   logical :: nodal_thickness ! If true, read the thickness at B-grid corner nodes.
   logical :: reentrant_x, reentrant_y ! True if the domain wraps in x or y
+  logical :: enable_bugs ! ENABLE_BUGS_BY_DEFAULT
+  logical :: edge_bug ! ICE_SHELF_EDGE_FACE_BUG, logged by MOM_ice_shelf_dynamics
   real :: len_sidestress, udh
 
   call MOM_mesg("Initialize_ice_thickness_from_file: reading thickness")
@@ -214,6 +216,8 @@ subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, melt
     call get_param(PF, mdl, "REENTRANT_Y", reentrant_y, &
                  " If true, the domain is meridionally reentrant.", &
                  default=.false., do_not_log=.true.)
+    call get_param(PF, mdl, "ENABLE_BUGS_BY_DEFAULT", enable_bugs, default=.true., do_not_log=.true.)
+    call get_param(PF, mdl, "ICE_SHELF_EDGE_FACE_BUG", edge_bug, default=enable_bugs, do_not_log=.true.)
     allocate(h_node(G%IsdB:G%IedB, G%JsdB:G%JedB), source=0.0)
     call MOM_read_data(filename, trim(thickness_varname), h_node, G%Domain, &
                        position=CORNER, scale=US%m_to_Z)
@@ -230,7 +234,7 @@ subroutine initialize_ice_thickness_from_file(h_shelf, area_shelf_h, hmask, melt
         h_nodal(i,j,2,2) = h_node(I,   J  )
         h_shelf(i,j) = corner_cell_mean(G, i, j, reentrant_x, reentrant_y, &
                                         h_nodal(i,j,1,1), h_nodal(i,j,2,1), &
-                                        h_nodal(i,j,1,2), h_nodal(i,j,2,2))
+                                        h_nodal(i,j,1,2), h_nodal(i,j,2,2), true_edges=(.not.edge_bug))
       endif
     enddo ; enddo
     deallocate(h_node)
@@ -588,8 +592,11 @@ pure real function nodal_cell_mean(h_cell, w_cell) result(Hbar)
 end function nodal_cell_mean
 
 !> South, north, west and east face lengths of cell (i,j). At a non-reentrant west or south domain
-!! edge the east or north length is used for both.
-subroutine cell_face_lengths(G, i, j, reentrant_x, reentrant_y, dxS, dxN, dyW, dyE)
+!! edge the east or north length is used for both, unless true_edges is present and true.  The face
+!! lengths of the domain edge are set in both memory modes (the supergrid is read as symmetric), so
+!! with true_edges the one length is used only where the face lies outside the arrays: the west or
+!! south face of the outermost halo cell in non-symmetric memory.
+subroutine cell_face_lengths(G, i, j, reentrant_x, reentrant_y, dxS, dxN, dyW, dyE, true_edges)
   type(ocean_grid_type), intent(in)  :: G   !< The grid structure used by the ice shelf.
   integer,               intent(in)  :: i   !< The i-index of the cell.
   integer,               intent(in)  :: j   !< The j-index of the cell.
@@ -599,13 +606,17 @@ subroutine cell_face_lengths(G, i, j, reentrant_x, reentrant_y, dxS, dxN, dyW, d
   real,                  intent(out) :: dxN !< North face length [L ~> m]
   real,                  intent(out) :: dyW !< West face length [L ~> m]
   real,                  intent(out) :: dyE !< East face length [L ~> m]
+  logical,     optional, intent(in)  :: true_edges !< If true, use the face lengths at a domain edge too
 
-  if ((J-1 >= G%JsdB) .and. (reentrant_y .or. (j + G%jdg_offset > G%jsg))) then
+  logical :: edge_ok ! The face lengths at a non-reentrant domain edge are used
+
+  edge_ok = .false. ; if (present(true_edges)) edge_ok = true_edges
+  if ((J-1 >= G%JsdB) .and. (edge_ok .or. reentrant_y .or. (j + G%jdg_offset > G%jsg))) then
     dxS = G%dxCv(i,J-1) ; dxN = G%dxCv(i,J)
   else
     dxS = G%dxCv(i,J)   ; dxN = G%dxCv(i,J)
   endif
-  if ((I-1 >= G%IsdB) .and. (reentrant_x .or. (i + G%idg_offset > G%isg))) then
+  if ((I-1 >= G%IsdB) .and. (edge_ok .or. reentrant_x .or. (i + G%idg_offset > G%isg))) then
     dyW = G%dyCu(I-1,j) ; dyE = G%dyCu(I,j)
   else
     dyW = G%dyCu(I,j)   ; dyE = G%dyCu(I,j)
@@ -614,7 +625,7 @@ end subroutine cell_face_lengths
 
 !> Area-weighted cell mean of the bilinear interpolant of the B-grid corner values of cell (i,j),
 !! with the face lengths from cell_face_lengths.
-function corner_cell_mean(G, i, j, reentrant_x, reentrant_y, c11, c21, c12, c22) result(cmean)
+function corner_cell_mean(G, i, j, reentrant_x, reentrant_y, c11, c21, c12, c22, true_edges) result(cmean)
   type(ocean_grid_type), intent(in) :: G   !< The grid structure used by the ice shelf.
   integer,               intent(in) :: i   !< The i-index of the cell.
   integer,               intent(in) :: j   !< The j-index of the cell.
@@ -624,13 +635,14 @@ function corner_cell_mean(G, i, j, reentrant_x, reentrant_y, c11, c21, c12, c22)
   real,                  intent(in) :: c21 !< Corner value at (I,J-1) [Z ~> m].
   real,                  intent(in) :: c12 !< Corner value at (I-1,J) [Z ~> m].
   real,                  intent(in) :: c22 !< Corner value at (I,J) [Z ~> m].
+  logical,     optional, intent(in) :: true_edges !< If true, use the face lengths at a domain edge too
   real :: cmean                            !< The area-weighted cell mean [Z ~> m].
 
   real :: dxS, dxN, dyW, dyE      ! Face lengths [L ~> m]
   real, dimension(2,2) :: w_cell  ! Per-corner integration weights [L2 ~> m2]
   real, dimension(2,2) :: c_cell  ! Corner values in the (a,b) layout [Z ~> m]
 
-  call cell_face_lengths(G, i, j, reentrant_x, reentrant_y, dxS, dxN, dyW, dyE)
+  call cell_face_lengths(G, i, j, reentrant_x, reentrant_y, dxS, dxN, dyW, dyE, true_edges)
   call corner_cell_weights(dxS, dxN, dyW, dyE, w_cell)
   c_cell(1,1) = c11 ; c_cell(2,1) = c21 ; c_cell(1,2) = c12 ; c_cell(2,2) = c22
   cmean = nodal_cell_mean(c_cell, w_cell)
@@ -651,6 +663,8 @@ subroutine initialize_bed_node_from_file(bed_node, bed_elev, G, US, PF)
   character(len=200) :: bed_node_varname
   character(len=40)  :: mdl = "initialize_bed_node_from_file"
   logical :: reentrant_x, reentrant_y ! True if the domain wraps in x or y
+  logical :: enable_bugs ! ENABLE_BUGS_BY_DEFAULT
+  logical :: edge_bug ! ICE_SHELF_EDGE_FACE_BUG, logged by MOM_ice_shelf_dynamics
   integer :: i, j
 
   call get_param(PF, mdl, "INPUTDIR", inputdir, default=".", do_not_log=.true.)
@@ -665,6 +679,8 @@ subroutine initialize_bed_node_from_file(bed_node, bed_elev, G, US, PF)
   call get_param(PF, mdl, "REENTRANT_Y", reentrant_y, &
                  " If true, the domain is meridionally reentrant.", &
                  default=.false., do_not_log=.true.)
+  call get_param(PF, mdl, "ENABLE_BUGS_BY_DEFAULT", enable_bugs, default=.true., do_not_log=.true.)
+  call get_param(PF, mdl, "ICE_SHELF_EDGE_FACE_BUG", edge_bug, default=enable_bugs, do_not_log=.true.)
   call get_param(PF, mdl, "BED_TOPO_VARNAME", bed_node_varname, &
                  "The name of the nodal bed elevation variable in BED_TOPO_FILE "//&
                  "when INIT_ICE_BED_NODAL=True.", &
@@ -681,7 +697,7 @@ subroutine initialize_bed_node_from_file(bed_node, bed_elev, G, US, PF)
   do j=G%jsc,G%jec ; do i=G%isc,G%iec
     bed_elev(i,j) = corner_cell_mean(G, i, j, reentrant_x, reentrant_y, &
                                      bed_node(I-1,J-1), bed_node(I,J-1), &
-                                     bed_node(I-1,J), bed_node(I,J))
+                                     bed_node(I-1,J), bed_node(I,J), true_edges=(.not.edge_bug))
   enddo ; enddo
   call pass_var(bed_elev, G%domain)
 
