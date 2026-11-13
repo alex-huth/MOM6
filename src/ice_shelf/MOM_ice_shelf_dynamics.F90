@@ -824,6 +824,9 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: dg_lim_cp_d0_thick = .false. !< DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS: the fixed tolerance of
                                   !! DG1_LIMITER_CORNER_PROJECT (its vertex and face bounds and
                                   !! DG1_LIMITER_BACKWARD_EDGE) is a thickness on both branches.
+  logical :: dg_lim_cp_exact = .false. !< DG1_LIMITER_CORNER_PROJECT_EXACT_MEANS: the cell mean surface of the
+                                  !! limiter in a cell whose corners straddle flotation is the mean of the surface
+                                  !! over the cell, (1 - r) times the mean thickness plus the mean of max(r h - D, 0).
   logical :: dg_lim_cp_branch = .false. !< DG1_LIMITER_CORNER_PROJECT_BRANCH_MEANS: the cell means in the vertex
                                   !! bounds of DG1_LIMITER_CORNER_PROJECT are the means of the two branch surfaces.
   logical :: dg_lim_bwe = .false. !< DG1_LIMITER_BACKWARD_EDGE: the projection first moves the backward edges of the
@@ -14503,6 +14506,21 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "them.  In a cell whose corners are all on one branch the upper bound is unchanged; the lower "//&
                  "bound is lower where grounded and floating cells meet at a node.", &
                  default=.false., do_not_log=(CS%dg_lim_cp == 0))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_EXACT_MEANS", CS%dg_lim_cp_exact, &
+                 "If true, the cell mean surface that the grounded limiter reads (the vertex bounds of "//&
+                 "DG1_LIMITER_CORNER_PROJECT, its face bounds and the limiter statistics) is, in a cell whose "//&
+                 "corners straddle flotation, the mean of the surface over the cell: with the surface "//&
+                 "s = (1 - r) h + max(r h - D, 0), it is (1 - r) times the mean thickness plus the mean of the "//&
+                 "height above flotation over the grounded part of the cell.  That mean is taken exactly on the "//&
+                 "four triangles that join the corners to the cell centre, from the corner values of h and D.  The "//&
+                 "mean of the corner surfaces lies above it there, and the branch means of "//&
+                 "DG1_LIMITER_CORNER_PROJECT_BRANCH_MEANS below it.  In every other cell the mean is unchanged, "//&
+                 "and it changes continuously as a corner crosses flotation.  Cannot be used with "//&
+                 "DG1_LIMITER_CORNER_PROJECT_BRANCH_MEANS.", &
+                 default=.false., do_not_log=(CS%dg_lim_cp == 0))
+  if (CS%dg_lim_cp_exact .and. CS%dg_lim_cp_branch) call MOM_error(FATAL, "MOM_ice_shelf_dynamics, "//&
+      "read_DG_params: DG1_LIMITER_CORNER_PROJECT_EXACT_MEANS and DG1_LIMITER_CORNER_PROJECT_BRANCH_MEANS "//&
+      "cannot both be true.")
   call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FACE", cpf_str, &
                  "Which cells of DG1_LIMITER_CORNER_PROJECT also take the face bounds of DG1_LIMITER_FACE_BOUNDS, "//&
                  "in the same projection.  The surface at the middle of each face, the mean of its two corner "//&
@@ -18181,6 +18199,16 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
         s_c(a,b) = max(CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b), (1.0 - rr) * CS%h_nodal(i,j,a,b))
       enddo ; enddo
       sbar(i,j) = nodal_cell_mean(s_c, CS%cell_mean_w(i,j,:,:))
+      if (CS%dg_lim_cp_exact) then
+        ! DG1_LIMITER_CORNER_PROJECT_EXACT_MEANS: where the corners straddle flotation, the mean surface over the cell.
+        do b = 1, 2 ; do a = 1, 2
+          br_c(a,b) = rr * CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b)
+        enddo ; enddo
+        if ((min(min(br_c(1,1), br_c(2,2)), min(br_c(1,2), br_c(2,1))) < 0.0) .and. &
+            (max(max(br_c(1,1), br_c(2,2)), max(br_c(1,2), br_c(2,1))) > 0.0)) &
+          sbar(i,j) = (1.0 - rr) * nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:)) + &
+                      dg1_lim_pos_mean(br_c, CS%cell_mean_w(i,j,:,:))
+      endif
       if (CS%dg_lim_cp_branch) then
         ! The same mean of each branch, so in a cell on one branch that branch mean is sbar bitwise.
         do b = 1, 2 ; do a = 1, 2 ; br_c(a,b) = CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b) ; enddo ; enddo
@@ -21118,6 +21146,66 @@ pure real function dg1_lim_face_factor(t_m, k_m, use_m, lo_m, hi_m, t_p, k_p, us
   dg1_lim_face_factor = 1.0
   if (feas .and. (q_lo <= q_hi)) dg1_lim_face_factor = 1.0 + q_hi
 end function dg1_lim_face_factor
+
+!> DG1_LIMITER_CORNER_PROJECT_EXACT_MEANS: the mean over a cell of max(f, 0), for f given at the corners, on the four
+!! triangles that join the corners to the centre, where f takes the weighted cell mean of the corners.  On each
+!! triangle f is linear, so the mean of its positive part is exact (dg1_lim_tri_pos_mean).  The triangles carry
+!! equal weights; the sum is then rescaled so that, where f has one sign at every corner, it is the weighted cell
+!! mean of f (or 0), as nodal_cell_mean gives: the part P of the positive values is raised by the share
+!! P / (P + N) of the difference between that mean and the triangle mean P - N.  The result is continuous in f, and
+!! the sums pair opposite triangles, so a turn or a reflection of the grid leaves it unchanged.
+pure real function dg1_lim_pos_mean(f, wc) result(pm)
+  real, dimension(2,2), intent(in) :: f  !< Corner values [Z ~> m]
+  real, dimension(2,2), intent(in) :: wc !< Corner weights of the cell mean [L2 ~> m2]
+
+  real :: f0     ! The weighted cell mean of f, the value at the centre [Z ~> m]
+  real :: p1, p2, p3, p4 ! Means of max(f, 0) on the four triangles [Z ~> m]
+  real :: n1, n2, n3, n4 ! Means of max(-f, 0) on the four triangles [Z ~> m]
+  real :: pp, nn ! The means of the positive and negative parts over the cell [Z ~> m]
+
+  f0 = nodal_cell_mean(f, wc)
+  ! The triangles south (SW, SE), east (SE, NE), north (NE, NW) and west (NW, SW) of the centre.
+  p1 = dg1_lim_tri_pos_mean(f0, f(1,1), f(2,1)) ; n1 = dg1_lim_tri_pos_mean(-f0, -f(1,1), -f(2,1))
+  p2 = dg1_lim_tri_pos_mean(f0, f(2,1), f(2,2)) ; n2 = dg1_lim_tri_pos_mean(-f0, -f(2,1), -f(2,2))
+  p3 = dg1_lim_tri_pos_mean(f0, f(2,2), f(1,2)) ; n3 = dg1_lim_tri_pos_mean(-f0, -f(2,2), -f(1,2))
+  p4 = dg1_lim_tri_pos_mean(f0, f(1,2), f(1,1)) ; n4 = dg1_lim_tri_pos_mean(-f0, -f(1,2), -f(1,1))
+  pp = 0.25 * ((p1 + p3) + (p2 + p4)) ; nn = 0.25 * ((n1 + n3) + (n2 + n4))
+  pm = 0.0
+  if (pp + nn > 0.0) pm = pp + (f0 - (pp - nn)) * (pp / (pp + nn))
+  pm = max(pm, 0.0)
+end function dg1_lim_pos_mean
+
+!> The mean over a triangle of max(f, 0), for f linear with the vertex values f1, f2 and f3: the mean of f where
+!! every vertex is at or above 0, 0 where every vertex is at or below 0, and otherwise the exact mean of the part
+!! of the triangle cut off by the zero line, from the vertex v whose sign differs from the other two (o1, o2).
+!! f2 and f3 are added first, so swapping them, as a reflection of the grid does, leaves the result unchanged.
+pure real function dg1_lim_tri_pos_mean(f1, f2, f3) result(pm)
+  real, intent(in) :: f1 !< The value at the first vertex [Z ~> m]
+  real, intent(in) :: f2 !< The value at the second vertex [Z ~> m]
+  real, intent(in) :: f3 !< The value at the third vertex [Z ~> m]
+
+  real :: v, o1, o2 ! The vertex of the other sign and the two others [Z ~> m]
+
+  if ((f1 >= 0.0) .and. (f2 >= 0.0) .and. (f3 >= 0.0)) then
+    pm = (f1 + (f2 + f3)) / 3.0
+  elseif ((f1 <= 0.0) .and. (f2 <= 0.0) .and. (f3 <= 0.0)) then
+    pm = 0.0
+  else
+    if ((f1 > 0.0) .neqv. (f2 > 0.0)) then
+      if ((f1 > 0.0) .neqv. (f3 > 0.0)) then ; v = f1 ; o1 = f2 ; o2 = f3
+      else ; v = f2 ; o1 = f1 ; o2 = f3 ; endif
+    else
+      v = f3 ; o1 = f1 ; o2 = f2
+    endif
+    if (v > 0.0) then
+      ! Only v is positive: the positive part is the corner triangle at v, of area fraction v^2/((v-o1)(v-o2)).
+      pm = (v**3) / (3.0 * ((v - o1) * (v - o2)))
+    else
+      ! Only v is at or below 0: the mean of f less the mean of the negative part at v.
+      pm = (f1 + (f2 + f3)) / 3.0 + ((-v)**3) / (3.0 * ((o1 - v) * (o2 - v)))
+    endif
+  endif
+end function dg1_lim_tri_pos_mean
 
 !> The largest part tau in [0, 1] of a change dh of the corner thicknesses h that keeps every corner at or above
 !! h_min, or at or above its value now where it is already below h_min.  A corner that the change does not
