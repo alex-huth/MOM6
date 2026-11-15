@@ -768,6 +768,8 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: dg_coupled = .false. !< If true, the velocity solve has one bubble per ice cell for u and for v,
                                   !! eliminated cell by cell (static condensation), and the bubble velocity, kept
                                   !! in dg_post_ub and dg_post_vb, is used in the transport volume term.
+  logical :: dg_cpl_tr = .true. !< If false (DG1_COUPLED_BUBBLE_TRANSPORT), no cell uses the bubble velocity in the
+                             !! DG(1) transport; the bubble stays in the velocity solve
   logical :: dg_cpl_tr_crossed = .true. !< If false (DG1_COUPLED_BUBBLE_TRANSPORT_CROSSED), the cells with sub-cell
                              !! quadrature keep their bubble in the velocity solve but not in the DG(1) volume term
   logical :: dg_cpl_tr_ramp = .false. !< If true (DG1_COUPLED_BUBBLE_TRANSPORT_RAMP), the bubble velocity in the
@@ -831,6 +833,9 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! of a cell that is not crossed may rise up to flotation to meet a jump bound.
   logical :: dg_lim_cp_jump_all = .false. !< DG1_LIMITER_CORNER_PROJECT_JUMP_ALL_NODES: the jump bounds are set at
                                   !! every node, and scaled back toward the other bounds where a cell cannot meet them.
+  real :: dg_jump_damp_time = 0.0 !< DG1_LIMITER_JUMP_DAMP_TIME: the time scale of the damping of the corner jumps
+                                  !! outside the range of DG1_LIMITER_CORNER_PROJECT_JUMP, inside each cell; 0 is off
+                                  !! [T ~> s].
   integer :: dg_lim_cp_jump_axes = 3 !< DG1_LIMITER_CORNER_PROJECT_JUMP_AXES (debugging): 1 x faces only, 2 y faces
                                   !! only, 3 both.
   real :: dg_lim_cp_jump_tol = 0.0 !< DG1_LIMITER_CORNER_PROJECT_JUMP_TOL (debugging): the tolerance of the jump
@@ -14253,6 +14258,14 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "quadrature, where their friction and driving stress use the same SEP2 or SEP3 "//&
                  "sub-points as the velocity solve.  If false, these cells have no bubble.", &
                  default=.true., do_not_log=.not.CS%dg_coupled)
+  call get_param(param_file, mdl, "DG1_COUPLED_BUBBLE_TRANSPORT", CS%dg_cpl_tr, &
+                 "If true, the bubble velocity of DG1_COUPLED_BUBBLE or DG1_POST_BUBBLE enters the DG(1) "//&
+                 "volume term, as DG1_COUPLED_BUBBLE_TRANSPORT_CROSSED, _RAMP and _SHARE set.  If false, it "//&
+                 "stays in the velocity solve, but no cell uses it in the transport, which then uses the "//&
+                 "bilinear velocity everywhere.  The bubble is zero on every face, so it never moves ice "//&
+                 "between cells; it only changes the corners inside a cell.  False overrides "//&
+                 "DG1_COUPLED_BUBBLE_TRANSPORT_CROSSED, _RAMP and _SHARE.", &
+                 default=.true., do_not_log=.not.(CS%dg_coupled .or. CS%dg_post_bubble))
   call get_param(param_file, mdl, "DG1_COUPLED_BUBBLE_TRANSPORT_CROSSED", CS%dg_cpl_tr_crossed, &
                  "If true, the bubble velocity of DG1_COUPLED_BUBBLE also enters the DG(1) volume term in the "//&
                  "cells with sub-cell quadrature (the grounding-line cells).  If false, those cells keep the "//&
@@ -14811,9 +14824,22 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "A debugging option: the faces whose jumps DG1_LIMITER_CORNER_PROJECT_JUMP bounds, 1 the x faces "//&
                  "only, 2 the y faces only, 3 both.  Values other than 3 break rotational symmetry.", &
                  default=3, do_not_log=(.not.CS%dg_lim_cp_jump))
+  call get_param(param_file, mdl, "DG1_LIMITER_JUMP_DAMP_TIME", CS%dg_jump_damp_time, &
+                 "If positive, once per advection step, before the limiter, damp each jump between the corner "//&
+                 "surfaces of two face neighbours at a node that lies outside the range of "//&
+                 "DG1_LIMITER_CORNER_PROJECT_JUMP (from its _STEPS, _TOL and _TVB, with the step m of the "//&
+                 "mean surfaces of the flat states of the two cells), with this time scale: each of the two "//&
+                 "corners moves toward the other by half of the part dt/tau of the excess (a floating low "//&
+                 "corner not at all if DG1_LIMITER_CORNER_PROJECT_JUMP_FLOAT_RAISE is false; the high corner then "//&
+                 "takes the whole move), but not across flotation and not below the floor, and each cell then "//&
+                 "takes one uniform thickness shift that "//&
+                 "keeps its mean.  No ice crosses a face.  The damping removes a sawtooth slowly, in proportion "//&
+                 "to its excess, so it does not hold a corner at a bound.  0 or less is off.", &
+                 units="s", default=0.0, scale=US%s_to_T, do_not_log=.not.CS%use_DG_thickness)
   call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_JUMP_TOL", CS%dg_lim_cp_jump_tol, &
                  "A debugging option: the tolerance of the jump bounds of DG1_LIMITER_CORNER_PROJECT_JUMP.", &
-                 units="m", default=CS%dg_lim_d0*US%Z_to_m, scale=US%m_to_Z, do_not_log=(.not.CS%dg_lim_cp_jump))
+                 units="m", default=CS%dg_lim_d0*US%Z_to_m, scale=US%m_to_Z, &
+                 do_not_log=(.not.(CS%dg_lim_cp_jump .or. (CS%dg_jump_damp_time > 0.0))))
   call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_JUMP_GROUNDED_PAIRS", CS%dg_lim_cp_jump_gr, &
                  "A debugging option: if false, DG1_LIMITER_CORNER_PROJECT_JUMP does not bound the jumps between "//&
                  "two cells whose corners are all grounded on entry.", &
@@ -14823,7 +14849,7 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "in the direction of the step m of their mean surfaces, in mean steps: the jump must lie in "//&
                  "[min(0, c m) - tau, max(0, c m) + tau].  Beyond m, a jump grows only by tilts of the two cells "//&
                  "against the step, so a value near 1 also bounds such backward tilts.", &
-                 units="nondim", default=4.0, do_not_log=(.not.CS%dg_lim_cp_jump))
+                 units="nondim", default=4.0, do_not_log=(.not.(CS%dg_lim_cp_jump .or. (CS%dg_jump_damp_time > 0.0))))
   call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_VERTEX", vtx_str, &
                  "A testing option: where the vertex bounds of DG1_LIMITER_CORNER_PROJECT act.  'ALL': at every "//&
                  "corner.  'EDGE': only at a corner with a face beyond which there is no ice cell inside the "//&
@@ -14845,7 +14871,7 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "of their centres, and d the distance of the centres of the two cells.  A jump no larger than the "//&
                  "resolved curvature of the means is then left alone, whatever the direction of the face.  K is "//&
                  "this factor; 0 keeps the fixed tolerance.", &
-                 units="nondim", default=0.0, do_not_log=(.not.CS%dg_lim_cp_jump))
+                 units="nondim", default=0.0, do_not_log=(.not.(CS%dg_lim_cp_jump .or. (CS%dg_jump_damp_time > 0.0))))
   call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_JUMP_SCALE", jsc_str, &
                  "How DG1_LIMITER_CORNER_PROJECT_JUMP_ALL_NODES moves the jump bounds of a cell that cannot "//&
                  "meet them all with its mean, by one factor theta: 'CORNER' moves a bound that the corner "//&
@@ -22033,6 +22059,156 @@ pure real function dg1_lim_twist_least_violation(base, tw, lo, hi)
   dg1_lim_twist_least_violation = best_p
 end function dg1_lim_twist_least_violation
 
+!> DG1_LIMITER_JUMP_DAMP_TIME: damp the jumps between the corner surfaces of two face neighbours that lie outside
+!! the range of DG1_LIMITER_CORNER_PROJECT_JUMP, inside each cell.  At each node of a face between two ice cells, each
+!! corner moves toward the other by half of the part dt/tau of the excess of their jump, but not across flotation and
+!! not below the floor, and each cell then takes one uniform thickness shift that keeps its mean, so no ice crosses a
+!! face.  The range reads only the corners on entry and the flat-state means of the two cells, and each cell finds its
+!! own half from the same data as its neighbour, so the rule is the same in every direction.
+subroutine dg1_jump_damp(CS, G, hmask, dt, bud_on)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS  !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in)    :: G   !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
+  real,                   intent(in)    :: dt  !< The advection time step [T ~> s]
+  logical,                intent(in)    :: bud_on !< If true, add the change to the relaxation term of the tilt budget
+
+  real, allocatable, dimension(:,:,:,:) :: h_in ! The corner thicknesses on entry [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: sbp ! The mean surface of the flat state of each ice cell [Z ~> m]
+  logical, dimension(SZDI_(G),SZDJ_(G)) :: in_dom ! The cell lies inside the domain
+  real, dimension(2,2) :: cp_d  ! The corner beds of a cell, positive down [Z ~> m]
+  real, dimension(2,2) :: fs_h  ! The corners of the flat state of a cell [Z ~> m]
+  real, dimension(2,2) :: s_c   ! The corner surfaces of the flat state [Z ~> m]
+  real, dimension(2,2) :: br_c  ! The corner values of r h - D of the flat state [Z ~> m]
+  real, dimension(2,2) :: ds    ! The change of the corner surfaces of a cell [Z ~> m]
+  real, dimension(2,2) :: dhc   ! The change of the corner thicknesses of a cell [Z ~> m]
+  real :: rr      ! The ice to ocean density ratio [nondim]
+  real :: r_d     ! The part of the excess that this step removes [nondim]
+  real :: fs_hb   ! The mean thickness of a cell [Z ~> m]
+  real :: d_n     ! The bed at a node, positive down [Z ~> m]
+  real :: s_a, s_b ! The corner surfaces of the cell and of its neighbour at the node [Z ~> m]
+  real :: m_s, j_s ! The step of the flat-state means and the jump, neighbour less cell [Z ~> m]
+  real :: tau     ! The tolerance of the jump at this face [Z ~> m]
+  real :: d_f     ! The distance of the centres of the two cells of the face [L ~> m]
+  real :: lo_b, hi_b ! The range of the jump [Z ~> m]
+  real :: ex      ! The signed excess of the jump, 0 inside the range [Z ~> m]
+  real :: w_lo    ! The part of the move that the low corner takes [nondim]
+  real :: h_lo    ! The thickness of the low corner [Z ~> m]
+  real :: h_o, h_n ! A corner thickness before and after the move [Z ~> m]
+  real :: h_fl    ! The flotation thickness of a corner [Z ~> m]
+  real :: shift   ! The uniform shift of the corners that keeps the cell mean [Z ~> m]
+  real :: f_dxS, f_dxN, f_dyW, f_dyE ! The face lengths of a cell [L ~> m]
+  logical :: north_open ! The north edge is a fold, so its halo lies inside the domain
+  integer :: i, j, a, b, ax, ii, jj, a2, b2, ig, jg
+  integer :: isc, iec, jsc, jec, isd, ied, jsd, jed
+
+  isc = G%isc ; iec = G%iec ; jsc = G%jsc ; jec = G%jec
+  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+  rr = CS%density_ice / CS%density_ocean_avg
+  r_d = min(1.0, dt / CS%dg_jump_damp_time)
+  north_open = (G%Domain%Y_FLAGS == FOLD_NORTH_EDGE)
+  allocate(h_in, source=CS%h_nodal)
+
+  do j = jsd, jed ; do i = isd, ied
+    ig = i + G%idg_offset ; jg = j + G%jdg_offset
+    in_dom(i,j) = .true.
+    if ((.not.CS%reentrant_x) .and. ((ig < G%isg) .or. (ig > G%ieg))) in_dom(i,j) = .false.
+    if ((.not.CS%reentrant_y) .and. (jg < G%jsg)) in_dom(i,j) = .false.
+    if ((.not.CS%reentrant_y) .and. (.not.north_open) .and. (jg > G%jeg)) in_dom(i,j) = .false.
+  enddo ; enddo
+
+  ! The mean surface of the flat state of each ice cell, as DG1_LIMITER_CORNER_PROJECT_FLAT_MEANS finds it.
+  sbp(:,:) = 0.0
+  do j = jsd+1, jed ; do i = isd+1, ied
+    if (.not.in_dom(i,j)) cycle
+    if ((hmask(i,j) /= 1.0) .and. (hmask(i,j) /= 3.0)) cycle
+    do b = 1, 2 ; do a = 1, 2 ; cp_d(a,b) = CS%bed_node(i-2+a,j-2+b) ; enddo ; enddo
+    fs_hb = nodal_cell_mean(h_in(i,j,:,:), CS%cell_mean_w(i,j,:,:))
+    call dg1_lim_flat_state(fs_hb, CS%cell_mean_w(i,j,:,:), cp_d, rr, min(CS%min_h_shelf, fs_hb), fs_h)
+    do b = 1, 2 ; do a = 1, 2
+      s_c(a,b) = max(fs_h(a,b) - cp_d(a,b), (1.0 - rr) * fs_h(a,b))
+      br_c(a,b) = rr * fs_h(a,b) - cp_d(a,b)
+    enddo ; enddo
+    sbp(i,j) = nodal_cell_mean(s_c, CS%cell_mean_w(i,j,:,:))
+    if (CS%dg_lim_cp_exact .and. &
+        (min(min(br_c(1,1), br_c(2,2)), min(br_c(1,2), br_c(2,1))) < 0.0) .and. &
+        (max(max(br_c(1,1), br_c(2,2)), max(br_c(1,2), br_c(2,1))) > 0.0)) then
+      if (CS%dg_lim_metric) then
+        call cell_face_lengths(G, i, j, CS%reentrant_x, CS%reentrant_y, f_dxS, f_dxN, f_dyW, f_dyE, &
+                               true_edges=(.not.CS%edge_face_bug))
+        sbp(i,j) = (1.0 - rr) * nodal_cell_mean(fs_h, CS%cell_mean_w(i,j,:,:)) + &
+                   dg1_lim_pos_mean_metric(br_c, CS%cell_mean_w(i,j,:,:), f_dxS, f_dxN, f_dyW, f_dyE)
+      else
+        sbp(i,j) = (1.0 - rr) * nodal_cell_mean(fs_h, CS%cell_mean_w(i,j,:,:)) + &
+                   dg1_lim_pos_mean(br_c, CS%cell_mean_w(i,j,:,:))
+      endif
+    endif
+  enddo ; enddo
+
+  do j = jsc, jec ; do i = isc, iec
+    if (hmask(i,j) /= 1.0) cycle
+    ds(:,:) = 0.0
+    do b = 1, 2 ; do a = 1, 2
+      d_n = CS%bed_node(i-2+a,j-2+b)
+      s_a = max(h_in(i,j,a,b) - d_n, (1.0 - rr) * h_in(i,j,a,b))
+      do ax = 1, 2
+        if (ax == 1) then ; ii = i + (2*a - 3) ; jj = j ; a2 = 3 - a ; b2 = b
+        else ; ii = i ; jj = j + (2*b - 3) ; a2 = a ; b2 = 3 - b ; endif
+        if ((.not.in_dom(ii,jj)) .or. (hmask(ii,jj) /= 1.0)) cycle
+        s_b = max(h_in(ii,jj,a2,b2) - d_n, (1.0 - rr) * h_in(ii,jj,a2,b2))
+        m_s = sbp(ii,jj) - sbp(i,j) ; j_s = s_b - s_a
+        tau = CS%dg_lim_cp_jump_tol
+        if (CS%dg_lim_cp_jump_tvb > 0.0) then
+          if (ax == 1) then ; d_f = G%dxCu(min(i,ii),j) ; else ; d_f = G%dyCv(i,min(j,jj)) ; endif
+          tau = max(tau, CS%dg_lim_cp_jump_tvb * (max(dg1_lim_curv(G, hmask, in_dom, sbp, i, j, ax), &
+                                                      dg1_lim_curv(G, hmask, in_dom, sbp, ii, jj, ax)) * d_f**2))
+        endif
+        hi_b = max(0.0, CS%dg_lim_cp_jump_cj * m_s) + tau ; lo_b = min(0.0, CS%dg_lim_cp_jump_cj * m_s) - tau
+        ex = 0.0
+        if (j_s > hi_b) then
+          ex = j_s - hi_b
+        elseif (j_s < lo_b) then
+          ex = j_s - lo_b
+        endif
+        if (ex == 0.0) cycle
+        ! The low corner (this cell's if ex > 0) takes half of the move, or none if it floats and
+        ! DG1_LIMITER_CORNER_PROJECT_JUMP_FLOAT_RAISE is false; the high corner takes the rest.
+        w_lo = 0.5
+        if (.not.CS%dg_lim_cp_jump_float) then
+          if (ex > 0.0) then ; h_lo = h_in(i,j,a,b) ; else ; h_lo = h_in(ii,jj,a2,b2) ; endif
+          if ((d_n > 0.0) .and. (rr * h_lo < d_n)) w_lo = 0.0
+        endif
+        if (ex > 0.0) then
+          ds(a,b) = ds(a,b) + w_lo * (r_d * ex)
+        else
+          ds(a,b) = ds(a,b) + (1.0 - w_lo) * (r_d * ex)
+        endif
+      enddo
+    enddo ; enddo
+    if (maxval(abs(ds)) == 0.0) cycle
+    do b = 1, 2 ; do a = 1, 2
+      d_n = CS%bed_node(i-2+a,j-2+b)
+      h_o = h_in(i,j,a,b)
+      s_a = max(h_o - d_n, (1.0 - rr) * h_o)
+      h_n = dg1_lim_h_from_s(s_a + ds(a,b), d_n, rr)
+      if (d_n > 0.0) then
+        h_fl = d_n / rr
+        ! The damping does not move a corner across flotation.
+        if ((h_o < h_fl) .and. (ds(a,b) > 0.0)) h_n = min(h_n, h_fl)
+        if ((h_o >= h_fl) .and. (ds(a,b) < 0.0)) h_n = max(h_n, h_fl)
+      endif
+      if (ds(a,b) < 0.0) h_n = max(h_n, min(h_o, CS%min_h_shelf))
+      dhc(a,b) = h_n - h_o
+    enddo ; enddo
+    shift = nodal_cell_mean(dhc, CS%cell_mean_w(i,j,:,:))
+    do b = 1, 2 ; do a = 1, 2
+      dhc(a,b) = dhc(a,b) - shift
+      CS%h_nodal(i,j,a,b) = h_in(i,j,a,b) + dhc(a,b)
+    enddo ; enddo
+    if (bud_on) call dg1_bud_add(CS, i, j, 4, 1.0, dhc)
+  enddo ; enddo
+  deallocate(h_in)
+end subroutine dg1_jump_damp
+
 !> DG1_LIMITER_CORNER_PROJECT_WALL_BOUND: the surface of a corner of thickness h on a bed at depth d.
 pure real function dg1_lim_wall_surf(h, d, rr)
   real, intent(in) :: h  !< The corner thickness [Z ~> m]
@@ -22864,6 +23040,7 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
         bub_tr = (w_c > 0.0)
         ub_c = w_c * CS%dg_post_ub(i,j) ; vb_c = w_c * CS%dg_post_vb(i,j)
       endif
+      if (.not.CS%dg_cpl_tr) bub_tr = .false.
       if (.not.bub_tr) cycle
       ub_t(i,j) = ub_c ; vb_t(i,j) = vb_c
     enddo ; enddo
@@ -22952,6 +23129,8 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
       bub_tr = (w_c > 0.0)
       ub_c = w_c * CS%dg_post_ub(i,j) ; vb_c = w_c * CS%dg_post_vb(i,j)
     endif
+    ! DG1_COUPLED_BUBBLE_TRANSPORT = False: no bubble in the volume term of any cell.
+    if (.not.CS%dg_cpl_tr) bub_tr = .false.
     dxCv_S = G%dxCv(i,j-1) ; dxCv_N = G%dxCv(i,j)
     dyCu_W = G%dyCu(i-1,j) ; dyCu_E = G%dyCu(i,j)
 
@@ -25039,6 +25218,11 @@ subroutine ice_shelf_advect_DG1_nodal(CS, ISS, G, time_step, hmask, uh_ice, vh_i
     endif
   enddo ; enddo
   call pass_corner_field(CS%h_nodal, G)
+  if (CS%dg_jump_damp_time > 0.0) then
+    ! DG1_LIMITER_JUMP_DAMP_TIME: damp the corner jumps once per step, inside each cell, before the limiter.
+    call dg1_jump_damp(CS, G, hmask, time_step, bud_on)
+    call pass_corner_field(CS%h_nodal, G)
+  endif
   if (CS%dg_grounded_limiter) call dg1_grounded_limiter(CS, G, hmask, bud_w=1.0)
 
   ! Keep the consumed source for diagnostics and reset the buffers.
