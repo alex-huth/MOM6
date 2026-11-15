@@ -825,6 +825,38 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! passes of a crossed cell.
   integer :: dg_lim_cp = 0        !< DG1_LIMITER_CORNER_PROJECT: 0 off, 1 in place of the passes of the crossed
                                   !! cells, 2 in place of every pass of every ice cell.
+  logical :: dg_lim_cp_jump = .false. !< DG1_LIMITER_CORNER_PROJECT_JUMP: the corner projection also bounds the jumps
+                                  !! at the nodes of each face that go against the step of the cell means.
+  logical :: dg_lim_cp_jump_float = .true. !< DG1_LIMITER_CORNER_PROJECT_JUMP_FLOAT_RAISE: a floating low corner
+                                  !! of a cell that is not crossed may rise up to flotation to meet a jump bound.
+  logical :: dg_lim_cp_jump_all = .false. !< DG1_LIMITER_CORNER_PROJECT_JUMP_ALL_NODES: the jump bounds are set at
+                                  !! every node, and scaled back toward the other bounds where a cell cannot meet them.
+  integer :: dg_lim_cp_jump_axes = 3 !< DG1_LIMITER_CORNER_PROJECT_JUMP_AXES (debugging): 1 x faces only, 2 y faces
+                                  !! only, 3 both.
+  real :: dg_lim_cp_jump_tol = 0.0 !< DG1_LIMITER_CORNER_PROJECT_JUMP_TOL (debugging): the tolerance of the jump
+                                  !! bounds [Z ~> m].
+  real :: dg_lim_cp_jump_tvb = 0.0 !< DG1_LIMITER_CORNER_PROJECT_JUMP_TVB: the factor K of the per-face TVB
+                                  !! tolerance K |kappa| d^2 of the jump bounds [nondim].
+  logical :: dg_lim_cp_wall_mirror = .false. !< DG1_LIMITER_CORNER_PROJECT_WALL_MIRROR: the vertex bounds of the
+                              !! projection read the mirror image of the cells beyond a wall.
+  integer :: dg_lim_cp_wall_bnd = 0 !< DG1_LIMITER_CORNER_PROJECT_WALL_BOUND: the vertex bounds of the projection at a
+                              !! corner on a wall or a divide: 0 MEANS, 1 NONE, 2 EDGE_TRACE.
+  logical :: dg_lim_cp_flat_own = .false. !< DG1_LIMITER_CORNER_PROJECT_FLAT_MEANS_OWN: the flat state only for the
+                              !! cell's own surface in its bounds.
+  logical :: dg_lim_cp_flat = .false. !< DG1_LIMITER_CORNER_PROJECT_FLAT_MEANS: the bounds of the corner projection
+                              !! read the mean surface of each cell's flat state in place of its mean surface.
+  real :: dg_lim_cp_soft = 0.0 !< DG1_LIMITER_CORNER_PROJECT_SOFT: the weight mu of the soft bounds of the corner
+                              !! projection, 0 for hard bounds [nondim].
+  integer :: dg_lim_cp_jump_sc = 0 !< DG1_LIMITER_CORNER_PROJECT_JUMP_SCALE with JUMP_ALL_NODES: 0 none, 1 CORNER,
+                                  !! 2 OTHER, 3 HYBRID.
+  real :: dg_lim_cp_jump_cj = 4.0 !< DG1_LIMITER_CORNER_PROJECT_JUMP_STEPS: the largest jump with the mean step, in
+                                  !! mean steps [nondim].
+  integer :: dg_lim_cp_vert = 0 !< DG1_LIMITER_CORNER_PROJECT_VERTEX (testing): 0 ALL, 1 EDGE, 2 OFF.
+  logical :: dg_lim_cp_jump_gr = .true. !< DG1_LIMITER_CORNER_PROJECT_JUMP_GROUNDED_PAIRS (debugging): bound the
+                                  !! jumps between two cells with every corner grounded too.
+  logical :: dg_lim_cp_jump_fb = .false. !< DG1_LIMITER_CORNER_PROJECT_JUMP_CROSSED_FALLBACK: a low corner of a
+                                  !! crossed cell takes the part of a jump excess that the cell of the high corner
+                                  !! could not.
   logical :: dg_lim_cp_face_pt = .false. !< DG1_LIMITER_CORNER_PROJECT_FACE_POINT: the face bounds of
                                   !! DG1_LIMITER_CORNER_PROJECT_FACE come from point values of the two branch
                                   !! surfaces, as thickness bounds.
@@ -892,7 +924,7 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! entry [nondim], 16 their largest corner change [Z ~> m]; 17 and 18 the same for
                                   !! cells with a corner out of those bounds.
   real :: dg_lim_nstage = 0.0     !< Limiter calls since the last post of dg_lim_stat [nondim]
-  integer, dimension(26) :: id_dg_lim_stat = -1 !< Diagnostic ids of the 26 fields of dg_lim_stat
+  integer, dimension(29) :: id_dg_lim_stat = -1 !< Diagnostic ids of the 29 fields of dg_lim_stat
   logical :: dg_art_visc_node_weight !< Artificial viscosity: the band weight of a face QP is interpolated along
                                   !! the face from the node weights, each the largest weight of the 4 cells there.
   real :: dg_art_visc_lump_frac  !< Artificial viscosity: the lumped fraction theta of the mass matrix whose
@@ -2551,7 +2583,17 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
            Time, 'DG(1) grounded limiter: corner thickness change of DG1_LIMITER_BACKWARD_EDGE_CONTINUOUS at edges '//&
            'at a local high or low of the cell means, summed over the edges, per limiter call', 'm', &
            conversion=US%Z_to_m)
-        if (any(CS%id_dg_lim_stat(:) > 0)) allocate(CS%dg_lim_stat(G%isd:G%ied,G%jsd:G%jed,26), source=0.0)
+        CS%id_dg_lim_stat(27) = register_diag_field('ice_shelf_model', 'dg_lim_jump_act', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: fraction of limiter calls in which a node of the ice cell was out of '//&
+           'the jump bounds of DG1_LIMITER_CORNER_PROJECT_JUMP on entry', 'nondim')
+        CS%id_dg_lim_stat(28) = register_diag_field('ice_shelf_model', 'dg_lim_jump_unmet', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: 1 - theta, the part of the jump bounds of the ice cell that '//&
+           'DG1_LIMITER_CORNER_PROJECT_JUMP_ALL_NODES scaled away so that the cell can meet them, summed over '//&
+           'the calls, per limiter call', 'nondim')
+        CS%id_dg_lim_stat(29) = register_diag_field('ice_shelf_model', 'dg_lim_jump_fb', CS%diag%axesT1, &
+           Time, 'DG(1) grounded limiter: fraction of limiter calls in which a corner of the ice cell took a '//&
+           'raise of DG1_LIMITER_CORNER_PROJECT_JUMP_CROSSED_FALLBACK', 'nondim')
+        if (any(CS%id_dg_lim_stat(:) > 0)) allocate(CS%dg_lim_stat(G%isd:G%ied,G%jsd:G%jed,29), source=0.0)
       endif
       if (CS%dg_source_positive) then
         allocate(CS%dg_src_cut_smb(G%isd:G%ied,G%jsd:G%jed), source=0.0)
@@ -3448,7 +3490,7 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
         call post_data(CS%id_dg_lim_phi_w, CS%dg_lim_phi(:,:,2), CS%diag)
     if (associated(CS%dg_lim_stat)) then
       if (CS%dg_lim_nstage > 0.0) then
-        do k = 1, 26
+        do k = 1, 29
           if (CS%id_dg_lim_stat(k) > 0) then
             lim_st(:,:) = CS%dg_lim_stat(:,:,k) / CS%dg_lim_nstage
             call post_data(CS%id_dg_lim_stat(k), lim_st, CS%diag)
@@ -13441,7 +13483,7 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   character(len=40) :: ccl_str      ! DG1_LIMITER_CROSSED_CORNER_CLIP
   character(len=40) :: cp_str       ! DG1_LIMITER_CORNER_PROJECT
   character(len=40) :: cpe_str      ! DG1_LIMITER_CORNER_PROJECT_ENDORSE
-  character(len=40) :: cpf_str      ! DG1_LIMITER_CORNER_PROJECT_FACE
+  character(len=40) :: cpf_str, jsc_str, vtx_str, wbd_str ! DG1_LIMITER_CORNER_PROJECT_FACE
   character(len=16) :: share_str    ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARE
   character(len=16) :: br_rule      ! DG1_LIMITER_BRANCH_RULE
 
@@ -14729,6 +14771,162 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  units="m", default=CS%dg_lim_d0*US%Z_to_m, scale=US%m_to_Z, do_not_log=(.not.CS%dg_lim_cp_face_pt))
   if (CS%dg_lim_cp_face_pt .and. (CS%dg_lim_cp_face_pt_d0 <= 0.0)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT_FACE_POINT_D0 must be above 0.")
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_JUMP", CS%dg_lim_cp_jump, &
+                 "If true, DG1_LIMITER_CORNER_PROJECT also bounds the jump j = s_B - s_A between the corner "//&
+                 "surfaces of two face neighbours A and B at each node of their face, on entry, against the step "//&
+                 "m = sbar_B - sbar_A of their cell-mean surfaces: j must lie in [min(0, 4 m) - D0, max(0, 4 m) "//&
+                 "+ D0], with D0 = DG1_LIMITER_D0.  A jump in the direction of the mean step (a grounding line "//&
+                 "or a front) may be up to four steps; a jump against it (a sawtooth whose faces step back up) "//&
+                 "only D0.  The excess is split between the low and the high corner in proportion to how far "//&
+                 "each lies from the mean of the other corners at the node, and becomes a lower bound on the low "//&
+                 "corner and an upper bound on the high one, which the projection meets with the cell mean kept.  "//&
+                 "As for the vertex bounds, a corner of a crossed cell (DG1_LIMITER_CROSSED) takes no lower bound, "//&
+                 "and a floating corner of any other cell no higher one than its flotation thickness; the part "//&
+                 "of the excess they cannot take goes to the high corner.  The projection keeps each cell mean, "//&
+                 "so a corner lowered there lifts the other corners of its cell.", &
+                 default=.false., do_not_log=(CS%dg_lim_cp == 0))
+  if (CS%dg_lim_cp_jump .and. (CS%dg_lim_cp == 0)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT_JUMP needs DG1_LIMITER_CORNER_PROJECT.")
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_JUMP_FLOAT_RAISE", CS%dg_lim_cp_jump_float, &
+                 "If true, a floating low corner of a cell that is not crossed may rise up to its flotation "//&
+                 "thickness to meet a DG1_LIMITER_CORNER_PROJECT_JUMP bound.  If false, a floating low corner "//&
+                 "takes no part, as a corner of a crossed cell, and the high corner takes the whole excess.", &
+                 default=.true., do_not_log=(.not.CS%dg_lim_cp_jump))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_JUMP_ALL_NODES", CS%dg_lim_cp_jump_all, &
+                 "If true, DG1_LIMITER_CORNER_PROJECT_JUMP also bounds every corner at a node whose jump is in its "//&
+                 "range on entry, so that the projection keeps it there: the corner surface stays in "//&
+                 "[s_B - max(0, 4 m) - D0, s_B - min(0, 4 m) + D0] of the neighbour surface s_B on entry, with no "//&
+                 "lower bound for a corner of a crossed cell.  Where the bounds of a cell cannot all hold with its "//&
+                 "mean, each jump bound is moved toward the other bounds of its corner by one factor 1 - theta "//&
+                 "(theta = 0 drops the jump bounds of the cell), theta the largest "//&
+                 "in [0, 1] with which they hold, so that the bounds never fight from one step to the next.", &
+                 default=.false., do_not_log=(.not.CS%dg_lim_cp_jump))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_JUMP_CROSSED_FALLBACK", CS%dg_lim_cp_jump_fb, &
+                 "If true, with DG1_LIMITER_CORNER_PROJECT_JUMP_ALL_NODES, a low corner of a crossed cell, which "//&
+                 "otherwise takes no part of a jump excess, takes the part (1 - theta) that the cell of the high "//&
+                 "corner could not meet, with theta of that cell from the first pass.  It needs "//&
+                 "DG1_LIMITER_BACKWARD_EDGE_CONTINUOUS.", &
+                 default=.false., do_not_log=(.not.CS%dg_lim_cp_jump_all))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_JUMP_AXES", CS%dg_lim_cp_jump_axes, &
+                 "A debugging option: the faces whose jumps DG1_LIMITER_CORNER_PROJECT_JUMP bounds, 1 the x faces "//&
+                 "only, 2 the y faces only, 3 both.  Values other than 3 break rotational symmetry.", &
+                 default=3, do_not_log=(.not.CS%dg_lim_cp_jump))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_JUMP_TOL", CS%dg_lim_cp_jump_tol, &
+                 "A debugging option: the tolerance of the jump bounds of DG1_LIMITER_CORNER_PROJECT_JUMP.", &
+                 units="m", default=CS%dg_lim_d0*US%Z_to_m, scale=US%m_to_Z, do_not_log=(.not.CS%dg_lim_cp_jump))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_JUMP_GROUNDED_PAIRS", CS%dg_lim_cp_jump_gr, &
+                 "A debugging option: if false, DG1_LIMITER_CORNER_PROJECT_JUMP does not bound the jumps between "//&
+                 "two cells whose corners are all grounded on entry.", &
+                 default=.true., do_not_log=(.not.CS%dg_lim_cp_jump))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_JUMP_STEPS", CS%dg_lim_cp_jump_cj, &
+                 "The largest jump of DG1_LIMITER_CORNER_PROJECT_JUMP between the corners of two cells at a node "//&
+                 "in the direction of the step m of their mean surfaces, in mean steps: the jump must lie in "//&
+                 "[min(0, c m) - tau, max(0, c m) + tau].  Beyond m, a jump grows only by tilts of the two cells "//&
+                 "against the step, so a value near 1 also bounds such backward tilts.", &
+                 units="nondim", default=4.0, do_not_log=(.not.CS%dg_lim_cp_jump))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_VERTEX", vtx_str, &
+                 "A testing option: where the vertex bounds of DG1_LIMITER_CORNER_PROJECT act.  'ALL': at every "//&
+                 "corner.  'EDGE': only at a corner with a face beyond which there is no ice cell inside the "//&
+                 "domain, where DG1_LIMITER_CORNER_PROJECT_JUMP sets no bound.  'OFF': nowhere; the floor stays.", &
+                 default="ALL", do_not_log=(CS%dg_lim_cp == 0))
+  select case (trim(vtx_str))
+    case ("ALL") ; CS%dg_lim_cp_vert = 0
+    case ("EDGE") ; CS%dg_lim_cp_vert = 1
+    case ("OFF") ; CS%dg_lim_cp_vert = 2
+    case default
+      call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT_VERTEX = "//&
+                     trim(vtx_str)//" is not ALL, EDGE or OFF.")
+  end select
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_JUMP_TVB", CS%dg_lim_cp_jump_tvb, &
+                 "If positive, the tolerance of each jump bound of DG1_LIMITER_CORNER_PROJECT_JUMP at a face is "//&
+                 "max(DG1_LIMITER_CORNER_PROJECT_JUMP_TOL, K |kappa| d^2), the TVB idea (Cockburn and Shu): kappa "//&
+                 "is the larger, in the two cells of the face, of the curvature of the cell-mean surfaces along the "//&
+                 "face normal, from the means of the cell and its two neighbours along that axis and the distances "//&
+                 "of their centres, and d the distance of the centres of the two cells.  A jump no larger than the "//&
+                 "resolved curvature of the means is then left alone, whatever the direction of the face.  K is "//&
+                 "this factor; 0 keeps the fixed tolerance.", &
+                 units="nondim", default=0.0, do_not_log=(.not.CS%dg_lim_cp_jump))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_JUMP_SCALE", jsc_str, &
+                 "How DG1_LIMITER_CORNER_PROJECT_JUMP_ALL_NODES moves the jump bounds of a cell that cannot "//&
+                 "meet them all with its mean, by one factor theta: 'CORNER' moves a bound that the corner "//&
+                 "breaks back toward the corner and keeps a met one; 'OTHER' moves each bound toward the "//&
+                 "other bound of its corner; 'HYBRID' moves a broken bound toward the corner, which then "//&
+                 "stays, and a met bound toward the other bound, so that at theta = 0 no corner is moved by "//&
+                 "a jump bound and none is held by one.", &
+                 default="HYBRID", do_not_log=(.not.CS%dg_lim_cp_jump))
+  select case (trim(jsc_str))
+    case ("CORNER") ; CS%dg_lim_cp_jump_sc = 1
+    case ("OTHER") ; CS%dg_lim_cp_jump_sc = 2
+    case ("HYBRID") ; CS%dg_lim_cp_jump_sc = 3
+    case default
+      call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT_JUMP_SCALE = "//&
+                     trim(jsc_str)//" is not CORNER, OTHER or HYBRID.")
+  end select
+  if (.not.CS%dg_lim_cp_jump_all) CS%dg_lim_cp_jump_sc = 0
+  if (CS%dg_lim_cp_jump_all .and. (.not.CS%dg_lim_cp_jump)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT_JUMP_ALL_NODES needs "//&
+      "DG1_LIMITER_CORNER_PROJECT_JUMP.")
+  if (CS%dg_lim_cp_jump_fb .and. (.not.CS%dg_lim_cp_jump_all)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT_JUMP_CROSSED_FALLBACK needs "//&
+      "DG1_LIMITER_CORNER_PROJECT_JUMP_ALL_NODES.")
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_SOFT", CS%dg_lim_cp_soft, &
+                 "If positive, every bound of DG1_LIMITER_CORNER_PROJECT but the floor of the corners and the "//&
+                 "cell mean is soft: the vertex, face and jump bounds of each corner are merged into one range "//&
+                 "(where they conflict, to the middle of the two) and the projection is the least change of the "//&
+                 "corners, in the norm of the cell mean, plus this weight mu times the squared distance of each "//&
+                 "corner outside its range, that keeps the mean and the floor.  The problem is strictly convex, so "//&
+                 "it always has one solution, which changes continuously with the bounds; a corner outside its "//&
+                 "range moves the part mu/(1+mu) of the way back for a fixed mean shift.  0 keeps hard bounds.", &
+                 units="nondim", default=0.0, do_not_log=(CS%dg_lim_cp == 0))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FLAT_MEANS", CS%dg_lim_cp_flat, &
+                 "If true, the bounds of DG1_LIMITER_CORNER_PROJECT (the range of the cell-mean surfaces at a "//&
+                 "node, and the step of the means and their curvature in DG1_LIMITER_CORNER_PROJECT_JUMP) read the "//&
+                 "surface of each ice cell as the mean surface of its flat state: the corner thicknesses under one "//&
+                 "level surface, each at least min(MIN_H_SHELF, mean), that hold the mean thickness on the corner "//&
+                 "beds (a corner on a bed above that level keeps the floor).  The mean surface is taken as for the "//&
+                 "cell itself (DG1_LIMITER_CORNER_PROJECT_EXACT_MEANS).  The flat state depends only on the mean "//&
+                 "thickness and the beds, which the projection keeps, so it cannot move these bounds; the mean "//&
+                 "surface over a crossed cell moves with the cell's own tilt, and bounds that move with the corners "//&
+                 "they act on can drive a period-2 flip.  Where the flat state is on one branch, its mean surface "//&
+                 "is the cell's own.", &
+                 default=.false., do_not_log=(CS%dg_lim_cp == 0))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FLAT_MEANS_OWN", CS%dg_lim_cp_flat_own, &
+                 "If true, with DG1_LIMITER_CORNER_PROJECT_FLAT_MEANS, the bounds of each cell read the mean "//&
+                 "surface of the flat state only for the cell itself (its own term in the range of the means at a "//&
+                 "node, its own side of the step of the means and its own point in the curvature of "//&
+                 "DG1_LIMITER_CORNER_PROJECT_JUMP_TVB), and the cell-mean surface of every other cell, so that the "//&
+                 "bounds of a cell do not move with its own corners but follow the true surfaces around it.", &
+                 default=.false., do_not_log=(.not.CS%dg_lim_cp_flat))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_WALL_MIRROR", CS%dg_lim_cp_wall_mirror, &
+                 "If true, the range of the cell-mean surfaces at a node in the vertex bounds of "//&
+                 "DG1_LIMITER_CORNER_PROJECT reads a cell beyond a wall or a divide as the mirror image of the cell "//&
+                 "inside, as DG1_LIMITER_EDGE_MIRROR does for the face pass, in place of the linear extrapolation "//&
+                 "normal to the edge.  Where the surface falls steeply away from a wall, as at a lateral grounding "//&
+                 "line, the extrapolation lies far above every real cell and widens the upper bounds of the corners "//&
+                 "on the wall.  Beyond any other domain edge the extrapolation stays.", &
+                 default=.false., do_not_log=(CS%dg_lim_cp == 0))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_WALL_BOUND", wbd_str, &
+                 "The vertex bounds of DG1_LIMITER_CORNER_PROJECT at a corner on a wall or a divide, where one of "//&
+                 "the two faces of the cell at the corner is a wall face at the domain edge.  The mirror image "//&
+                 "of a cell beyond a wall is the cell itself, so the range of the cell means at such a node "//&
+                 "reads nothing normal to the wall and clips a surface that is even about the wall, such as a "//&
+                 "ridge along it.  'MEANS': the range of the cell means, as at any other corner.  'NONE': no "//&
+                 "vertex bound at such a corner; the floor stays.  'EDGE_TRACE': the range of the mean surfaces of "//&
+                 "the wall edges of the cell and of the cell next along the wall, a vertex bound of the surface "//&
+                 "along the wall, so that a corner on the wall does not rise above both wall edges; 'MEANS' where "//&
+                 "the cell next along the wall is not an ice cell inside the domain.", &
+                 default="MEANS", do_not_log=(CS%dg_lim_cp == 0))
+  select case (trim(wbd_str))
+    case ("MEANS") ; CS%dg_lim_cp_wall_bnd = 0
+    case ("NONE") ; CS%dg_lim_cp_wall_bnd = 1
+    case ("EDGE_TRACE") ; CS%dg_lim_cp_wall_bnd = 2
+    case default
+      call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT_WALL_BOUND = "//&
+                     trim(wbd_str)//" is not MEANS, NONE or EDGE_TRACE.")
+  end select
+  if ((CS%dg_lim_cp_soft > 0.0) .and. CS%dg_lim_cp_jump_fb) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT_SOFT does not work with "//&
+      "DG1_LIMITER_CORNER_PROJECT_JUMP_CROSSED_FALLBACK.")
   call get_param(param_file, mdl, "DG1_LIMITER_BACKWARD_EDGE", CS%dg_lim_bwe, &
                  "If true, with DG1_LIMITER_CORNER_PROJECT = ALL, the projection first moves the backward edges of "//&
                  "the ice cells that are not crossed toward their neighbours.  An edge is the two corners on one "//&
@@ -14761,6 +14959,9 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "leaves, so that a face bound, which holds both corners of its face, never stops a tilt along "//&
                  "the face that keeps its middle.  The result changes continuously with the state.", &
                  default=.false., do_not_log=.not.CS%dg_lim_bwe)
+  if (CS%dg_lim_cp_jump_fb .and. (.not.(CS%dg_lim_bwe .and. CS%dg_lim_bwe_cont))) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT_JUMP_CROSSED_FALLBACK needs "//&
+      "DG1_LIMITER_BACKWARD_EDGE and DG1_LIMITER_BACKWARD_EDGE_CONTINUOUS.")
   if (CS%dg_lim_bwe_cont .and. (.not.CS%dg_lim_bwe)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_BACKWARD_EDGE_CONTINUOUS needs DG1_LIMITER_BACKWARD_EDGE.")
   if ((CS%dg_lim_cp == 1) .and. (.not.CS%dg_lim_crossed)) call MOM_error(FATAL, &
@@ -18380,6 +18581,13 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   real :: dhm        ! Largest corner thickness change of a cell over the limiter [Z ~> m]
   integer :: a2, b2  ! Corner indices of another cell at a node, for dg_lim_agree_* and the projection
   real, allocatable, dimension(:,:,:,:) :: h_pe ! Corner thicknesses on entry, for DG1_LIMITER_CORNER_PROJECT [Z ~> m]
+  real, allocatable, dimension(:,:) :: sbp ! The cell surfaces of the bounds of DG1_LIMITER_CORNER_PROJECT: sbar, or
+                                           ! with DG1_LIMITER_CORNER_PROJECT_FLAT_MEANS that of the flat state [Z ~> m]
+  real, dimension(2,2) :: fs_h ! DG1_LIMITER_CORNER_PROJECT_FLAT_MEANS: the corners of the flat state [Z ~> m]
+  real, allocatable, dimension(:,:) :: sbn ! The surfaces of the other cells in the bounds of a cell: sbp, or sbar
+                                           ! with DG1_LIMITER_CORNER_PROJECT_FLAT_MEANS_OWN [Z ~> m]
+  real :: s_u        ! A cell surface of the vertex range [Z ~> m]
+  real :: fs_hb      ! DG1_LIMITER_CORNER_PROJECT_FLAT_MEANS: the mean thickness of a cell [Z ~> m]
   real, allocatable, dimension(:,:,:,:) :: cpb_lo, cpb_hi ! DG1_LIMITER_CORNER_PROJECT: the thickness bounds of each
                                                   ! corner that the projection uses [Z ~> m]
   integer, allocatable, dimension(:,:) :: cpb_n   ! DG1_LIMITER_CORNER_PROJECT: faces out of the face bounds of a
@@ -18393,7 +18601,26 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   real, dimension(2,2) :: cp_lo, cp_hi ! DG1_LIMITER_CORNER_PROJECT: corner surface bounds [Z ~> m]
   real, dimension(2,2) :: cp_d, cp_h   ! DG1_LIMITER_CORNER_PROJECT: corner beds and new corners [Z ~> m]
   logical, dimension(2,2) :: cp_one    ! DG1_LIMITER_CORNER_PROJECT: the corner has no lower surface bound
+  real, allocatable, dimension(:,:,:,:) :: cpj_lo, cpj_hi ! DG1_LIMITER_CORNER_PROJECT_JUMP: the jump bounds of each
+                                                  ! corner, kept from pass 1, as thicknesses [Z ~> m]
+  real, dimension(2,2) :: cj_lo, cj_hi ! DG1_LIMITER_CORNER_PROJECT_JUMP: the jump bounds of a cell, or with the face
+                                       ! bounds merged in [Z ~> m]
+  integer :: cj_n    ! DG1_LIMITER_CORNER_PROJECT_JUMP: the number of jump bounds set in a cell
+  real, allocatable, dimension(:,:) :: cpj_th ! DG1_LIMITER_CORNER_PROJECT_JUMP_ALL_NODES: theta of each cell from
+                                              ! pass 1 [nondim]
+  real, allocatable, dimension(:,:) :: cpj_ex, cpj_fb ! DG1_LIMITER_CORNER_PROJECT_JUMP: nodes out of the jump bounds
+                                              ! on entry and fallback raises of each cell [nondim]
+  real :: cj_th      ! DG1_LIMITER_CORNER_PROJECT_JUMP_ALL_NODES: theta of a cell [nondim]
+  integer :: cj_ex, cj_fb ! Nodes out of the jump bounds on entry and fallback raises of a cell
   logical :: cp_act  ! DG1_LIMITER_CORNER_PROJECT changed the cell
+  logical :: cp_soft ! DG1_LIMITER_CORNER_PROJECT_SOFT is on
+  logical :: vx_keep ! DG1_LIMITER_CORNER_PROJECT_VERTEX: keep the vertex bounds of this corner
+  logical :: w_x, w_y ! DG1_LIMITER_CORNER_PROJECT_WALL_BOUND: the x or the y face of the cell at a corner is a wall
+  logical :: wb_none  ! DG1_LIMITER_CORNER_PROJECT_WALL_BOUND = NONE acts at this corner
+  integer :: i_w, j_w ! DG1_LIMITER_CORNER_PROJECT_WALL_BOUND: the cell next along the wall
+  real :: em_o, em_n  ! DG1_LIMITER_CORNER_PROJECT_WALL_BOUND: the mean surfaces of the wall edges of the cell and of
+                      ! the cell next along the wall [Z ~> m]
+  real :: cp_fl      ! DG1_LIMITER_CORNER_PROJECT_SOFT: the floor of the corners of a cell [Z ~> m]
   logical :: cpf     ! DG1_LIMITER_CORNER_PROJECT_FACE bounds this cell
   integer :: cf_n    ! DG1_LIMITER_CORNER_PROJECT_FACE: faces of the cell out of their bounds
   real, dimension(4) :: cf_al ! DG1_LIMITER_CORNER_PROJECT_FACE: allowances of the west, east, south and north
@@ -19531,12 +19758,60 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
     ! its face.  Pass 1 then finds the vertex bounds only and keeps them; pass 2, after the backward edges, adds the
     ! face bounds.  Otherwise pass 1 finds both, and the backward edges follow it.
     cp_late = CS%dg_lim_bwe .and. CS%dg_lim_bwe_cont
+    cp_soft = (CS%dg_lim_cp_soft > 0.0)
+    allocate(sbp(isd:ied,jsd:jed)) ; sbp(:,:) = sbar(:,:)
+    if (CS%dg_lim_cp_flat) then
+      ! DG1_LIMITER_CORNER_PROJECT_FLAT_MEANS: the mean surface of the flat state of each ice cell, as sbar.
+      do j = jsd+1, jed ; do i = isd+1, ied
+        if (.not.in_dom(i,j)) cycle
+        if ((hmask(i,j) /= 1.0) .and. (hmask(i,j) /= 3.0)) cycle
+        do b = 1, 2 ; do a = 1, 2 ; cp_d(a,b) = CS%bed_node(i-2+a,j-2+b) ; enddo ; enddo
+        fs_hb = nodal_cell_mean(h_pe(i,j,:,:), CS%cell_mean_w(i,j,:,:))
+        call dg1_lim_flat_state(fs_hb, CS%cell_mean_w(i,j,:,:), cp_d, rr, min(CS%min_h_shelf, fs_hb), fs_h)
+        do b = 1, 2 ; do a = 1, 2
+          s_c(a,b) = max(fs_h(a,b) - cp_d(a,b), (1.0 - rr) * fs_h(a,b))
+          br_c(a,b) = rr * fs_h(a,b) - cp_d(a,b)
+        enddo ; enddo
+        sbp(i,j) = nodal_cell_mean(s_c, CS%cell_mean_w(i,j,:,:))
+        if (CS%dg_lim_cp_exact .and. &
+            (min(min(br_c(1,1), br_c(2,2)), min(br_c(1,2), br_c(2,1))) < 0.0) .and. &
+            (max(max(br_c(1,1), br_c(2,2)), max(br_c(1,2), br_c(2,1))) > 0.0)) then
+          if (CS%dg_lim_metric) then
+            call cell_face_lengths(G, i, j, CS%reentrant_x, CS%reentrant_y, f_dxS, f_dxN, f_dyW, f_dyE, &
+                                   true_edges=(.not.CS%edge_face_bug))
+            sbp(i,j) = (1.0 - rr) * nodal_cell_mean(fs_h, CS%cell_mean_w(i,j,:,:)) + &
+                       dg1_lim_pos_mean_metric(br_c, CS%cell_mean_w(i,j,:,:), f_dxS, f_dxN, f_dyW, f_dyE)
+          else
+            sbp(i,j) = (1.0 - rr) * nodal_cell_mean(fs_h, CS%cell_mean_w(i,j,:,:)) + &
+                       dg1_lim_pos_mean(br_c, CS%cell_mean_w(i,j,:,:))
+          endif
+        endif
+      enddo ; enddo
+    endif
+    allocate(sbn(isd:ied,jsd:jed)) ; sbn(:,:) = sbp(:,:)
+    if (CS%dg_lim_cp_flat .and. CS%dg_lim_cp_flat_own) sbn(:,:) = sbar(:,:)
     if (cp_late) then
       allocate(cps_lo(isd:ied,jsd:jed,2,2), source=0.0) ; allocate(cps_hi(isd:ied,jsd:jed,2,2), source=0.0)
       allocate(cps_one(isd:ied,jsd:jed,2,2), source=.false.)
     endif
+    if (CS%dg_lim_cp_jump) then
+      allocate(cpj_lo(isd:ied,jsd:jed,2,2), source=-huge(1.0)) ; allocate(cpj_hi(isd:ied,jsd:jed,2,2), source=huge(1.0))
+      allocate(cpj_ex(isd:ied,jsd:jed), source=0.0) ; allocate(cpj_fb(isd:ied,jsd:jed), source=0.0)
+      allocate(cpj_th(isd:ied,jsd:jed), source=1.0)
+    endif
     do cpass = 1, 2
     if (cpass == 2) then
+      ! DG1_LIMITER_CORNER_PROJECT_JUMP_CROSSED_FALLBACK: the jump bounds again, with theta of the neighbours from
+      ! pass 1, so that a crossed low corner takes what the cell of its high corner could not.
+      if (CS%dg_lim_cp_jump_fb) then
+        call pass_var(cpj_th, G%domain)
+        do j = jsc, jec ; do i = isc, iec
+          if (cpb_n(i,j) < 0) cycle
+          call dg1_lim_jump_bounds(CS, G, hmask, h_pe, sbn, in_dom, trb, rr, i, j, cj_lo, cj_hi, cj_n, &
+                                   th=cpj_th, n_fb=cj_fb, s_own=sbp(i,j))
+          cpj_lo(i,j,:,:) = cj_lo(:,:) ; cpj_hi(i,j,:,:) = cj_hi(:,:) ; cpj_fb(i,j) = real(cj_fb)
+        enddo ; enddo
+      endif
       ! DG1_LIMITER_BACKWARD_EDGE: the backward edges, held inside the bounds of pass 1.
       if (CS%dg_lim_bwe) then
         bw = 0.0 ; if (do_bud) bw = bud_w
@@ -19569,7 +19844,11 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
             if (CS%dg_lim_cp_branch) then
               u_m = max(u_m, max(abr(ii,jj), bbr(ii,jj))) ; la = min(la, abr(ii,jj)) ; lb = min(lb, bbr(ii,jj))
             else
-              u_m = max(u_m, sbar(ii,jj)) ; l_m = min(l_m, sbar(ii,jj))
+              s_u = sbn(ii,jj) ; if ((ii == i) .and. (jj == j)) s_u = sbp(i,j)
+              if (CS%dg_lim_cp_wall_mirror) then
+                if (.not.in_dom(ii,jj)) s_u = sbar_f(ii,jj)
+              endif
+              u_m = max(u_m, s_u) ; l_m = min(l_m, s_u)
             endif
           endif
           if (((ii /= i) .or. (jj /= j)) .and. in_dom(ii,jj) .and. &
@@ -19581,6 +19860,41 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
           endif
         enddo ; enddo
         if (CS%dg_lim_cp_branch) l_m = max(la, lb)
+        ! DG1_LIMITER_CORNER_PROJECT_WALL_BOUND: a corner on a wall or a divide reads nothing normal to the wall in
+        ! the range of the means.  NONE drops its vertex bound; EDGE_TRACE takes the range from the wall edges.
+        wb_none = .false.
+        if (CS%dg_lim_cp_wall_bnd > 0) then
+          w_x = .false. ; w_y = .false.
+          if (.not.in_dom(i+2*a-3,j)) w_x = dg1_lim_wall_face(CS%u_face_mask_bdry(i+a-2,j), &
+                                                CS%u_bdry_val(i+a-2,j-1), CS%u_bdry_val(i+a-2,j))
+          if (.not.in_dom(i,j+2*b-3)) w_y = dg1_lim_wall_face(CS%v_face_mask_bdry(i,j+b-2), &
+                                                CS%v_bdry_val(i-1,j+b-2), CS%v_bdry_val(i,j+b-2))
+          if (w_x .neqv. w_y) then
+            if (CS%dg_lim_cp_wall_bnd == 1) then
+              wb_none = .true.
+            else
+              if (w_y) then
+                i_w = i+2*a-3 ; j_w = j
+              else
+                i_w = i ; j_w = j+2*b-3
+              endif
+              if (in_dom(i_w,j_w) .and. ((hmask(i_w,j_w) == 1.0) .or. (hmask(i_w,j_w) == 3.0))) then
+                if (w_y) then
+                  em_o = 0.5 * (dg1_lim_wall_surf(h_pe(i,j,1,b), CS%bed_node(i-1,j-2+b), rr) + &
+                                dg1_lim_wall_surf(h_pe(i,j,2,b), CS%bed_node(i,j-2+b), rr))
+                  em_n = 0.5 * (dg1_lim_wall_surf(h_pe(i_w,j_w,1,b), CS%bed_node(i_w-1,j-2+b), rr) + &
+                                dg1_lim_wall_surf(h_pe(i_w,j_w,2,b), CS%bed_node(i_w,j-2+b), rr))
+                else
+                  em_o = 0.5 * (dg1_lim_wall_surf(h_pe(i,j,a,1), CS%bed_node(i-2+a,j-1), rr) + &
+                                dg1_lim_wall_surf(h_pe(i,j,a,2), CS%bed_node(i-2+a,j), rr))
+                  em_n = 0.5 * (dg1_lim_wall_surf(h_pe(i_w,j_w,a,1), CS%bed_node(i-2+a,j_w-1), rr) + &
+                                dg1_lim_wall_surf(h_pe(i_w,j_w,a,2), CS%bed_node(i-2+a,j_w), rr))
+                endif
+                u_m = max(em_o, em_n) ; l_m = min(em_o, em_n)
+              endif
+            endif
+          endif
+        endif
         ! DG1_LIMITER_CORNER_PROJECT_ENDORSE = ALL: the bounds widen only as far as every other ice cell agrees.
         u_n = o_hi ; l_n = o_lo
         if (CS%dg_lim_cp_all .and. (o_hi >= o_lo)) then ; u_n = o_lo ; l_n = o_hi ; endif
@@ -19594,14 +19908,49 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
           cp_lo(a,b) = min(l_m, l_n) - max(CS%dg_lim_d0, lim_eps * (u_m - l_m))
         endif
         cp_one(a,b) = trb(i,j)
+        ! DG1_LIMITER_CORNER_PROJECT_VERTEX (testing): no vertex bound at this corner.
+        if (CS%dg_lim_cp_vert > 0) then
+          vx_keep = .false.
+          if (CS%dg_lim_cp_vert == 1) then
+            if (.not.(in_dom(i+2*a-3,j) .and. (hmask(i+2*a-3,j) == 1.0))) vx_keep = .true.
+            if (.not.(in_dom(i,j+2*b-3) .and. (hmask(i,j+2*b-3) == 1.0))) vx_keep = .true.
+          endif
+          if (.not.vx_keep) then
+            cp_hi(a,b) = cp_hi(a,b) + 1.0e6 * CS%dg_lim_d0 ; cp_lo(a,b) = cp_lo(a,b) - 1.0e6 * CS%dg_lim_d0
+          endif
+        endif
+        if (wb_none) then
+          cp_hi(a,b) = cp_hi(a,b) + 1.0e6 * CS%dg_lim_d0 ; cp_lo(a,b) = cp_lo(a,b) - 1.0e6 * CS%dg_lim_d0
+        endif
       enddo ; enddo
+      cj_n = 0 ; cj_th = 1.0
+      if (CS%dg_lim_cp_jump) then
+        ! DG1_LIMITER_CORNER_PROJECT_JUMP: the jump bounds from the state on entry, kept for pass 2.
+        call dg1_lim_jump_bounds(CS, G, hmask, h_pe, sbn, in_dom, trb, rr, i, j, cj_lo, cj_hi, cj_n, &
+                                 n_ex=cj_ex, s_own=sbp(i,j))
+        cpj_lo(i,j,:,:) = cj_lo(:,:) ; cpj_hi(i,j,:,:) = cj_hi(:,:) ; cpj_ex(i,j) = real(cj_ex)
+      endif
       if (cp_late) then
         cps_lo(i,j,:,:) = cp_lo(:,:) ; cps_hi(i,j,:,:) = cp_hi(:,:) ; cps_one(i,j,:,:) = cp_one(:,:)
-        call dg1_lim_corner_project(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:), cp_d, cp_lo, cp_hi, cp_one, rr, &
-                                    CS%min_h_shelf, cp_h, cp_act, hl_out=cpb_lo(i,j,:,:), hu_out=cpb_hi(i,j,:,:))
+        if (cj_n > 0) then
+          call dg1_lim_corner_project(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:), cp_d, cp_lo, cp_hi, cp_one, rr, &
+                                      CS%min_h_shelf, cp_h, cp_act, cj_lo, cj_hi, &
+                                      hl_out=cpb_lo(i,j,:,:), hu_out=cpb_hi(i,j,:,:), &
+                                      x_mode=CS%dg_lim_cp_jump_sc, x_th=cj_th, soft=cp_soft)
+          cpj_th(i,j) = cj_th
+        else
+          call dg1_lim_corner_project(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:), cp_d, cp_lo, cp_hi, cp_one, rr, &
+                                      CS%min_h_shelf, cp_h, cp_act, hl_out=cpb_lo(i,j,:,:), hu_out=cpb_hi(i,j,:,:), &
+                                      soft=cp_soft)
+        endif
         cpb_n(i,j) = 0
         cycle
       endif
+      endif
+      if ((cpass == 2) .and. CS%dg_lim_cp_jump) then
+        ! Pass 2: the jump bounds of pass 1 again.
+        cj_lo(:,:) = cpj_lo(i,j,:,:) ; cj_hi(:,:) = cpj_hi(i,j,:,:)
+        cj_n = count(cj_lo(:,:) > -huge(1.0)) + count(cj_hi(:,:) < huge(1.0))
       endif
       ! DG1_LIMITER_CORNER_PROJECT_FACE: the face bounds of DG1_LIMITER_FACE_BOUNDS, from the state on entry, as
       ! thickness bounds on the corners of the faces that are out of them.
@@ -19652,23 +20001,48 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
                                       cf_tr, cf_lo, cf_hi, cf_n)
         endif
       endif
-      if (cf_n > 0) then
+      if (do_st .and. CS%dg_lim_cp_jump) then
+        if (cpj_ex(i,j) > 0.0) CS%dg_lim_stat(i,j,27) = CS%dg_lim_stat(i,j,27) + 1.0
+        if (cpj_fb(i,j) > 0.0) CS%dg_lim_stat(i,j,29) = CS%dg_lim_stat(i,j,29) + 1.0
+      endif
+      if (cj_n > 0) then
+        ! DG1_LIMITER_CORNER_PROJECT_JUMP: the jump bounds, with the face bounds where they are set.
+        if (cf_n > 0) then
+          do b = 1, 2 ; do a = 1, 2
+            cj_lo(a,b) = max(cj_lo(a,b), cf_lo(a,b)) ; cj_hi(a,b) = min(cj_hi(a,b), cf_hi(a,b))
+          enddo ; enddo
+        endif
+        call dg1_lim_corner_project(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:), cp_d, cp_lo, cp_hi, cp_one, rr, &
+                                    CS%min_h_shelf, cp_h, cp_act, cj_lo, cj_hi, &
+                                    hl_out=cpb_lo(i,j,:,:), hu_out=cpb_hi(i,j,:,:), &
+                                    x_mode=CS%dg_lim_cp_jump_sc, x_th=cj_th, soft=cp_soft)
+        if (do_st .and. CS%dg_lim_cp_jump_all) CS%dg_lim_stat(i,j,28) = CS%dg_lim_stat(i,j,28) + (1.0 - cj_th)
+      elseif (cf_n > 0) then
         call dg1_lim_corner_project(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:), cp_d, cp_lo, cp_hi, cp_one, rr, &
                                     CS%min_h_shelf, cp_h, cp_act, cf_lo, cf_hi, &
-                                    hl_out=cpb_lo(i,j,:,:), hu_out=cpb_hi(i,j,:,:))
+                                    hl_out=cpb_lo(i,j,:,:), hu_out=cpb_hi(i,j,:,:), &
+                                    soft=cp_soft)
       else
         call dg1_lim_corner_project(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:), cp_d, cp_lo, cp_hi, cp_one, rr, &
-                                    CS%min_h_shelf, cp_h, cp_act, hl_out=cpb_lo(i,j,:,:), hu_out=cpb_hi(i,j,:,:))
+                                    CS%min_h_shelf, cp_h, cp_act, hl_out=cpb_lo(i,j,:,:), hu_out=cpb_hi(i,j,:,:), &
+                                    soft=cp_soft)
       endif
       cpb_n(i,j) = cf_n
     enddo ; enddo
     enddo ! cpass-loop
     if (cp_late) deallocate(cps_lo, cps_hi, cps_one)
+    if (CS%dg_lim_cp_jump) deallocate(cpj_lo, cpj_hi, cpj_ex, cpj_fb, cpj_th)
     do j = jsc, jec ; do i = isc, iec
       if (cpb_n(i,j) < 0) cycle
       cf_n = cpb_n(i,j)
-      call dg1_lim_cp_apply(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:), cpb_lo(i,j,:,:), cpb_hi(i,j,:,:), &
-                            cp_h, cp_act)
+      if (cp_soft) then
+        cp_fl = min(CS%min_h_shelf, nodal_cell_mean(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:)))
+        call dg1_lim_cp_apply_soft(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:), cpb_lo(i,j,:,:), &
+                                   cpb_hi(i,j,:,:), cp_fl, CS%dg_lim_cp_soft, cp_h, cp_act)
+      else
+        call dg1_lim_cp_apply(CS%h_nodal(i,j,:,:), CS%cell_mean_w(i,j,:,:), cpb_lo(i,j,:,:), cpb_hi(i,j,:,:), &
+                              cp_h, cp_act)
+      endif
       if ((cf_n > 0) .and. do_st) CS%dg_lim_stat(i,j,19) = CS%dg_lim_stat(i,j,19) + 1.0
       if (cp_act) then
         if (do_st) then
@@ -19691,7 +20065,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
         CS%dg_lim_phi(i,j,2) = 0.0
       endif
     enddo ; enddo
-    deallocate(h_pe, cpb_lo, cpb_hi, cpb_n)
+    deallocate(h_pe, cpb_lo, cpb_hi, cpb_n, sbp, sbn)
   endif
 
   ! dg_lim_agree_*: the changes of this call, split by the neighbour bounds on entry.  A change below 1e-3 d0 is
@@ -19982,6 +20356,79 @@ pure real function dg1_lim_s_widen(s, ds, d0, d, rr)
   dg1_lim_s_widen = max(h_b - d, (1.0 - rr) * h_b)
 end function dg1_lim_s_widen
 
+!> DG1_LIMITER_CORNER_PROJECT_FLAT_MEANS: the flat state of a cell, the corner thicknesses hc = max(h(s, D_c), fl)
+!! under one level surface s (dg1_lim_h_from_s on the bed of each corner) that have the mean thickness hb with the
+!! weights wc, fl <= hb.  That mean is continuous, nondecreasing and piecewise linear in s, fl at and below the
+!! smallest floor break, with breaks where a corner leaves the floor and at the flotation surfaces of the corners,
+!! so the largest break at which it is at most hb is found with max (no sort, so the result does not depend on the
+!! order of the corners) and s follows from the slope above it.
+pure subroutine dg1_lim_flat_state(hb, wc, dn, rr, fl, hc)
+  real,                 intent(in)  :: hb  !< The mean thickness of the cell [Z ~> m]
+  real, dimension(2,2), intent(in)  :: wc  !< The corner weights of the cell mean [L2 ~> m2]
+  real, dimension(2,2), intent(in)  :: dn  !< Bed depths at the corners, positive down [Z ~> m]
+  real,                 intent(in)  :: rr  !< Ice to ocean density ratio [nondim]
+  real,                 intent(in)  :: fl  !< The floor of the corners, at most hb [Z ~> m]
+  real, dimension(2,2), intent(out) :: hc  !< The corner thicknesses of the flat state [Z ~> m]
+
+  real, dimension(2,2) :: s_fl ! The surface at which each corner leaves the floor [Z ~> m]
+  real, dimension(2,2) :: q_f  ! The flotation surface of each corner, -huge on a bed above sea level [Z ~> m]
+  real, dimension(2,2) :: sl   ! Corner slopes of the thickness against the surface just above p [nondim]
+  real :: q      ! A break [Z ~> m]
+  real :: p      ! The largest break at which the mean thickness is at most hb [Z ~> m]
+  real :: fp     ! The mean thickness at p [Z ~> m]
+  real :: slm    ! The mean slope just above p [nondim]
+  real :: s_f    ! The level surface [Z ~> m]
+  integer :: a, b, k
+
+  do b = 1, 2 ; do a = 1, 2
+    q_f(a,b) = -huge(1.0)
+    if (dn(a,b) > 0.0) q_f(a,b) = (1.0 - rr) * (dn(a,b) / rr)
+    if ((dn(a,b) <= 0.0) .or. (rr * fl >= dn(a,b))) then
+      s_fl(a,b) = fl - dn(a,b)
+    else
+      s_fl(a,b) = (1.0 - rr) * fl
+    endif
+  enddo ; enddo
+  ! Every corner is at the floor at the smallest floor break, where the mean is fl <= hb.
+  p = min(min(s_fl(1,1), s_fl(2,2)), min(s_fl(1,2), s_fl(2,1)))
+  do k = 1, 2 ; do b = 1, 2 ; do a = 1, 2
+    if (k == 1) then
+      q = s_fl(a,b)
+    else
+      q = q_f(a,b)
+    endif
+    if (q > p) then
+      if (flat_mean(q) <= hb) p = q
+    endif
+  enddo ; enddo ; enddo
+  do b = 1, 2 ; do a = 1, 2
+    if (p < s_fl(a,b)) then
+      sl(a,b) = 0.0
+    elseif (p < q_f(a,b)) then
+      sl(a,b) = 1.0 / (1.0 - rr)
+    else
+      sl(a,b) = 1.0
+    endif
+  enddo ; enddo
+  fp = flat_mean(p) ; slm = nodal_cell_mean(sl, wc)
+  s_f = p
+  if (slm > 0.0) s_f = p + (hb - fp) / slm
+  do b = 1, 2 ; do a = 1, 2
+    hc(a,b) = max(dg1_lim_h_from_s(s_f, dn(a,b), rr), fl)
+  enddo ; enddo
+contains
+  !> The mean thickness of the corners under the level surface sq.
+  pure real function flat_mean(sq)
+    real, intent(in) :: sq !< The level surface [Z ~> m]
+    real, dimension(2,2) :: hq ! The corner thicknesses [Z ~> m]
+    integer :: a2, b2
+    do b2 = 1, 2 ; do a2 = 1, 2
+      hq(a2,b2) = max(dg1_lim_h_from_s(sq, dn(a2,b2), rr), fl)
+    enddo ; enddo
+    flat_mean = nodal_cell_mean(hq, wc)
+  end function flat_mean
+end subroutine dg1_lim_flat_state
+
 !> DG1_LIMITER_CROSSED_CORNER_CLIP: the flat surface s whose corner thicknesses max(h(s, D_c), 0), on the bed of
 !! each corner (dg1_lim_h_from_s), have the mean thickness hb with the weights wc.  That mean is continuous,
 !! nondecreasing and piecewise linear in s, 0 at s = 0, with breaks at the flotation surfaces of the corners and
@@ -20127,6 +20574,323 @@ pure subroutine dg1_lim_corner_clip(hn, wc, dn, slo, shi, rr, d0, eps, pi_c, h_m
   acted = .true.
 end subroutine dg1_lim_corner_clip
 
+!> DG1_LIMITER_CORNER_PROJECT_JUMP: the jump bounds of the corners of cell (i,j), from the state on entry.  At each
+!! node of each face with an ice neighbour inside the domain, the jump of the corner surfaces across the face must lie
+!! in [min(0, 4 m) - D0, max(0, 4 m) + D0], m the step of the cell-mean surfaces.  The excess is split between the
+!! low corner L and the high corner H in proportion to their distances from the mean of the other ice corners at the
+!! node (equal parts where both are 0).  L takes no part where its cell is crossed, and a floating L of another cell no
+!! more than lifts it to flotation; H takes the rest.  The two cells of a face find the same split, as it is computed
+!! from the low and high corners, not from the cell that asks.  Bounds not set are -huge and huge.
+!! DG1_LIMITER_CORNER_PROJECT_JUMP_ALL_NODES: a corner whose jump is in its range takes the bounds that keep it
+!! there, from the neighbour on entry (no lower bound in a crossed cell).
+!! DG1_LIMITER_CORNER_PROJECT_JUMP_CROSSED_FALLBACK, with th: a crossed low corner also takes the part 1 - th of
+!! the excess left to the high corner, th of its cell.
+subroutine dg1_lim_jump_bounds(CS, G, hmask, h_pe, sbar, in_dom, trb, rr, i, j, hl_j, hu_j, n_j, th, n_ex, n_fb, &
+                               s_own)
+  type(ice_shelf_dyn_CS), intent(in) :: CS  !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in) :: G   !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in) :: h_pe !< Corner thicknesses on entry [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: sbar !< Cell-mean surfaces on entry [Z ~> m]
+  logical, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: in_dom !< The cell lies inside the domain
+  logical, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: trb !< The cell is crossed (DG1_LIMITER_CROSSED)
+  real,                   intent(in)  :: rr  !< Ice to ocean density ratio [nondim]
+  integer,                intent(in)  :: i   !< The i-index of the cell
+  integer,                intent(in)  :: j   !< The j-index of the cell
+  real, dimension(2,2),   intent(out) :: hl_j !< Lower thickness bounds of the corners [Z ~> m]
+  real, dimension(2,2),   intent(out) :: hu_j !< Upper thickness bounds of the corners [Z ~> m]
+  integer,                intent(out) :: n_j !< The number of bounds set
+  real, dimension(SZDI_(G),SZDJ_(G)), optional, intent(in) :: th !< Theta of each cell from pass 1, for
+                                                 !! DG1_LIMITER_CORNER_PROJECT_JUMP_CROSSED_FALLBACK [nondim]
+  integer,      optional, intent(out) :: n_ex !< The number of node pairs out of their range on entry
+  integer,      optional, intent(out) :: n_fb !< The number of fallback raises of the corners of the cell
+  real,         optional, intent(in)  :: s_own !< The surface of cell (i,j) itself, in place of sbar(i,j) [Z ~> m]
+
+  real :: c_j      ! The largest jump with the mean step, in mean steps [nondim]
+  real :: so       ! The surface of cell (i,j) [Z ~> m]
+  real :: d_n      ! The bed at the node [Z ~> m]
+  real :: s_a, s_b ! The surfaces of the corner of the cell and of its neighbour [Z ~> m]
+  real :: m_s, j_s ! The step of the mean surfaces and the jump, neighbour less cell [Z ~> m]
+  real :: ex       ! The excess of the jump, > 0 [Z ~> m]
+  real :: s_l, s_h ! The surfaces of the low and high corners [Z ~> m]
+  real :: w_l, w_h ! Their distances from the mean of the other corners at the node [Z ~> m]
+  real :: e_l      ! The part of the excess the low corner takes [Z ~> m]
+  real :: room     ! How far the low corner may rise [Z ~> m]
+  logical :: own_low ! The corner of cell (i,j) is the low one
+  real :: lo_b, hi_b ! The range of the jump [Z ~> m]
+  real :: tau      ! The tolerance of the jump at this face [Z ~> m]
+  real :: d_f      ! The distance of the centres of the two cells of the face [L ~> m]
+  integer :: ne, nf  ! Node pairs out of range and fallback raises
+  logical :: own_gr  ! Every corner of cell (i,j) is grounded (DG1_LIMITER_CORNER_PROJECT_JUMP_GROUNDED_PAIRS)
+  integer :: a, b, ax, ii, jj, a2, b2, il, jl
+
+  hl_j(:,:) = -huge(1.0) ; hu_j(:,:) = huge(1.0) ; n_j = 0 ; ne = 0 ; nf = 0
+  c_j = CS%dg_lim_cp_jump_cj
+  so = sbar(i,j) ; if (present(s_own)) so = s_own
+  if (present(n_ex)) n_ex = 0
+  if (present(n_fb)) n_fb = 0
+  if (hmask(i,j) /= 1.0) return
+  own_gr = .false.
+  if (.not.CS%dg_lim_cp_jump_gr) own_gr = dg1_lim_all_grounded(CS, G, h_pe, i, j, rr)
+  do b = 1, 2 ; do a = 1, 2
+    d_n = CS%bed_node(i-2+a,j-2+b)
+    s_a = max(h_pe(i,j,a,b) - d_n, (1.0 - rr) * h_pe(i,j,a,b))
+    do ax = 1, 2
+      if ((CS%dg_lim_cp_jump_axes /= 3) .and. (ax /= CS%dg_lim_cp_jump_axes)) cycle
+      if (ax == 1) then ; ii = i + (2*a - 3) ; jj = j ; a2 = 3 - a ; b2 = b
+      else ; ii = i ; jj = j + (2*b - 3) ; a2 = a ; b2 = 3 - b ; endif
+      if ((.not.in_dom(ii,jj)) .or. (hmask(ii,jj) /= 1.0)) cycle
+      if (.not.CS%dg_lim_cp_jump_gr) then
+        if (own_gr .and. dg1_lim_all_grounded(CS, G, h_pe, ii, jj, rr)) cycle
+      endif
+      s_b = max(h_pe(ii,jj,a2,b2) - d_n, (1.0 - rr) * h_pe(ii,jj,a2,b2))
+      m_s = sbar(ii,jj) - so ; j_s = s_b - s_a
+      tau = CS%dg_lim_cp_jump_tol
+      if (CS%dg_lim_cp_jump_tvb > 0.0) then
+        if (ax == 1) then ; d_f = G%dxCu(min(i,ii),j) ; else ; d_f = G%dyCv(i,min(j,jj)) ; endif
+        tau = max(tau, CS%dg_lim_cp_jump_tvb * (max(dg1_lim_curv(G, hmask, in_dom, sbar, i, j, ax, i, j, so), &
+                                                    dg1_lim_curv(G, hmask, in_dom, sbar, ii, jj, ax, i, j, so)) * &
+                                                d_f**2))
+      endif
+      hi_b = max(0.0, c_j * m_s) + tau ; lo_b = min(0.0, c_j * m_s) - tau
+      ex = 0.0
+      if (j_s > hi_b) then
+        ex = j_s - hi_b ; own_low = .true.
+      elseif (j_s < lo_b) then
+        ex = lo_b - j_s ; own_low = .false.
+      endif
+      if (ex <= 0.0) then
+        ! DG1_LIMITER_CORNER_PROJECT_JUMP_ALL_NODES: keep a jump that is in its range there.
+        if (CS%dg_lim_cp_jump_all) then
+          hu_j(a,b) = min(hu_j(a,b), dg1_lim_h_from_s(s_b - lo_b, d_n, rr)) ; n_j = n_j + 1
+          if (.not.trb(i,j)) then
+            hl_j(a,b) = max(hl_j(a,b), dg1_lim_h_from_s(s_b - hi_b, d_n, rr)) ; n_j = n_j + 1
+          endif
+        endif
+        cycle
+      endif
+      ne = ne + 1
+      if (own_low) then
+        s_l = s_a ; s_h = s_b ; il = i ; jl = j
+      else
+        s_l = s_b ; s_h = s_a ; il = ii ; jl = jj
+      endif
+      w_l = abs(s_l - dg1_lim_node_other(CS, G, hmask, h_pe, in_dom, rr, i-2+a, j-2+b, s_l))
+      w_h = abs(s_h - dg1_lim_node_other(CS, G, hmask, h_pe, in_dom, rr, i-2+a, j-2+b, s_h))
+      if (w_l + w_h > 0.0) then
+        e_l = ex * (w_l / (w_l + w_h))
+      else
+        e_l = 0.5 * ex
+      endif
+      ! How far the low corner may rise: not at all in a crossed cell, to flotation if it floats.
+      room = huge(1.0)
+      if (trb(il,jl)) then
+        room = 0.0
+      elseif ((d_n > 0.0) .and. (s_l < (1.0 - rr) * (d_n / rr))) then
+        room = max(0.0, (1.0 - rr) * (d_n / rr) - s_l)
+        if (.not.CS%dg_lim_cp_jump_float) room = 0.0
+      endif
+      e_l = min(e_l, room)
+      ! DG1_LIMITER_CORNER_PROJECT_JUMP_CROSSED_FALLBACK: a crossed low corner of this cell takes the part of the
+      ! excess that the cell of the high corner could not meet.
+      if (present(th) .and. own_low) then
+        if (CS%dg_lim_cp_jump_fb .and. trb(il,jl)) then
+          if (th(ii,jj) < 1.0) then
+            e_l = e_l + (1.0 - th(ii,jj)) * (ex - e_l) ; nf = nf + 1
+          endif
+        endif
+      endif
+      if (own_low) then
+        if (e_l > 0.0) then
+          hl_j(a,b) = max(hl_j(a,b), dg1_lim_h_from_s(s_l + e_l, d_n, rr)) ; n_j = n_j + 1
+        endif
+      else
+        hu_j(a,b) = min(hu_j(a,b), dg1_lim_h_from_s(s_h - (ex - e_l), d_n, rr)) ; n_j = n_j + 1
+      endif
+    enddo
+  enddo ; enddo
+  if (present(n_ex)) n_ex = ne
+  if (present(n_fb)) n_fb = nf
+end subroutine dg1_lim_jump_bounds
+
+!> DG1_LIMITER_CORNER_PROJECT_JUMP_ALL_NODES: a further bound x of a corner hn moved by the factor theta t, with
+!! the other bound ho of the corner (upper bounds if up, else lower).  Mode 1 (CORNER) moves a bound the corner breaks
+!! toward the corner and keeps a met one; 2 (OTHER) moves a bound tighter than ho toward ho; 3 (HYBRID) moves a broken
+!! bound toward the corner and a met one tighter than ho toward ho.  t = 1 gives x.
+pure real function dg1_lim_x_move(x, hn, ho, t, xm, up)
+  real,    intent(in) :: x  !< The further bound [Z ~> m]
+  real,    intent(in) :: hn !< The corner [Z ~> m]
+  real,    intent(in) :: ho !< The other bound of the corner on the same side [Z ~> m]
+  real,    intent(in) :: t  !< Theta [nondim]
+  integer, intent(in) :: xm !< The mode, 1 CORNER, 2 OTHER, 3 HYBRID
+  logical, intent(in) :: up !< x is an upper bound
+  logical :: brk ! The corner breaks x
+  dg1_lim_x_move = x
+  if (up) then
+    brk = (x < hn)
+    if (brk .and. ((xm == 1) .or. (xm == 3))) then
+      dg1_lim_x_move = hn - t * (hn - x)
+    elseif (((xm == 2) .or. ((xm == 3) .and. (.not.brk))) .and. (x < ho)) then
+      dg1_lim_x_move = ho - t * (ho - x)
+    endif
+  else
+    brk = (x > hn)
+    if (brk .and. ((xm == 1) .or. (xm == 3))) then
+      dg1_lim_x_move = hn + t * (x - hn)
+    elseif (((xm == 2) .or. ((xm == 3) .and. (.not.brk))) .and. (x > ho)) then
+      dg1_lim_x_move = ho + t * (x - ho)
+    endif
+  endif
+end function dg1_lim_x_move
+
+!> DG1_LIMITER_CORNER_PROJECT_JUMP_TVB: the absolute curvature of the cell-mean surfaces sbar along axis ax (1 x,
+!! 2 y) at cell (ic,jc), from the cell and its two neighbours on that axis and the distances of their centres, 0
+!! where a neighbour is not an ice cell inside the domain.  The two sides are summed, so a reflection gives the same.
+real function dg1_lim_curv(G, hmask, in_dom, sbar, ic, jc, ax, io, jo, so)
+  type(ocean_grid_type),  intent(in) :: G   !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
+  logical, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: in_dom !< The cell lies inside the domain
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: sbar !< Cell-mean surfaces on entry [Z ~> m]
+  integer, intent(in) :: ic  !< The i-index of the cell
+  integer, intent(in) :: jc  !< The j-index of the cell
+  integer, intent(in) :: ax  !< The axis, 1 x, 2 y
+  integer, optional, intent(in) :: io !< The i-index of a cell read with so in place of sbar
+  integer, optional, intent(in) :: jo !< The j-index of a cell read with so in place of sbar
+  real,    optional, intent(in) :: so !< The surface of cell (io,jo) [Z ~> m]
+  real :: dp, dm   ! The distances to the centres of the cells on the plus and minus sides [L ~> m]
+  real :: sp, sm   ! Their mean surfaces [Z ~> m]
+  real :: s0       ! The mean surface of the cell [Z ~> m]
+  integer :: ip, jp, im, jm
+  dg1_lim_curv = 0.0
+  if (ax == 1) then
+    ip = ic + 1 ; jp = jc ; im = ic - 1 ; jm = jc
+    dp = G%dxCu(ic,jc) ; dm = G%dxCu(ic-1,jc)
+  else
+    ip = ic ; jp = jc + 1 ; im = ic ; jm = jc - 1
+    dp = G%dyCv(ic,jc) ; dm = G%dyCv(ic,jc-1)
+  endif
+  if ((ip < G%isd) .or. (ip > G%ied) .or. (jp < G%jsd) .or. (jp > G%jed)) return
+  if ((im < G%isd) .or. (im > G%ied) .or. (jm < G%jsd) .or. (jm > G%jed)) return
+  if (.not.(in_dom(ip,jp) .and. in_dom(im,jm))) return
+  if ((hmask(ip,jp) /= 1.0) .or. (hmask(im,jm) /= 1.0)) return
+  if ((dp <= 0.0) .or. (dm <= 0.0)) return
+  sp = sbar(ip,jp) ; sm = sbar(im,jm) ; s0 = sbar(ic,jc)
+  if (present(so)) then
+    if ((ip == io) .and. (jp == jo)) sp = so
+    if ((im == io) .and. (jm == jo)) sm = so
+    if ((ic == io) .and. (jc == jo)) s0 = so
+  endif
+  dg1_lim_curv = abs(2.0 * (((sp - s0) / dp) + ((sm - s0) / dm)) / (dp + dm))
+end function dg1_lim_curv
+
+!> DG1_LIMITER_CORNER_PROJECT_JUMP_GROUNDED_PAIRS: every corner of cell (ic,jc) is grounded on entry.
+logical function dg1_lim_all_grounded(CS, G, h_pe, ic, jc, rr)
+  type(ice_shelf_dyn_CS), intent(in) :: CS  !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in) :: G   !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in) :: h_pe !< Corner thicknesses on entry [Z ~> m]
+  integer, intent(in) :: ic  !< The i-index of the cell
+  integer, intent(in) :: jc  !< The j-index of the cell
+  real,    intent(in) :: rr  !< Ice to ocean density ratio [nondim]
+  integer :: a, b
+  dg1_lim_all_grounded = .true.
+  do b = 1, 2 ; do a = 1, 2
+    if (rr * h_pe(ic,jc,a,b) <= CS%bed_node(ic-2+a,jc-2+b)) dg1_lim_all_grounded = .false.
+  enddo ; enddo
+end function dg1_lim_all_grounded
+
+!> DG1_LIMITER_CORNER_PROJECT_JUMP_ALL_NODES: the largest theta in [0, 1] for which the further bounds xlo and xhi,
+!! each moved toward the other bound of its corner, hu + theta (xhi - hu) where xhi < hu and hl + theta (xlo - hl)
+!! where xlo > hl (theta = 0 drops them), merged with the bounds hl and
+!! hu as dg1_lim_corner_project merges them, still hold the mean hb: mean(upper) >= hb >= mean(lower).  Both means
+!! are monotone in theta, so theta is found by bisection, from comparisons only.  The other bounds hold the mean
+!! by themselves, so theta = 0 holds; 0 is returned if round-off says otherwise.
+pure real function dg1_lim_x_theta(hn, wc, hl, hu, xlo, xhi, lo_t, hb, xm)
+  real, dimension(2,2), intent(in) :: hn   !< Corner thicknesses [Z ~> m]
+  real, dimension(2,2), intent(in) :: wc   !< Corner weights of the cell mean [L2 ~> m2]
+  real, dimension(2,2), intent(in) :: hl   !< Lower thickness bounds before the further bounds [Z ~> m]
+  real, dimension(2,2), intent(in) :: hu   !< Upper thickness bounds before the further bounds [Z ~> m]
+  real, dimension(2,2), intent(in) :: xlo  !< Further lower thickness bounds [Z ~> m]
+  real, dimension(2,2), intent(in) :: xhi  !< Further upper thickness bounds [Z ~> m]
+  real,                 intent(in) :: lo_t !< The floor of every corner [Z ~> m]
+  real,                 intent(in) :: hb   !< The mean thickness [Z ~> m]
+  integer,              intent(in) :: xm   !< How the bounds move: 1 CORNER, 2 OTHER, 3 HYBRID
+
+  real :: t_lo, t_hi, t_m ! Feasible and infeasible ends and their middle [nondim]
+  integer :: k
+
+  if (x_ok(1.0)) then
+    dg1_lim_x_theta = 1.0 ; return
+  endif
+  if (.not.x_ok(0.0)) then
+    dg1_lim_x_theta = 0.0 ; return
+  endif
+  t_lo = 0.0 ; t_hi = 1.0
+  do k = 1, 40
+    t_m = 0.5 * (t_lo + t_hi)
+    if (x_ok(t_m)) then
+      t_lo = t_m
+    else
+      t_hi = t_m
+    endif
+  enddo
+  dg1_lim_x_theta = t_lo
+contains
+  !> The merged bounds at theta t hold the mean.
+  pure logical function x_ok(t)
+    real, intent(in) :: t !< Theta [nondim]
+    real, dimension(2,2) :: u_t, l_t ! Merged upper and lower bounds [Z ~> m]
+    real :: xu, xl ! The further bounds at t [Z ~> m]
+    integer :: a, b
+    do b = 1, 2 ; do a = 1, 2
+      xu = xhi(a,b) ; xl = xlo(a,b)
+      if ((t < 1.0) .or. (xm == 1)) then
+        xu = dg1_lim_x_move(xhi(a,b), hn(a,b), hu(a,b), t, xm, .true.)
+        xl = dg1_lim_x_move(xlo(a,b), hn(a,b), hl(a,b), t, xm, .false.)
+      endif
+      u_t(a,b) = max(min(hu(a,b), xu), lo_t)
+      l_t(a,b) = min(max(min(hl(a,b), u_t(a,b)), xl), u_t(a,b))
+    enddo ; enddo
+    x_ok = (nodal_cell_mean(u_t, wc) >= hb) .and. (nodal_cell_mean(l_t, wc) <= hb)
+  end function x_ok
+end function dg1_lim_x_theta
+
+!> DG1_LIMITER_CORNER_PROJECT_JUMP: the mean of the corner surfaces at node (iN,jN) of the ice cells inside the domain,
+!! without one corner of surface s_x; s_x itself where it is the only one.  The four corners are summed in diagonal
+!! pairs, so that a turn or a reflection of the grid sums the same pairs.
+real function dg1_lim_node_other(CS, G, hmask, h_pe, in_dom, rr, iN, jN, s_x)
+  type(ice_shelf_dyn_CS), intent(in) :: CS  !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in) :: G   !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in) :: h_pe !< Corner thicknesses on entry [Z ~> m]
+  logical, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: in_dom !< The cell lies inside the domain
+  real,    intent(in) :: rr  !< Ice to ocean density ratio [nondim]
+  integer, intent(in) :: iN  !< The i-index of the node
+  integer, intent(in) :: jN  !< The j-index of the node
+  real,    intent(in) :: s_x !< The surface of the corner left out [Z ~> m]
+
+  real, dimension(4) :: v_q, k_q ! The corner surfaces [Z ~> m] and their counts [nondim]
+  real :: d_n ! The bed at the node [Z ~> m]
+  real :: sm, cn ! Their sum [Z ~> m] and count [nondim]
+  integer :: q, ic, jc, a, b
+
+  d_n = CS%bed_node(iN,jN)
+  do q = 1, 4
+    select case (q)
+      case (1) ; ic = iN ; jc = jN ; a = 2 ; b = 2
+      case (2) ; ic = iN+1 ; jc = jN+1 ; a = 1 ; b = 1
+      case (3) ; ic = iN+1 ; jc = jN ; a = 1 ; b = 2
+      case default ; ic = iN ; jc = jN+1 ; a = 2 ; b = 1
+    end select
+    v_q(q) = 0.0 ; k_q(q) = 0.0
+    if (in_dom(ic,jc) .and. ((hmask(ic,jc) == 1.0) .or. (hmask(ic,jc) == 3.0))) then
+      v_q(q) = max(h_pe(ic,jc,a,b) - d_n, (1.0 - rr) * h_pe(ic,jc,a,b)) ; k_q(q) = 1.0
+    endif
+  enddo
+  sm = (v_q(1) + v_q(2)) + (v_q(3) + v_q(4)) ; cn = (k_q(1) + k_q(2)) + (k_q(3) + k_q(4))
+  dg1_lim_node_other = s_x
+  if (cn > 1.0) dg1_lim_node_other = (sm - s_x) / (cn - 1.0)
+end function dg1_lim_node_other
+
 !> DG1_LIMITER_CORNER_PROJECT: the least change, in the norm of the cell mean, of the corner thicknesses hn of a cell
 !! that keeps their mean hb and holds every corner in its bounds.  The floor of every corner is min(h_min, hb).  The
 !! surface bounds slo and shi are widened to hold the flat surface of dg1_lim_flat_surface and become thickness
@@ -20137,7 +20901,7 @@ end subroutine dg1_lim_corner_clip
 !! bound, so mu is found exactly between the two breaks around the root; these are chosen by max and min only, so
 !! the result does not depend on the order of the corners.  A cell already in its bounds is left as it is.
 pure subroutine dg1_lim_corner_project(hn, wc, dn, slo, shi, one_sided, rr, h_min, hout, acted, hlo_x, hhi_x, &
-                                       hl_out, hu_out)
+                                       hl_out, hu_out, x_mode, x_th, soft)
   real, dimension(2,2), intent(in)  :: hn   !< Corner thicknesses [Z ~> m]
   real, dimension(2,2), intent(in)  :: wc   !< Corner weights of the cell mean [L2 ~> m2]
   real, dimension(2,2), intent(in)  :: dn   !< Bed depths at the corners, positive down [Z ~> m]
@@ -20154,15 +20918,27 @@ pure subroutine dg1_lim_corner_project(hn, wc, dn, slo, shi, one_sided, rr, h_mi
                                             !! (DG1_LIMITER_CORNER_PROJECT_FACE) [Z ~> m]
   real, dimension(2,2), optional, intent(out) :: hl_out !< The lower thickness bounds that the projection used [Z ~> m]
   real, dimension(2,2), optional, intent(out) :: hu_out !< The upper thickness bounds that the projection used [Z ~> m]
+  integer,              optional, intent(in)  :: x_mode !< Move hlo_x and hhi_x by one factor where they cannot
+                                            !! all hold (DG1_LIMITER_CORNER_PROJECT_JUMP_ALL_NODES): 0 no, 1 CORNER,
+                                            !! 2 OTHER, 3 HYBRID (DG1_LIMITER_CORNER_PROJECT_JUMP_SCALE)
+  real,                 optional, intent(out) :: x_th !< The factor theta kept, 1 if none was needed [nondim]
+  logical,              optional, intent(in)  :: soft !< DG1_LIMITER_CORNER_PROJECT_SOFT: only merge the bounds into
+                                            !! one range per corner, for dg1_lim_cp_apply_soft; no theta, no
+                                            !! scaling, and the corners are returned unchanged
 
   real, dimension(2,2) :: hl, hu  ! Lower and upper corner thickness bounds [Z ~> m]
+  real, dimension(2,2) :: xlo, xhi ! The further bounds, moved back by x_mode [Z ~> m]
+  real :: x_t     ! The factor theta of x_mode [nondim]
+  integer :: xm   ! x_mode, 0 where absent
   real :: hb      ! The mean thickness [Z ~> m]
   real :: s_ref   ! The flat surface [Z ~> m]
   real :: lo_t    ! The floor of every corner [Z ~> m]
   real :: ml, mu_u ! Means of the lower and upper bounds [Z ~> m]
   real :: th      ! The part of the lower bounds above the floor that is kept [nondim]
+  logical :: do_soft ! DG1_LIMITER_CORNER_PROJECT_SOFT
   integer :: a, b
 
+  do_soft = .false. ; if (present(soft)) do_soft = soft
   hb = nodal_cell_mean(hn, wc)
   s_ref = dg1_lim_flat_surface(hb, wc, dn, rr)
   lo_t = min(h_min, hb)
@@ -20175,12 +20951,40 @@ pure subroutine dg1_lim_corner_project(hn, wc, dn, slo, shi, one_sided, rr, h_mi
     endif
   enddo ; enddo
   ! The face bounds: the upper bounds first, so that where the two cannot both hold the upper bound wins.
+  xhi(:,:) = huge(1.0) ; if (present(hhi_x)) xhi(:,:) = hhi_x(:,:)
+  xlo(:,:) = -huge(1.0) ; if (present(hlo_x)) xlo(:,:) = hlo_x(:,:)
+  if (do_soft) then
+    ! DG1_LIMITER_CORNER_PROJECT_SOFT: one range per corner; where the bounds conflict, the middle of the two.
+    do b = 1, 2 ; do a = 1, 2
+      hu(a,b) = max(min(hu(a,b), xhi(a,b)), lo_t) ; hl(a,b) = max(hl(a,b), xlo(a,b))
+      if (hl(a,b) > hu(a,b)) then
+        hl(a,b) = 0.5 * (hl(a,b) + hu(a,b)) ; hu(a,b) = hl(a,b)
+      endif
+    enddo ; enddo
+    if (present(x_th)) x_th = 1.0
+    if (present(hl_out)) hl_out(:,:) = hl(:,:)
+    if (present(hu_out)) hu_out(:,:) = hu(:,:)
+    hout(:,:) = hn(:,:) ; acted = .false.
+    return
+  endif
+  x_t = 1.0 ; xm = 0
+  if (present(x_mode)) xm = x_mode
+  if (xm > 0) then
+    x_t = dg1_lim_x_theta(hn, wc, hl, hu, xlo, xhi, lo_t, hb, xm)
+    if (x_t < 1.0) then
+      do b = 1, 2 ; do a = 1, 2
+        xhi(a,b) = dg1_lim_x_move(xhi(a,b), hn(a,b), hu(a,b), x_t, xm, .true.)
+        xlo(a,b) = dg1_lim_x_move(xlo(a,b), hn(a,b), hl(a,b), x_t, xm, .false.)
+      enddo ; enddo
+    endif
+  endif
+  if (present(x_th)) x_th = x_t
   if (present(hhi_x)) then
-    do b = 1, 2 ; do a = 1, 2 ; hu(a,b) = max(min(hu(a,b), hhi_x(a,b)), lo_t) ; enddo ; enddo
+    do b = 1, 2 ; do a = 1, 2 ; hu(a,b) = max(min(hu(a,b), xhi(a,b)), lo_t) ; enddo ; enddo
     do b = 1, 2 ; do a = 1, 2 ; hl(a,b) = min(hl(a,b), hu(a,b)) ; enddo ; enddo
   endif
   if (present(hlo_x)) then
-    do b = 1, 2 ; do a = 1, 2 ; hl(a,b) = min(max(hl(a,b), hlo_x(a,b)), hu(a,b)) ; enddo ; enddo
+    do b = 1, 2 ; do a = 1, 2 ; hl(a,b) = min(max(hl(a,b), xlo(a,b)), hu(a,b)) ; enddo ; enddo
   endif
   ml = nodal_cell_mean(hl, wc)
   if (ml > hb) then
@@ -20258,6 +21062,99 @@ pure subroutine dg1_lim_cp_apply(hn, wc, hl, hu, hout, acted)
   hout(:,:) = min(max(hn(:,:) + mu, hl(:,:)), hu(:,:))
   acted = .true.
 end subroutine dg1_lim_cp_apply
+
+!> DG1_LIMITER_CORNER_PROJECT_SOFT: the corners h of a cell that minimise sum wc ((h - hn)^2 + w_s d^2), with d the
+!! distance of h outside its range [hl, hu], keep the mean of hn and stay at or above the floor h_fl.  For a shift
+!! lam of the mean, each corner has the closed form h = max(p(hn + lam), h_fl), with p(y) = y in the range and
+!! (y + w_s b)/(1 + w_s) outside it, b the nearer end.  The mean is continuous, nondecreasing and piecewise linear
+!! in lam, with breaks where y reaches hl, hu or the floor, and slope 1/(1 + w_s) beyond the last one, so lam is
+!! found exactly between the two breaks around the root, by max and min only, so that the result does not depend
+!! on the order of the corners.  A cell with every corner in its range is left as it is.
+pure subroutine dg1_lim_cp_apply_soft(hn, wc, hl, hu, h_fl, w_s, hout, acted)
+  real, dimension(2,2), intent(in)  :: hn   !< Corner thicknesses [Z ~> m]
+  real, dimension(2,2), intent(in)  :: wc   !< Corner weights of the cell mean [L2 ~> m2]
+  real, dimension(2,2), intent(in)  :: hl   !< Lower ends of the ranges of the corners [Z ~> m]
+  real, dimension(2,2), intent(in)  :: hu   !< Upper ends of the ranges of the corners [Z ~> m]
+  real,                 intent(in)  :: h_fl !< The floor of the corners, at most their mean [Z ~> m]
+  real,                 intent(in)  :: w_s  !< The weight of the soft bounds, > 0 [nondim]
+  real, dimension(2,2), intent(out) :: hout !< The new corner thicknesses [Z ~> m]
+  logical,              intent(out) :: acted !< The corners changed
+
+  real, dimension(2,2) :: lo, hi  ! The ranges, at or above the floor [Z ~> m]
+  real, dimension(2,2) :: hc      ! Corners at a trial shift [Z ~> m]
+  real :: hb      ! The mean thickness [Z ~> m]
+  real :: x, gx   ! A break of the shift and the mean less hb there [Z ~> m]
+  real :: p_lo, g_lo, p_hi, g_hi ! The breaks around the root and the mean less hb there [Z ~> m]
+  real :: lam     ! The shift [Z ~> m]
+  logical :: inb, f_lo, f_hi ! Every corner is in its range; a break below and above the root is found
+  integer :: a, b, k
+
+  hout(:,:) = hn(:,:) ; acted = .false.
+  do b = 1, 2 ; do a = 1, 2
+    lo(a,b) = max(hl(a,b), h_fl) ; hi(a,b) = max(hu(a,b), lo(a,b))
+  enddo ; enddo
+  inb = .true.
+  do b = 1, 2 ; do a = 1, 2
+    if ((hn(a,b) < lo(a,b)) .or. (hn(a,b) > hi(a,b))) inb = .false.
+  enddo ; enddo
+  if (inb) return
+  hb = nodal_cell_mean(hn, wc)
+
+  p_lo = 0.0 ; g_lo = 0.0 ; p_hi = 0.0 ; g_hi = 0.0 ; f_lo = .false. ; f_hi = .false.
+  do k = 1, 3 ; do b = 1, 2 ; do a = 1, 2
+    if (k == 1) then
+      x = lo(a,b) - hn(a,b)
+    elseif (k == 2) then
+      x = hi(a,b) - hn(a,b)
+    else
+      x = (h_fl - w_s * (lo(a,b) - h_fl)) - hn(a,b)
+    endif
+    call soft_at(x, hc)
+    gx = nodal_cell_mean(hc, wc) - hb
+    if ((gx <= 0.0) .and. ((.not.f_lo) .or. (x > p_lo))) then
+      p_lo = x ; g_lo = gx ; f_lo = .true.
+    endif
+    if ((gx >= 0.0) .and. ((.not.f_hi) .or. (x < p_hi))) then
+      p_hi = x ; g_hi = gx ; f_hi = .true.
+    endif
+  enddo ; enddo ; enddo
+  ! At the lowest break every corner is at the floor, so the mean is at most hb in exact arithmetic; take that
+  ! break if round-off says otherwise.
+  if (.not.f_lo) then
+    p_lo = min(min(h_fl - w_s * (lo(1,1) - h_fl) - hn(1,1), h_fl - w_s * (lo(2,2) - h_fl) - hn(2,2)), &
+               min(h_fl - w_s * (lo(1,2) - h_fl) - hn(1,2), h_fl - w_s * (lo(2,1) - h_fl) - hn(2,1)))
+    g_lo = 0.0
+  endif
+  if (g_lo == 0.0) then
+    lam = p_lo
+  elseif (.not.f_hi) then
+    ! Beyond the last break every corner is above its range: the mean rises by 1/(1 + w_s) per unit shift.
+    lam = p_lo + (-g_lo) * (1.0 + w_s)
+  elseif ((g_hi == 0.0) .or. (p_hi <= p_lo)) then
+    lam = p_hi
+  else
+    lam = p_lo + (p_hi - p_lo) * ((-g_lo) / (g_hi - g_lo))
+  endif
+  call soft_at(lam, hout)
+  acted = .true.
+contains
+  !> The corners at the shift xs.
+  pure subroutine soft_at(xs, h)
+    real,                 intent(in)  :: xs !< The shift [Z ~> m]
+    real, dimension(2,2), intent(out) :: h  !< The corners [Z ~> m]
+    real :: y ! The shifted corner [Z ~> m]
+    integer :: a2, b2
+    do b2 = 1, 2 ; do a2 = 1, 2
+      y = hn(a2,b2) + xs
+      if (y < lo(a2,b2)) then
+        y = (y + w_s * lo(a2,b2)) / (1.0 + w_s)
+      elseif (y > hi(a2,b2)) then
+        y = (y + w_s * hi(a2,b2)) / (1.0 + w_s)
+      endif
+      h(a2,b2) = max(y, h_fl)
+    enddo ; enddo
+  end subroutine soft_at
+end subroutine dg1_lim_cp_apply_soft
 
 !> DG1_LIMITER_CORNER_PROJECT_FACE: thickness bounds on the corners of each face of a cell whose surface at the
 !! middle, the mean of its two corner surfaces, is out of the face bounds of DG1_LIMITER_FACE_BOUNDS.  The two
@@ -21135,6 +22032,14 @@ pure real function dg1_lim_twist_least_violation(base, tw, lo, hi)
   enddo
   dg1_lim_twist_least_violation = best_p
 end function dg1_lim_twist_least_violation
+
+!> DG1_LIMITER_CORNER_PROJECT_WALL_BOUND: the surface of a corner of thickness h on a bed at depth d.
+pure real function dg1_lim_wall_surf(h, d, rr)
+  real, intent(in) :: h  !< The corner thickness [Z ~> m]
+  real, intent(in) :: d  !< The bed depth at the corner, positive down [Z ~> m]
+  real, intent(in) :: rr !< Ice to ocean density ratio [nondim]
+  dg1_lim_wall_surf = max(h - d, (1.0 - rr) * h)
+end function dg1_lim_wall_surf
 
 !> DG1_LIMITER_EDGE_MIRROR: whether a face at the domain edge is a wall or a divide, across which the ice is a mirror
 !! image of the ice inside: velocity boundary code 5 (free slip) or 3 (set velocity), with zero normal velocity at
