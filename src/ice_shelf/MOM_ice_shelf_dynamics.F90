@@ -844,6 +844,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! tolerance K |kappa| d^2 of the jump bounds [nondim].
   logical :: dg_lim_cp_wall_mirror = .false. !< DG1_LIMITER_CORNER_PROJECT_WALL_MIRROR: the vertex bounds of the
                               !! projection read the mirror image of the cells beyond a wall.
+  logical :: dg_lim_cp_wall_bnd_c = .false. !< DG1_LIMITER_CORNER_PROJECT_WALL_BOUND_CORNERS: WALL_BOUND also acts at a
+                              !! corner of the domain, where both faces of the cell at the corner are walls.
   integer :: dg_lim_cp_wall_bnd = 0 !< DG1_LIMITER_CORNER_PROJECT_WALL_BOUND: the vertex bounds of the projection at a
                               !! corner on a wall or a divide: 0 MEANS, 1 NONE, 2 EDGE_TRACE.
   logical :: dg_lim_cp_flat_own = .false. !< DG1_LIMITER_CORNER_PROJECT_FLAT_MEANS_OWN: the flat state only for the
@@ -14950,6 +14952,15 @@ subroutine read_DG_params(param_file, mdl, CS, US)
       call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT_WALL_BOUND = "//&
                      trim(wbd_str)//" is not MEANS, NONE or EDGE_TRACE.")
   end select
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_WALL_BOUND_CORNERS", CS%dg_lim_cp_wall_bnd_c, &
+                 "If true, DG1_LIMITER_CORNER_PROJECT_WALL_BOUND also acts at a corner of the domain, where both "//&
+                 "faces of the cell at the corner are walls or divides: EDGE_TRACE takes the range of the mean "//&
+                 "surfaces of the cell's two wall edges, as the mirror images of the cell beyond both walls have "//&
+                 "the same wall edges, and NONE drops the vertex bound.  If false, such a corner keeps the range of "//&
+                 "the cell means.  There, no other cell inside the domain shares the node, so with "//&
+                 "DG1_LIMITER_CORNER_PROJECT_WALL_MIRROR nothing widens the bound past the means, and a smooth "//&
+                 "maximum at a divide is clipped at the corner of the domain but not along the rest of the divide.", &
+                 default=.false., do_not_log=(CS%dg_lim_cp_wall_bnd == 0))
   if ((CS%dg_lim_cp_soft > 0.0) .and. CS%dg_lim_cp_jump_fb) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT_SOFT does not work with "//&
       "DG1_LIMITER_CORNER_PROJECT_JUMP_CROSSED_FALLBACK.")
@@ -19918,6 +19929,18 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
                 endif
                 u_m = max(em_o, em_n) ; l_m = min(em_o, em_n)
               endif
+            endif
+          elseif (w_x .and. w_y .and. CS%dg_lim_cp_wall_bnd_c) then
+            ! DG1_LIMITER_CORNER_PROJECT_WALL_BOUND_CORNERS: a corner of the domain.  The mirror images of the cell
+            ! beyond both walls have the same wall edges, so the range is that of the cell's own two wall edges.
+            if (CS%dg_lim_cp_wall_bnd == 1) then
+              wb_none = .true.
+            else
+              em_o = 0.5 * (dg1_lim_wall_surf(h_pe(i,j,1,b), CS%bed_node(i-1,j-2+b), rr) + &
+                            dg1_lim_wall_surf(h_pe(i,j,2,b), CS%bed_node(i,j-2+b), rr))
+              em_n = 0.5 * (dg1_lim_wall_surf(h_pe(i,j,a,1), CS%bed_node(i-2+a,j-1), rr) + &
+                            dg1_lim_wall_surf(h_pe(i,j,a,2), CS%bed_node(i-2+a,j), rr))
+              u_m = max(em_o, em_n) ; l_m = min(em_o, em_n)
             endif
           endif
         endif
