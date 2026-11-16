@@ -14946,15 +14946,24 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "along the wall, so that a corner on the wall does not rise above both wall edges; 'MEANS' where "//&
                  "the cell next along the wall is not an ice cell inside the domain.  'QUADRATIC': for the cell "//&
                  "and for the cell next along the wall (where it is an ice cell inside the domain), the range of "//&
-                 "its mean surface m0 and of the value at the wall of the even parabola a + c n^2 in the distance "//&
-                 "n from the wall whose means are m0 over the cell, m0 over its mirror image and m1 over the ice "//&
-                 "cell inside it, a = m0 + K (m0 - m1) A/(B - A) with A = d0^2/3 and B = d0^2 + d0 d1 + d1^2/3 for "//&
-                 "the widths d0 and d1 of the two cells normal to the wall (m0 + K (m0 - m1)/6 for equal widths), "//&
-                 "and a = m0 where the inner cell is not an ice cell inside the domain.  The surface is even about "//&
-                 "the wall, so the wall is an extremum normal to it, and the bound lets it rise above or fall "//&
-                 "below the means by the curvature that the inner cell supports.  At a corner of the domain, where "//&
-                 "both faces of the cell are walls or divides, it is the range of m0 and of the wall values on "//&
-                 "both axes, whatever DG1_LIMITER_CORNER_PROJECT_WALL_BOUND_CORNERS is.", &
+                 "its mean surface m0 and of the corner at the wall of the P1 fit over the cell of the even "//&
+                 "parabola a + c n^2 in the distance n from the wall whose means are m0 over the cell, m0 over its "//&
+                 "mirror image and m1 over the ice cell inside it, m0 + K (m0 - m1) (d0^2/2)/(B - A) with "//&
+                 "A = d0^2/3 and B = d0^2 + d0 d1 + d1^2/3 for the widths d0 and d1 of the two cells normal to the "//&
+                 "wall (m0 + K (m0 - m1)/4 for equal widths), and m0 alone where the inner cell is not an ice cell "//&
+                 "inside the domain.  The surface is even about the wall, so the wall is an extremum normal to it, "//&
+                 "and the bound lets it rise above or fall below the means by the curvature that the inner cell "//&
+                 "supports.  "//&
+                 "For the cell itself, m0 and m1 are flat means (DG1_LIMITER_CORNER_PROJECT_FLAT_MEANS), and the "//&
+                 "exact mean of the inner cell takes the place of that of the mirror image, which would read the "//&
+                 "cell's own corners; for the cell next along the wall they are the means its neighbours read.  "//&
+                 "With DG1_LIMITER_CORNER_PROJECT_ENDORSE = ALL, the mirror images are cells at the node for the "//&
+                 "agreement, so the cell's own corner is among the corners that must agree.  Then a state that is "//&
+                 "the same in every row along a wall has the same bounds at the wall as one row inside.  At a "//&
+                 "corner of the domain, where both faces of the cell are walls or divides, the range is that of "//&
+                 "the cell's parabolas on both axes and of the inner cell on each axis as a cell next along the "//&
+                 "other wall, and the corner is never clipped, as all the images are the cell itself; this holds "//&
+                 "whatever DG1_LIMITER_CORNER_PROJECT_WALL_BOUND_CORNERS is.", &
                  default="MEANS", do_not_log=(CS%dg_lim_cp == 0))
   select case (trim(wbd_str))
     case ("MEANS") ; CS%dg_lim_cp_wall_bnd = 0
@@ -14967,8 +14976,8 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   end select
   call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_WALL_QUAD_K", CS%dg_lim_cp_wall_quad_k, &
                  "The factor K of the curvature allowance of DG1_LIMITER_CORNER_PROJECT_WALL_BOUND = QUADRATIC: "//&
-                 "1 is the even parabola through the means; a larger K leaves more room above or below the means "//&
-                 "at the wall.", units="nondim", default=1.0, do_not_log=(CS%dg_lim_cp_wall_bnd /= 3))
+                 "1 is the P1 corner of the even parabola through the means; a larger K leaves more room above or "//&
+                 "below the means at the wall.", units="nondim", default=1.0, do_not_log=(CS%dg_lim_cp_wall_bnd /= 3))
   call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_WALL_BOUND_CORNERS", CS%dg_lim_cp_wall_bnd_c, &
                  "If true, DG1_LIMITER_CORNER_PROJECT_WALL_BOUND also acts at a corner of the domain, where both "//&
                  "faces of the cell at the corner are walls or divides: EDGE_TRACE takes the range of the mean "//&
@@ -19928,20 +19937,22 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
               wb_none = .true.
             elseif (CS%dg_lim_cp_wall_bnd == 3) then
               ! QUADRATIC: the cell and the cell next along the wall, each with its parabola normal to the wall.
+              ! The cell's own column reads flat means (sbp) for its parabola and the exact mean (sbn) of its inner
+              ! cell in place of the exact mean of its mirror image, which would read the cell's own corners.
               u_m = -huge(1.0) ; l_m = huge(1.0)
               if (w_y) then
-                call dg1_lim_wall_quad(G, hmask, in_dom, sbp(i,j), sbn, i, j, 2, 2*b-3, &
+                call dg1_lim_wall_quad(G, hmask, in_dom, sbp(i,j), sbp, sbn, .true., i, j, 2, 2*b-3, &
                                        CS%dg_lim_cp_wall_quad_k, u_m, l_m)
                 i_w = i+2*a-3
                 if (in_dom(i_w,j) .and. ((hmask(i_w,j) == 1.0) .or. (hmask(i_w,j) == 3.0))) &
-                  call dg1_lim_wall_quad(G, hmask, in_dom, sbn(i_w,j), sbn, i_w, j, 2, 2*b-3, &
+                  call dg1_lim_wall_quad(G, hmask, in_dom, sbn(i_w,j), sbn, sbn, .false., i_w, j, 2, 2*b-3, &
                                          CS%dg_lim_cp_wall_quad_k, u_m, l_m)
               else
-                call dg1_lim_wall_quad(G, hmask, in_dom, sbp(i,j), sbn, i, j, 1, 2*a-3, &
+                call dg1_lim_wall_quad(G, hmask, in_dom, sbp(i,j), sbp, sbn, .true., i, j, 1, 2*a-3, &
                                        CS%dg_lim_cp_wall_quad_k, u_m, l_m)
                 j_w = j+2*b-3
                 if (in_dom(i,j_w) .and. ((hmask(i,j_w) == 1.0) .or. (hmask(i,j_w) == 3.0))) &
-                  call dg1_lim_wall_quad(G, hmask, in_dom, sbn(i,j_w), sbn, i, j_w, 1, 2*a-3, &
+                  call dg1_lim_wall_quad(G, hmask, in_dom, sbn(i,j_w), sbn, sbn, .false., i, j_w, 1, 2*a-3, &
                                          CS%dg_lim_cp_wall_quad_k, u_m, l_m)
               endif
             else
@@ -19966,12 +19977,21 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
               endif
             endif
           elseif (w_x .and. w_y .and. (CS%dg_lim_cp_wall_bnd == 3)) then
-            ! QUADRATIC at a corner of the domain: the cell's own parabolas normal to both walls.
+            ! QUADRATIC at a corner of the domain: the cell's own parabolas normal to both walls, and, in place of
+            ! the mirror image of the cell beyond each wall, the inner cell on the other axis as a cell next along
+            ! that wall, so that a state uniform along one wall has the bounds of the nodes along it.
             u_m = -huge(1.0) ; l_m = huge(1.0)
-            call dg1_lim_wall_quad(G, hmask, in_dom, sbp(i,j), sbn, i, j, 1, 2*a-3, &
+            call dg1_lim_wall_quad(G, hmask, in_dom, sbp(i,j), sbp, sbn, .true., i, j, 1, 2*a-3, &
                                    CS%dg_lim_cp_wall_quad_k, u_m, l_m)
-            call dg1_lim_wall_quad(G, hmask, in_dom, sbp(i,j), sbn, i, j, 2, 2*b-3, &
+            call dg1_lim_wall_quad(G, hmask, in_dom, sbp(i,j), sbp, sbn, .true., i, j, 2, 2*b-3, &
                                    CS%dg_lim_cp_wall_quad_k, u_m, l_m)
+            i_w = i-(2*a-3) ; j_w = j-(2*b-3)
+            if (in_dom(i,j_w) .and. ((hmask(i,j_w) == 1.0) .or. (hmask(i,j_w) == 3.0))) &
+              call dg1_lim_wall_quad(G, hmask, in_dom, sbn(i,j_w), sbn, sbn, .false., i, j_w, 1, 2*a-3, &
+                                     CS%dg_lim_cp_wall_quad_k, u_m, l_m)
+            if (in_dom(i_w,j) .and. ((hmask(i_w,j) == 1.0) .or. (hmask(i_w,j) == 3.0))) &
+              call dg1_lim_wall_quad(G, hmask, in_dom, sbn(i_w,j), sbn, sbn, .false., i_w, j, 2, 2*b-3, &
+                                     CS%dg_lim_cp_wall_quad_k, u_m, l_m)
           elseif (w_x .and. w_y .and. CS%dg_lim_cp_wall_bnd_c) then
             ! DG1_LIMITER_CORNER_PROJECT_WALL_BOUND_CORNERS: a corner of the domain.  The mirror images of the cell
             ! beyond both walls have the same wall edges, so the range is that of the cell's own two wall edges.
@@ -19984,6 +20004,15 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
                             dg1_lim_wall_surf(h_pe(i,j,a,2), CS%bed_node(i-2+a,j), rr))
               u_m = max(em_o, em_n) ; l_m = min(em_o, em_n)
             endif
+          endif
+          ! QUADRATIC with ENDORSE = ALL: the mirror images of the cells at a node on a wall are cells at the node too,
+          ! with the corners of the cells they mirror.  The images of the other cells add nothing; the image of the
+          ! cell itself adds its own corner, so that a wall node agrees as a node inside the domain does where the
+          ! cell across the face has the same corner.  At a corner of the domain, the three images are the cell, so
+          ! the corner is never clipped, as at the nodes along a divide where the cells agree.
+          if ((CS%dg_lim_cp_wall_bnd == 3) .and. CS%dg_lim_cp_all .and. (w_x .or. w_y)) then
+            s_o = max(h_pe(i,j,a,b) - CS%bed_node(i-2+a,j-2+b), (1.0 - rr) * h_pe(i,j,a,b))
+            o_hi = max(o_hi, s_o) ; o_lo = min(o_lo, s_o)
           endif
         endif
         ! DG1_LIMITER_CORNER_PROJECT_ENDORSE = ALL: the bounds widen only as far as every other ice cell agrees.
@@ -22283,15 +22312,20 @@ pure real function dg1_lim_wall_surf(h, d, rr)
 end function dg1_lim_wall_surf
 
 !> DG1_LIMITER_CORNER_PROJECT_WALL_BOUND = QUADRATIC: widen the range [l_m, u_m] by the mean surface s0 of cell
-!! (ic,jc), on a wall normal to axis ax (1 x, 2 y) on side sd (-1 the minus side, +1 the plus side), and by the value
-!! at the wall of the even parabola whose means are s0 over the cell and over its mirror image and sbn over the ice
-!! cell inside it, or by s0 alone where that cell is not an ice cell inside the domain.
-subroutine dg1_lim_wall_quad(G, hmask, in_dom, s0, sbn, ic, jc, ax, sd, kq, u_m, l_m)
+!! (ic,jc), on a wall normal to axis ax (1 x, 2 y) on side sd (-1 the minus side, +1 the plus side), and by the P1
+!! corner at the wall of the even parabola whose means are s0 over the cell and over its mirror image and s_par over
+!! the ice cell inside it; with add_ex, also by s_ex of that inner cell.  Where the inner cell is not an ice cell
+!! inside the domain, by s0 alone.
+subroutine dg1_lim_wall_quad(G, hmask, in_dom, s0, s_par, s_ex, add_ex, ic, jc, ax, sd, kq, u_m, l_m)
   type(ocean_grid_type), intent(in) :: G   !< The grid structure
   real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
   logical, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: in_dom !< The cell lies inside the domain
   real,    intent(in) :: s0  !< The mean surface of the cell [Z ~> m]
-  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: sbn !< The mean surfaces of the other cells [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: s_par !< The mean surfaces the parabola reads for the inner
+                                                          !! cell, of the same kind as s0 [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: s_ex  !< The mean surfaces added to the range for the inner
+                                                          !! cell with add_ex [Z ~> m]
+  logical, intent(in) :: add_ex !< Add s_ex of the inner cell to the range
   integer, intent(in) :: ic  !< The i-index of the cell
   integer, intent(in) :: jc  !< The j-index of the cell
   integer, intent(in) :: ax  !< The axis normal to the wall, 1 x, 2 y
@@ -22309,16 +22343,18 @@ subroutine dg1_lim_wall_quad(G, hmask, in_dom, s0, sbn, ic, jc, ax, sd, kq, u_m,
   if ((ii >= G%isd) .and. (ii <= G%ied) .and. (jj >= G%jsd) .and. (jj <= G%jed)) then
     if (in_dom(ii,jj) .and. ((hmask(ii,jj) == 1.0) .or. (hmask(ii,jj) == 3.0))) then
       if (ax == 1) then ; d0 = G%dxT(ic,jc) ; d1 = G%dxT(ii,jj) ; else ; d0 = G%dyT(ic,jc) ; d1 = G%dyT(ii,jj) ; endif
-      if ((d0 > 0.0) .and. (d1 > 0.0)) s_w = dg1_lim_wall_parab(s0, sbn(ii,jj), d0, d1, kq)
+      if ((d0 > 0.0) .and. (d1 > 0.0)) s_w = dg1_lim_wall_parab(s0, s_par(ii,jj), d0, d1, kq)
+      if (add_ex) then ; u_m = max(u_m, s_ex(ii,jj)) ; l_m = min(l_m, s_ex(ii,jj)) ; endif
     endif
   endif
   u_m = max(u_m, max(s0, s_w)) ; l_m = min(l_m, min(s0, s_w))
 end subroutine dg1_lim_wall_quad
 
-!> DG1_LIMITER_CORNER_PROJECT_WALL_BOUND = QUADRATIC: the value at the wall, n = 0, of the even parabola a + c n^2
-!! whose mean is m0 over the cell next to the wall, 0 < n < d0 (and over its mirror image), and m1 over the cell
-!! inside it, d0 < n < d0 + d1, with the curvature term scaled by kq: m0 + kq (m0 - m1) A/(B - A), A = d0^2/3,
-!! B = d0^2 + d0 d1 + d1^2/3.
+!> DG1_LIMITER_CORNER_PROJECT_WALL_BOUND = QUADRATIC: the corner at the wall, n = 0, of the P1 (least-squares linear)
+!! fit over the cell next to the wall, 0 < n < d0, of the even parabola a + c n^2 whose mean is m0 over that cell (and
+!! over its mirror image) and m1 over the cell inside it, d0 < n < d0 + d1, with the curvature term scaled by kq:
+!! m0 + kq (m0 - m1) (d0^2/2)/(B - A), A = d0^2/3, B = d0^2 + d0 d1 + d1^2/3.  The P1 corner lies beyond the value of
+!! the parabola at the wall, a = m0 + (m0 - m1) A/(B - A), by half of a - m0: on equal widths m0 + kq (m0 - m1)/4.
 pure real function dg1_lim_wall_parab(m0, m1, d0, d1, kq)
   real, intent(in) :: m0 !< The mean over the cell next to the wall [Z ~> m]
   real, intent(in) :: m1 !< The mean over the cell inside it [Z ~> m]
@@ -22326,10 +22362,10 @@ pure real function dg1_lim_wall_parab(m0, m1, d0, d1, kq)
   real, intent(in) :: d1 !< The width of the cell inside it [L ~> m]
   real, intent(in) :: kq !< The factor of the curvature term [nondim]
   real :: q0, q1 ! The widths as fractions of their sum [nondim]
-  real :: r      ! A/(B - A) [nondim]
+  real :: r      ! (d0^2/2)/(B - A) [nondim]
 
   q0 = d0 / (d0 + d1) ; q1 = d1 / (d0 + d1)
-  r = (q0 * q0) / ((2.0 * (q0 * q0) + 3.0 * (q0 * q1)) + (q1 * q1))
+  r = (1.5 * (q0 * q0)) / ((2.0 * (q0 * q0) + 3.0 * (q0 * q1)) + (q1 * q1))
   dg1_lim_wall_parab = m0 + kq * (r * (m0 - m1))
 end function dg1_lim_wall_parab
 
