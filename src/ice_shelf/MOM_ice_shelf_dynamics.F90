@@ -892,6 +892,8 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! the cells beyond the domain keep their own values in the range of the means.
   logical :: dg_lim_cp_face_cl_crs = .true. !< DG1_LIMITER_CORNER_PROJECT_FACE_CURV_LIMIT_CROSSED: the limited
                                   !! second difference also in the crossed cells.
+  logical :: dg_lim_cp_face_pt_means = .false. !< DG1_LIMITER_CORNER_PROJECT_FACE_POINT_SURFACE = MEANS: the points
+                                    !! of the face bounds carry the cell surfaces of the vertex bounds.
   integer :: dg_lim_cp_vert_ffl = 0 !< DG1_LIMITER_CORNER_PROJECT_VERTEX_FLOAT_FLOOR: 0 off, 1 FLOTATION,
                                     !! 2 FLOAT_BRANCH.
   integer :: dg_lim_cp_face_ffl = 0 !< DG1_LIMITER_CORNER_PROJECT_FACE_FLOAT_FLOOR: 0 off, 1 FLOTATION, 2 FLOAT_BRANCH.
@@ -13649,6 +13651,7 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   character(len=40) :: twm_str      ! DG1_LIMITER_TWIST_MOMENT
   character(len=40) :: ffl_str      ! DG1_LIMITER_CORNER_PROJECT_FACE_FLOAT_FLOOR
   character(len=40) :: vfl_str      ! DG1_LIMITER_CORNER_PROJECT_VERTEX_FLOAT_FLOOR
+  character(len=40) :: fps_str      ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT_SURFACE
   character(len=40) :: cpf_str, jsc_str, vtx_str, wbd_str ! DG1_LIMITER_CORNER_PROJECT_FACE
   character(len=16) :: share_str    ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARE
   character(len=16) :: br_rule      ! DG1_LIMITER_BRANCH_RULE
@@ -15097,6 +15100,22 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   if ((CS%dg_lim_cp_face_ffl > 0) .and. (.not.CS%dg_lim_cp_face_pt)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT_FACE_FLOAT_FLOOR needs "//&
       "DG1_LIMITER_CORNER_PROJECT_FACE_POINT.")
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FACE_POINT_SURFACE", fps_str, &
+                 "The surface that the cell points of DG1_LIMITER_CORNER_PROJECT_FACE_POINT carry.  'CENTRE': the "//&
+                 "surface max(h - D, (1 - r) h) at the cell-mean thickness and bed.  Across a crossed cell the "//&
+                 "surface is the larger of two linear branches, so this lies below every surface the cell can have "//&
+                 "on average, and on a steep bed the face bounds of a crossed cell can exclude its mean.  'MEANS': "//&
+                 "the cell surfaces of the vertex bounds, the cell's own from its own term and the cells across "//&
+                 "from theirs (DG1_LIMITER_CORNER_PROJECT_EXACT_MEANS, _FLAT_MEANS and _FLAT_MEANS_OWN), each as "//&
+                 "the thickness that has that surface on the cell-mean bed.  In a cell on one branch the two are "//&
+                 "the same.  A cell beyond the domain keeps its extended centre point.", &
+                 default="CENTRE", do_not_log=(.not.CS%dg_lim_cp_face_pt))
+  select case (trim(fps_str))
+    case ("CENTRE") ; CS%dg_lim_cp_face_pt_means = .false.
+    case ("MEANS") ; CS%dg_lim_cp_face_pt_means = .true.
+    case default ; call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: "//&
+          "DG1_LIMITER_CORNER_PROJECT_FACE_POINT_SURFACE must be CENTRE or MEANS, not "//trim(fps_str)//".")
+  end select
   call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_VERTEX_FLOAT_FLOOR", vfl_str, &
                  "The lower vertex bound of DG1_LIMITER_CORNER_PROJECT at a corner where one of the ice cells at "//&
                  "the node has a floating mean (rr h < D for the cell-mean thickness and bed).  The bound is a "//&
@@ -18899,6 +18918,9 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   real, dimension(SZDI_(G),SZDJ_(G)) :: hpt, hpt_f ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT: the thickness at the
                                               ! centre of a cell (its cell mean, 0 in a cell without ice), as
                                               ! sbar and sbar_f [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: hfp, hqo_f, hqn_f ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT: the centre
+                                    ! thicknesses that the face bounds read, and with _SURFACE = MEANS those of the
+                                    ! cell's own and of the other cells' surfaces [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G)) :: dpt, dpt_f ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT: the bed at the centre
                                               ! of a cell, as sbar and sbar_f [Z ~> m]
   logical, dimension(SZDI_(G),SZDJ_(G)) :: have_p, have_q ! hpt and dpt are set
@@ -20203,6 +20225,18 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
         "of at least 2 cells.")
     allocate(sbn(isd:ied,jsd:jed)) ; sbn(:,:) = sbp(:,:)
     if (CS%dg_lim_cp_flat .and. CS%dg_lim_cp_flat_own) sbn(:,:) = sbar(:,:)
+    ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT_SURFACE: the centre thicknesses of the face bounds.
+    hfp(:,:) = hpt_f(:,:)
+    if (CS%dg_lim_cp_face_pt_means) then
+      hqo_f(:,:) = hpt_f(:,:) ; hqn_f(:,:) = hpt_f(:,:)
+      do j = jsd+1, jed ; do i = isd+1, ied
+        if (.not.in_dom(i,j)) cycle
+        if ((hmask(i,j) /= 1.0) .and. (hmask(i,j) /= 3.0)) cycle
+        hqo_f(i,j) = dg1_lim_h_from_s(sbp(i,j), dpt_f(i,j), rr)
+        hqn_f(i,j) = dg1_lim_h_from_s(sbn(i,j), dpt_f(i,j), rr)
+      enddo ; enddo
+      hfp(:,:) = hqn_f(:,:)
+    endif
     if (CS%dg_lim_cp_curv) then
       ! DG1_LIMITER_CORNER_PROJECT_ENDORSE = CURVATURE: the cell each cell of the stencils reads.
       if ((isc - isd < 3) .or. (jsc - jsd < 3)) call MOM_error(FATAL, "MOM_ice_shelf_dynamics, "//&
@@ -20532,39 +20566,41 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
         ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT: the bounds from point values of the two branch surfaces, each
         ! with the second difference of its own centre values along the axis.
         ca_x = 0.0 ; cb_x = 0.0 ; ca_y = 0.0 ; cb_y = 0.0
+        ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT_SURFACE = MEANS: the cell reads its own surface for itself.
+        if (CS%dg_lim_cp_face_pt_means) hfp(i,j) = hqo_f(i,j)
         if (f_use(i-1,j) .and. f_use(i+1,j)) then
           if (CS%dg_lim_cp_face_cw) then
-            ca_x = CS%dg_lim_face_curv * abs(dg1_lim_d2w(hpt_f(i-1,j) - dpt_f(i-1,j), hpt_f(i,j) - dpt_f(i,j), &
-                                         hpt_f(i+1,j) - dpt_f(i+1,j), fw_xm, G%dxT(i,j), fw_xp))
+            ca_x = CS%dg_lim_face_curv * abs(dg1_lim_d2w(hfp(i-1,j) - dpt_f(i-1,j), hfp(i,j) - dpt_f(i,j), &
+                                         hfp(i+1,j) - dpt_f(i+1,j), fw_xm, G%dxT(i,j), fw_xp))
             cb_x = CS%dg_lim_face_curv * (1.0 - rr) * &
-                   abs(dg1_lim_d2w(hpt_f(i-1,j), hpt_f(i,j), hpt_f(i+1,j), fw_xm, G%dxT(i,j), fw_xp))
+                   abs(dg1_lim_d2w(hfp(i-1,j), hfp(i,j), hfp(i+1,j), fw_xm, G%dxT(i,j), fw_xp))
           else
-            ca_x = CS%dg_lim_face_curv * abs(((hpt_f(i-1,j) - dpt_f(i-1,j)) + (hpt_f(i+1,j) - dpt_f(i+1,j))) - &
-                                             2.0*(hpt_f(i,j) - dpt_f(i,j)))
-            cb_x = CS%dg_lim_face_curv * (1.0 - rr) * abs((hpt_f(i-1,j) + hpt_f(i+1,j)) - 2.0*hpt_f(i,j))
+            ca_x = CS%dg_lim_face_curv * abs(((hfp(i-1,j) - dpt_f(i-1,j)) + (hfp(i+1,j) - dpt_f(i+1,j))) - &
+                                             2.0*(hfp(i,j) - dpt_f(i,j)))
+            cb_x = CS%dg_lim_face_curv * (1.0 - rr) * abs((hfp(i-1,j) + hfp(i+1,j)) - 2.0*hfp(i,j))
           endif
         endif
         if (f_use(i,j-1) .and. f_use(i,j+1)) then
           if (CS%dg_lim_cp_face_cw) then
-            ca_y = CS%dg_lim_face_curv * abs(dg1_lim_d2w(hpt_f(i,j-1) - dpt_f(i,j-1), hpt_f(i,j) - dpt_f(i,j), &
-                                         hpt_f(i,j+1) - dpt_f(i,j+1), fw_ym, G%dyT(i,j), fw_yp))
+            ca_y = CS%dg_lim_face_curv * abs(dg1_lim_d2w(hfp(i,j-1) - dpt_f(i,j-1), hfp(i,j) - dpt_f(i,j), &
+                                         hfp(i,j+1) - dpt_f(i,j+1), fw_ym, G%dyT(i,j), fw_yp))
             cb_y = CS%dg_lim_face_curv * (1.0 - rr) * &
-                   abs(dg1_lim_d2w(hpt_f(i,j-1), hpt_f(i,j), hpt_f(i,j+1), fw_ym, G%dyT(i,j), fw_yp))
+                   abs(dg1_lim_d2w(hfp(i,j-1), hfp(i,j), hfp(i,j+1), fw_ym, G%dyT(i,j), fw_yp))
           else
-            ca_y = CS%dg_lim_face_curv * abs(((hpt_f(i,j-1) - dpt_f(i,j-1)) + (hpt_f(i,j+1) - dpt_f(i,j+1))) - &
-                                             2.0*(hpt_f(i,j) - dpt_f(i,j)))
-            cb_y = CS%dg_lim_face_curv * (1.0 - rr) * abs((hpt_f(i,j-1) + hpt_f(i,j+1)) - 2.0*hpt_f(i,j))
+            ca_y = CS%dg_lim_face_curv * abs(((hfp(i,j-1) - dpt_f(i,j-1)) + (hfp(i,j+1) - dpt_f(i,j+1))) - &
+                                             2.0*(hfp(i,j) - dpt_f(i,j)))
+            cb_y = CS%dg_lim_face_curv * (1.0 - rr) * abs((hfp(i,j-1) + hfp(i,j+1)) - 2.0*hfp(i,j))
           endif
         endif
         if (fl_use) then
           ! DG1_LIMITER_CORNER_PROJECT_FACE_CURV_LIMIT: the limited second differences of a and of h.
           do kf = 1, 5
-            fl_v(kf,1) = hpt_f(i+kf-3,j) - dpt_f(i+kf-3,j) ; fl_v(kf,2) = hpt_f(i,j+kf-3) - dpt_f(i,j+kf-3)
+            fl_v(kf,1) = hfp(i+kf-3,j) - dpt_f(i+kf-3,j) ; fl_v(kf,2) = hfp(i,j+kf-3) - dpt_f(i,j+kf-3)
           enddo
           ca_x = CS%dg_lim_face_curv * dg1_lim_face_d2lim(fl_v(:,1), fl_ok(:,1), fl_w(:,1), CS%dg_lim_cp_face_cw)
           ca_y = CS%dg_lim_face_curv * dg1_lim_face_d2lim(fl_v(:,2), fl_ok(:,2), fl_w(:,2), CS%dg_lim_cp_face_cw)
           do kf = 1, 5
-            fl_v(kf,1) = hpt_f(i+kf-3,j) ; fl_v(kf,2) = hpt_f(i,j+kf-3)
+            fl_v(kf,1) = hfp(i+kf-3,j) ; fl_v(kf,2) = hfp(i,j+kf-3)
           enddo
           cb_x = CS%dg_lim_face_curv * (1.0 - rr) * &
                  dg1_lim_face_d2lim(fl_v(:,1), fl_ok(:,1), fl_w(:,1), CS%dg_lim_cp_face_cw)
@@ -20576,13 +20612,14 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
         cf_ice(:) = (/ f_ice(i-1,j), f_ice(i+1,j), f_ice(i,j-1), f_ice(i,j+1) /)
         if (CS%dg_lim_cp_face_wfree) then ; where (cf_wl(:)) cf_use(:) = .false. ; endif
         if (.not.CS%dg_lim_cp_face_trace) cf_ice(:) = .false.
-        cf_hc(:) = (/ hpt_f(i-1,j), hpt_f(i+1,j), hpt_f(i,j-1), hpt_f(i,j+1) /)
+        cf_hc(:) = (/ hfp(i-1,j), hfp(i+1,j), hfp(i,j-1), hfp(i,j+1) /)
         cf_dc(:) = (/ dpt_f(i-1,j), dpt_f(i+1,j), dpt_f(i,j-1), dpt_f(i,j+1) /)
         cf_ht(:) = (/ trh(i-1,j,2), trh(i+1,j,1), trh(i,j-1,4), trh(i,j+1,3) /)
-        call dg1_lim_cp_face_bounds_pt(CS%h_nodal(i,j,:,:), cp_d, rr, hpt_f(i,j), dpt_f(i,j), cf_ca, cf_cb, &
+        call dg1_lim_cp_face_bounds_pt(CS%h_nodal(i,j,:,:), cp_d, rr, hfp(i,j), dpt_f(i,j), cf_ca, cf_cb, &
                                        CS%dg_lim_cp_face_pt_d0, cf_use, cf_ice, cf_hc, cf_dc, cf_ht, &
                                        cf_lo, cf_hi, cf_n, feas=CS%dg_lim_cp_face_pt_feas, &
                                        all=CS%dg_lim_cp_face_all, ffl=CS%dg_lim_cp_face_ffl)
+        if (CS%dg_lim_cp_face_pt_means) hfp(i,j) = hqn_f(i,j)
       elseif (cpf) then
         al_x = CS%dg_lim_d0 ; al_y = CS%dg_lim_d0
         ! DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS: the floor of the allowance is set at each face, from its corners.
