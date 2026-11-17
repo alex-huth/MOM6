@@ -744,6 +744,9 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! toward one shared value at nodes where the corners straddle flotation.
   real :: dg_gl_shared_h_reach = 1.0 !< DG1_GL_SHARED_H: the blend starts where the corner nearest flotation is
                                   !! within this many jumps (largest minus smallest corner) of it [nondim].
+  logical :: dg_taud_face_path = .false. !< DG1_TAUD_FACE_PATH: the interior-face term of the driving stress is
+                                  !! the integral of h ds along the straight path between the two traces, with the
+                                  !! face split where a flotation test changes along it.
   logical :: dg_gl_shared_flot = .false. !< If true, the flotation tests of the velocity solve read the corners
                                   !! of DG1_GL_SHARED_H (h_flot), while every thickness it multiplies by stays
                                   !! the transported one.
@@ -871,6 +874,29 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! surfaces, as thickness bounds.
   real :: dg_lim_cp_face_pt_d0    !< DG1_LIMITER_CORNER_PROJECT_FACE_POINT_D0: the tolerance of those bounds
                                   !! [Z ~> m], a thickness.
+  logical :: dg_lim_cp_face_trace = .true. !< DG1_LIMITER_CORNER_PROJECT_FACE_TRACE: the face bounds of
+                                  !! DG1_LIMITER_CORNER_PROJECT_FACE also read the surface of the cell across at
+                                  !! the middle of the face; if false, the cell means only (Cockburn and Shu).
+  logical :: dg_lim_cp_face_wfree = .false. !< DG1_LIMITER_CORNER_PROJECT_FACE_WALL_FREE: a face on a wall or a
+                                  !! divide sets no face bound.
+  logical :: dg_lim_cp_face_cw = .false. !< DG1_LIMITER_CORNER_PROJECT_FACE_CURV_WIDTHS: the second differences
+                                  !! of the face allowances are weighted by the cell widths.
+  logical :: dg_lim_cp_face_cl = .false. !< DG1_LIMITER_CORNER_PROJECT_FACE_CURV_LIMIT: the face allowances take
+                                  !! the limited second difference (the same sign over three cells, else 0).
+  logical :: dg_lim_cp_cross_glo = .false. !< DG1_LIMITER_CORNER_PROJECT_CROSSED_GROUNDED_LOWER: the grounded corners
+                                  !! of a crossed cell keep their lower bound; only its floating corners have none.
+  integer :: dg_lim_twist = 0     !< DG1_LIMITER_TWIST_MOMENT: 0 off, 1 every ice cell, 2 not the crossed cells.
+  logical :: dg_lim_cp_face_all = .false. !< DG1_LIMITER_CORNER_PROJECT_FACE_ALL: every face of a cell, also one in
+                                  !! its bounds, gives its two corners the room it has left.
+  logical :: dg_lim_cp_curv_wext = .false. !< DG1_LIMITER_CORNER_PROJECT_CURV_WALL_EXTRAP: with ENDORSE = CURVATURE,
+                                  !! the cells beyond the domain keep their own values in the range of the means.
+  logical :: dg_lim_cp_face_cl_crs = .true. !< DG1_LIMITER_CORNER_PROJECT_FACE_CURV_LIMIT_CROSSED: the limited
+                                  !! second difference also in the crossed cells.
+  integer :: dg_lim_cp_vert_ffl = 0 !< DG1_LIMITER_CORNER_PROJECT_VERTEX_FLOAT_FLOOR: 0 off, 1 FLOTATION,
+                                    !! 2 FLOAT_BRANCH.
+  integer :: dg_lim_cp_face_ffl = 0 !< DG1_LIMITER_CORNER_PROJECT_FACE_FLOAT_FLOOR: 0 off, 1 FLOTATION, 2 FLOAT_BRANCH.
+  logical :: dg_lim_cp_face_pt_feas = .false. !< DG1_LIMITER_CORNER_PROJECT_FACE_POINT_FEASIBLE: the bounds of two
+                                  !! opposite faces are made feasible with the cell mean by the least change.
   logical :: dg_lim_cp_d0_thick = .false. !< DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS: the fixed tolerance of
                                   !! DG1_LIMITER_CORNER_PROJECT (its vertex and face bounds and
                                   !! DG1_LIMITER_BACKWARD_EDGE) is a thickness on both branches.
@@ -887,6 +913,18 @@ type, public :: ice_shelf_dyn_CS ; private
                                   !! on/off tests, in every ice cell of the projection, crossed cells too.
   logical :: dg_lim_cp_all = .false. !< DG1_LIMITER_CORNER_PROJECT_ENDORSE = ALL: the corners of the other ice
                                   !! cells at a node widen the bounds of a corner only as far as all of them agree.
+  logical :: dg_lim_cp_none = .false. !< DG1_LIMITER_CORNER_PROJECT_ENDORSE = NONE: no corner of another cell
+                                  !! widens the bounds.
+  logical :: dg_lim_cp_curv = .false. !< DG1_LIMITER_CORNER_PROJECT_ENDORSE = CURVATURE: no corner of another cell
+                                  !! widens the bounds; the corner of a smooth quadratic fit to the means at the
+                                  !! node does, with the limited curvatures of the means.
+  real :: dg_lim_cp_curv_c = 1.25 !< DG1_LIMITER_CORNER_PROJECT_CURV_C: the factor C of the smallest second
+                                  !! difference in the limited curvature of ENDORSE = CURVATURE [nondim]
+  logical :: dg_lim_cp_curv_all = .false. !< DG1_LIMITER_CORNER_PROJECT_CURV_ENDORSE_ALL (testing): with
+                                  !! ENDORSE = CURVATURE, the bounds also widen as far as all other ice cells agree.
+  logical :: dg_lim_cp_curv_wall = .false. !< DG1_LIMITER_CORNER_PROJECT_CURV_WALL_ALL (testing): with
+                                  !! ENDORSE = CURVATURE, a corner on a wall or a divide takes the agreement of
+                                  !! ENDORSE = ALL in place of the allowance.
   integer :: dg_lim_cp_face = 0   !< DG1_LIMITER_CORNER_PROJECT_FACE: 0 off, 1 the face bounds of
                                   !! DG1_LIMITER_FACE_BOUNDS hold the crossed cells in the projection, 2 every ice cell.
   logical :: dg_lim_crossed_float !< If true, with dg_lim_crossed and dg_lim_face, a floating corner of a crossed
@@ -12300,7 +12338,7 @@ end subroutine add_Neumann_face_DG
 subroutine add_taud_edge_correction_DG(face_length, face_sign, &
     h_loc_A, h_loc_B, h_ngh_A, h_ngh_B, b_corner_A, b_corner_B, &
     rho, rhoi_rhow, grav, min_h_shelf, &
-    xquad, face_A, face_B, use_flot, hf4)
+    xquad, face_A, face_B, use_flot, hf4, path)
   real, intent(in)    :: face_length      !< Face length [L ~> m]
   real, intent(in)    :: face_sign        !< +1 or -1, outward unit-normal component [nondim]
   real, intent(in)    :: h_loc_A          !< Local-cell h_nodal at face endpoint A [Z ~> m]
@@ -12319,51 +12357,163 @@ subroutine add_taud_edge_correction_DG(face_length, face_sign, &
   logical, intent(in) :: use_flot         !< DG1_GL_SHARED_FLOTATION: s = (1 - r) h + max(r h_f - b, 0)
   real, dimension(4), intent(in) :: hf4   !< The blended corners h_f of use_flot, local A and B, then
                                           !! neighbour A and B [Z ~> m]
+  logical, optional,  intent(in) :: path  !< DG1_TAUD_FACE_PATH: the straight-path integral of h ds, with the face
+                                          !! split where a flotation test changes along it
 
   real :: hL_A, hL_B, hN_A, hN_B, b_A, b_B
   real :: hf_loc, hf_ngh ! The blended thicknesses at the face point, clamped [Z ~> m]
   real :: t_face, h_loc, h_ngh, b_loc
   real :: s_loc, s_ngh, h_avg, jump_factor
   real :: phi_A, phi_B
+  real :: gL_A, gL_B, gN_A, gN_B ! r h_t - D of the two sides at the two ends, h_t the flotation thickness [Z ~> m]
+  real, dimension(2) :: ub ! Points along the face where a flotation test changes, as u = t - 1/2 [nondim]
+  real, dimension(12) :: uq, wq ! Gauss points (as u) and weights of all the pieces [nondim]
+  real, dimension(12) :: cq_A, cq_B ! Their contributions to the two corners [Z2 ~> m2]
+  real :: u0, u1, um, hw ! The ends, the middle and the half length of a piece [nondim]
+  real :: tot_A, tot_B ! The sums of the contributions [Z2 ~> m2]
+  real :: ht_loc, ht_ngh ! The flotation thicknesses of the two sides at a point [Z ~> m]
+  real :: f_path       ! The integral of h ds along the path at a point [Z2 ~> m2]
   integer :: gp_face
+  integer :: nb, nq, ip, kp
+  logical :: do_path, same
+  logical :: mix       ! The two sides lie on opposite sides of flotation at an end of the face
 
   hL_A = max(h_loc_A, min_h_shelf) ; hL_B = max(h_loc_B, min_h_shelf)
   hN_A = max(h_ngh_A, min_h_shelf) ; hN_B = max(h_ngh_B, min_h_shelf)
   b_A = b_corner_A ; b_B = b_corner_B
 
-  do gp_face = 1, 2
-    t_face = xquad(gp_face)
-    h_loc = ((1.0 - t_face)*hL_A) + (t_face*hL_B)
-    h_ngh = ((1.0 - t_face)*hN_A) + (t_face*hN_B)
-    b_loc = ((1.0 - t_face)*b_A) + (t_face*b_B)
-
+  ! DG1_TAUD_FACE_PATH: the points along the face where the flotation test of either side changes, from the
+  ! unclamped linear traces.  Where the two sides have the same flotation thickness, the flotation part of s has no
+  ! jump and the default rule is exact, so no point is kept.
+  do_path = .false. ; if (present(path)) do_path = path
+  nb = 0 ; mix = .false.
+  if (do_path) then
     if (use_flot) then
-      hf_loc = max(((1.0 - t_face)*hf4(1)) + (t_face*hf4(2)), min_h_shelf)
-      hf_ngh = max(((1.0 - t_face)*hf4(3)) + (t_face*hf4(4)), min_h_shelf)
-      s_loc = ((1.0 - rhoi_rhow) * h_loc) + max((rhoi_rhow * hf_loc) - b_loc, 0.0)
-      s_ngh = ((1.0 - rhoi_rhow) * h_ngh) + max((rhoi_rhow * hf_ngh) - b_loc, 0.0)
+      gL_A = rhoi_rhow * hf4(1) - b_A ; gL_B = rhoi_rhow * hf4(2) - b_B
+      gN_A = rhoi_rhow * hf4(3) - b_A ; gN_B = rhoi_rhow * hf4(4) - b_B
+      same = (hf4(1) == hf4(3)) .and. (hf4(2) == hf4(4))
     else
-      if (rhoi_rhow * h_loc - b_loc > 0.0) then
-        s_loc = h_loc - b_loc                          ! grounded
-      else
-        s_loc = (1.0 - rhoi_rhow) * h_loc              ! floating
-      endif
-      if (rhoi_rhow * h_ngh - b_loc > 0.0) then
-        s_ngh = h_ngh - b_loc                          ! grounded
-      else
-        s_ngh = (1.0 - rhoi_rhow) * h_ngh              ! floating
-      endif
+      gL_A = rhoi_rhow * hL_A - b_A ; gL_B = rhoi_rhow * hL_B - b_B
+      gN_A = rhoi_rhow * hN_A - b_A ; gN_B = rhoi_rhow * hN_B - b_B
+      same = (hL_A == hN_A) .and. (hL_B == hN_B)
     endif
+    if (.not.same) then
+      ! As u = t - 1/2, so that the face seen from its other end gives the same numbers with u -> -u.
+      if ((gL_A > 0.0) .neqv. (gL_B > 0.0)) then ; nb = nb + 1 ; ub(nb) = 0.5 * ((gL_A + gL_B) / (gL_A - gL_B)) ; endif
+      if ((gN_A > 0.0) .neqv. (gN_B > 0.0)) then ; nb = nb + 1 ; ub(nb) = 0.5 * ((gN_A + gN_B) / (gN_A - gN_B)) ; endif
+      if (nb == 2) then ; if (ub(2) < ub(1)) then ; u0 = ub(1) ; ub(1) = ub(2) ; ub(2) = u0 ; endif ; endif
+      mix = ((gL_A > 0.0) .neqv. (gN_A > 0.0)) .or. ((gL_B > 0.0) .neqv. (gN_B > 0.0))
+    endif
+  endif
 
-    h_avg = 0.5 * (h_loc + h_ngh)
-    jump_factor = rho * grav * h_avg * (s_loc - s_ngh)
+  ! The default rule where both sides lie on one side of flotation all along the face: it is then exact.
+  if ((nb == 0) .and. (.not.mix)) then
+    do gp_face = 1, 2
+      t_face = xquad(gp_face)
+      h_loc = ((1.0 - t_face)*hL_A) + (t_face*hL_B)
+      h_ngh = ((1.0 - t_face)*hN_A) + (t_face*hN_B)
+      b_loc = ((1.0 - t_face)*b_A) + (t_face*b_B)
 
-    phi_A = 1.0 - t_face ; phi_B = t_face
-    !0.25 is the Gauss weight times the cell's half share of the inter-cell edge integral
-    face_A = face_A + (face_sign * 0.25 * face_length * phi_A * jump_factor)
-    face_B = face_B + (face_sign * 0.25 * face_length * phi_B * jump_factor)
-  enddo
+      if (use_flot) then
+        hf_loc = max(((1.0 - t_face)*hf4(1)) + (t_face*hf4(2)), min_h_shelf)
+        hf_ngh = max(((1.0 - t_face)*hf4(3)) + (t_face*hf4(4)), min_h_shelf)
+        s_loc = ((1.0 - rhoi_rhow) * h_loc) + max((rhoi_rhow * hf_loc) - b_loc, 0.0)
+        s_ngh = ((1.0 - rhoi_rhow) * h_ngh) + max((rhoi_rhow * hf_ngh) - b_loc, 0.0)
+      else
+        if (rhoi_rhow * h_loc - b_loc > 0.0) then
+          s_loc = h_loc - b_loc                          ! grounded
+        else
+          s_loc = (1.0 - rhoi_rhow) * h_loc              ! floating
+        endif
+        if (rhoi_rhow * h_ngh - b_loc > 0.0) then
+          s_ngh = h_ngh - b_loc                          ! grounded
+        else
+          s_ngh = (1.0 - rhoi_rhow) * h_ngh              ! floating
+        endif
+      endif
+
+      h_avg = 0.5 * (h_loc + h_ngh)
+      jump_factor = rho * grav * h_avg * (s_loc - s_ngh)
+
+      phi_A = 1.0 - t_face ; phi_B = t_face
+      !0.25 is the Gauss weight times the cell's half share of the inter-cell edge integral
+      face_A = face_A + (face_sign * 0.25 * face_length * phi_A * jump_factor)
+      face_B = face_B + (face_sign * 0.25 * face_length * phi_B * jump_factor)
+    enddo
+  else
+    ! The face in pieces between the points; on each, the integrand is a cubic along the face where both sides lie on
+    ! one side of flotation (two Gauss points are exact), and smooth where they lie on opposite sides (four points).
+    ! The points are symmetric about the middle of the face and their contributions are summed in pairs from the two
+    ! ends, so a face reversed by a rotation of the grid gives the same sums.
+    nq = 0
+    do ip = 1, nb + 1
+      u0 = -0.5 ; if (ip > 1) u0 = ub(ip-1)
+      u1 = 0.5 ; if (ip <= nb) u1 = ub(ip)
+      if (u1 <= u0) cycle
+      um = 0.5 * (u0 + u1) ; hw = 0.5 * (u1 - u0)
+      if (((0.5*(gL_A + gL_B) + um*(gL_B - gL_A)) > 0.0) .neqv. ((0.5*(gN_A + gN_B) + um*(gN_B - gN_A)) > 0.0)) then
+        uq(nq+1) = um - hw*0.8611363115940526 ; wq(nq+1) = hw*0.3478548451374538
+        uq(nq+2) = um - hw*0.3399810435848563 ; wq(nq+2) = hw*0.6521451548625461
+        uq(nq+3) = um + hw*0.3399810435848563 ; wq(nq+3) = hw*0.6521451548625461
+        uq(nq+4) = um + hw*0.8611363115940526 ; wq(nq+4) = hw*0.3478548451374538
+        nq = nq + 4
+      else
+        uq(nq+1) = um - hw*0.5773502691896258 ; wq(nq+1) = hw
+        uq(nq+2) = um + hw*0.5773502691896258 ; wq(nq+2) = hw
+        nq = nq + 2
+      endif
+    enddo
+    do kp = 1, nq
+      h_loc = 0.5*(hL_A + hL_B) + uq(kp)*(hL_B - hL_A)
+      h_ngh = 0.5*(hN_A + hN_B) + uq(kp)*(hN_B - hN_A)
+      b_loc = 0.5*(b_A + b_B) + uq(kp)*(b_B - b_A)
+      if (use_flot) then
+        ht_loc = max(0.5*(hf4(1) + hf4(2)) + uq(kp)*(hf4(2) - hf4(1)), min_h_shelf)
+        ht_ngh = max(0.5*(hf4(3) + hf4(4)) + uq(kp)*(hf4(4) - hf4(3)), min_h_shelf)
+      else
+        ht_loc = h_loc ; ht_ngh = h_ngh
+      endif
+      f_path = taud_face_path_integral(h_ngh, h_loc, (rhoi_rhow * ht_ngh) - b_loc, (rhoi_rhow * ht_loc) - b_loc, &
+                                       rhoi_rhow)
+      cq_A(kp) = (wq(kp) * (0.5 - uq(kp))) * f_path
+      cq_B(kp) = (wq(kp) * (0.5 + uq(kp))) * f_path
+    enddo
+    tot_A = 0.0 ; tot_B = 0.0
+    do kp = 1, nq/2
+      tot_A = tot_A + (cq_A(kp) + cq_A(nq+1-kp)) ; tot_B = tot_B + (cq_B(kp) + cq_B(nq+1-kp))
+    enddo
+    ! As 0.25 above: the Gauss weight times the cell's half share of the face integral.
+    face_A = face_A + (face_sign * 0.5 * face_length * (rho * grav * tot_A))
+    face_B = face_B + (face_sign * 0.5 * face_length * (rho * grav * tot_B))
+  endif
 end subroutine add_taud_edge_correction_DG
+
+!> DG1_TAUD_FACE_PATH: the integral of h ds along the straight path from the state (h_n, g_n) of the cell across a face
+!! to the state (h_l, g_l) of the cell, with s = (1 - r) h + max(g, 0), g = r h_t - D, and h and g changing in
+!! proportion along the path.  The part (1 - r) h gives (1 - r)(h_l^2 - h_n^2)/2; the part max(g, 0) gives
+!! (g_l - g_n) times the integral of h over the part of the path where g > 0.  With h_t = h this is the jump of the
+!! net pressure P = h^2/2 - min(r h, D)^2/(2 r) (in units of rho_i g), on either branch or across flotation.
+pure real function taud_face_path_integral(h_n, h_l, g_n, g_l, rr)
+  real, intent(in) :: h_n !< Thickness of the cell across [Z ~> m]
+  real, intent(in) :: h_l !< Thickness of the cell [Z ~> m]
+  real, intent(in) :: g_n !< r h_t - D of the cell across [Z ~> m]
+  real, intent(in) :: g_l !< r h_t - D of the cell [Z ~> m]
+  real, intent(in) :: rr  !< Ice to ocean density ratio [nondim]
+  real :: s_lo, s_hi ! The part of the path where g > 0 [nondim]
+  real :: dh, dg     ! The changes of h and of g along the path [Z ~> m]
+
+  dh = h_l - h_n ; dg = g_l - g_n
+  s_lo = 0.0 ; s_hi = 0.0
+  if ((g_n > 0.0) .and. (g_l > 0.0)) then
+    s_hi = 1.0
+  elseif (g_l > 0.0) then
+    s_lo = g_n / (g_n - g_l) ; s_hi = 1.0
+  elseif (g_n > 0.0) then
+    s_hi = g_n / (g_n - g_l)
+  endif
+  taud_face_path_integral = ((1.0 - rr) * (0.5 * ((h_l*h_l) - (h_n*h_n)))) + &
+                            (dg * ((h_n * (s_hi - s_lo)) + (dh * (0.5 * ((s_hi*s_hi) - (s_lo*s_lo))))))
+end function taud_face_path_integral
 
 !> DG(1) driving stress: the volume integral int phi*(-rho*g*h*grad(s)) dA (2x2 Gauss, or
 !! SEP2/SEP3 sub-element quadrature in grounding-line cells), plus the interior-face jump
@@ -12598,7 +12748,8 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, taudx, taudy)
         CS%h_nodal(i-1,j,2,1), CS%h_nodal(i-1,j,2,2), &
         bed_corners(1,1), bed_corners(1,2), &
         rho, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
-        face_dx_W_A, face_dx_W_B, CS%dg_gl_shared_flot, hf4)
+        face_dx_W_A, face_dx_W_B, CS%dg_gl_shared_flot, hf4, &
+        path=CS%dg_taud_face_path)
     endif
 
     ! East face (n_x = +1).
@@ -12621,7 +12772,8 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, taudx, taudy)
         CS%h_nodal(i+1,j,1,1), CS%h_nodal(i+1,j,1,2), &
         bed_corners(2,1), bed_corners(2,2), &
         rho, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
-        face_dx_E_A, face_dx_E_B, CS%dg_gl_shared_flot, hf4)
+        face_dx_E_A, face_dx_E_B, CS%dg_gl_shared_flot, hf4, &
+        path=CS%dg_taud_face_path)
     endif
 
     ! South face (n_y = -1).
@@ -12644,7 +12796,8 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, taudx, taudy)
         CS%h_nodal(i,j-1,1,2), CS%h_nodal(i,j-1,2,2), &
         bed_corners(1,1), bed_corners(2,1), &
         rho, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
-        face_dy_S_A, face_dy_S_B, CS%dg_gl_shared_flot, hf4)
+        face_dy_S_A, face_dy_S_B, CS%dg_gl_shared_flot, hf4, &
+        path=CS%dg_taud_face_path)
     endif
 
     ! North face (n_y = +1).
@@ -12667,7 +12820,8 @@ subroutine calc_shelf_driving_stress_DG(CS, ISS, G, taudx, taudy)
         CS%h_nodal(i,j+1,1,1), CS%h_nodal(i,j+1,2,1), &
         bed_corners(1,2), bed_corners(2,2), &
         rho, rhoi_rhow, grav, CS%min_h_shelf, xquad, &
-        face_dy_N_A, face_dy_N_B, CS%dg_gl_shared_flot, hf4)
+        face_dy_N_A, face_dy_N_B, CS%dg_gl_shared_flot, hf4, &
+        path=CS%dg_taud_face_path)
     endif
 
     cell_dx_node(1,1) = vol_dx(1,1) + face_dx_W_A
@@ -13492,6 +13646,9 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   character(len=40) :: ccl_str      ! DG1_LIMITER_CROSSED_CORNER_CLIP
   character(len=40) :: cp_str       ! DG1_LIMITER_CORNER_PROJECT
   character(len=40) :: cpe_str      ! DG1_LIMITER_CORNER_PROJECT_ENDORSE
+  character(len=40) :: twm_str      ! DG1_LIMITER_TWIST_MOMENT
+  character(len=40) :: ffl_str      ! DG1_LIMITER_CORNER_PROJECT_FACE_FLOAT_FLOOR
+  character(len=40) :: vfl_str      ! DG1_LIMITER_CORNER_PROJECT_VERTEX_FLOAT_FLOOR
   character(len=40) :: cpf_str, jsc_str, vtx_str, wbd_str ! DG1_LIMITER_CORNER_PROJECT_FACE
   character(len=16) :: share_str    ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARE
   character(len=16) :: br_rule      ! DG1_LIMITER_BRANCH_RULE
@@ -14151,6 +14308,19 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  units="nondim", default=1.0, do_not_log=.not.CS%dg_gl_shared_h)
   if (CS%dg_gl_shared_h .and. (.not.CS%use_DG_thickness)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics: DG1_GL_SHARED_H needs USE_DG_THICKNESS.")
+  call get_param(param_file, mdl, "DG1_TAUD_FACE_PATH", CS%dg_taud_face_path, &
+                 "If true, the interior-face term of the DG(1) driving stress at each face point is "//&
+                 "rho_i g times the integral of h ds along the straight path from the trace of the cell across "//&
+                 "to the trace of the cell, in which h and the thickness of the flotation test change in "//&
+                 "proportion, with s = (1 - r) h + max(r h_t - D, 0) and h_t the thickness of the flotation test "//&
+                 "(the blended corners with DG1_GL_SHARED_FLOTATION, else h itself).  Without "//&
+                 "DG1_GL_SHARED_FLOTATION this is the exact jump of the depth-integrated ice pressure minus the "//&
+                 "ocean pressure, P = rho_i g h^2/2 - rho_w g min(r h, D)^2/2, also where one side is grounded "//&
+                 "and the other floats.  Where both sides lie on one side of flotation it equals the default "//&
+                 "{h}[s].  The face is split where the flotation test of either side changes along it, with two "//&
+                 "Gauss points on each piece and four where the two sides lie on opposite sides of flotation, so "//&
+                 "the kinks are integrated.  A face whose two flotation traces are the same, or with no change "//&
+                 "along it, keeps the default two-point rule.", default=.false.)
   call get_param(param_file, mdl, "DG1_GL_SHARED_FLOTATION", CS%dg_gl_shared_flot, &
                  "If true, every flotation test of the velocity solve (the grounded fraction, the SEP2 "//&
                  "partition or the SEP3 sub-points, and the per-point tests of the friction and the driving "//&
@@ -14676,14 +14846,53 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "surfaces there.  'ANY': up to the largest and down to the smallest of these corners, so that one "//&
                  "other cell that agrees is enough.  'ALL': up to the smallest and down to the largest of them, so "//&
                  "that all the other ice cells at the node must agree; two cells that share an overshoot at a node "//&
-                 "then do not hold each other in bounds.  A continuous state is in the bounds of both.", &
+                 "then do not hold each other in bounds.  A continuous state is in the bounds of both.  "//&
+                 "'CURVATURE': no corner of another cell widens the bounds.  Instead each bound widens to the "//&
+                 "corner A of the bilinear least-squares fit over the cell of a quadratic surface whose means over "//&
+                 "the four cells at the node are their mean surfaces, with limited curvatures on the two axes: "//&
+                 "A = sum of the bilinear weights times the means + Cx Fx + Cy Fy, F = -d0 (d0 + 2 d1)/12 with "//&
+                 "d0 the width of the cell and d1 that of the cell across the node on that axis (on equal "//&
+                 "widths A = the average of the four means - (dx^2/4) Cx - (dy^2/4) Cy).  The fit is exact for "//&
+                 "any quadratic, its cross term too, so the rule does not depend on the alignment of the grid.  The "//&
+                 "limited curvature on an axis is C times the smallest second difference of the means along that "//&
+                 "axis (DG1_LIMITER_CORNER_PROJECT_CURV_C) where the second differences of the two cells at the "//&
+                 "node and of the next cell beyond each, in both rows at the node, all have the same sign, and 0 "//&
+                 "otherwise (Colella and Sekora 2008, McCorquodale and Colella 2011).  Across a wall or a divide "//&
+                 "the cells are the mirror images of those inside; the image of the cell itself has its flat mean "//&
+                 "(DG1_LIMITER_CORNER_PROJECT_FLAT_MEANS), so no bound reads the cell's own corners.  Any "//&
+                 "other cell of the stencil that is not ice sets that curvature to 0.  "//&
+                 "DG1_LIMITER_CORNER_PROJECT_WALL_BOUND "//&
+                 "has no effect.  A continuous state with a kink or a step at an extremum is not in these bounds, "//&
+                 "and is clipped there.  Needs a halo of at least 3 cells.  'NONE': no corner of another cell "//&
+                 "widens the bounds, which are the range of the cell means and the flat corner only.", &
                  default="ANY", do_not_log=(CS%dg_lim_cp == 0))
   select case (trim(cpe_str))
     case ("ANY") ; CS%dg_lim_cp_all = .false.
     case ("ALL") ; CS%dg_lim_cp_all = .true.
-    case default ; call MOM_error(FATAL, "read_DG_params: DG1_LIMITER_CORNER_PROJECT_ENDORSE must be ANY or "//&
-                                  "ALL, not "//trim(cpe_str)//".")
+    case ("CURVATURE") ; CS%dg_lim_cp_all = .false. ; CS%dg_lim_cp_curv = .true.
+    case ("NONE") ; CS%dg_lim_cp_all = .false. ; CS%dg_lim_cp_none = .true.
+    case default ; call MOM_error(FATAL, "read_DG_params: DG1_LIMITER_CORNER_PROJECT_ENDORSE must be ANY, "//&
+                                  "ALL, CURVATURE or NONE, not "//trim(cpe_str)//".")
   end select
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_CURV_WALL_EXTRAP", CS%dg_lim_cp_curv_wext, &
+                 "If true, with DG1_LIMITER_CORNER_PROJECT_ENDORSE = CURVATURE the cells beyond the domain keep, in "//&
+                 "the range of the means of a vertex bound, the values they have without CURVATURE (the linear "//&
+                 "extrapolation of the means, or the mirror image with DG1_LIMITER_CORNER_PROJECT_WALL_MIRROR).  "//&
+                 "If false, CURVATURE reads the mirror image of the cell inside there.", &
+                 default=.false., do_not_log=(.not.CS%dg_lim_cp_curv))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_CURV_C", CS%dg_lim_cp_curv_c, &
+                 "The factor C of the smallest second difference in the limited curvature of "//&
+                 "DG1_LIMITER_CORNER_PROJECT_ENDORSE = CURVATURE.  Colella and Sekora (2008) found their results "//&
+                 "the same for C from 1.25 to 5.", units="nondim", default=1.25, do_not_log=.not.CS%dg_lim_cp_curv)
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_CURV_ENDORSE_ALL", CS%dg_lim_cp_curv_all, &
+                 "Testing: if true, with DG1_LIMITER_CORNER_PROJECT_ENDORSE = CURVATURE the bounds also widen as "//&
+                 "far as all the other ice cells at the node agree, as with ENDORSE = ALL, so a bound is the wider "//&
+                 "of the two.", default=.false., do_not_log=.not.CS%dg_lim_cp_curv)
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_CURV_WALL_ALL", CS%dg_lim_cp_curv_wall, &
+                 "Testing: if true, with DG1_LIMITER_CORNER_PROJECT_ENDORSE = CURVATURE a corner on a wall or a "//&
+                 "divide widens its bounds as far as all the other ice cells at the node agree, as with "//&
+                 "ENDORSE = ALL, in place of the curvature allowance.  Other corners keep the allowance.", &
+                 default=.false., do_not_log=.not.CS%dg_lim_cp_curv)
   call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS", CS%dg_lim_cp_d0_thick, &
                  "If true, the fixed tolerance DG1_LIMITER_D0 of DG1_LIMITER_CORNER_PROJECT is a thickness on "//&
                  "both branches, so grounded, floating and crossed corners take the same tolerance.  Each vertex "//&
@@ -14788,6 +14997,124 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  units="m", default=CS%dg_lim_d0*US%Z_to_m, scale=US%m_to_Z, do_not_log=(.not.CS%dg_lim_cp_face_pt))
   if (CS%dg_lim_cp_face_pt .and. (CS%dg_lim_cp_face_pt_d0 <= 0.0)) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT_FACE_POINT_D0 must be above 0.")
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FACE_TRACE", CS%dg_lim_cp_face_trace, &
+                 "If true, the face bounds of DG1_LIMITER_CORNER_PROJECT_FACE also read the surface (or, with "//&
+                 "DG1_LIMITER_CORNER_PROJECT_FACE_POINT, the thickness) of the ice cell across at the middle of "//&
+                 "the face, so that a continuous state is never cut.  If false, they read the two cell means "//&
+                 "only, as the limiter of Cockburn and Shu (1998) does: the middle of a face must lie between "//&
+                 "the mean of the cell and the mean of the cell across, widened by the allowance, and a "//&
+                 "continuous state with a tilt steeper than the steps of the means is cut.", &
+                 default=.true., do_not_log=(CS%dg_lim_cp_face == 0))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FACE_WALL_FREE", CS%dg_lim_cp_face_wfree, &
+                 "If true, a face of a cell on a wall or a divide (DG1_LIMITER_EDGE_MIRROR) sets no face bound "//&
+                 "of DG1_LIMITER_CORNER_PROJECT_FACE.  The mirror image has the mean of the cell, so its bound "//&
+                 "holds the middle of the wall face within the allowance of the cell mean and the wall-normal "//&
+                 "tilt near the step of the means; the inner face still bounds that tilt.", &
+                 default=.false., do_not_log=(CS%dg_lim_cp_face == 0))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FACE_CURV_WIDTHS", CS%dg_lim_cp_face_cw, &
+                 "If true, the second differences in the allowances of DG1_LIMITER_CORNER_PROJECT_FACE are "//&
+                 "weighted by the cell widths and scaled by the square of the width of the cell, w0^2 "//&
+                 "2((v+ - v0)/d+ + (v- - v0)/d-)/(d+ + d-), with d the distances between the cell centres; on "//&
+                 "cells of equal width this is v+ + v- - 2 v0.  A cell beyond the domain takes the width of the "//&
+                 "cell.", default=.false., do_not_log=(CS%dg_lim_cp_face == 0))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FACE_CURV_LIMIT", CS%dg_lim_cp_face_cl, &
+                 "If true, the second difference in each allowance of DG1_LIMITER_CORNER_PROJECT_FACE is "//&
+                 "the limited one: the smallest magnitude of the second differences at the cell and at the two "//&
+                 "cells next to it along the axis, where all three have one sign, and 0 otherwise (Colella and "//&
+                 "Sekora 2008), so that a zigzag of the cell means does not widen its own bounds.  A second "//&
+                 "difference next to the cell whose cells are not all available is left out of the test.", &
+                 default=.false., do_not_log=(CS%dg_lim_cp_face == 0))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FACE_CURV_LIMIT_CROSSED", CS%dg_lim_cp_face_cl_crs, &
+                 "If true, DG1_LIMITER_CORNER_PROJECT_FACE_CURV_LIMIT acts in the crossed cells of "//&
+                 "DG1_LIMITER_CROSSED too; if false, those cells keep the unlimited second difference in their "//&
+                 "face allowances.", default=.true., do_not_log=(.not.CS%dg_lim_cp_face_cl))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_CROSSED_GROUNDED_LOWER", CS%dg_lim_cp_cross_glo, &
+                 "If true, in the corner projection only the floating corners of a crossed cell (on entry) have no "//&
+                 "lower bound; its grounded corners keep the lower bound of the vertex bounds, as in a cell that "//&
+                 "is not crossed.  If false, every corner of a crossed cell has no lower bound.", &
+                 default=.false., do_not_log=(CS%dg_lim_cp == 0))
+  call get_param(param_file, mdl, "DG1_LIMITER_TWIST_MOMENT", twm_str, &
+                 "A moment limiter on the twist of the corners after DG1_LIMITER_CORNER_PROJECT (Biswas, Devine "//&
+                 "and Flaherty 1994; Krivodonova 2007).  With corners = mean + tx (2 xi - 1) + ty (2 eta - 1) + "//&
+                 "tw (2 xi - 1)(2 eta - 1), the twist tw is limited to minmod(tw, (ty(i+1) - ty)/2, "//&
+                 "(ty - ty(i-1))/2, (tx(j+1) - tx)/2, (tx - tx(j-1))/2) of the tilts of the ice cells next to it "//&
+                 "in the domain, or to "//&
+                 "DG1_LIMITER_D0 if that is larger, so that the twist is never larger than the change of the tilts "//&
+                 "across the cell that a smooth field has.  The variable is h - D in a cell whose mean is grounded "//&
+                 "and h in a floating one, the same in the cell and its neighbours, and the change is a twist of h, "//&
+                 "so the cell mean and the tilts are kept.  A change that would take a corner below "//&
+                 "min(MIN_H_SHELF, its smallest corner) is not made.  'OFF': not used.  'ALL': every ice cell.  "//&
+                 "'NOT_CROSSED': not the crossed cells of DG1_LIMITER_CROSSED.", &
+                 default="OFF", do_not_log=(CS%dg_lim_cp == 0))
+  select case (trim(twm_str))
+    case ("OFF") ; CS%dg_lim_twist = 0
+    case ("ALL") ; CS%dg_lim_twist = 1
+    case ("NOT_CROSSED") ; CS%dg_lim_twist = 2
+    case default ; call MOM_error(FATAL, "read_DG_params: DG1_LIMITER_TWIST_MOMENT must be OFF, ALL or "//&
+                                  "NOT_CROSSED, not "//trim(twm_str)//".")
+  end select
+  if ((CS%dg_lim_twist > 0) .and. (CS%dg_lim_cp == 0)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_TWIST_MOMENT needs DG1_LIMITER_CORNER_PROJECT.")
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FACE_ALL", CS%dg_lim_cp_face_all, &
+                 "If true, every face of DG1_LIMITER_CORNER_PROJECT_FACE gives its two corners thickness bounds, "//&
+                 "not only a face out of its bounds: each corner may move down by at most the distance of the "//&
+                 "middle of the face above its lower bound and up by at most its distance below its upper bound "//&
+                 "(where the face is out, one of the two is negative and moves the corner).  The projection then "//&
+                 "keeps every face of the cell in its bounds, so a cell whose one face is moved onto its bound does "//&
+                 "not push the opposite face out of its own; on one axis this is the minmod tilt of Cockburn and "//&
+                 "Shu.  Without it only the faces out of their bounds on entry are bounded.", &
+                 default=.false., do_not_log=(CS%dg_lim_cp_face == 0))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FACE_POINT_FEASIBLE", CS%dg_lim_cp_face_pt_feas, &
+                 "If true, the bounds of DG1_LIMITER_CORNER_PROJECT_FACE_POINT on two opposite faces of a cell are "//&
+                 "made feasible with the cell mean: the middles of the two faces average to the cell-mean "//&
+                 "thickness, so where the two upper bounds sum to less than twice that mean, or the two lower "//&
+                 "bounds to more, one bound moves by the least amount that lets both hold.  An upper bound moves "//&
+                 "on the face whose middle is grounded, so too much mass stays on the grounded side; a lower bound "//&
+                 "moves on the floating face, so too little mass (melt) stays on the floating side; where both or "//&
+                 "neither face is grounded, both bounds move by half.  Pairs that are feasible are not changed.  "//&
+                 "Without it, where the bed changes much across a cell (a crossed cell on a steep flank), the "//&
+                 "surface bound at a face can invert to a thickness far from the cell mean, the two bounds exclude "//&
+                 "the mean, and the projection splits the excess between the faces.", &
+                 default=.false., do_not_log=(.not.CS%dg_lim_cp_face_pt))
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_FACE_FLOAT_FLOOR", ffl_str, &
+                 "The lower bound of DG1_LIMITER_CORNER_PROJECT_FACE_POINT on a face whose cell across has a "//&
+                 "floating centre.  Between grounded ice and a floating cell a grounding line lies at or before "//&
+                 "the face, and where the floating ice beyond is thicker the surface has its minimum there, at the "//&
+                 "flotation surface; the bound from a = h - D of the floating cell can forbid that minimum on a "//&
+                 "steep bed, hold the face grounded and thick, and so take the mass from the opposite face.  "//&
+                 "'OFF': the bound as before.  'FLOTATION': the lower bound is at most the flotation thickness "//&
+                 "D / r at the middle of the face.  'FLOAT_BRANCH': the lower bound comes from the floating "//&
+                 "surfaces b = (1 - r) h of the points only, so the face may float down to the thinnest of them.", &
+                 default="OFF", do_not_log=(.not.CS%dg_lim_cp_face_pt))
+  select case (trim(ffl_str))
+    case ("OFF") ; CS%dg_lim_cp_face_ffl = 0
+    case ("FLOTATION") ; CS%dg_lim_cp_face_ffl = 1
+    case ("FLOAT_BRANCH") ; CS%dg_lim_cp_face_ffl = 2
+    case default ; call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: "//&
+          "DG1_LIMITER_CORNER_PROJECT_FACE_FLOAT_FLOOR must be OFF, FLOTATION or FLOAT_BRANCH, not "//&
+          trim(ffl_str)//".")
+  end select
+  if ((CS%dg_lim_cp_face_ffl > 0) .and. (.not.CS%dg_lim_cp_face_pt)) call MOM_error(FATAL, &
+      "MOM_ice_shelf_dynamics, read_DG_params: DG1_LIMITER_CORNER_PROJECT_FACE_FLOAT_FLOOR needs "//&
+      "DG1_LIMITER_CORNER_PROJECT_FACE_POINT.")
+  call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_VERTEX_FLOAT_FLOOR", vfl_str, &
+                 "The lower vertex bound of DG1_LIMITER_CORNER_PROJECT at a corner where one of the ice cells at "//&
+                 "the node has a floating mean (rr h < D for the cell-mean thickness and bed).  The bound is a "//&
+                 "surface, the smallest node mean; a floating cell's surface (1 - r) h above the flotation "//&
+                 "surface at a deeper corner inverts there to grounded ice thicker than flotation, which holds "//&
+                 "the corner grounded and takes the mass from the other corners of the cell.  'OFF': as before.  "//&
+                 "'FLOTATION': the surface bound is at most the flotation surface (1 - r) D / r at the corner.  "//&
+                 "'FLOAT_BRANCH': it is at most (1 - r) (h_min - DG1_LIMITER_D0), with h_min the smallest "//&
+                 "cell-mean thickness of the ice cells at the node, so the corner may float down to it.", &
+                 default="OFF", do_not_log=(CS%dg_lim_cp == 0))
+  select case (trim(vfl_str))
+    case ("OFF") ; CS%dg_lim_cp_vert_ffl = 0
+    case ("FLOTATION") ; CS%dg_lim_cp_vert_ffl = 1
+    case ("FLOAT_BRANCH") ; CS%dg_lim_cp_vert_ffl = 2
+    case default ; call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: "//&
+          "DG1_LIMITER_CORNER_PROJECT_VERTEX_FLOAT_FLOOR must be OFF, FLOTATION or FLOAT_BRANCH, not "//&
+          trim(vfl_str)//".")
+  end select
   call get_param(param_file, mdl, "DG1_LIMITER_CORNER_PROJECT_JUMP", CS%dg_lim_cp_jump, &
                  "If true, DG1_LIMITER_CORNER_PROJECT also bounds the jump j = s_B - s_A between the corner "//&
                  "surfaces of two face neighbours A and B at each node of their face, on entry, against the step "//&
@@ -18681,6 +19008,25 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
   logical :: w_x, w_y ! DG1_LIMITER_CORNER_PROJECT_WALL_BOUND: the x or the y face of the cell at a corner is a wall
   logical :: wb_none  ! DG1_LIMITER_CORNER_PROJECT_WALL_BOUND = NONE acts at this corner
   integer :: i_w, j_w ! DG1_LIMITER_CORNER_PROJECT_WALL_BOUND: the cell next along the wall
+  integer, allocatable, dimension(:,:) :: msi, msj ! DG1_LIMITER_CORNER_PROJECT_ENDORSE = CURVATURE: the indices of
+                      ! the cell inside the domain whose mean a cell reads, itself inside the domain, its mirror
+                      ! image across walls and divides beyond it, or 0 elsewhere
+  real :: cv_a        ! ENDORSE = CURVATURE: the corner allowance A of the node [Z ~> m]
+  logical :: cv_ok    ! ENDORSE = CURVATURE: A is set
+  logical :: cv_w     ! ENDORSE = CURVATURE: the corner is on a wall or a divide
+  logical, dimension(4) :: cf_wl ! DG1_LIMITER_CORNER_PROJECT_FACE_WALL_FREE: the west, east, south and north
+                      ! faces of the cell on a wall or a divide
+  real :: fw_xm, fw_xp, fw_ym, fw_yp ! DG1_LIMITER_CORNER_PROJECT_FACE_CURV_WIDTHS: the widths of the cells west,
+                      ! east, south and north of the cell [L ~> m]
+  real, dimension(5,2) :: fl_v ! DG1_LIMITER_CORNER_PROJECT_FACE_CURV_LIMIT: values at the cells -2..2 along x
+                      ! and y [Z ~> m]
+  real, dimension(5,2) :: fl_w ! DG1_LIMITER_CORNER_PROJECT_FACE_CURV_LIMIT: the widths of those cells [L ~> m]
+  logical, dimension(5,2) :: fl_ok ! DG1_LIMITER_CORNER_PROJECT_FACE_CURV_LIMIT: those cells are available
+  integer :: kf       ! DG1_LIMITER_CORNER_PROJECT_FACE_CURV_LIMIT: a cell of those
+  integer :: kv       ! DG1_LIMITER_CORNER_PROJECT_VERTEX_FLOAT_FLOOR: a cell at the node
+  logical :: vf_any  ! DG1_LIMITER_CORNER_PROJECT_VERTEX_FLOAT_FLOOR: a cell at the node has a floating mean
+  real :: vf_h, vf_d, vf_hmin ! A cell-mean thickness and bed and the smallest mean thickness at the node [Z ~> m]
+  logical :: fl_use   ! DG1_LIMITER_CORNER_PROJECT_FACE_CURV_LIMIT acts in this cell
   real :: em_o, em_n  ! DG1_LIMITER_CORNER_PROJECT_WALL_BOUND: the mean surfaces of the wall edges of the cell and of
                       ! the cell next along the wall [Z ~> m]
   real :: cp_fl      ! DG1_LIMITER_CORNER_PROJECT_SOFT: the floor of the corners of a cell [Z ~> m]
@@ -18856,6 +19202,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
         if (CS%dg_lim_cp_branch) l_m = max(la, lb)
         u_n = o_hi ; l_n = o_lo
         if (CS%dg_lim_cp_all .and. (o_hi >= o_lo)) then ; u_n = o_lo ; l_n = o_hi ; endif
+        if (CS%dg_lim_cp_none) then ; u_n = -huge(1.0) ; l_n = huge(1.0) ; endif
         s_o = max(CS%h_nodal(i,j,a,b) - CS%bed_node(i-2+a,j-2+b), (1.0 - rr) * CS%h_nodal(i,j,a,b))
         if (CS%dg_lim_cp_d0_thick) then
           ! As the vertex bounds of DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS below.
@@ -19851,8 +20198,18 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
         endif
       enddo ; enddo
     endif
+    if (CS%dg_lim_cp_face_cl .and. ((isc - isd < 2) .or. (jsc - jsd < 2))) call MOM_error(FATAL, &
+        "MOM_ice_shelf_dynamics, dg1_grounded_limiter: DG1_LIMITER_CORNER_PROJECT_FACE_CURV_LIMIT needs a halo "//&
+        "of at least 2 cells.")
     allocate(sbn(isd:ied,jsd:jed)) ; sbn(:,:) = sbp(:,:)
     if (CS%dg_lim_cp_flat .and. CS%dg_lim_cp_flat_own) sbn(:,:) = sbar(:,:)
+    if (CS%dg_lim_cp_curv) then
+      ! DG1_LIMITER_CORNER_PROJECT_ENDORSE = CURVATURE: the cell each cell of the stencils reads.
+      if ((isc - isd < 3) .or. (jsc - jsd < 3)) call MOM_error(FATAL, "MOM_ice_shelf_dynamics, "//&
+          "dg1_grounded_limiter: DG1_LIMITER_CORNER_PROJECT_ENDORSE = CURVATURE needs a halo of at least 3 cells.")
+      allocate(msi(isd:ied,jsd:jed), source=0) ; allocate(msj(isd:ied,jsd:jed), source=0)
+      call dg1_lim_mirror_src(CS, G, in_dom, north_open, msi, msj)
+    endif
     if (cp_late) then
       allocate(cps_lo(isd:ied,jsd:jed,2,2), source=0.0) ; allocate(cps_hi(isd:ied,jsd:jed,2,2), source=0.0)
       allocate(cps_one(isd:ied,jsd:jed,2,2), source=.false.)
@@ -19911,6 +20268,13 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
               if (CS%dg_lim_cp_wall_mirror) then
                 if (.not.in_dom(ii,jj)) s_u = sbar_f(ii,jj)
               endif
+              if (CS%dg_lim_cp_curv .and. (in_dom(ii,jj) .or. (.not.CS%dg_lim_cp_curv_wext))) then
+                ! ENDORSE = CURVATURE: the mirror image of a cell inside reads the mean that cell has here.
+                if (msi(ii,jj) > 0) then
+                  s_u = sbn(msi(ii,jj),msj(ii,jj))
+                  if ((msi(ii,jj) == i) .and. (msj(ii,jj) == j)) s_u = sbp(i,j)
+                endif
+              endif
               u_m = max(u_m, s_u) ; l_m = min(l_m, s_u)
             endif
           endif
@@ -19926,7 +20290,7 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
         ! DG1_LIMITER_CORNER_PROJECT_WALL_BOUND: a corner on a wall or a divide reads nothing normal to the wall in
         ! the range of the means.  NONE drops its vertex bound; EDGE_TRACE takes the range from the wall edges.
         wb_none = .false.
-        if (CS%dg_lim_cp_wall_bnd > 0) then
+        if ((CS%dg_lim_cp_wall_bnd > 0) .and. (.not.CS%dg_lim_cp_curv)) then
           w_x = .false. ; w_y = .false.
           if (.not.in_dom(i+2*a-3,j)) w_x = dg1_lim_wall_face(CS%u_face_mask_bdry(i+a-2,j), &
                                                 CS%u_bdry_val(i+a-2,j-1), CS%u_bdry_val(i+a-2,j))
@@ -20018,6 +20382,30 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
         ! DG1_LIMITER_CORNER_PROJECT_ENDORSE = ALL: the bounds widen only as far as every other ice cell agrees.
         u_n = o_hi ; l_n = o_lo
         if (CS%dg_lim_cp_all .and. (o_hi >= o_lo)) then ; u_n = o_lo ; l_n = o_hi ; endif
+        if (CS%dg_lim_cp_none) then ; u_n = -huge(1.0) ; l_n = huge(1.0) ; endif
+        if (CS%dg_lim_cp_curv) then
+          ! DG1_LIMITER_CORNER_PROJECT_ENDORSE = CURVATURE: the corner of the quadratic fit in place of the corners
+          ! of the other cells.
+          u_n = -huge(1.0) ; l_n = huge(1.0)
+          cv_w = .false.
+          if (CS%dg_lim_cp_curv_wall) then
+            if (.not.in_dom(i+2*a-3,j)) cv_w = dg1_lim_wall_face(CS%u_face_mask_bdry(i+a-2,j), &
+                                                 CS%u_bdry_val(i+a-2,j-1), CS%u_bdry_val(i+a-2,j))
+            if (.not.in_dom(i,j+2*b-3)) cv_w = cv_w .or. dg1_lim_wall_face(CS%v_face_mask_bdry(i,j+b-2), &
+                                                 CS%v_bdry_val(i-1,j+b-2), CS%v_bdry_val(i,j+b-2))
+          endif
+          if (cv_w) then
+            ! DG1_LIMITER_CORNER_PROJECT_CURV_WALL_ALL (testing): the agreement of ENDORSE = ALL at a wall.
+            if (o_hi >= o_lo) then ; u_n = o_lo ; l_n = o_hi ; endif
+          else
+            call dg1_lim_curv_allow(G, hmask, msi, msj, sbp, sbn, i, j, a, b, CS%dg_lim_cp_curv_c, cv_a, cv_ok)
+            if (cv_ok) then ; u_n = cv_a ; l_n = cv_a ; endif
+          endif
+          ! DG1_LIMITER_CORNER_PROJECT_CURV_ENDORSE_ALL (testing): also as far as all other ice cells agree.
+          if (CS%dg_lim_cp_curv_all .and. (o_hi >= o_lo)) then
+            u_n = max(u_n, o_lo) ; l_n = min(l_n, o_hi)
+          endif
+        endif
         cp_d(a,b) = CS%bed_node(i-2+a,j-2+b)
         if (CS%dg_lim_cp_d0_thick) then
           ! DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS: the bounds widen as thicknesses at the corner bed.
@@ -20027,7 +20415,35 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
           cp_hi(a,b) = max(u_m, u_n) + max(CS%dg_lim_d0, lim_eps * (u_m - l_m))
           cp_lo(a,b) = min(l_m, l_n) - max(CS%dg_lim_d0, lim_eps * (u_m - l_m))
         endif
+        ! DG1_LIMITER_CORNER_PROJECT_VERTEX_FLOAT_FLOOR: next to a cell with a floating mean the corner may go
+        ! down to flotation (1) or float down to the thinnest cell mean at the node (2).
+        if (CS%dg_lim_cp_vert_ffl > 0) then
+          vf_any = .false. ; vf_hmin = huge(1.0)
+          do kv = 1, 4
+            ii = i ; jj = j
+            if ((kv == 2) .or. (kv == 4)) ii = i + 2*a - 3
+            if (kv >= 3) jj = j + 2*b - 3
+            if (.not.in_dom(ii,jj)) cycle
+            if ((hmask(ii,jj) /= 1.0) .and. (hmask(ii,jj) /= 3.0)) cycle
+            vf_h = 0.25 * ((h_pe(ii,jj,1,1) + h_pe(ii,jj,2,2)) + (h_pe(ii,jj,2,1) + h_pe(ii,jj,1,2)))
+            vf_d = 0.25 * ((CS%bed_node(ii-1,jj-1) + CS%bed_node(ii,jj)) + &
+                           (CS%bed_node(ii,jj-1) + CS%bed_node(ii-1,jj)))
+            if (.not.(rr * vf_h > vf_d)) vf_any = .true.
+            vf_hmin = min(vf_hmin, vf_h)
+          enddo
+          if (vf_any) then
+            if (CS%dg_lim_cp_vert_ffl == 1) then
+              cp_lo(a,b) = min(cp_lo(a,b), (1.0 - rr) * (cp_d(a,b) / rr))
+            else
+              cp_lo(a,b) = min(cp_lo(a,b), (1.0 - rr) * (vf_hmin - CS%dg_lim_d0))
+            endif
+          endif
+        endif
         cp_one(a,b) = trb(i,j)
+        ! DG1_LIMITER_CORNER_PROJECT_CROSSED_GROUNDED_LOWER: only a floating corner of a crossed cell has no lower
+        ! bound.
+        if (cp_one(a,b) .and. CS%dg_lim_cp_cross_glo) &
+          cp_one(a,b) = (rr * h_pe(i,j,a,b) <= CS%bed_node(i-2+a,j-2+b))
         ! DG1_LIMITER_CORNER_PROJECT_VERTEX (testing): no vertex bound at this corner.
         if (CS%dg_lim_cp_vert > 0) then
           vx_keep = .false.
@@ -20075,50 +20491,143 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
       ! DG1_LIMITER_CORNER_PROJECT_FACE: the face bounds of DG1_LIMITER_FACE_BOUNDS, from the state on entry, as
       ! thickness bounds on the corners of the faces that are out of them.
       cpf = (CS%dg_lim_cp_face == 2)
+      ! DG1_LIMITER_CORNER_PROJECT_FACE_CURV_LIMIT, and with _CURV_LIMIT_CROSSED = False not in a crossed cell.
+      fl_use = CS%dg_lim_cp_face_cl
+      if (fl_use .and. (.not.CS%dg_lim_cp_face_cl_crs)) fl_use = (.not.trb(i,j))
       if (CS%dg_lim_cp_face == 1) cpf = trb(i,j)
       cf_n = 0
+      if (cpf) then
+        ! DG1_LIMITER_CORNER_PROJECT_FACE_WALL_FREE: the faces on a wall or a divide.
+        cf_wl(:) = .false.
+        if (CS%dg_lim_cp_face_wfree) then
+          if (.not.in_dom(i-1,j)) cf_wl(1) = dg1_lim_wall_face(CS%u_face_mask_bdry(i-1,j), &
+                                                CS%u_bdry_val(i-1,j-1), CS%u_bdry_val(i-1,j))
+          if (.not.in_dom(i+1,j)) cf_wl(2) = dg1_lim_wall_face(CS%u_face_mask_bdry(i,j), &
+                                                CS%u_bdry_val(i,j-1), CS%u_bdry_val(i,j))
+          if (.not.in_dom(i,j-1)) cf_wl(3) = dg1_lim_wall_face(CS%v_face_mask_bdry(i,j-1), &
+                                                CS%v_bdry_val(i-1,j-1), CS%v_bdry_val(i,j-1))
+          if (.not.in_dom(i,j+1)) cf_wl(4) = dg1_lim_wall_face(CS%v_face_mask_bdry(i,j), &
+                                                CS%v_bdry_val(i-1,j), CS%v_bdry_val(i,j))
+        endif
+        ! DG1_LIMITER_CORNER_PROJECT_FACE_CURV_WIDTHS: the widths of the cells along each axis; a cell beyond the
+        ! domain takes the width of the cell.
+        fw_xm = G%dxT(i,j) ; fw_xp = G%dxT(i,j) ; fw_ym = G%dyT(i,j) ; fw_yp = G%dyT(i,j)
+        if (CS%dg_lim_cp_face_cw) then
+          if (in_dom(i-1,j)) fw_xm = G%dxT(i-1,j)
+          if (in_dom(i+1,j)) fw_xp = G%dxT(i+1,j)
+          if (in_dom(i,j-1)) fw_ym = G%dyT(i,j-1)
+          if (in_dom(i,j+1)) fw_yp = G%dyT(i,j+1)
+        endif
+        ! DG1_LIMITER_CORNER_PROJECT_FACE_CURV_LIMIT: the cells -2..2 along each axis, with their widths; a cell
+        ! beyond the domain takes the width of the cell.
+        if (fl_use) then
+          do kf = 1, 5
+            fl_ok(kf,1) = f_use(i+kf-3,j) ; fl_ok(kf,2) = f_use(i,j+kf-3)
+            fl_w(kf,1) = G%dxT(i,j) ; if (in_dom(i+kf-3,j)) fl_w(kf,1) = G%dxT(i+kf-3,j)
+            fl_w(kf,2) = G%dyT(i,j) ; if (in_dom(i,j+kf-3)) fl_w(kf,2) = G%dyT(i,j+kf-3)
+          enddo
+        endif
+      endif
       if (cpf .and. CS%dg_lim_cp_face_pt) then
         ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT: the bounds from point values of the two branch surfaces, each
         ! with the second difference of its own centre values along the axis.
         ca_x = 0.0 ; cb_x = 0.0 ; ca_y = 0.0 ; cb_y = 0.0
         if (f_use(i-1,j) .and. f_use(i+1,j)) then
-          ca_x = CS%dg_lim_face_curv * abs(((hpt_f(i-1,j) - dpt_f(i-1,j)) + (hpt_f(i+1,j) - dpt_f(i+1,j))) - &
-                                           2.0*(hpt_f(i,j) - dpt_f(i,j)))
-          cb_x = CS%dg_lim_face_curv * (1.0 - rr) * abs((hpt_f(i-1,j) + hpt_f(i+1,j)) - 2.0*hpt_f(i,j))
+          if (CS%dg_lim_cp_face_cw) then
+            ca_x = CS%dg_lim_face_curv * abs(dg1_lim_d2w(hpt_f(i-1,j) - dpt_f(i-1,j), hpt_f(i,j) - dpt_f(i,j), &
+                                         hpt_f(i+1,j) - dpt_f(i+1,j), fw_xm, G%dxT(i,j), fw_xp))
+            cb_x = CS%dg_lim_face_curv * (1.0 - rr) * &
+                   abs(dg1_lim_d2w(hpt_f(i-1,j), hpt_f(i,j), hpt_f(i+1,j), fw_xm, G%dxT(i,j), fw_xp))
+          else
+            ca_x = CS%dg_lim_face_curv * abs(((hpt_f(i-1,j) - dpt_f(i-1,j)) + (hpt_f(i+1,j) - dpt_f(i+1,j))) - &
+                                             2.0*(hpt_f(i,j) - dpt_f(i,j)))
+            cb_x = CS%dg_lim_face_curv * (1.0 - rr) * abs((hpt_f(i-1,j) + hpt_f(i+1,j)) - 2.0*hpt_f(i,j))
+          endif
         endif
         if (f_use(i,j-1) .and. f_use(i,j+1)) then
-          ca_y = CS%dg_lim_face_curv * abs(((hpt_f(i,j-1) - dpt_f(i,j-1)) + (hpt_f(i,j+1) - dpt_f(i,j+1))) - &
-                                           2.0*(hpt_f(i,j) - dpt_f(i,j)))
-          cb_y = CS%dg_lim_face_curv * (1.0 - rr) * abs((hpt_f(i,j-1) + hpt_f(i,j+1)) - 2.0*hpt_f(i,j))
+          if (CS%dg_lim_cp_face_cw) then
+            ca_y = CS%dg_lim_face_curv * abs(dg1_lim_d2w(hpt_f(i,j-1) - dpt_f(i,j-1), hpt_f(i,j) - dpt_f(i,j), &
+                                         hpt_f(i,j+1) - dpt_f(i,j+1), fw_ym, G%dyT(i,j), fw_yp))
+            cb_y = CS%dg_lim_face_curv * (1.0 - rr) * &
+                   abs(dg1_lim_d2w(hpt_f(i,j-1), hpt_f(i,j), hpt_f(i,j+1), fw_ym, G%dyT(i,j), fw_yp))
+          else
+            ca_y = CS%dg_lim_face_curv * abs(((hpt_f(i,j-1) - dpt_f(i,j-1)) + (hpt_f(i,j+1) - dpt_f(i,j+1))) - &
+                                             2.0*(hpt_f(i,j) - dpt_f(i,j)))
+            cb_y = CS%dg_lim_face_curv * (1.0 - rr) * abs((hpt_f(i,j-1) + hpt_f(i,j+1)) - 2.0*hpt_f(i,j))
+          endif
+        endif
+        if (fl_use) then
+          ! DG1_LIMITER_CORNER_PROJECT_FACE_CURV_LIMIT: the limited second differences of a and of h.
+          do kf = 1, 5
+            fl_v(kf,1) = hpt_f(i+kf-3,j) - dpt_f(i+kf-3,j) ; fl_v(kf,2) = hpt_f(i,j+kf-3) - dpt_f(i,j+kf-3)
+          enddo
+          ca_x = CS%dg_lim_face_curv * dg1_lim_face_d2lim(fl_v(:,1), fl_ok(:,1), fl_w(:,1), CS%dg_lim_cp_face_cw)
+          ca_y = CS%dg_lim_face_curv * dg1_lim_face_d2lim(fl_v(:,2), fl_ok(:,2), fl_w(:,2), CS%dg_lim_cp_face_cw)
+          do kf = 1, 5
+            fl_v(kf,1) = hpt_f(i+kf-3,j) ; fl_v(kf,2) = hpt_f(i,j+kf-3)
+          enddo
+          cb_x = CS%dg_lim_face_curv * (1.0 - rr) * &
+                 dg1_lim_face_d2lim(fl_v(:,1), fl_ok(:,1), fl_w(:,1), CS%dg_lim_cp_face_cw)
+          cb_y = CS%dg_lim_face_curv * (1.0 - rr) * &
+                 dg1_lim_face_d2lim(fl_v(:,2), fl_ok(:,2), fl_w(:,2), CS%dg_lim_cp_face_cw)
         endif
         cf_ca(:) = (/ ca_x, ca_x, ca_y, ca_y /) ; cf_cb(:) = (/ cb_x, cb_x, cb_y, cb_y /)
         cf_use(:) = (/ f_use(i-1,j), f_use(i+1,j), f_use(i,j-1), f_use(i,j+1) /)
         cf_ice(:) = (/ f_ice(i-1,j), f_ice(i+1,j), f_ice(i,j-1), f_ice(i,j+1) /)
+        if (CS%dg_lim_cp_face_wfree) then ; where (cf_wl(:)) cf_use(:) = .false. ; endif
+        if (.not.CS%dg_lim_cp_face_trace) cf_ice(:) = .false.
         cf_hc(:) = (/ hpt_f(i-1,j), hpt_f(i+1,j), hpt_f(i,j-1), hpt_f(i,j+1) /)
         cf_dc(:) = (/ dpt_f(i-1,j), dpt_f(i+1,j), dpt_f(i,j-1), dpt_f(i,j+1) /)
         cf_ht(:) = (/ trh(i-1,j,2), trh(i+1,j,1), trh(i,j-1,4), trh(i,j+1,3) /)
         call dg1_lim_cp_face_bounds_pt(CS%h_nodal(i,j,:,:), cp_d, rr, hpt_f(i,j), dpt_f(i,j), cf_ca, cf_cb, &
                                        CS%dg_lim_cp_face_pt_d0, cf_use, cf_ice, cf_hc, cf_dc, cf_ht, &
-                                       cf_lo, cf_hi, cf_n)
+                                       cf_lo, cf_hi, cf_n, feas=CS%dg_lim_cp_face_pt_feas, &
+                                       all=CS%dg_lim_cp_face_all, ffl=CS%dg_lim_cp_face_ffl)
       elseif (cpf) then
         al_x = CS%dg_lim_d0 ; al_y = CS%dg_lim_d0
         ! DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS: the floor of the allowance is set at each face, from its corners.
         if (CS%dg_lim_cp_d0_thick) then ; al_x = 0.0 ; al_y = 0.0 ; endif
-        if (f_use(i-1,j) .and. f_use(i+1,j)) &
-          al_x = max(al_x, CS%dg_lim_face_curv * abs((sbar_f(i-1,j) + sbar_f(i+1,j)) - 2.0*sbar_f(i,j)))
-        if (f_use(i,j-1) .and. f_use(i,j+1)) &
-          al_y = max(al_y, CS%dg_lim_face_curv * abs((sbar_f(i,j-1) + sbar_f(i,j+1)) - 2.0*sbar_f(i,j)))
+        if (f_use(i-1,j) .and. f_use(i+1,j)) then
+          if (CS%dg_lim_cp_face_cw) then
+            al_x = max(al_x, CS%dg_lim_face_curv * abs(dg1_lim_d2w(sbar_f(i-1,j), sbar_f(i,j), sbar_f(i+1,j), &
+                                                                    fw_xm, G%dxT(i,j), fw_xp)))
+          else
+            al_x = max(al_x, CS%dg_lim_face_curv * abs((sbar_f(i-1,j) + sbar_f(i+1,j)) - 2.0*sbar_f(i,j)))
+          endif
+        endif
+        if (f_use(i,j-1) .and. f_use(i,j+1)) then
+          if (CS%dg_lim_cp_face_cw) then
+            al_y = max(al_y, CS%dg_lim_face_curv * abs(dg1_lim_d2w(sbar_f(i,j-1), sbar_f(i,j), sbar_f(i,j+1), &
+                                                                    fw_ym, G%dyT(i,j), fw_yp)))
+          else
+            al_y = max(al_y, CS%dg_lim_face_curv * abs((sbar_f(i,j-1) + sbar_f(i,j+1)) - 2.0*sbar_f(i,j)))
+          endif
+        endif
+        if (fl_use) then
+          ! DG1_LIMITER_CORNER_PROJECT_FACE_CURV_LIMIT: the limited second differences of the mean surfaces.
+          al_x = CS%dg_lim_d0 ; al_y = CS%dg_lim_d0
+          if (CS%dg_lim_cp_d0_thick) then ; al_x = 0.0 ; al_y = 0.0 ; endif
+          do kf = 1, 5
+            fl_v(kf,1) = sbar_f(i+kf-3,j) ; fl_v(kf,2) = sbar_f(i,j+kf-3)
+          enddo
+          al_x = max(al_x, CS%dg_lim_face_curv * &
+                     dg1_lim_face_d2lim(fl_v(:,1), fl_ok(:,1), fl_w(:,1), CS%dg_lim_cp_face_cw))
+          al_y = max(al_y, CS%dg_lim_face_curv * &
+                     dg1_lim_face_d2lim(fl_v(:,2), fl_ok(:,2), fl_w(:,2), CS%dg_lim_cp_face_cw))
+        endif
         cf_al(:) = (/ al_x, al_x, al_y, al_y /)
         cf_use(:) = (/ f_use(i-1,j), f_use(i+1,j), f_use(i,j-1), f_use(i,j+1) /)
         cf_ice(:) = (/ f_ice(i-1,j), f_ice(i+1,j), f_ice(i,j-1), f_ice(i,j+1) /)
+        if (CS%dg_lim_cp_face_wfree) then ; where (cf_wl(:)) cf_use(:) = .false. ; endif
+        if (.not.CS%dg_lim_cp_face_trace) cf_ice(:) = .false.
         cf_sb(:) = (/ sbar_f(i-1,j), sbar_f(i+1,j), sbar_f(i,j-1), sbar_f(i,j+1) /)
         cf_tr(:) = (/ trc(i-1,j,2), trc(i+1,j,1), trc(i,j-1,4), trc(i,j+1,3) /)
         if (CS%dg_lim_cp_d0_thick) then
           call dg1_lim_cp_face_bounds(CS%h_nodal(i,j,:,:), cp_d, rr, sbar_f(i,j), cf_al, cf_use, cf_ice, cf_sb, &
-                                      cf_tr, cf_lo, cf_hi, cf_n, d0=CS%dg_lim_d0)
+                                      cf_tr, cf_lo, cf_hi, cf_n, d0=CS%dg_lim_d0, all=CS%dg_lim_cp_face_all)
         else
           call dg1_lim_cp_face_bounds(CS%h_nodal(i,j,:,:), cp_d, rr, sbar_f(i,j), cf_al, cf_use, cf_ice, cf_sb, &
-                                      cf_tr, cf_lo, cf_hi, cf_n)
+                                      cf_tr, cf_lo, cf_hi, cf_n, all=CS%dg_lim_cp_face_all)
         endif
       endif
       if (do_st .and. CS%dg_lim_cp_jump) then
@@ -20186,6 +20695,12 @@ subroutine dg1_grounded_limiter(CS, G, hmask, bud_w)
       endif
     enddo ; enddo
     deallocate(h_pe, cpb_lo, cpb_hi, cpb_n, sbp, sbn)
+    if (allocated(msi)) deallocate(msi, msj)
+    ! DG1_LIMITER_TWIST_MOMENT: the twist of each cell against the change of the tilts of its neighbours.
+    if (CS%dg_lim_twist > 0) then
+      call pass_corner_field(CS%h_nodal, G)
+      call dg1_lim_twist_moment(CS, G, hmask, in_dom, trb, rr)
+    endif
   endif
 
   ! dg_lim_agree_*: the changes of this call, split by the neighbour bounds on entry.  A change below 1e-3 d0 is
@@ -21285,7 +21800,7 @@ end subroutine dg1_lim_cp_apply_soft
 !! out of bounds takes the tighter bound of the two.  With d0 (DG1_LIMITER_CORNER_PROJECT_D0_THICKNESS), the
 !! allowance of a face is at least d0 (k1 + k2) / 2, the change of the surface at its middle when both of its
 !! corners change by d0 in thickness.  The faces are west, east, south and north.
-pure subroutine dg1_lim_cp_face_bounds(hn, dn, rr, sb, al, use_nb, ice_nb, sb_nb, tr_nb, hlo, hhi, nset, d0)
+pure subroutine dg1_lim_cp_face_bounds(hn, dn, rr, sb, al, use_nb, ice_nb, sb_nb, tr_nb, hlo, hhi, nset, d0, all)
   real, dimension(2,2), intent(in)  :: hn     !< Corner thicknesses [Z ~> m]
   real, dimension(2,2), intent(in)  :: dn     !< Bed depths at the corners, positive down [Z ~> m]
   real,                 intent(in)  :: rr     !< Ice to ocean density ratio [nondim]
@@ -21299,6 +21814,8 @@ pure subroutine dg1_lim_cp_face_bounds(hn, dn, rr, sb, al, use_nb, ice_nb, sb_nb
   real, dimension(2,2), intent(out) :: hhi    !< Upper thickness bounds of the corners, huge where none [Z ~> m]
   integer,              intent(out) :: nset   !< The number of faces out of their bounds
   real,       optional, intent(in)  :: d0     !< The least allowance as a thickness of both corners of a face [Z ~> m]
+  logical,    optional, intent(in)  :: all    !< DG1_LIMITER_CORNER_PROJECT_FACE_ALL: every face bounds its corners,
+                                              !! and nset counts every bounded face
 
   real, dimension(2,2) :: s_c ! Corner surfaces [Z ~> m]
   real, dimension(2,2) :: k_c ! Slopes of the corner surfaces in the thickness [nondim]
@@ -21307,9 +21824,11 @@ pure subroutine dg1_lim_cp_face_bounds(hn, dn, rr, sb, al, use_nb, ice_nb, sb_nb
   real :: sm      ! Surface at the middle of a face [Z ~> m]
   real :: d       ! Distance of the middle of a face past its bound [Z ~> m]
   real :: q       ! k1^2 + k2^2 [nondim]
+  logical :: do_all ! Bound the corners of every face
   integer :: f, a, b, a1, b1, a2, b2
 
   hlo(:,:) = -huge(1.0) ; hhi(:,:) = huge(1.0) ; nset = 0
+  do_all = .false. ; if (present(all)) do_all = all
   do b = 1, 2 ; do a = 1, 2
     s_c(a,b) = max(hn(a,b) - dn(a,b), (1.0 - rr) * hn(a,b))
     k_c(a,b) = 1.0 - rr
@@ -21328,7 +21847,14 @@ pure subroutine dg1_lim_cp_face_bounds(hn, dn, rr, sb, al, use_nb, ice_nb, sb_nb
     call dg1_lim_face_bounds(sb, al_f, use_nb(f), ice_nb(f), sb_nb(f), tr_nb(f), lo, hi)
     sm = 0.5*(s_c(a1,b1) + s_c(a2,b2))
     q = k_c(a1,b1)*k_c(a1,b1) + k_c(a2,b2)*k_c(a2,b2)
-    if (sm < lo) then
+    if (do_all) then
+      ! DG1_LIMITER_CORNER_PROJECT_FACE_ALL: each corner within the room the middle of the face has left.
+      nset = nset + 1
+      hlo(a1,b1) = max(hlo(a1,b1), hn(a1,b1) - (2.0*(sm - lo)) * (k_c(a1,b1) / q))
+      hlo(a2,b2) = max(hlo(a2,b2), hn(a2,b2) - (2.0*(sm - lo)) * (k_c(a2,b2) / q))
+      hhi(a1,b1) = min(hhi(a1,b1), hn(a1,b1) + (2.0*(hi - sm)) * (k_c(a1,b1) / q))
+      hhi(a2,b2) = min(hhi(a2,b2), hn(a2,b2) + (2.0*(hi - sm)) * (k_c(a2,b2) / q))
+    elseif (sm < lo) then
       d = lo - sm ; nset = nset + 1
       hlo(a1,b1) = max(hlo(a1,b1), hn(a1,b1) + (2.0*d) * (k_c(a1,b1) / q))
       hlo(a2,b2) = max(hlo(a2,b2), hn(a2,b2) + (2.0*d) * (k_c(a2,b2) / q))
@@ -21352,7 +21878,7 @@ end subroutine dg1_lim_cp_face_bounds
 !! and the face lie on one branch, these are the bounds of that branch surface.  The faces are west, east, south
 !! and north.
 pure subroutine dg1_lim_cp_face_bounds_pt(hn, dn, rr, hc, dc, ca, cb, d0, use_nb, ice_nb, hc_nb, dc_nb, ht_nb, &
-                                          hlo, hhi, nset)
+                                          hlo, hhi, nset, feas, all, ffl)
   real, dimension(2,2), intent(in)  :: hn     !< Corner thicknesses [Z ~> m]
   real, dimension(2,2), intent(in)  :: dn     !< Bed depths at the corners, positive down [Z ~> m]
   real,                 intent(in)  :: rr     !< Ice to ocean density ratio [nondim]
@@ -21369,22 +21895,32 @@ pure subroutine dg1_lim_cp_face_bounds_pt(hn, dn, rr, hc, dc, ca, cb, d0, use_nb
   real, dimension(2,2), intent(out) :: hlo    !< Lower thickness bounds of the corners, -huge where none [Z ~> m]
   real, dimension(2,2), intent(out) :: hhi    !< Upper thickness bounds of the corners, huge where none [Z ~> m]
   integer,              intent(out) :: nset   !< The number of faces out of their bounds
+  logical, optional,    intent(in)  :: feas   !< DG1_LIMITER_CORNER_PROJECT_FACE_POINT_FEASIBLE: make the bounds of
+                                              !! each pair of opposite faces feasible with the cell mean
+  logical, optional,    intent(in)  :: all    !< DG1_LIMITER_CORNER_PROJECT_FACE_ALL: every face bounds its corners,
+                                              !! and nset counts every bounded face
+  integer, optional,    intent(in)  :: ffl    !< DG1_LIMITER_CORNER_PROJECT_FACE_FLOAT_FLOOR: 0 off, 1 FLOTATION,
+                                              !! 2 FLOAT_BRANCH
 
+  real, dimension(4) :: f_lo, f_hi ! Thickness bounds of the middle of each face [Z ~> m]
+  real, dimension(4) :: f_hm       ! Thickness at the middle of each face [Z ~> m]
+  logical, dimension(4) :: f_gr    ! The middle of the face is grounded
   real :: hm, dm  ! Mean thickness and bed of the two corners of a face [Z ~> m]
   real :: a_lo, a_hi, b_lo, b_hi ! Smallest and largest a and b of the points [Z ~> m]
-  real :: h_lo, h_hi ! Thickness bounds of the middle of a face [Z ~> m]
   real :: dh      ! The thickness change of both corners of a face [Z ~> m]
-  integer :: f, a1, b1, a2, b2
+  real :: ex      ! The part of the bounds of two opposite faces that the cell mean cannot meet [Z ~> m]
+  logical :: do_feas ! Make the pairs feasible
+  logical :: do_all  ! Bound the corners of every face
+  integer :: f, f1, f2, ax, a1, b1, a2, b2, iffl
 
   hlo(:,:) = -huge(1.0) ; hhi(:,:) = huge(1.0) ; nset = 0
+  do_feas = .false. ; if (present(feas)) do_feas = feas
+  do_all = .false. ; if (present(all)) do_all = all
+  iffl = 0 ; if (present(ffl)) iffl = ffl
+  f_lo(:) = -huge(1.0) ; f_hi(:) = huge(1.0) ; f_hm(:) = 0.0 ; f_gr(:) = .false.
   do f = 1, 4
     if (.not.use_nb(f)) cycle
-    select case (f)
-      case (1) ; a1 = 1 ; b1 = 1 ; a2 = 1 ; b2 = 2
-      case (2) ; a1 = 2 ; b1 = 1 ; a2 = 2 ; b2 = 2
-      case (3) ; a1 = 1 ; b1 = 1 ; a2 = 2 ; b2 = 1
-      case default ; a1 = 1 ; b1 = 2 ; a2 = 2 ; b2 = 2
-    end select
+    call face_corners(f, a1, b1, a2, b2)
     hm = 0.5*(hn(a1,b1) + hn(a2,b2)) ; dm = 0.5*(dn(a1,b1) + dn(a2,b2))
     a_lo = min(hc - dc, hc_nb(f) - dc_nb(f)) ; a_hi = max(hc - dc, hc_nb(f) - dc_nb(f))
     b_lo = (1.0 - rr) * min(hc, hc_nb(f)) ; b_hi = (1.0 - rr) * max(hc, hc_nb(f))
@@ -21392,18 +21928,88 @@ pure subroutine dg1_lim_cp_face_bounds_pt(hn, dn, rr, hc, dc, ca, cb, d0, use_nb
       a_lo = min(a_lo, ht_nb(f) - dm) ; a_hi = max(a_hi, ht_nb(f) - dm)
       b_lo = min(b_lo, (1.0 - rr) * ht_nb(f)) ; b_hi = max(b_hi, (1.0 - rr) * ht_nb(f))
     endif
-    h_lo = min(dg1_lim_h_from_s(max(a_lo - ca(f), b_lo - cb(f)), dm, rr), &
-               dg1_lim_h_from_s(max(a_lo, b_lo), dm, rr) - d0)
-    h_hi = max(dg1_lim_h_from_s(max(a_hi + ca(f), b_hi + cb(f)), dm, rr), &
-               dg1_lim_h_from_s(max(a_hi, b_hi), dm, rr) + d0)
-    if (hm < h_lo) then
-      dh = h_lo - hm ; nset = nset + 1
+    f_lo(f) = min(dg1_lim_h_from_s(max(a_lo - ca(f), b_lo - cb(f)), dm, rr), &
+                  dg1_lim_h_from_s(max(a_lo, b_lo), dm, rr) - d0)
+    f_hi(f) = max(dg1_lim_h_from_s(max(a_hi + ca(f), b_hi + cb(f)), dm, rr), &
+                  dg1_lim_h_from_s(max(a_hi, b_hi), dm, rr) + d0)
+    ! DG1_LIMITER_CORNER_PROJECT_FACE_FLOAT_FLOOR: next to a cell with a floating centre the face may go down to
+    ! flotation (1) or float down to the floating surfaces of the points (2).
+    if ((iffl > 0) .and. (.not.(rr * hc_nb(f) > dc_nb(f)))) then
+      if (iffl == 1) then
+        f_lo(f) = min(f_lo(f), dm / rr)
+      else
+        f_lo(f) = min(dg1_lim_h_from_s(b_lo - cb(f), dm, rr), dg1_lim_h_from_s(b_lo, dm, rr) - d0)
+      endif
+    endif
+    f_hm(f) = hm ; f_gr(f) = (rr * hm > dm)
+  enddo
+  if (do_feas) then
+    ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT_FEASIBLE: the middles of two opposite faces average to the cell mean,
+    ! so their upper bounds must sum to at least 2 hc and their lower bounds to at most 2 hc.  Where they do not, the
+    ! bound of one face moves by the least amount that makes the pair feasible: an upper bound of the grounded face
+    ! (too much mass stays on the grounded side) and a lower bound of the floating face (too little mass, as melt
+    ! leaves, stays on the floating side); where both or neither face is grounded, both move by half.
+    do ax = 1, 2
+      f1 = 2*ax - 1 ; f2 = 2*ax
+      if (.not.(use_nb(f1) .and. use_nb(f2))) cycle
+      ex = 2.0*hc - (f_hi(f1) + f_hi(f2))
+      if (ex > 0.0) then
+        if (f_gr(f1) .and. (.not.f_gr(f2))) then
+          f_hi(f1) = f_hi(f1) + ex
+        elseif (f_gr(f2) .and. (.not.f_gr(f1))) then
+          f_hi(f2) = f_hi(f2) + ex
+        else
+          f_hi(f1) = f_hi(f1) + 0.5*ex ; f_hi(f2) = f_hi(f2) + 0.5*ex
+        endif
+      endif
+      ex = (f_lo(f1) + f_lo(f2)) - 2.0*hc
+      if (ex > 0.0) then
+        if (f_gr(f1) .and. (.not.f_gr(f2))) then
+          f_lo(f2) = f_lo(f2) - ex
+        elseif (f_gr(f2) .and. (.not.f_gr(f1))) then
+          f_lo(f1) = f_lo(f1) - ex
+        else
+          f_lo(f1) = f_lo(f1) - 0.5*ex ; f_lo(f2) = f_lo(f2) - 0.5*ex
+        endif
+      endif
+    enddo
+  endif
+  do f = 1, 4
+    if (.not.use_nb(f)) cycle
+    call face_corners(f, a1, b1, a2, b2)
+    hm = f_hm(f)
+    if (do_all) then
+      ! DG1_LIMITER_CORNER_PROJECT_FACE_ALL: each corner within the room the middle of the face has left.
+      nset = nset + 1
+      hlo(a1,b1) = max(hlo(a1,b1), hn(a1,b1) - (hm - f_lo(f)))
+      hlo(a2,b2) = max(hlo(a2,b2), hn(a2,b2) - (hm - f_lo(f)))
+      hhi(a1,b1) = min(hhi(a1,b1), hn(a1,b1) + (f_hi(f) - hm))
+      hhi(a2,b2) = min(hhi(a2,b2), hn(a2,b2) + (f_hi(f) - hm))
+    elseif (hm < f_lo(f)) then
+      dh = f_lo(f) - hm ; nset = nset + 1
       hlo(a1,b1) = max(hlo(a1,b1), hn(a1,b1) + dh) ; hlo(a2,b2) = max(hlo(a2,b2), hn(a2,b2) + dh)
-    elseif (hm > h_hi) then
-      dh = hm - h_hi ; nset = nset + 1
+    elseif (hm > f_hi(f)) then
+      dh = hm - f_hi(f) ; nset = nset + 1
       hhi(a1,b1) = min(hhi(a1,b1), hn(a1,b1) - dh) ; hhi(a2,b2) = min(hhi(a2,b2), hn(a2,b2) - dh)
     endif
   enddo
+
+contains
+
+  !> The two corners of face fc: west, east, south and north.
+  pure subroutine face_corners(fc, i1, j1, i2, j2)
+    integer, intent(in)  :: fc !< The face
+    integer, intent(out) :: i1 !< The x corner of the first corner
+    integer, intent(out) :: j1 !< The y corner of the first corner
+    integer, intent(out) :: i2 !< The x corner of the second corner
+    integer, intent(out) :: j2 !< The y corner of the second corner
+    select case (fc)
+      case (1) ; i1 = 1 ; j1 = 1 ; i2 = 1 ; j2 = 2
+      case (2) ; i1 = 2 ; j1 = 1 ; i2 = 2 ; j2 = 2
+      case (3) ; i1 = 1 ; j1 = 1 ; i2 = 2 ; j2 = 1
+      case default ; i1 = 1 ; j1 = 2 ; i2 = 2 ; j2 = 2
+    end select
+  end subroutine face_corners
 end subroutine dg1_lim_cp_face_bounds_pt
 
 !> DG1_LIMITER_BACKWARD_EDGE: in each ice cell that the projection limits and that is not crossed, an edge (the two
@@ -22369,6 +22975,175 @@ pure real function dg1_lim_wall_parab(m0, m1, d0, d1, kq)
   dg1_lim_wall_parab = m0 + kq * (r * (m0 - m1))
 end function dg1_lim_wall_parab
 
+!> DG1_LIMITER_CORNER_PROJECT_ENDORSE = CURVATURE: for each cell of the data domain, the indices of the cell inside
+!! the domain whose mean it reads.  A cell inside the domain reads itself.  A cell beyond a wall or a divide (an edge
+!! face that dg1_lim_wall_face passes) reads its mirror image, the cell as far inside as it is beyond; beyond a
+!! corner of the domain, its image across both edges, where both edge faces of that image pass.  Any other cell
+!! beyond the domain, and an image outside the data domain, has 0.
+subroutine dg1_lim_mirror_src(CS, G, in_dom, north_open, msi, msj)
+  type(ice_shelf_dyn_CS), intent(in) :: CS  !< Ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in) :: G   !< The grid structure
+  logical, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: in_dom !< The cell lies inside the domain
+  logical, intent(in) :: north_open !< The north edge is a fold, so its halo lies inside the domain
+  integer, dimension(SZDI_(G),SZDJ_(G)), intent(out) :: msi !< The i-index of the cell read, or 0
+  integer, dimension(SZDI_(G),SZDJ_(G)), intent(out) :: msj !< The j-index of the cell read, or 0
+  integer :: i, j, ig, jg ! The local and global indices of a cell
+  integer :: im, jm       ! The local indices of its image
+  integer :: fx, fy       ! The local indices of the edge faces it lies beyond, or -huge
+  logical :: ok
+
+  msi(:,:) = 0 ; msj(:,:) = 0
+  do j = G%jsd, G%jed ; do i = G%isd, G%ied
+    if (in_dom(i,j)) then ; msi(i,j) = i ; msj(i,j) = j ; cycle ; endif
+    ig = i + G%idg_offset ; jg = j + G%jdg_offset
+    im = i ; jm = j ; fx = -huge(1) ; fy = -huge(1)
+    if (.not.CS%reentrant_x) then
+      if (ig < G%isg) then
+        im = i + ((2*G%isg - 1) - 2*ig) ; fx = (G%isg - 1) - G%idg_offset
+      elseif (ig > G%ieg) then
+        im = i + ((2*G%ieg + 1) - 2*ig) ; fx = G%ieg - G%idg_offset
+      endif
+    endif
+    if (.not.CS%reentrant_y) then
+      if (jg < G%jsg) then
+        jm = j + ((2*G%jsg - 1) - 2*jg) ; fy = (G%jsg - 1) - G%jdg_offset
+      elseif ((jg > G%jeg) .and. (.not.north_open)) then
+        jm = j + ((2*G%jeg + 1) - 2*jg) ; fy = G%jeg - G%jdg_offset
+      endif
+    endif
+    if ((im < G%isd) .or. (im > G%ied) .or. (jm < G%jsd) .or. (jm > G%jed)) cycle
+    if (.not.in_dom(im,jm)) cycle
+    ok = .true.
+    if (fx > -huge(1)) then
+      if ((fx < G%IsdB) .or. (fx > G%IedB) .or. (jm-1 < G%JsdB)) cycle
+      ok = ok .and. dg1_lim_wall_face(CS%u_face_mask_bdry(fx,jm), CS%u_bdry_val(fx,jm-1), CS%u_bdry_val(fx,jm))
+    endif
+    if (fy > -huge(1)) then
+      if ((fy < G%JsdB) .or. (fy > G%JedB) .or. (im-1 < G%IsdB)) cycle
+      ok = ok .and. dg1_lim_wall_face(CS%v_face_mask_bdry(im,fy), CS%v_bdry_val(im-1,fy), CS%v_bdry_val(im,fy))
+    endif
+    if (ok) then ; msi(i,j) = im ; msj(i,j) = jm ; endif
+  enddo ; enddo
+end subroutine dg1_lim_mirror_src
+
+!> DG1_LIMITER_CORNER_PROJECT_ENDORSE = CURVATURE: the allowance A at corner (a,b) of cell (i,j), the corner of the
+!! bilinear least-squares fit over the cell of the quadratic surface whose means over the four cells at the node are
+!! their mean surfaces, with the limited curvature cx, cy on each axis:
+!! A = (wP mP + wD mD) + (wX mX + wY mY) + (cx Fx + cy Fy), with qx = a0/(a0 + a1), qy = b0/(b0 + b1),
+!! wP = (1-qx)(1-qy), wX = qx (1-qy), wY = (1-qx) qy, wD = qx qy and F = -d0 (d0 + 2 d1)/12.  P is the cell, X the
+!! cell across the node on the x axis, Y on the y axis, D the diagonal cell; a0, b0 are the widths of P and a1, b1
+!! those of X and Y.  The cell reads its own flat mean sbp, wherever it is read, and every other cell its mean sbn.
+!! The limited curvature on an axis is cc times the smallest second difference of the means along the axis, at the
+!! two cells of the node and the next cell beyond each, in both rows at the node, where all eight have one sign, and
+!! 0 otherwise.  ok is false where a cell at the node is not ice; a cell of the curvature stencil that is not ice
+!! sets that curvature to 0.
+subroutine dg1_lim_curv_allow(G, hmask, msi, msj, sbp, sbn, i, j, a, b, cc, allow, ok)
+  type(ocean_grid_type), intent(in) :: G   !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
+  integer, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: msi !< The i-index of the cell each cell reads, or 0
+  integer, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: msj !< The j-index of the cell each cell reads, or 0
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: sbp !< The flat mean surfaces [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: sbn !< The mean surfaces of the other cells [Z ~> m]
+  integer, intent(in) :: i  !< The i-index of the cell
+  integer, intent(in) :: j  !< The j-index of the cell
+  integer, intent(in) :: a  !< The x corner of the cell, 1 or 2
+  integer, intent(in) :: b  !< The y corner of the cell, 1 or 2
+  real,    intent(in) :: cc !< The factor of the smallest second difference [nondim]
+  real,    intent(out) :: allow !< The allowance A [Z ~> m]
+  logical, intent(out) :: ok    !< A is set
+  real :: mP, mX, mY, mD ! The means of the four cells at the node [Z ~> m]
+  real :: a0, a1, b0, b1 ! Their widths, see above [L ~> m]
+  real :: wx, wy         ! The widths of a cell [L ~> m]
+  real :: qx, qy         ! The bilinear fractions [nondim]
+  real :: cx, cy         ! The limited curvatures [Z L-2 ~> m-1]
+  logical :: okc
+  integer :: sx, sy
+
+  allow = 0.0 ; ok = .false.
+  sx = 2*a - 3 ; sy = 2*b - 3
+  call cell_val(i, j, mP, a0, b0, okc) ; if (.not.okc) return
+  call cell_val(i+sx, j, mX, a1, wy, okc) ; if (.not.okc) return
+  call cell_val(i, j+sy, mY, wx, b1, okc) ; if (.not.okc) return
+  call cell_val(i+sx, j+sy, mD, wx, wy, okc) ; if (.not.okc) return
+  qx = a0 / (a0 + a1) ; qy = b0 / (b0 + b1)
+  cx = lim_curv(1) ; cy = lim_curv(2)
+  allow = (((1.0 - qx) * (1.0 - qy)) * mP + (qx * qy) * mD) + &
+          ((qx * (1.0 - qy)) * mX + ((1.0 - qx) * qy) * mY) + &
+          (cx * (-(a0 * (a0 + 2.0*a1)) / 12.0) + cy * (-(b0 * (b0 + 2.0*b1)) / 12.0))
+  ok = .true.
+
+contains
+
+  !> The mean and the widths of the cell that cell (ii,jj) reads; okv is false where it is not ice.
+  subroutine cell_val(ii, jj, m, w_x, w_y, okv)
+    integer, intent(in)  :: ii  !< The i-index of the cell
+    integer, intent(in)  :: jj  !< The j-index of the cell
+    real,    intent(out) :: m   !< Its mean surface [Z ~> m]
+    real,    intent(out) :: w_x !< Its width on the x axis [L ~> m]
+    real,    intent(out) :: w_y !< Its width on the y axis [L ~> m]
+    logical, intent(out) :: okv !< The cell is ice
+    integer :: is, js
+    m = 0.0 ; w_x = 0.0 ; w_y = 0.0 ; okv = .false.
+    if ((ii < G%isd) .or. (ii > G%ied) .or. (jj < G%jsd) .or. (jj > G%jed)) return
+    is = msi(ii,jj) ; js = msj(ii,jj)
+    if (is <= 0) return
+    if ((hmask(is,js) /= 1.0) .and. (hmask(is,js) /= 3.0)) return
+    w_x = G%dxT(is,js) ; w_y = G%dyT(is,js)
+    if ((w_x <= 0.0) .or. (w_y <= 0.0)) return
+    m = sbn(is,js) ; if ((is == i) .and. (js == j)) m = sbp(i,j)
+    okv = .true.
+  end subroutine cell_val
+
+  !> The limited curvature on axis ax (1 x, 2 y) at the node.
+  real function lim_curv(ax)
+    integer, intent(in) :: ax !< The axis
+    real :: d2     ! A second difference [Z L-2 ~> m-1]
+    real :: d2_min ! The smallest magnitude [Z L-2 ~> m-1]
+    real :: sg     ! The common sign, 0 before the first [nondim]
+    real :: m_m, m_0, m_p ! The means of the three cells of a second difference [Z ~> m]
+    real :: w_m, w_0, w_p ! Their widths on the axis [L ~> m]
+    real :: dm, dp ! The distances between their centres [L ~> m]
+    real :: wo     ! The width on the other axis, not used [L ~> m]
+    integer :: r, k, ic, jc, di, dj
+    logical :: okm, ok0, okp
+
+    lim_curv = 0.0
+    d2_min = huge(1.0) ; sg = 0.0
+    di = 0 ; dj = 0
+    if (ax == 1) then ; di = 1 ; else ; dj = 1 ; endif
+    do r = 0, 1 ; do k = -1, 2
+      if (ax == 1) then
+        ic = i + k*sx ; jc = j + r*sy
+      else
+        ic = i + r*sx ; jc = j + k*sy
+      endif
+      if (ax == 1) then
+        call cell_val(ic-di, jc-dj, m_m, w_m, wo, okm)
+        call cell_val(ic, jc, m_0, w_0, wo, ok0)
+        call cell_val(ic+di, jc+dj, m_p, w_p, wo, okp)
+      else
+        call cell_val(ic-di, jc-dj, m_m, wo, w_m, okm)
+        call cell_val(ic, jc, m_0, wo, w_0, ok0)
+        call cell_val(ic+di, jc+dj, m_p, wo, w_p, okp)
+      endif
+      if (.not.(okm .and. ok0 .and. okp)) return
+      dm = 0.5 * (w_m + w_0) ; dp = 0.5 * (w_0 + w_p)
+      d2 = 2.0 * (((m_p - m_0) / dp) + ((m_m - m_0) / dm)) / (dp + dm)
+      if (d2 > 0.0) then
+        if (sg < 0.0) return
+        sg = 1.0
+      elseif (d2 < 0.0) then
+        if (sg > 0.0) return
+        sg = -1.0
+      else
+        return
+      endif
+      d2_min = min(d2_min, abs(d2))
+    enddo ; enddo
+    lim_curv = sg * (cc * d2_min)
+  end function lim_curv
+end subroutine dg1_lim_curv_allow
+
 !> DG1_LIMITER_EDGE_MIRROR: whether a face at the domain edge is a wall or a divide, across which the ice is a mirror
 !! image of the ice inside: velocity boundary code 5 (free slip) or 3 (set velocity), with zero normal velocity at
 !! both nodes of the face.  A calving front (code 2) or an open edge is not.
@@ -22679,6 +23454,162 @@ pure logical function dg1_lim_smooth3(cm, c0, cp, ratio)
   a_lo = min(min(abs(cm), abs(cp)), abs(c0)) ; a_hi = max(max(abs(cm), abs(cp)), abs(c0))
   dg1_lim_smooth3 = (a_lo >= ratio * a_hi)
 end function dg1_lim_smooth3
+
+!> DG1_LIMITER_TWIST_MOMENT: limit the twist of every ice cell of the compute domain by minmod of itself and half the
+!! differences of the tilts of its in-domain ice neighbours (the y tilts along x and the x tilts along y), in the
+!! variable h - D of a cell whose mean is grounded or h of a floating one, with D0 = DG1_LIMITER_D0 as the least twist
+!! kept.  The tilts and twists are read from a copy of the corners, so the result does not depend on the order of the
+!! loop.  The change is a twist of h: the cell mean and the tilts do not change.
+subroutine dg1_lim_twist_moment(CS, G, hmask, in_dom, trb, rr)
+  type(ice_shelf_dyn_CS), intent(inout) :: CS   !< The ice shelf dynamics control structure
+  type(ocean_grid_type),  intent(in)    :: G    !< The grid structure
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
+  logical, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: in_dom !< The cell lies inside the domain
+  logical, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: trb !< The crossed cells
+  real, intent(in) :: rr !< Ice to ocean density ratio [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: txh, tyh, twh ! Tilts and twist of h [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: txd, tyd, twd ! Tilts and twist of the bed depth D [Z ~> m]
+  real, dimension(2,2) :: hc ! Corners of a cell [Z ~> m]
+  real, dimension(4) :: dv   ! Half differences of the neighbours' tilts [Z ~> m]
+  real :: tw, tw_l, a_k, dtw ! The twist, its limited value, the magnitude kept and the change [Z ~> m]
+  real :: hmn, hfl ! The smallest corner and the floor of the corners [Z ~> m]
+  real :: hb, db ! Mean thickness and bed of a cell [Z ~> m]
+  real :: sg     ! The common sign [nondim]
+  logical :: grd, ok_n
+  integer :: i, j, n, k, isd, ied, jsd, jed
+
+  isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
+  txh(:,:) = 0.0 ; tyh(:,:) = 0.0 ; twh(:,:) = 0.0 ; txd(:,:) = 0.0 ; tyd(:,:) = 0.0 ; twd(:,:) = 0.0
+  do j = jsd+1, jed ; do i = isd+1, ied
+    if ((hmask(i,j) /= 1.0) .and. (hmask(i,j) /= 3.0)) cycle
+    hc(:,:) = CS%h_nodal(i,j,:,:)
+    txh(i,j) = 0.25 * ((hc(2,1) + hc(2,2)) - (hc(1,1) + hc(1,2)))
+    tyh(i,j) = 0.25 * ((hc(1,2) + hc(2,2)) - (hc(1,1) + hc(2,1)))
+    twh(i,j) = 0.25 * ((hc(1,1) + hc(2,2)) - (hc(2,1) + hc(1,2)))
+    txd(i,j) = 0.25 * ((CS%bed_node(i,j-1) + CS%bed_node(i,j)) - (CS%bed_node(i-1,j-1) + CS%bed_node(i-1,j)))
+    tyd(i,j) = 0.25 * ((CS%bed_node(i-1,j) + CS%bed_node(i,j)) - (CS%bed_node(i-1,j-1) + CS%bed_node(i,j-1)))
+    twd(i,j) = 0.25 * ((CS%bed_node(i-1,j-1) + CS%bed_node(i,j)) - (CS%bed_node(i,j-1) + CS%bed_node(i-1,j)))
+  enddo ; enddo
+  do j = G%jsc, G%jec ; do i = G%isc, G%iec
+    if (hmask(i,j) /= 1.0) cycle
+    if ((CS%dg_lim_twist == 2) .and. trb(i,j)) cycle
+    hb = 0.25 * ((CS%h_nodal(i,j,1,1) + CS%h_nodal(i,j,2,2)) + (CS%h_nodal(i,j,2,1) + CS%h_nodal(i,j,1,2)))
+    db = 0.25 * ((CS%bed_node(i-1,j-1) + CS%bed_node(i,j)) + (CS%bed_node(i,j-1) + CS%bed_node(i-1,j)))
+    grd = (rr * hb > db)
+    tw = twh(i,j) ; if (grd) tw = twh(i,j) - twd(i,j)
+    if (abs(tw) <= CS%dg_lim_d0) cycle
+    ! The half differences of the neighbours' tilts, in the variable of the cell.
+    n = 0
+    do k = 1, 4
+      select case (k)
+        case (1) ; ok_n = ice_in(i+1,j) ; if (ok_n) dv(n+1) = 0.5 * (tyv(i+1,j) - tyv(i,j))
+        case (2) ; ok_n = ice_in(i-1,j) ; if (ok_n) dv(n+1) = 0.5 * (tyv(i,j) - tyv(i-1,j))
+        case (3) ; ok_n = ice_in(i,j+1) ; if (ok_n) dv(n+1) = 0.5 * (txv(i,j+1) - txv(i,j))
+        case default ; ok_n = ice_in(i,j-1) ; if (ok_n) dv(n+1) = 0.5 * (txv(i,j) - txv(i,j-1))
+      end select
+      if (ok_n) n = n + 1
+    enddo
+    if (n == 0) cycle
+    ! minmod(tw, dv(1:n)): the smallest magnitude where all have the sign of tw, else 0.
+    sg = sign(1.0, tw) ; tw_l = abs(tw)
+    do k = 1, n
+      if (dv(k) * sg <= 0.0) then ; tw_l = 0.0 ; exit ; endif
+      tw_l = min(tw_l, abs(dv(k)))
+    enddo
+    a_k = max(tw_l, CS%dg_lim_d0)
+    if (abs(tw) <= a_k) cycle
+    dtw = sg * a_k - tw
+    ! No corner below min(MIN_H_SHELF, its smallest corner now).
+    hmn = min(min(CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,2,2)), min(CS%h_nodal(i,j,2,1), CS%h_nodal(i,j,1,2)))
+    hfl = min(CS%min_h_shelf, hmn)
+    if ((min(CS%h_nodal(i,j,1,1), CS%h_nodal(i,j,2,2)) + dtw < hfl) .or. &
+        (min(CS%h_nodal(i,j,2,1), CS%h_nodal(i,j,1,2)) - dtw < hfl)) cycle
+    CS%h_nodal(i,j,1,1) = CS%h_nodal(i,j,1,1) + dtw ; CS%h_nodal(i,j,2,2) = CS%h_nodal(i,j,2,2) + dtw
+    CS%h_nodal(i,j,2,1) = CS%h_nodal(i,j,2,1) - dtw ; CS%h_nodal(i,j,1,2) = CS%h_nodal(i,j,1,2) - dtw
+  enddo ; enddo
+
+contains
+
+  !> The cell is an ice cell inside the domain.
+  logical function ice_in(ii, jj)
+    integer, intent(in) :: ii, jj !< The cell
+    ice_in = in_dom(ii,jj) .and. ((hmask(ii,jj) == 1.0) .or. (hmask(ii,jj) == 3.0))
+  end function ice_in
+
+  !> The x tilt of cell (ii,jj) in the variable of the cell (i,j) being limited [Z ~> m].
+  real function txv(ii, jj)
+    integer, intent(in) :: ii, jj !< The cell
+    txv = txh(ii,jj) ; if (grd) txv = txh(ii,jj) - txd(ii,jj)
+  end function txv
+
+  !> The y tilt of cell (ii,jj) in the variable of the cell (i,j) being limited [Z ~> m].
+  real function tyv(ii, jj)
+    integer, intent(in) :: ii, jj !< The cell
+    tyv = tyh(ii,jj) ; if (grd) tyv = tyh(ii,jj) - tyd(ii,jj)
+  end function tyv
+end subroutine dg1_lim_twist_moment
+
+!> DG1_LIMITER_CORNER_PROJECT_FACE_CURV_WIDTHS: the second difference of three values along an axis, weighted by
+!! the widths of their cells and scaled by the square of the width of the middle cell, so that on cells of equal
+!! width it is vm + vp - 2 v0.  The two sides enter as one sum, so a reflection of the axis gives the same value.
+pure real function dg1_lim_d2w(vm, v0, vp, wm, w0, wp)
+  real, intent(in) :: vm !< The value in the cell before [Z ~> m]
+  real, intent(in) :: v0 !< The value in the cell [Z ~> m]
+  real, intent(in) :: vp !< The value in the cell after [Z ~> m]
+  real, intent(in) :: wm !< The width of the cell before [L ~> m]
+  real, intent(in) :: w0 !< The width of the cell [L ~> m]
+  real, intent(in) :: wp !< The width of the cell after [L ~> m]
+  real :: dm, dp ! The distances between the cell centres [L ~> m]
+
+  dm = 0.5 * (wm + w0) ; dp = 0.5 * (w0 + wp)
+  dg1_lim_d2w = (w0 * w0) * (2.0 * (((vp - v0) / dp) + ((vm - v0) / dm)) / (dp + dm))
+end function dg1_lim_d2w
+
+!> DG1_LIMITER_CORNER_PROJECT_FACE_CURV_LIMIT: the magnitude of the limited second difference at cell 3 of five cells
+!! along an axis: the smallest magnitude of the second differences at cells 2, 3 and 4 where all of them have one
+!! sign, and 0 otherwise.  Cells 2..4 must be available, or the result is 0; a second difference at cell 2 or 4
+!! whose outer cell is not available is left out.  With cw the second differences are weighted by the widths
+!! (dg1_lim_d2w) per unit length squared, and the result is scaled by the square of the width of cell 3;
+!! otherwise they are v(k-1) + v(k+1) - 2 v(k).  The two directions enter in the same way, so a reflection of
+!! the axis gives the same value.
+pure real function dg1_lim_face_d2lim(v, ok, w, cw)
+  real, dimension(5),    intent(in) :: v  !< The values at the five cells [Z ~> m]
+  logical, dimension(5), intent(in) :: ok !< The cells are available
+  real, dimension(5),    intent(in) :: w  !< The widths of the cells [L ~> m]
+  logical,               intent(in) :: cw !< Weight by the widths
+  real :: d2      ! A second difference [Z ~> m] or, with cw, [Z L-2 ~> m-1]
+  real :: d2_min  ! The smallest magnitude, in the units of d2
+  real :: sg      ! The common sign, 0 before the first [nondim]
+  integer :: k
+
+  dg1_lim_face_d2lim = 0.0
+  if (.not.(ok(2) .and. ok(3) .and. ok(4))) return
+  d2_min = huge(1.0) ; sg = 0.0
+  do k = 2, 4
+    if (.not.(ok(k-1) .and. ok(k+1))) cycle
+    if (cw) then
+      d2 = dg1_lim_d2w(v(k-1), v(k), v(k+1), w(k-1), w(k), w(k+1)) / (w(k) * w(k))
+    else
+      d2 = (v(k-1) + v(k+1)) - 2.0*v(k)
+    endif
+    if (d2 > 0.0) then
+      if (sg < 0.0) return
+      sg = 1.0
+    elseif (d2 < 0.0) then
+      if (sg > 0.0) return
+      sg = -1.0
+    else
+      return
+    endif
+    d2_min = min(d2_min, abs(d2))
+  enddo
+  if (sg == 0.0) return
+  if (cw) then
+    dg1_lim_face_d2lim = (w(3) * w(3)) * d2_min
+  else
+    dg1_lim_face_d2lim = d2_min
+  endif
+end function dg1_lim_face_d2lim
 
 !> DG1_LIMITER_FACE_BOUNDS: the bounds of one face, the smallest and largest of the cell mean, the mean
 !! across the face and, if the cell across is an ice cell, its own surface at the face, widened by the
