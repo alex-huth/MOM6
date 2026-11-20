@@ -124,17 +124,26 @@ real, parameter, dimension(2) :: SEP2_GC = (/ SEP2_GP(2), SEP2_GP(1) /)
 integer, parameter :: SEP2_MAXQP = 15    !< Largest number of QPs on one SEP2 parent triangle
 ! The layout of the DG1_COUPLED_BUBBLE block values of a cell (cpl_blk): a set of 19 for the Picard operator
 ! (the residual) and one for the operator of the linear solve, each the node-bubble block (16 values, cpl_nb)
-! and then the bubble block 11, 12, 22; then the driving stress against the two bubbles; then W.
-integer, parameter :: CPL_NV  = 56 !< The number of block values of a cell
+! and then the bubble block 11, 12, 22; then the driving stress against the two bubbles; then W; then the two
+! damper sets of DG1_SUBSCALE_DAMPER (Picard, then tangent): the symmetric 4x4 block of the shapes b (u), b (v),
+! eta b (u) and xi b (v), 10 values in the order of DM_PI, DM_PJ.
+integer, parameter :: CPL_NV  = 76 !< The number of block values of a cell
 integer, parameter :: CPL_PIC = 0  !< The offset of the Picard set
 integer, parameter :: CPL_LIN = 19 !< The offset of the linear-solve set
 integer, parameter :: CPL_BB  = 16 !< The offset of the bubble block within a set
 integer, parameter :: CPL_NSET = 19 !< The number of values of one set
 integer, parameter :: CPL_FB  = 38 !< The offset of the driving stress against the bubbles
 integer, parameter :: CPL_W   = 40 !< The offset of W = K_bb^-1 K_bn of the linear-solve set (cpl_nb layout)
+integer, parameter :: CPL_DP  = 56 !< The offset of the Picard damper set (10 values)
+integer, parameter :: CPL_DT  = 66 !< The offset of the tangent (Newton) damper set (10 values)
 integer, parameter :: CPL_KM  = 40 !< In the work values of dg1_cpl_blocks only: the offset of the corner
                                    !! friction matrix (10 corner pairs times 4 blocks, as gl_fric_K)
-integer, parameter :: CPL_NWK = 80 !< The number of work values of dg1_cpl_blocks
+integer, parameter :: CPL_WP  = 80 !< In the work values of dg1_cpl_blocks only: the Picard damper set
+integer, parameter :: CPL_WT  = 90 !< In the work values of dg1_cpl_blocks only: the tangent damper set
+integer, parameter :: CPL_NWK = 100 !< The number of work values of dg1_cpl_blocks
+integer, dimension(10), parameter :: DM_PI = (/ 1, 1, 2, 3, 3, 4, 1, 1, 2, 2 /) !< First shape of a damper set value
+integer, dimension(10), parameter :: DM_PJ = (/ 1, 2, 2, 3, 4, 4, 3, 4, 3, 4 /) !< Second shape of a damper set value
+integer, dimension(4), parameter :: DM_CM = (/ 1, 2, 1, 2 /) !< The velocity component of each damper shape
 real, parameter :: SEP2_T6L1 = 0.44594849091596488632 !< Light barycentric of 6-pt orbit 1 [nondim]
 real, parameter :: SEP2_T6H1 = 1.0 - 2.0*SEP2_T6L1    !< Heavy barycentric of 6-pt orbit 1 [nondim]
 real, parameter :: SEP2_T6L2 = 0.09157621350977074346 !< Light barycentric of 6-pt orbit 2 [nondim]
@@ -771,6 +780,9 @@ type, public :: ice_shelf_dyn_CS ; private
   logical :: dg_coupled = .false. !< If true, the velocity solve has one bubble per ice cell for u and for v,
                                   !! eliminated cell by cell (static condensation), and the bubble velocity, kept
                                   !! in dg_post_ub and dg_post_vb, is used in the transport volume term.
+  logical :: dg_cpl_blocks_only = .false. !< DG1_COUPLED_BUBBLE with DG1_COUPLED_BUBBLE_SOLVE = False: the velocity
+                                  !! solve has no bubbles (dg_coupled is then false), and the bubble blocks are built
+                                  !! once after each velocity solve, only for DG1_SUBSCALE_DAMPER
   logical :: dg_cpl_tr = .true. !< If false (DG1_COUPLED_BUBBLE_TRANSPORT), no cell uses the bubble velocity in the
                              !! DG(1) transport; the bubble stays in the velocity solve
   logical :: dg_cpl_tr_crossed = .true. !< If false (DG1_COUPLED_BUBBLE_TRANSPORT_CROSSED), the cells with sub-cell
@@ -790,6 +802,32 @@ type, public :: ice_shelf_dyn_CS ; private
                              !! terms (2, as the rest of the solve, or 3)
   logical :: dg_cpl_crossed = .true. !< If true, DG1_COUPLED_BUBBLE also has a bubble in the grounding-line
                                   !! cells, with the sub-cell quadrature of the velocity solve.
+  logical :: dg_ssd = .false. !< DG1_SUBSCALE_DAMPER: the transport volume term adds an in-cell velocity with the
+                              !! bubble shape, driven by the fine-scale part of the surface (dg1_ssd_velocity).
+  logical :: dg_ssd_pos = .true.     !< DG1_SUBSCALE_DAMPER_POSITIVE: the damper keeps the corners above MIN_H_SHELF
+  real, pointer, dimension(:,:) :: dg_ssd_ub => NULL() !< DG1_SUBSCALE_DAMPER: the x damper velocity of each cell at
+                                  !! the 2x2 Gauss points, at the last transport stage [L T-1 ~> m s-1]
+  real, pointer, dimension(:,:) :: dg_ssd_vb => NULL() !< DG1_SUBSCALE_DAMPER: the y damper velocity of each cell at
+                                  !! the 2x2 Gauss points, at the last transport stage [L T-1 ~> m s-1]
+  real, pointer, dimension(:,:) :: dg_ssd_tilt => NULL() !< DG1_SUBSCALE_DAMPER: the size of the fine-scale surface
+                                  !! tilt of each cell, at the last transport stage [Z ~> m]
+  real, pointer, dimension(:,:) :: dg_ssd_uo => NULL() !< DG1_SUBSCALE_DAMPER: the x velocity of the odd bubble
+                                  !! eta b of each cell, at the last transport stage [L T-1 ~> m s-1]
+  real, pointer, dimension(:,:) :: dg_ssd_vo => NULL() !< DG1_SUBSCALE_DAMPER: the y velocity of the odd bubble
+                                  !! xi b of each cell, at the last transport stage [L T-1 ~> m s-1]
+  real, pointer, dimension(:,:) :: dg_ssd_twist => NULL() !< DG1_SUBSCALE_DAMPER: the size of the fine-scale surface
+                                  !! twist of each cell, at the last transport stage [Z ~> m]
+  real, pointer, dimension(:,:) :: dg_ssd_path => NULL() !< DG1_SUBSCALE_DAMPER: the block each cell used at the last
+                                  !! stage: 1 the 2x2 bubble block, 2 the Picard damper set, 3 the tangent set [nondim]
+  real, pointer, dimension(:,:) :: dg_ssd_power => NULL() !< DG1_SUBSCALE_DAMPER: the force times the damper velocity
+                                  !! of each cell at the last stage [R L4 Z T-3 ~> W]
+  real, pointer, dimension(:,:) :: dg_ssd_rdt => NULL() !< DG1_SUBSCALE_DAMPER: the damping rate of the fine-scale
+                                  !! thickness of each cell times the stage time step [nondim]
+  real, pointer, dimension(:,:) :: dg_ssd_dpe => NULL() !< DG1_SUBSCALE_DAMPER: the rate of change of the potential
+                                  !! energy of each cell from the damper part of the last stage [R L4 Z T-3 ~> W]
+  real, pointer, dimension(:,:) :: dg_ssd_dfe => NULL() !< DG1_SUBSCALE_DAMPER: the rate of change of the fine-scale
+                                  !! energy 1/2 rho_i g sum_c w_c f_c**2 of each cell from the damper part of the last
+                                  !! stage, allocated only if its diagnostic is asked for [R L4 Z T-3 ~> W]
   real, pointer, dimension(:,:,:) :: cpl_blk => NULL() !< DG1_COUPLED_BUBBLE blocks of each cell for the current
                                   !! linearization: 1-16 the Picard node-bubble block (8 node unknowns, u then v
                                   !! at SW, SE, NW, NE, times 2 bubbles), 17-19 the Picard bubble block (11, 12, 22)
@@ -1102,6 +1140,10 @@ type, public :: ice_shelf_dyn_CS ; private
              id_dg_art_visc_cell_scale = -1, id_dg_band_kappa = -1, id_dg_band_w = -1, id_dg_fc = -1, &
              id_dg_lim_phi_t = -1, id_dg_lim_phi_w = -1, &
              id_dg_post_ub = -1, id_dg_post_vb = -1, id_dg_post_skip = -1, &
+             id_dg_ssd_ub = -1, id_dg_ssd_vb = -1, id_dg_ssd_tilt = -1, &
+             id_dg_ssd_uo = -1, id_dg_ssd_vo = -1, id_dg_ssd_twist = -1, &
+             id_dg_ssd_path = -1, id_dg_ssd_power = -1, id_dg_ssd_rdt = -1, id_dg_ssd_dpe = -1, &
+             id_dg_ssd_dfe = -1, &
              id_dg_src_cut_smb = -1, id_dg_src_cut_bmb = -1, id_dg_outflow_ratio = -1, &
              id_dg_slow_idle_face_u = -1, id_dg_slow_idle_face_v = -1, &
              id_h_jump_face_u = -1, id_h_jump_face_v = -1, &
@@ -1975,6 +2017,20 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
     if (CS%dg_lim_grounded_upper .and. ((G%isc - G%isd < 4) .or. (G%jsc - G%jsd < 4))) &
       call MOM_error(FATAL, "MOM_ice_shelf_dynamics: DG1_LIMITER_GROUNDED_UPPER and DG1_LIMITER_FACE_INVERSION "//&
                      "need a halo of at least 4 cells (NIHALO and NJHALO >= 4).")
+    if (CS%dg_ssd) then
+      if ((G%isc - G%isd < 4) .or. (G%jsc - G%jsd < 4)) call MOM_error(FATAL, &
+          "MOM_ice_shelf_dynamics: DG1_SUBSCALE_DAMPER needs a halo of at least 4 cells (NIHALO and NJHALO >= 4).")
+      allocate(CS%dg_ssd_ub(G%isd:G%ied,G%jsd:G%jed), source=0.0)
+      allocate(CS%dg_ssd_vb(G%isd:G%ied,G%jsd:G%jed), source=0.0)
+      allocate(CS%dg_ssd_tilt(G%isd:G%ied,G%jsd:G%jed), source=0.0)
+      allocate(CS%dg_ssd_uo(G%isd:G%ied,G%jsd:G%jed), source=0.0)
+      allocate(CS%dg_ssd_vo(G%isd:G%ied,G%jsd:G%jed), source=0.0)
+      allocate(CS%dg_ssd_twist(G%isd:G%ied,G%jsd:G%jed), source=0.0)
+      allocate(CS%dg_ssd_path(G%isd:G%ied,G%jsd:G%jed), source=0.0)
+      allocate(CS%dg_ssd_power(G%isd:G%ied,G%jsd:G%jed), source=0.0)
+      allocate(CS%dg_ssd_rdt(G%isd:G%ied,G%jsd:G%jed), source=0.0)
+      allocate(CS%dg_ssd_dpe(G%isd:G%ied,G%jsd:G%jed), source=0.0)
+    endif
     ! They are for the limiter-only law: with the band, its artificial viscosity and diffusion treat the cells at the
     ! grounding line, and these bounds would act there only in crossed cells, at full strength, against the band.
     if ((CS%dg_lim_grounded_upper .or. CS%dg_lim_face_inv) .and. (CS%dg_band_width >= 0) .and. &
@@ -1993,7 +2049,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
                  "if OBS read from a file, "//&
                  "if CONSTANT a constant value (for debugging).", &
                  default="MODEL")
-    if (CS%dg_coupled .and. (CS%dg_cpl_quad == 3) .and. &
+    if ((CS%dg_coupled .or. CS%dg_cpl_blocks_only) .and. (CS%dg_cpl_quad == 3) .and. &
         ((trim(CS%ice_viscosity_compute) /= "MODEL") .or. (CS%visc_qps /= 4))) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics, initialize_ice_shelf_dyn: DG1_COUPLED_BUBBLE_QUAD = 3 needs "//&
       "ICE_VISCOSITY_COMPUTE = MODEL and NUMBER_OF_ICE_VISCOSITY_QUADRATURE_POINTS = 4.")
@@ -2100,7 +2156,7 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
       allocate(CS%elem_K(8,8,isd:ied,jsd:jed), source=0.0)
       if (CS%local_basal_friction) allocate(CS%elem_locF(4,Isdq:Iedq,Jsdq:Jedq), source=0.0)
     endif
-    if (CS%dg_coupled) then
+    if (CS%dg_coupled .or. CS%dg_cpl_blocks_only) then
       allocate(CS%cpl_blk(CPL_NV,isd:ied,jsd:jed), source=0.0)
       allocate(CS%cpl_rb(2,isd:ied,jsd:jed), source=0.0)
       allocate(CS%cpl_on(isd:ied,jsd:jed), source=0.0)
@@ -2537,6 +2593,48 @@ subroutine initialize_ice_shelf_dyn(param_file, Time, ISS, CS, G, US, diag, new_
            'or no finite result); DG1_COUPLED_BUBBLE: 1 where the cell has no bubble, 0.5 where its '//&
            'linear solve uses the Picard bubble blocks', 'nondim')
       endif
+      if (CS%dg_ssd) then
+        CS%id_dg_ssd_ub = register_diag_field('ice_shelf_model', 'dg_ssd_ub', CS%diag%axesT1, Time, &
+           'DG1_SUBSCALE_DAMPER: x damper velocity of each cell at its 2x2 Gauss points, at the last transport '//&
+           'stage', 'm yr-1', conversion=365.0*86400.0*US%L_T_to_m_s)
+        CS%id_dg_ssd_vb = register_diag_field('ice_shelf_model', 'dg_ssd_vb', CS%diag%axesT1, Time, &
+           'DG1_SUBSCALE_DAMPER: y damper velocity of each cell at its 2x2 Gauss points, at the last transport '//&
+           'stage', 'm yr-1', conversion=365.0*86400.0*US%L_T_to_m_s)
+        CS%id_dg_ssd_tilt = register_diag_field('ice_shelf_model', 'dg_ssd_tilt', CS%diag%axesT1, Time, &
+           'DG1_SUBSCALE_DAMPER: size of the fine-scale surface tilt of each cell, sqrt(fx**2 + fy**2) of the '//&
+           'corner surface minus the node reference, at the last transport stage', 'm', conversion=US%Z_to_m)
+        CS%id_dg_ssd_twist = register_diag_field('ice_shelf_model', 'dg_ssd_twist', CS%diag%axesT1, Time, &
+           'DG1_SUBSCALE_DAMPER: size of the fine-scale surface twist of each cell, |f_SW + f_NE - f_SE - f_NW|/4 '//&
+           'of the corner surface minus the node reference, at the last transport stage', 'm', conversion=US%Z_to_m)
+        CS%id_dg_ssd_path = register_diag_field('ice_shelf_model', 'dg_ssd_path', CS%diag%axesT1, Time, &
+           'DG1_SUBSCALE_DAMPER: the block each cell used at the last transport stage: 1 the 2x2 bubble block, 2 '//&
+           'the Picard damper set, 3 the tangent damper set, 0 no damper', 'nondim')
+        CS%id_dg_ssd_power = register_diag_field('ice_shelf_model', 'dg_ssd_power', CS%diag%axesT1, Time, &
+           'DG1_SUBSCALE_DAMPER: the force of the fine-scale surface times the damper velocity of each cell at the '//&
+           'last transport stage (the rate at which it does work), before the relaxation factor and _POSITIVE', &
+           'W', conversion=US%RZL2_to_kg*(US%L_T_to_m_s**2)*US%s_to_T)
+        CS%id_dg_ssd_rdt = register_diag_field('ice_shelf_model', 'dg_ssd_rdt', CS%diag%axesT1, Time, &
+           'DG1_SUBSCALE_DAMPER: the damping rate of the fine-scale thickness of each cell (a Rayleigh quotient of '//&
+           'its corner tendency) times the stage time step, at the last transport stage', 'nondim')
+        CS%id_dg_ssd_dpe = register_diag_field('ice_shelf_model', 'dg_ssd_dpe', CS%diag%axesT1, Time, &
+           'DG1_SUBSCALE_DAMPER: the rate of change of the potential energy of each cell from the damper part of '//&
+           'the last transport stage, rho_i g sum over the corners of the surface times the damper volume term '//&
+           '(after _RELAX and _POSITIVE); negative where the damper removes energy', &
+           'W', conversion=US%RZL2_to_kg*(US%L_T_to_m_s**2)*US%s_to_T)
+        CS%id_dg_ssd_dfe = register_diag_field('ice_shelf_model', 'dg_ssd_dfe', CS%diag%axesT1, Time, &
+           'DG1_SUBSCALE_DAMPER: the rate of change of the fine-scale energy 1/2 rho_i g sum_c w_c f_c**2 of each '//&
+           'cell (w_c the cell area of corner c) from the damper part of the last transport stage alone: f after '//&
+           'the damper change of the stage minus f before, over the stage time step; negative where the damper '//&
+           'removes fine-scale energy.  It costs one more evaluation of the reference per stage.', &
+           'W', conversion=US%RZL2_to_kg*(US%L_T_to_m_s**2)*US%s_to_T)
+        if (CS%id_dg_ssd_dfe > 0) allocate(CS%dg_ssd_dfe(G%isd:G%ied,G%jsd:G%jed), source=0.0)
+        CS%id_dg_ssd_uo = register_diag_field('ice_shelf_model', 'dg_ssd_uo', CS%diag%axesT1, Time, &
+           'DG1_SUBSCALE_DAMPER: x velocity of the odd bubble eta b of each cell (eta from -1 to 1, b 1 at '//&
+           'the 2x2 Gauss points), at the last transport stage', 'm yr-1', conversion=365.0*86400.0*US%L_T_to_m_s)
+        CS%id_dg_ssd_vo = register_diag_field('ice_shelf_model', 'dg_ssd_vo', CS%diag%axesT1, Time, &
+           'DG1_SUBSCALE_DAMPER: y velocity of the odd bubble xi b of each cell (xi from -1 to 1, b 1 at '//&
+           'the 2x2 Gauss points), at the last transport stage', 'm yr-1', conversion=365.0*86400.0*US%L_T_to_m_s)
+      endif
       if (CS%dg_grounded_limiter) then
         allocate(CS%dg_lim_phi(G%isd:G%ied,G%jsd:G%jed,2), source=1.0)
         CS%id_dg_lim_phi_t = register_diag_field('ice_shelf_model', 'dg_lim_phi_t', CS%diag%axesT1, Time, &
@@ -2936,7 +3034,7 @@ subroutine update_ice_shelf(CS, ISS, G, US, time_step, Time, calve_ice_shelf_ber
       ! DG1_GL_SHARED_H: the solve reads the blended corners; the transported corners come back after it.
       allocate(h_keep(G%isd:G%ied,G%jsd:G%jed,2,2), h_ssa(G%isd:G%ied,G%jsd:G%jed,2,2))
       h_keep(:,:,:,:) = CS%h_nodal(:,:,:,:)
-      call dg1_gl_shared_h(CS, G, ISS%hmask, h_ssa)
+      call dg1_gl_shared_h(CS, G, ISS%hmask, CS%h_nodal, h_ssa)
       CS%h_nodal(:,:,:,:) = h_ssa(:,:,:,:)
       CS%grounded_geom_current = .false.
     endif
@@ -3533,6 +3631,17 @@ subroutine IS_dynamics_post_data(time_step, Time, CS, ISS, G)
     if (CS%id_dg_post_ub > 0) call post_data(CS%id_dg_post_ub, CS%dg_post_ub, CS%diag)
     if (CS%id_dg_post_vb > 0) call post_data(CS%id_dg_post_vb, CS%dg_post_vb, CS%diag)
     if (CS%id_dg_post_skip > 0) call post_data(CS%id_dg_post_skip, CS%dg_post_skip, CS%diag)
+    if (CS%id_dg_ssd_ub > 0) call post_data(CS%id_dg_ssd_ub, CS%dg_ssd_ub, CS%diag)
+    if (CS%id_dg_ssd_vb > 0) call post_data(CS%id_dg_ssd_vb, CS%dg_ssd_vb, CS%diag)
+    if (CS%id_dg_ssd_tilt > 0) call post_data(CS%id_dg_ssd_tilt, CS%dg_ssd_tilt, CS%diag)
+    if (CS%id_dg_ssd_twist > 0) call post_data(CS%id_dg_ssd_twist, CS%dg_ssd_twist, CS%diag)
+    if (CS%id_dg_ssd_path > 0) call post_data(CS%id_dg_ssd_path, CS%dg_ssd_path, CS%diag)
+    if (CS%id_dg_ssd_power > 0) call post_data(CS%id_dg_ssd_power, CS%dg_ssd_power, CS%diag)
+    if (CS%id_dg_ssd_rdt > 0) call post_data(CS%id_dg_ssd_rdt, CS%dg_ssd_rdt, CS%diag)
+    if (CS%id_dg_ssd_dpe > 0) call post_data(CS%id_dg_ssd_dpe, CS%dg_ssd_dpe, CS%diag)
+    if (CS%id_dg_ssd_dfe > 0) call post_data(CS%id_dg_ssd_dfe, CS%dg_ssd_dfe, CS%diag)
+    if (CS%id_dg_ssd_uo > 0) call post_data(CS%id_dg_ssd_uo, CS%dg_ssd_uo, CS%diag)
+    if (CS%id_dg_ssd_vo > 0) call post_data(CS%id_dg_ssd_vo, CS%dg_ssd_vo, CS%diag)
     if (CS%id_dg_lim_phi_t > 0) &
         call post_data(CS%id_dg_lim_phi_t, CS%dg_lim_phi(:,:,1), CS%diag)
     if (CS%id_dg_lim_phi_w > 0) &
@@ -4433,6 +4542,16 @@ subroutine ice_shelf_solve_outer(CS, ISS, G, US, u_shlf, v_shlf, taudx, taudy, i
   enddo
   CS%doing_newton = .false.
   CS%cg_tol_current = CS%cg_tolerance
+
+  ! DG1_COUPLED_BUBBLE_SOLVE = False: the Picard bubble blocks of the converged velocity (its viscosity is current),
+  ! for the rate of DG1_SUBSCALE_DAMPER only.  The friction cache of the solve is left as it is.
+  ! The bubble velocities of a restart are not part of this solve, so they are zeroed first: the blocks read the
+  ! node velocities only.
+  if (CS%dg_cpl_blocks_only .and. CS%dg_ssd) then
+    CS%dg_post_ub(:,:) = 0.0 ; CS%dg_post_vb(:,:) = 0.0
+    call dg1_cpl_blocks(CS, ISS, G, US, u_shlf, v_shlf, G%isc-1, G%iec+1, G%jsc-1, G%jec+1, .false., .false., &
+                        set_cache=.false.)
+  endif
 
   write(mesg,*) "ice_shelf_solve_outer: nonlinear fractional residual = ", err_max/err_init
   call MOM_mesg(mesg)
@@ -10487,6 +10606,68 @@ pure real function dg1_minmod2(a, b)
   if ((a < 0.0) .and. (b < 0.0)) dg1_minmod2 = max(a, b)
 end function dg1_minmod2
 
+!> The part that three values all share: the one nearest 0 if they have one sign, else 0.  The last two enter
+!! symmetrically.
+pure real function dg1_minmod3(a, b, c)
+  real, intent(in) :: a !< The first value [A]
+  real, intent(in) :: b !< The second value [A]
+  real, intent(in) :: c !< The third value [A]
+  dg1_minmod3 = 0.0
+  if ((a > 0.0) .and. (b > 0.0) .and. (c > 0.0)) dg1_minmod3 = min(a, min(b, c))
+  if ((a < 0.0) .and. (b < 0.0) .and. (c < 0.0)) dg1_minmod3 = max(a, max(b, c))
+end function dg1_minmod3
+
+!> DG1_SUBSCALE_DAMPER: the velocities w of the shapes b (u), b (v), eta b (u), xi b (v) of a cell from a damper set
+!! k (the symmetric 4x4 block in the order of DM_PI, DM_PJ) and the forces on the two bubbles fb and on the two odd
+!! bubbles fo: by blocks, A = the bubble block, B = the coupling, D = the odd block, with the Schur complement
+!! S = D - B^T A^-1 B.  Without odd the two bubbles only.  ok is false if A or S is not positive definite.  Every sum
+!! is grouped so that swapping the u and v shapes gives the same rounding.
+pure subroutine dg1_ssd_solve4(k, fb, fo, odd, w, ok)
+  real, dimension(10), intent(in)  :: k  !< The damper set [R L2 Z T-1 ~> kg s-1]
+  real, dimension(2),  intent(in)  :: fb !< The forces on the two bubbles [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(2),  intent(in)  :: fo !< The forces on the two odd bubbles [R L3 Z T-2 ~> kg m s-2]
+  logical,             intent(in)  :: odd !< Solve for the odd bubbles too
+  real, dimension(4),  intent(out) :: w  !< The velocities of the four shapes [L T-1 ~> m s-1]
+  logical,             intent(out) :: ok !< The solution exists
+  real :: deta, dets ! The determinants of A and S [R2 L4 Z2 T-2 ~> kg2 s-2]
+  real :: ai11, ai12, ai22 ! The inverse of A [R-1 L-2 Z-1 T ~> kg-1 s]
+  real :: c11, c12, c21, c22 ! C = A^-1 B [nondim]
+  real :: s11, s12, s22 ! S [R L2 Z T-1 ~> kg s-1]
+  real :: y1, y2, g1, g2 ! A^-1 fb [L T-1 ~> m s-1] and fo - B^T A^-1 fb [R L3 Z T-2 ~> kg m s-2]
+  w(:) = 0.0 ; ok = .false.
+  deta = (k(1) * k(3)) - (k(2) * k(2))
+  if (.not.((deta > 0.0) .and. (k(1) > 0.0) .and. (abs(deta) <= huge(deta)))) return
+  ai11 = k(3) / deta ; ai12 = (-k(2)) / deta ; ai22 = k(1) / deta
+  y1 = (ai11 * fb(1)) + (ai12 * fb(2)) ; y2 = (ai12 * fb(1)) + (ai22 * fb(2))
+  if (.not.odd) then
+    w(1) = y1 ; w(2) = y2 ; ok = .true. ; return
+  endif
+  ! B: rows the bubbles (u, v), columns the odd bubbles (eta b u, xi b v): B11 = k(7), B12 = k(8), B21 = k(9),
+  ! B22 = k(10).
+  c11 = (ai11 * k(7)) + (ai12 * k(9)) ; c12 = (ai11 * k(8)) + (ai12 * k(10))
+  c21 = (ai12 * k(7)) + (ai22 * k(9)) ; c22 = (ai12 * k(8)) + (ai22 * k(10))
+  s11 = k(4) - ((k(7) * c11) + (k(9) * c21))
+  s22 = k(6) - ((k(8) * c12) + (k(10) * c22))
+  s12 = k(5) - (0.5 * (((k(7) * c12) + (k(9) * c22)) + ((k(8) * c11) + (k(10) * c21))))
+  dets = (s11 * s22) - (s12 * s12)
+  if (.not.((dets > 0.0) .and. (s11 > 0.0) .and. (abs(dets) <= huge(dets)))) return
+  g1 = fo(1) - ((k(7) * y1) + (k(9) * y2)) ; g2 = fo(2) - ((k(8) * y1) + (k(10) * y2))
+  w(3) = ((s22 * g1) - (s12 * g2)) / dets ; w(4) = ((s11 * g2) - (s12 * g1)) / dets
+  w(1) = y1 - ((c11 * w(3)) + (c12 * w(4))) ; w(2) = y2 - ((c21 * w(3)) + (c22 * w(4)))
+  ok = .true.
+end subroutine dg1_ssd_solve4
+
+!> DG1_SUBSCALE_DAMPER: the divided second difference at node k of a row of node surfaces sk with node
+!! spacings sp (sp(k) between nodes k-1 and k): 2 ((sk(k+1) - sk(k))/sp(k+1) - (sk(k) - sk(k-1))/sp(k)) divided by
+!! (sp(k) + sp(k+1)).
+pure real function dg1_ssd_dd2(sk, sp, k)
+  real, dimension(-3:3), intent(in) :: sk !< The node surfaces [Z ~> m]
+  real, dimension(-2:3), intent(in) :: sp !< The node spacings [L ~> m]
+  integer,               intent(in) :: k  !< The node
+  dg1_ssd_dd2 = (2.0 * (((sk(k+1) - sk(k)) / sp(k+1)) - ((sk(k) - sk(k-1)) / sp(k)))) / (sp(k) + sp(k+1))
+end function dg1_ssd_dd2
+
+
 !> True if cell (i,j) integrates its basal friction and DG driving stress with the grounding-line
 !! sub-element quadrature: a grounding-line cell (0 < ground_frac < 1), or a fully grounded cell
 !! flagged by set_gl_subgrid_neighbors.
@@ -11830,6 +12011,17 @@ subroutine ice_shelf_dyn_end(CS)
   if (associated(CS%dg_post_ub)) deallocate(CS%dg_post_ub)
   if (associated(CS%dg_post_vb)) deallocate(CS%dg_post_vb)
   if (associated(CS%dg_post_skip)) deallocate(CS%dg_post_skip)
+  if (associated(CS%dg_ssd_ub)) deallocate(CS%dg_ssd_ub)
+  if (associated(CS%dg_ssd_vb)) deallocate(CS%dg_ssd_vb)
+  if (associated(CS%dg_ssd_tilt)) deallocate(CS%dg_ssd_tilt)
+  if (associated(CS%dg_ssd_uo)) deallocate(CS%dg_ssd_uo)
+  if (associated(CS%dg_ssd_vo)) deallocate(CS%dg_ssd_vo)
+  if (associated(CS%dg_ssd_twist)) deallocate(CS%dg_ssd_twist)
+  if (associated(CS%dg_ssd_path)) deallocate(CS%dg_ssd_path)
+  if (associated(CS%dg_ssd_power)) deallocate(CS%dg_ssd_power)
+  if (associated(CS%dg_ssd_rdt)) deallocate(CS%dg_ssd_rdt)
+  if (associated(CS%dg_ssd_dpe)) deallocate(CS%dg_ssd_dpe)
+  if (associated(CS%dg_ssd_dfe)) deallocate(CS%dg_ssd_dfe)
   if (associated(CS%dg_lim_stat)) deallocate(CS%dg_lim_stat)
   if (associated(CS%dg_src_cut_smb)) deallocate(CS%dg_src_cut_smb)
   if (associated(CS%dg_src_cut_bmb)) deallocate(CS%dg_src_cut_bmb)
@@ -13654,6 +13846,7 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   character(len=40) :: fps_str      ! DG1_LIMITER_CORNER_PROJECT_FACE_POINT_SURFACE
   character(len=40) :: cpf_str, jsc_str, vtx_str, wbd_str ! DG1_LIMITER_CORNER_PROJECT_FACE
   character(len=16) :: share_str    ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARE
+  logical :: cpl_solve              ! DG1_COUPLED_BUBBLE_SOLVE
   character(len=16) :: br_rule      ! DG1_LIMITER_BRANCH_RULE
 
 
@@ -14430,6 +14623,14 @@ subroutine read_DG_params(param_file, mdl, CS, US)
                  "and the solution minimizes the SSA functional over the larger space, so it is no worse "//&
                  "than the bilinear solution in that energy.", &
                  default=.false., do_not_log=.not.CS%use_DG_thickness)
+  call get_param(param_file, mdl, "DG1_COUPLED_BUBBLE_SOLVE", cpl_solve, &
+                 "If false, DG1_COUPLED_BUBBLE has no bubbles in the velocity solve: the solve, the transport "//&
+                 "and every other use are those of DG1_COUPLED_BUBBLE = False, and the bubble blocks (the "//&
+                 "bubble rows of the SSA with its viscosity and friction, the sub-cell grounding-line rule "//&
+                 "included) are built once after each velocity solve, only to set the rate of "//&
+                 "DG1_SUBSCALE_DAMPER.  The other DG1_COUPLED_BUBBLE parameters keep their checks.  Needs "//&
+                 "DG1_COUPLED_BUBBLE_OWN_SURFACE = False and DG1_SSA_METRIC_TERMS = False.", &
+                 default=.true., do_not_log=.not.CS%dg_coupled)
   call get_param(param_file, mdl, "DG1_COUPLED_BUBBLE_CROSSED", CS%dg_cpl_crossed, &
                  "If true, DG1_COUPLED_BUBBLE also has bubbles in the cells with sub-cell grounding-line "//&
                  "quadrature, where their friction and driving stress use the same SEP2 or SEP3 "//&
@@ -14533,6 +14734,40 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   if ((CS%dg_cpl_tr_share > 0) .and. ((.not.CS%dg_coupled) .or. (CS%dg_cpl_quad /= 3))) call MOM_error(FATAL, &
       "MOM_ice_shelf_dynamics, read_DG_params: DG1_COUPLED_BUBBLE_TRANSPORT_SHARE needs DG1_COUPLED_BUBBLE and "//&
       "DG1_COUPLED_BUBBLE_QUAD = 3.")
+  call get_param(param_file, mdl, "DG1_SUBSCALE_DAMPER", CS%dg_ssd, &
+                 "If true, the DG(1) transport adds in each ice cell an in-cell velocity with the shape of the "//&
+                 "DG1_COUPLED_BUBBLE bubble, driven only by the fine-scale part of the surface, the part that the "//&
+                 "grid cannot hold.  At each node the corner thicknesses of the ice cells there are averaged and "//&
+                 "turned into a surface with the node's own flotation test (the thickness is continuous across the "//&
+                 "grounding line; the surface has the kink); the average is weighted by the cell area each corner "//&
+                 "stands for (cell_mean_w).  The alternating 2 dx part of that node surface is removed along x and "//&
+                 "along y: minmod(d2, -d2_minus, -d2_plus)/4 of the second differences (divided by the node "//&
+                 "spacings) at the node and its two neighbours is added, which is 0 at a single kink or on a "//&
+                 "smooth curve; the x-then-y and y-then-x results are averaged.  Beyond a wall node the test reads "//&
+                 "the mirror images of the nodes inside; at the other edges of the ice (a calving front, an "//&
+                 "ice-free side) it fits a quadratic and a zigzag to the 4 nodes nearest on the ice side.  The "//&
+                 "fine-scale surface of a corner is its surface (its own flotation test) minus that node "//&
+                 "reference.  Its driving stress against the two bubbles b and the two odd bubbles (eta b for u, "//&
+                 "xi b for v, which see the twist) of the cell is solved with the tangent (Newton) linearization "//&
+                 "of the SSA at the last velocity solve (the Picard block where the tangent one is not positive "//&
+                 "definite), so the rate is that at which the ice flattens a small change of its surface, with "//&
+                 "no constant to tune.  Each cell's velocity is then multiplied by (1 - exp(-r dt))/(r dt), with r "//&
+                 "its damping rate, so the relaxation is exact at any time step.  The velocity is zero on the "//&
+                 "faces, so the cell means and the mass do not change; only the tilts do.  It damps the thickness "//&
+                 "shapes that the node velocities cannot see (staircases, 2 dx zigzags) without the false "//&
+                 "tilts that the bubble transport makes in shear margins.  Needs DG1_COUPLED_BUBBLE with "//&
+                 "DG1_COUPLED_BUBBLE_QUAD = 3 and a halo of 4 cells.", &
+                 default=.false., do_not_log=.not.CS%dg_coupled)
+  call get_param(param_file, mdl, "DG1_SUBSCALE_DAMPER_POSITIVE", CS%dg_ssd_pos, &
+                 "If true, the damper velocity of each cell is scaled down only as far as needed to keep every "//&
+                 "corner of the cell at or above MIN_H_SHELF after the damper part of a stage, from the corner "//&
+                 "tendency of the damper alone.  If false, only the positivity limiter keeps the corners above "//&
+                 "MIN_H_SHELF.", &
+                 default=.true., do_not_log=.not.CS%dg_ssd)
+  if (CS%dg_ssd .and. .not.CS%dg_coupled) call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: "//&
+      "DG1_SUBSCALE_DAMPER needs DG1_COUPLED_BUBBLE, whose bubble blocks set its rate.")
+  if (CS%dg_ssd .and. (CS%dg_cpl_quad /= 3)) call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: "//&
+      "DG1_SUBSCALE_DAMPER needs DG1_COUPLED_BUBBLE_QUAD = 3 (its tangent and odd blocks use the 4x4 point rule).")
   if (CS%dg_coupled .and. (CS%dg_cpl_quad == 3)) then
     ! With the node-node terms on the 2-point rule the rows of a cell do not come from one energy, and the
     ! nonlinear iterations need not converge; the 3-point node terms exist only in the stored cell matrices.
@@ -15427,6 +15662,18 @@ subroutine read_DG_params(param_file, mdl, CS, US)
   CS%dg_slow_idle_eps_tiny = 1.0e-12 * US%s_to_T
   CS%dg_slow_idle_s_tol    = 1.0     * US%m_to_Z
 
+  ! DG1_COUPLED_BUBBLE_SOLVE = False: every check above saw DG1_COUPLED_BUBBLE; from here on the model runs as without
+  ! it, except that the bubble blocks are built after each velocity solve for DG1_SUBSCALE_DAMPER.
+  if (CS%dg_coupled .and. .not.cpl_solve) then
+    if (CS%dg_cpl_own_surf) call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: "//&
+        "DG1_COUPLED_BUBBLE_SOLVE = False needs DG1_COUPLED_BUBBLE_OWN_SURFACE = False (a term of the solve).")
+    if (CS%ssa_metric) call MOM_error(FATAL, "MOM_ice_shelf_dynamics, read_DG_params: "//&
+        "DG1_COUPLED_BUBBLE_SOLVE = False needs DG1_SSA_METRIC_TERMS = False.")
+    CS%dg_cpl_blocks_only = .true.
+    CS%dg_coupled = .false.
+    CS%ssa_q3 = .false.
+  endif
+
 end subroutine read_DG_params
 
 !> Build the per-cell tables Minv_nodal and cell_mean_w. On an orthogonal grid the Q1 mass
@@ -15645,10 +15892,12 @@ end subroutine pass_corner_field
 !! flotation moves from 0 to DG1_GL_SHARED_H_REACH times the jump (largest minus smallest corner) away from it.
 !! Sums pair diagonally opposite corners, so the result does not depend on the orientation of the grid.
 !! With w_node, the weight of a node is the larger of this one and w_node.
-subroutine dg1_gl_shared_h(CS, G, hmask, h_ssa, w_node)
+subroutine dg1_gl_shared_h(CS, G, hmask, hn, h_ssa, w_node)
   type(ice_shelf_dyn_CS), intent(in)    :: CS    !< The ice shelf dynamics control structure
   type(ocean_grid_type),  intent(in)    :: G     !< The grid structure
   real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in) :: hn !< The corner thicknesses to blend, the transported ones
+                                                         !! or those of a transport stage [Z ~> m]
   real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out) :: h_ssa !< Corner thicknesses for the solve [Z ~> m]
   real, dimension(SZDIB_(G),SZDJB_(G)), optional, intent(in) :: w_node !< A lower bound of the blend weight
                                                                        !! of each node [nondim]
@@ -15664,7 +15913,7 @@ subroutine dg1_gl_shared_h(CS, G, hmask, h_ssa, w_node)
   real :: wn      ! Blend weight of the node [nondim]
   integer :: a, b, ic, jc, In, Jn, n
 
-  h_ssa(:,:,:,:) = CS%h_nodal(:,:,:,:)
+  h_ssa(:,:,:,:) = hn(:,:,:,:)
   rr = CS%density_ice / CS%density_ocean_avg
   do Jn = G%jsd, G%jed-1 ; do In = G%isd, G%ied-1
     ! Corner (a,b) of cell (In+2-a, Jn+2-b) lies on node (In, Jn).
@@ -15673,7 +15922,7 @@ subroutine dg1_gl_shared_h(CS, G, hmask, h_ssa, w_node)
       ic = In + 2 - a ; jc = Jn + 2 - b
       hc(a,b) = 0.0 ; wc(a,b) = 0.0
       if ((hmask(ic,jc) == 1.0) .or. (hmask(ic,jc) == 3.0)) then
-        hc(a,b) = CS%h_nodal(ic,jc,a,b) ; wc(a,b) = CS%cell_mean_w(ic,jc,a,b)
+        hc(a,b) = hn(ic,jc,a,b) ; wc(a,b) = CS%cell_mean_w(ic,jc,a,b)
         if (n == 0) then
           hmin = hc(a,b) ; hmax = hc(a,b)
         else
@@ -15719,10 +15968,10 @@ subroutine dg1_set_h_flot(CS, G, hmask)
   if (.not.allocated(CS%h_flot)) allocate(CS%h_flot(G%isd:G%ied,G%jsd:G%jed,2,2), source=0.0)
   allocate(h_bl(G%isd:G%ied,G%jsd:G%jed,2,2))
   if (CS%dg_gl_flot_band >= 0) then
-    call dg1_flot_band_weight(CS, G, hmask, w_band)
-    call dg1_gl_shared_h(CS, G, hmask, h_bl, w_band)
+    call dg1_flot_band_weight(CS, G, hmask, CS%h_nodal, w_band)
+    call dg1_gl_shared_h(CS, G, hmask, CS%h_nodal, h_bl, w_band)
   else
-    call dg1_gl_shared_h(CS, G, hmask, h_bl)
+    call dg1_gl_shared_h(CS, G, hmask, CS%h_nodal, h_bl)
   endif
   CS%h_flot(:,:,:,:) = h_bl(:,:,:,:)
   deallocate(h_bl)
@@ -15743,10 +15992,10 @@ subroutine dg1_flot_corners(CS, G, hmask, h_out)
   if (.not.CS%dg_gl_shared_flot) then
     h_out(:,:,:,:) = CS%h_nodal(:,:,:,:)
   elseif (CS%dg_gl_flot_band >= 0) then
-    call dg1_flot_band_weight(CS, G, hmask, w_band)
-    call dg1_gl_shared_h(CS, G, hmask, h_out, w_band)
+    call dg1_flot_band_weight(CS, G, hmask, CS%h_nodal, w_band)
+    call dg1_gl_shared_h(CS, G, hmask, CS%h_nodal, h_out, w_band)
   else
-    call dg1_gl_shared_h(CS, G, hmask, h_out)
+    call dg1_gl_shared_h(CS, G, hmask, CS%h_nodal, h_out)
   endif
 end subroutine dg1_flot_corners
 
@@ -15762,10 +16011,12 @@ end subroutine dg1_flot_corners
 !! gives it max(0, 1 - e/(W J)), with e the distance from flotation of the corner of the cell nearest it (0
 !! where the cell straddles) and J the largest minus the smallest corner at the node, and w is the largest
 !! of these and the band weight, so w is continuous in the corners.
-subroutine dg1_flot_band_weight(CS, G, hmask, w_band)
+subroutine dg1_flot_band_weight(CS, G, hmask, hn, w_band)
   type(ice_shelf_dyn_CS), intent(in)    :: CS    !< The ice shelf dynamics control structure
   type(ocean_grid_type),  intent(in)    :: G     !< The grid structure
   real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in) :: hn !< The corner thicknesses, the transported ones or those
+                                                         !! of a transport stage [Z ~> m]
   real, dimension(SZDIB_(G),SZDJB_(G)), intent(out) :: w_band !< The band weight of each node [nondim]
 
   real, parameter :: d_far = 1.0e30 ! Distance of a node with no grounding-line node in reach [nondim]
@@ -15793,7 +16044,7 @@ subroutine dg1_flot_band_weight(CS, G, hmask, w_band)
   do j = G%jsd+1, G%jed ; do i = G%isd+1, G%ied
     if ((hmask(i,j) == 1.0) .or. (hmask(i,j) == 3.0)) then
       do b = 1, 2 ; do a = 1, 2
-        dc = CS%h_nodal(i,j,a,b) - CS%bed_node(i+a-2,j+b-2) / rr
+        dc = hn(i,j,a,b) - CS%bed_node(i+a-2,j+b-2) / rr
         if ((a == 1) .and. (b == 1)) then
           hmin = dc ; hmax = dc
         else
@@ -15819,9 +16070,9 @@ subroutine dg1_flot_band_weight(CS, G, hmask, w_band)
       i = In + 2 - a ; j = Jn + 2 - b
       if ((hmask(i,j) == 1.0) .or. (hmask(i,j) == 3.0)) then
         if (n == 0) then
-          hmin = CS%h_nodal(i,j,a,b) ; hmax = CS%h_nodal(i,j,a,b)
+          hmin = hn(i,j,a,b) ; hmax = hn(i,j,a,b)
         else
-          hmin = min(hmin, CS%h_nodal(i,j,a,b)) ; hmax = max(hmax, CS%h_nodal(i,j,a,b))
+          hmin = min(hmin, hn(i,j,a,b)) ; hmax = max(hmax, hn(i,j,a,b))
         endif
         n = n + 1
       endif
@@ -15870,9 +16121,9 @@ subroutine dg1_flot_band_weight(CS, G, hmask, w_band)
         i = In + 2 - a ; j = Jn + 2 - b
         if ((hmask(i,j) == 1.0) .or. (hmask(i,j) == 3.0)) then
           if (n == 0) then
-            hmin = CS%h_nodal(i,j,a,b) ; hmax = CS%h_nodal(i,j,a,b)
+            hmin = hn(i,j,a,b) ; hmax = hn(i,j,a,b)
           else
-            hmin = min(hmin, CS%h_nodal(i,j,a,b)) ; hmax = max(hmax, CS%h_nodal(i,j,a,b))
+            hmin = min(hmin, hn(i,j,a,b)) ; hmax = max(hmax, hn(i,j,a,b))
           endif
           n = n + 1
         endif
@@ -16296,7 +16547,7 @@ end subroutine dg1_post_bubble
 !! the linear-solve blocks and, with BASAL_FRICTION_PRECOMPUTE, sets the friction cache of
 !! build_basal_friction_cache from the same friction evaluations (fric_cache_cell for the cells without a
 !! bubble), so the friction is evaluated once per linearization.
-subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_newton, with_fb)
+subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_newton, with_fb, set_cache)
   type(ice_shelf_dyn_CS), intent(in) :: CS  !< The ice shelf dynamics control structure; only the targets
                                             !! of its DG1_COUPLED_BUBBLE pointers are written
   type(ice_shelf_state),  intent(in) :: ISS !< A structure with elements that describe the ice-shelf state
@@ -16313,7 +16564,10 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
   logical,                intent(in) :: use_newton !< If true, the operator of the linear solve is Newton's
   logical,                intent(in) :: with_fb !< If true, also set the driving stress against the bubbles; it
                                           !! depends on the thickness only, so once per velocity solve is enough
+  logical, optional,      intent(in) :: set_cache !< If false, the friction cache of BASAL_FRICTION_PRECOMPUTE is
+                                          !! not written (DG1_COUPLED_BUBBLE_SOLVE = False); the default is true
 
+  logical :: put_cache ! Write the friction cache
   real, dimension(2) :: xquad  ! The 2-point Gauss abscissae on [0,1] [nondim]
   real :: btx, bty  ! The bubble gradient at a Gauss point [L-1 ~> m-1]
   real :: jac_wt    ! Per-quadrature-point metric correction |J_q|/areaT [nondim]
@@ -16404,6 +16658,8 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
   do_newton_visc = use_newton .and. trim(CS%ice_viscosity_compute) == "MODEL"
   own_fb = with_fb .and. CS%dg_gl_shared_flot .and. CS%dg_cpl_own_surf
   qpv = 1
+  put_cache = CS%fric_precompute
+  if (present(set_cache)) put_cache = put_cache .and. set_cache
 
   do j=js,je ; do i=is,ie
     fb_keep(:) = CS%cpl_blk(CPL_FB+1:CPL_FB+2,i,j)
@@ -16414,7 +16670,7 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
       ! cell gets it as build_basal_friction_cache would.
       CS%dg_post_ub(i,j) = 0.0 ; CS%dg_post_vb(i,j) = 0.0
       CS%dg_post_skip(i,j) = merge(1.0, 0.0, ISS%hmask(i,j) == 1.0)
-      if (CS%fric_precompute .and. ((ISS%hmask(i,j) == 1.0) .or. (ISS%hmask(i,j) == 3.0))) &
+      if (put_cache .and. ((ISS%hmask(i,j) == 1.0) .or. (ISS%hmask(i,j) == 3.0))) &
         call fric_cache_cell(CS, G, US, u_curr, v_curr, CS%Phisub, CS%H_node, CS%bed_elev, rhoi_rhow, &
                              .true., i, j)
       cycle
@@ -16467,7 +16723,7 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
       call basal_friction_qp(CS, G, US, i, j, iq, jq, xquad, u_curr, v_curr, .true., rhoi_rhow, &
                              rho_oi_ratio, rho_ice_g_LtoZ, coef_prefactor_e, min_trac_e, fB_e, &
                              eps_vel2_e, .true., grounded_qp, bcf, dnw, cur(1), cur(2))
-      if (CS%fric_precompute) then
+      if (put_cache) then
         CS%fric_qp_on(qp,i,j) = merge(1.0, 0.0, grounded_qp)
         CS%fric_qp_coef(qp,i,j) = bcf ; CS%fric_qp_newt(qp,i,j) = dnw
         CS%fric_qp_u(qp,i,j) = cur(1) ; CS%fric_qp_v(qp,i,j) = cur(2)
@@ -16768,7 +17024,7 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
     if (.not.with_fb) tot(CPL_FB+1:CPL_FB+2) = fb_keep(:)
     ! The corner friction matrix of the friction cache, summed as in CG_action_subgrid_basal and
     ! CG_action_sep2_basal.
-    if (CS%fric_precompute .and. sub_cell) then ; do ip=1,10 ; do k=1,4
+    if (put_cache .and. sub_cell) then ; do ip=1,10 ; do k=1,4
       CS%gl_fric_K(pc(ip),pn(ip),k,i,j) = tot(CPL_KM+ip+10*(k-1))
       CS%gl_fric_K(pn(ip),pc(ip),k,i,j) = tot(CPL_KM+ip+10*(k-1))
     enddo ; enddo ; endif
@@ -16787,6 +17043,7 @@ subroutine dg1_cpl_blocks(CS, ISS, G, US, u_curr, v_curr, is, ie, js, je, use_ne
     endif
     if (ok) then
       CS%cpl_blk(1:CPL_W,i,j) = tot(1:CPL_W) ; CS%cpl_on(i,j) = 1.0
+      CS%cpl_blk(CPL_DP+1:CPL_DP+20,i,j) = tot(CPL_WP+1:CPL_WP+20)
       CS%dg_post_skip(i,j) = merge(0.5, 0.0, fallback)
       ! W = K_bb^-1 K_bn of the linear-solve set, so that a linear-solve iteration has no division.
       detn = (tot(CPL_LIN+CPL_BB+1) * tot(CPL_LIN+CPL_BB+3)) - (tot(CPL_LIN+CPL_BB+2) * tot(CPL_LIN+CPL_BB+2))
@@ -16877,6 +17134,17 @@ subroutine dg1_cpl_bb3(CS, G, US, i, j, Hc, Bc, Uc, Vc, sub_cell, use_newton, wi
   real, dimension(2) :: gn_s ! DG1_SSA_METRIC_TERMS: the Newton strain products of a unit u and v at a corner
                       ! [L-1 T-1 ~> m-1 s-1]
   logical :: gr_cell, gr_p ! The cell and the point carry friction
+  logical :: dm_b     ! DG1_SUBSCALE_DAMPER: form the damper sets
+  real, dimension(10,4,4) :: pdp, pdt ! The Picard and tangent damper set values at the 4x4 points
+                      ! [R L2 Z T-1 ~> kg s-1]
+  real, dimension(4) :: x4, w4 ! The 4-point Gauss abscissae on [0,1] and their weights [nondim]
+  real :: xh, eh      ! The odd factors 2 xi - 1 and 2 eta - 1 at the point [nondim]
+  real, dimension(4) :: vl ! The damper shapes b, b, eta b, xi b at the point [nondim]
+  real, dimension(4) :: gx, gy ! Their gradients [L-1 ~> m-1]
+  real, dimension(3,4) :: st ! Their strain vectors (e_xx, e_yy, 2 e_xy) with their components [L-1 ~> m-1]
+  real, dimension(3) :: sdm ! The unused strain vector of the other component [L-1 ~> m-1]
+  real, dimension(4) :: dnv ! Their Newton strain products [L-1 T-1 ~> m-1 s-1]
+  integer :: ps, qs  ! The two shapes of a damper set value
   integer :: ia, ja, k, c, f, aa, mc, nc
 
   x3(1) = 0.5 - 0.5*sqrt(0.6) ; x3(2) = 0.5 ; x3(3) = 0.5 + 0.5*sqrt(0.6)
@@ -16886,6 +17154,7 @@ subroutine dg1_cpl_bb3(CS, G, US, i, j, Hc, Bc, Uc, Vc, sub_cell, use_newton, wi
   gr_cell = merge((CS%ground_frac(i,j) >= 1.0) .and. .not.sub_cell, CS%ground_frac(i,j) > 0.0, CS%GL_regularize)
   gr_cell = gr_cell .and. .not.sub_cell
   pv(:,:,:) = 0.0 ; pr(:,:,:) = 0.0 ; pf(:,:,:) = 0.0
+  dm_b = CS%dg_ssd
 
   do ja=1,3 ; do ia=1,3
     xi = x3(ia) ; eta = x3(ja) ; wq = w3(ia) * w3(ja)
@@ -17041,6 +17310,67 @@ subroutine dg1_cpl_bb3(CS, G, US, i, j, Hc, Bc, Uc, Vc, sub_cell, use_newton, wi
   if (with_fb .and. .not.sub_cell) then
     tot(CPL_FB+1) = sf(1) ; tot(CPL_FB+2) = sf(2)
   endif
+  ! DG1_SUBSCALE_DAMPER: the damper sets, the symmetric 4x4 block of the shapes b (u), b (v), eta b (u)
+  ! and xi b (v), Picard and tangent (Newton), on a 4x4 rule (the 3x3 rule misses (eta b)**2 by 30 %) with the
+  ! viscosity, Newton factors and friction of each point.  In a cell with sub-cell quadrature the friction comes from
+  ! its sub-points (dg1_cpl_fric_point), as for the bubble block.  The 16 points are summed in groups that a quarter
+  ! turn or a mirror maps onto themselves.
+  if (dm_b) then
+    ! The lower points are 1 minus the upper ones, so that 1 - x, x (1 - x) and 1 - 2 x of a point and of its mirror
+    ! image agree to the bit (with 0.5 - c they do not), as a mirror or a quarter turn needs.
+    x4(3) = 0.5 + 0.5*0.3399810435848563 ; x4(4) = 0.5 + 0.5*0.8611363115940526
+    x4(1) = 1.0 - x4(4) ; x4(2) = 1.0 - x4(3)
+    w4(1) = 0.5*0.3478548451374538 ; w4(2) = 0.5*0.6521451548625461
+    w4(3) = w4(2) ; w4(4) = w4(1)
+    pdp(:,:,:) = 0.0 ; pdt(:,:,:) = 0.0
+    do ja=1,4 ; do ia=1,4
+      xi = x4(ia) ; eta = x4(ja) ; wq = w4(ia) * w4(ja)
+      call dg1_q3_point(CS, G, US, i, j, xi, eta, Hc, Bc, Uc, Vc, CS%dg_post_ub(i,j), CS%dg_post_vb(i,j), gr_cell, &
+                        .true., coef_prefactor_e, min_trac_e, eps_vel2_e, rhoi_rhow, rho_oi_ratio, &
+                        rho_ice_g_LtoZ, Visc_coef, a, d, jac_wt, bt, btx, bty, h_p, visc, fnw, g1, g2, g3, &
+                        gr_p, bcf, dnw, cur, kx, ky)
+      nu = jac_wt * visc
+      xh = x4(ia) - x4(5-ia) ; eh = x4(ja) - x4(5-ja)
+      vl(1) = bt ; vl(2) = bt ; vl(3) = eh * bt ; vl(4) = xh * bt
+      gx(1) = btx ; gy(1) = bty ; gx(2) = btx ; gy(2) = bty
+      gx(3) = eh * btx ; gy(3) = (eh * bty) + ((2.0 * bt) / d)
+      gx(4) = (xh * btx) + ((2.0 * bt) / a) ; gy(4) = xh * bty
+      call dg1_metric_strain(vl(1), gx(1), gy(1), kx, ky, st(:,1), sdm)
+      call dg1_metric_strain(vl(2), gx(2), gy(2), kx, ky, sdm, st(:,2))
+      call dg1_metric_strain(vl(3), gx(3), gy(3), kx, ky, st(:,3), sdm)
+      call dg1_metric_strain(vl(4), gx(4), gy(4), kx, ky, sdm, st(:,4))
+      do f=1,4
+        dnv(f) = ((g1 * st(1,f)) + (g2 * st(2,f))) + (g3 * st(3,f))
+      enddo
+      do k=1,10
+        ps = DM_PI(k) ; qs = DM_PJ(k)
+        pdp(k,ia,ja) = wq * (nu * dg1_strain_energy(st(:,ps), st(:,qs)))
+        if (gr_p .and. (DM_CM(ps) == DM_CM(qs))) &
+          pdp(k,ia,ja) = pdp(k,ia,ja) + (wq * ((jac_wt * bcf) * (vl(ps) * vl(qs))))
+        pdt(k,ia,ja) = pdp(k,ia,ja) + (wq * (fnw * (dnv(ps) * dnv(qs))))
+        if (gr_p) pdt(k,ia,ja) = pdt(k,ia,ja) + &
+            (wq * ((jac_wt * (dnw * (cur(DM_CM(ps)) * cur(DM_CM(qs))))) * (vl(ps) * vl(qs))))
+      enddo
+    enddo ; enddo
+    do k=1,10
+      if (sub_cell) then
+        tot(CPL_WP+k) = tot(CPL_WP+k) + sum_q4(pdp(k,:,:))
+        tot(CPL_WT+k) = tot(CPL_WT+k) + sum_q4(pdt(k,:,:))
+      else
+        tot(CPL_WP+k) = sum_q4(pdp(k,:,:)) ; tot(CPL_WT+k) = sum_q4(pdt(k,:,:))
+      endif
+    enddo
+  endif
+
+contains
+
+  !> The sum of values at the 4x4 points in groups that a quarter turn or a mirror maps onto themselves: the corners,
+  !! the inner points and the edge points, each in pairs of opposite points.
+  real function sum_q4(v)
+    real, dimension(4,4), intent(in) :: v !< The values at the points [A]
+    sum_q4 = (((v(1,1) + v(4,4)) + (v(1,4) + v(4,1))) + ((v(2,2) + v(3,3)) + (v(2,3) + v(3,2)))) + &
+             (((v(1,2) + v(4,3)) + (v(3,1) + v(2,4))) + ((v(1,3) + v(4,2)) + (v(2,1) + v(3,4))))
+  end function sum_q4
 end subroutine dg1_cpl_bb3
 
 !> DG1_COUPLED_BUBBLE_OWN_SURFACE with SEP2: the driving stress against the two bubbles of a cell on the SEP2
@@ -17353,7 +17683,8 @@ subroutine dg1_cpl_fric_point(wj, bt, bc, dnw, cur, phc, use_newton, v)
   real, dimension(CPL_NWK), intent(inout) :: v !< The work values of dg1_cpl_blocks [various]
   real, dimension(2,2) :: Tp, Tn ! Picard and linear-solve friction tangents times wj bt [R L2 Z T-1 ~> kg s-1]
   real :: wcn ! The weight times two corner basis functions [nondim]
-  integer :: a, f, c, ip
+  real, dimension(4) :: m4 ! The factors of the damper shapes over the bubble: 1, 1, 2 eta - 1, 2 xi - 1 [nondim]
+  integer :: a, f, c, ip, k
   integer, dimension(10), parameter :: pc = (/ 1, 1, 2, 1, 2, 3, 1, 2, 3, 4 /) ! First corner of a pair
   integer, dimension(10), parameter :: pn = (/ 1, 2, 2, 3, 3, 3, 4, 4, 4, 4 /) ! Second corner of a pair
   Tp(:,:) = 0.0
@@ -17367,6 +17698,13 @@ subroutine dg1_cpl_fric_point(wj, bt, bc, dnw, cur, phc, use_newton, v)
   enddo ; enddo ; enddo
   v(CPL_PIC+CPL_BB+1) = v(CPL_PIC+CPL_BB+1) + (Tp(1,1) * bt)
   v(CPL_PIC+CPL_BB+3) = v(CPL_PIC+CPL_BB+3) + (Tp(2,2) * bt)
+  ! DG1_SUBSCALE_DAMPER: the friction of the damper shapes b (u), b (v), eta b (u) and xi b (v), Picard and tangent.
+  m4(1) = 1.0 ; m4(2) = 1.0
+  m4(3) = (phc(3) + phc(4)) - (phc(1) + phc(2)) ; m4(4) = (phc(2) + phc(4)) - (phc(1) + phc(3))
+  do k=1,10
+    v(CPL_WP+k) = v(CPL_WP+k) + ((Tp(DM_CM(DM_PI(k)),DM_CM(DM_PJ(k))) * bt) * (m4(DM_PI(k)) * m4(DM_PJ(k))))
+    v(CPL_WT+k) = v(CPL_WT+k) + ((Tn(DM_CM(DM_PI(k)),DM_CM(DM_PJ(k))) * bt) * (m4(DM_PI(k)) * m4(DM_PJ(k))))
+  enddo
   if (use_newton) then
     v(CPL_LIN+CPL_BB+1) = v(CPL_LIN+CPL_BB+1) + (Tn(1,1) * bt)
     v(CPL_LIN+CPL_BB+2) = v(CPL_LIN+CPL_BB+2) + (Tn(1,2) * bt)
@@ -23943,6 +24281,365 @@ pure subroutine dg1_lim_face_room(t, k, lo, hi, q_lo, q_hi, feas)
   endif
 end subroutine dg1_lim_face_room
 
+!> DG1_SUBSCALE_DAMPER: the in-cell damper velocity of each computational ice cell, in the units and scaling of
+!! the DG1_COUPLED_BUBBLE bubble velocity (the bubble is 1 at the 2x2 Gauss points).  At each node, the corner
+!! thicknesses of the ice cells there (hmask 1 or 3) are averaged and turned into a surface
+!! max(h - D, (1 - r) h) with the node bed (weighted by the cell area each corner stands for).  The alternating
+!! 2 dx part of the node surface is removed along x and along y: at a node with two valid nodes on each side, the
+!! minmod of the second differences (divided by the node spacings) at the node and its two neighbours is added; it
+!! is 0 unless the second difference flips sign at every node, so a single kink (a grounding line) or a smooth curve
+!! is left alone.  Beyond a wall the test reads mirror nodes; at the other edges of the ice it uses a one-sided fit.
+!! The x-then-y and y-then-x results are averaged, so that a quarter turn of the grid gives the same bits.  In each
+!! ice cell (hmask 1) with a bubble (cpl_on), the fine-scale corner surface f is the corner surface minus that node
+!! reference; its driving stress -rho_i g h grad(f), with f bilinear from its corners, against the bubbles b and the
+!! odd bubbles eta b, xi b at the 3x3 points, is solved with the tangent damper set of the last velocity solve (the
+!! Picard set where the tangent one is not positive definite, the 2x2 bubble block where neither is).  Cells
+!! without a bubble get 0.  Thin ice is guarded in the stage update (DG1_SUBSCALE_DAMPER_POSITIVE), not here.
+!! Needs a halo of 4 cells of corner thicknesses.
+subroutine dg1_ssd_velocity(CS, G, hmask, h_c, ud, vd, uo, vo, fc, fine_only)
+  type(ice_shelf_dyn_CS), intent(in) :: CS !< The ice shelf dynamics control structure; only the targets of its
+                                           !! DG1_SUBSCALE_DAMPER diagnostic pointers are written
+  type(ocean_grid_type),  intent(in) :: G  !< The grid structure used by the ice shelf
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(in) :: hmask !< Mask of ice cells [nondim]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(in) :: h_c !< The corner thicknesses of the stage [Z ~> m]
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(out) :: ud !< The x damper velocity of each cell [L T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(out) :: vd !< The y damper velocity of each cell [L T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(out) :: uo !< The x velocity of the odd bubble eta b of each cell
+                                                        !! [L T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G)), intent(out) :: vo !< The y velocity of the odd bubble xi b of each cell
+                                                        !! [L T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G),2,2), intent(out) :: fc !< The fine-scale corner surfaces of the cells with a
+                                                        !! damper velocity, else 0 [Z ~> m]
+  logical, optional, intent(in) :: fine_only !< If true, only fc is set (the velocities stay 0) and the damper
+                                             !! diagnostics are not changed
+  logical :: fine   ! fine_only
+
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: spx ! The spacing of nodes (I-1,J) and (I,J) [L ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: spy ! The spacing of nodes (I,J-1) and (I,J) [L ~> m]
+  real, dimension(4) :: wv  ! The area weights of the four corners at a node [L2 ~> m2]
+  real :: wsum      ! The sum of the weights [L2 ~> m2]
+  real, dimension(2,2) :: sr ! The reference surface at the four nodes of a cell [Z ~> m]
+  real :: pw        ! The power of a cell [R L4 Z T-3 ~> W]
+  real :: dpath     ! The block a cell used [nondim]
+
+  real, parameter :: gp1 = 0.5 * (1.0 - sqrt(1.0/3.0)) ! The first 2-point Gauss abscissa on [0,1] [nondim]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: s_n  ! The node surface of the averaged thickness [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: s_x, s_y ! The node surface after a zigzag pass along x, along y [Z ~> m]
+  real, dimension(SZDIB_(G),SZDJB_(G)) :: s_xy, s_yx ! After both passes, in the two orders [Z ~> m]
+  logical, dimension(SZDIB_(G),SZDJB_(G)) :: ok_n ! The node has a corner of an ice cell
+  logical, dimension(SZDIB_(G),SZDJB_(G)) :: ok_p ! The node may enter the zigzag test (ok_n or a mirror node)
+  integer, dimension(SZDIB_(G),SZDJB_(G)) :: wall_x, wall_y ! +1 (-1) at a node
+                                   ! with a wall on its west or south (east or north) side and mirror nodes beyond
+  real, dimension(4) :: hv  ! The corner thicknesses of the four cells at a node, 0 where no ice [Z ~> m]
+  real, dimension(4) :: cv  ! 1 where that cell holds ice, else 0 [nondim]
+  real, dimension(2,2) :: f_c ! The fine-scale corner surfaces of a cell [Z ~> m]
+  real, dimension(3) :: x3, w3 ! The 3-point Gauss abscissae on [0,1] and their weights [nondim]
+  real, dimension(3,3,2) :: fq ! The driving force of f against the two bubbles at the 3x3 points
+                               ! [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(3,3,2) :: fo ! The driving force of f against the two odd bubbles at the 3x3 points
+                               ! [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(2) :: fb   ! The driving force of f against the two bubbles [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(2) :: fob  ! The driving force of f against the two odd bubbles [R L3 Z T-2 ~> kg m s-2]
+  real, dimension(2) :: wb   ! The damper velocity [L T-1 ~> m s-1]
+  real, dimension(2) :: wo   ! The odd damper velocity [L T-1 ~> m s-1]
+  real, dimension(3) :: kb   ! The Picard bubble block 11, 12, 22 of the cell [R L2 Z T-1 ~> kg s-1]
+  real, dimension(10) :: k10 ! A damper set of the cell [R L2 Z T-1 ~> kg s-1]
+  real, dimension(4) :: w4   ! The velocities of the four damper shapes
+                             ! [L T-1 ~> m s-1]
+  logical :: ok4             ! The damper set gave a solution
+  real :: rr        ! The ice to ocean density ratio [nondim]
+  real :: rho_g     ! The ice density times gravity [R L2 Z-1 T-2 ~> kg m-2 s-2]
+  real :: h_n       ! The weighted mean corner thickness at a node [Z ~> m]
+  real :: bb_t      ! The bubble at a 2x2 Gauss point before its scaling [nondim]
+  real :: xi_q, eta_q, w_t, bt ! A 3x3 point, its weight and the bubble there [nondim]
+  real :: xh, eh    ! The odd factors 2 xi - 1 and 2 eta - 1 at a point [nondim]
+  real :: a_qp, d_qp ! The cell lengths at a point [L ~> m]
+  real :: h_qp      ! The thickness at a point [Z ~> m]
+  real :: dfdx, dfdy ! The fine-scale surface gradient at a point [Z L-1 ~> nondim]
+  real :: fx, fy    ! The fine-scale surface tilts of a cell [Z ~> m]
+  real :: dxCv_S, dxCv_N, dyCu_W, dyCu_E ! Cell-edge lengths [L ~> m]
+  integer :: i, j, a, b, ia, ja, k, m
+
+  ud(:,:) = 0.0 ; vd(:,:) = 0.0 ; uo(:,:) = 0.0 ; vo(:,:) = 0.0 ; fc(:,:,:,:) = 0.0
+  fine = .false. ; if (present(fine_only)) fine = fine_only
+  if (associated(CS%dg_ssd_path) .and. .not.fine) then
+    CS%dg_ssd_path(:,:) = 0.0 ; CS%dg_ssd_power(:,:) = 0.0 ; CS%dg_ssd_rdt(:,:) = 0.0 ; CS%dg_ssd_dpe(:,:) = 0.0
+  endif
+  fob(:) = 0.0
+  rr = CS%density_ice / CS%density_ocean_avg
+  rho_g = CS%density_ice * CS%g_Earth
+  bb_t = gp1 * (1.0 - gp1)
+  x3(1) = 0.5 - 0.5*sqrt(0.6) ; x3(2) = 0.5 ; x3(3) = 0.5 + 0.5*sqrt(0.6)
+  w3(1) = 5.0/18.0 ; w3(2) = 8.0/18.0 ; w3(3) = 5.0/18.0
+
+  ! The node spacings along the rows and columns of nodes.
+  spx(:,:) = 0.0 ; spy(:,:) = 0.0
+  do J = G%JsdB, G%JedB ; do I = G%isd, G%ied ; spx(I,J) = G%dxCv(I,J) ; enddo ; enddo
+  do J = G%jsd, G%jed ; do I = G%IsdB, G%IedB ; spy(I,J) = G%dyCu(I,J) ; enddo ; enddo
+
+  ! The node surfaces: node (I,J) is the NE corner of cell (I,J), the NW corner of (I+1,J), the SE corner of
+  ! (I,J+1) and the SW corner of (I+1,J+1); the four are summed in pairs of opposite cells.
+  s_n(:,:) = 0.0 ; ok_n(:,:) = .false.
+  do J = G%jsd, G%jed-1 ; do I = G%isd, G%ied-1
+    hv(1) = h_c(i,j,2,2) ; hv(2) = h_c(i+1,j+1,1,1) ; hv(3) = h_c(i+1,j,1,2) ; hv(4) = h_c(i,j+1,2,1)
+    cv(1) = ice_c(i,j) ; cv(2) = ice_c(i+1,j+1) ; cv(3) = ice_c(i+1,j) ; cv(4) = ice_c(i,j+1)
+    wv(1) = cv(1) * CS%cell_mean_w(i,j,2,2) ; wv(2) = cv(2) * CS%cell_mean_w(i+1,j+1,1,1)
+    wv(3) = cv(3) * CS%cell_mean_w(i+1,j,1,2) ; wv(4) = cv(4) * CS%cell_mean_w(i,j+1,2,1)
+    wsum = (wv(1) + wv(2)) + (wv(3) + wv(4))
+    if (wsum <= 0.0) cycle
+    h_n = (((wv(1) * hv(1)) + (wv(2) * hv(2))) + ((wv(3) * hv(3)) + (wv(4) * hv(4)))) / wsum
+    s_n(I,J) = max(h_n - CS%bed_node(I,J), (1.0 - rr) * h_n)
+    ok_n(I,J) = .true.
+  enddo ; enddo
+
+  ! At a node on a wall, the two nodes beyond it become mirror images of the two nodes inside, so that the zigzag
+  ! test works up to the wall.
+  ok_p(:,:) = ok_n(:,:) ; wall_x(:,:) = 0 ; wall_y(:,:) = 0
+  do J = G%jsd+2, G%jed-3 ; do I = G%isd+2, G%ied-3
+    if (.not.ok_n(I,J)) cycle
+    if ((.not.ok_n(I,J-1)) .and. (.not.ok_n(I,J-2)) .and. ok_n(I,J+1) .and. ok_n(I,J+2)) then
+      if (wall_v(I,J)) wall_y(I,J) = 1
+    elseif ((.not.ok_n(I,J+1)) .and. (.not.ok_n(I,J+2)) .and. ok_n(I,J-1) .and. ok_n(I,J-2)) then
+      if (wall_v(I,J)) wall_y(I,J) = -1
+    endif
+    if ((.not.ok_n(I-1,J)) .and. (.not.ok_n(I-2,J)) .and. ok_n(I+1,J) .and. ok_n(I+2,J)) then
+      if (wall_u(I,J)) wall_x(I,J) = 1
+    elseif ((.not.ok_n(I+1,J)) .and. (.not.ok_n(I+2,J)) .and. ok_n(I-1,J) .and. ok_n(I-2,J)) then
+      if (wall_u(I,J)) wall_x(I,J) = -1
+    endif
+  enddo ; enddo
+  do J = G%jsd+2, G%jed-3 ; do I = G%isd+2, G%ied-3
+    do m = 1, 2
+      if (wall_y(I,J) /= 0) ok_p(I,J-m*wall_y(I,J)) = .true.
+      if (wall_x(I,J) /= 0) ok_p(I-m*wall_x(I,J),J) = .true.
+    enddo
+    ! The spacings beyond the wall mirror those inside.
+    if (wall_y(I,J) == 1) then
+      spy(I,J) = spy(I,J+1) ; spy(I,J-1) = spy(I,J+2)
+    elseif (wall_y(I,J) == -1) then
+      spy(I,J+1) = spy(I,J) ; spy(I,J+2) = spy(I,J-1)
+    endif
+    if (wall_x(I,J) == 1) then
+      spx(I,J) = spx(I+1,J) ; spx(I-1,J) = spx(I+2,J)
+    elseif (wall_x(I,J) == -1) then
+      spx(I+1,J) = spx(I,J) ; spx(I+2,J) = spx(I-1,J)
+    endif
+  enddo ; enddo
+  call mirror_nodes(s_n)
+
+  ! The zigzag passes, along x then y and along y then x, over the nodes that the cells of the computational domain
+  ! and their passes need.
+  ! The one-sided test at an edge of the ice reads 3 nodes along, so the first passes cover 4 node rows beyond the
+  ! cells of the computational domain on each side.
+  s_x(:,:) = s_n(:,:) ; s_y(:,:) = s_n(:,:)
+  call zz_pass(s_n, s_x, .true., G%isc-1, G%iec, G%jsc-4, G%jec+3)
+  call zz_pass(s_n, s_y, .false., G%isc-4, G%iec+3, G%jsc-1, G%jec)
+  call mirror_nodes(s_x) ; call mirror_nodes(s_y)
+  s_xy(:,:) = s_x(:,:) ; s_yx(:,:) = s_y(:,:)
+  call zz_pass(s_x, s_xy, .false., G%isc-1, G%iec, G%jsc-1, G%jec)
+  call zz_pass(s_y, s_yx, .true., G%isc-1, G%iec, G%jsc-1, G%jec)
+
+  do j = G%jsc, G%jec ; do i = G%isc, G%iec
+    if (hmask(i,j) /= 1.0) cycle
+    if (CS%cpl_on(i,j) <= 0.0) cycle
+    do b = 1, 2 ; do a = 1, 2
+      sr(a,b) = 0.5 * (s_xy(i-2+a,j-2+b) + s_yx(i-2+a,j-2+b))
+      f_c(a,b) = surf_c(i, j, a, b) - sr(a,b)
+      fc(i,j,a,b) = f_c(a,b)
+    enddo ; enddo
+    if (fine) cycle
+    dxCv_S = G%dxCv(i,J-1) ; dxCv_N = G%dxCv(i,J)
+    dyCu_W = G%dyCu(I-1,j) ; dyCu_E = G%dyCu(I,j)
+    do ja = 1, 3 ; do ia = 1, 3
+      xi_q = x3(ia) ; eta_q = x3(ja) ; w_t = w3(ia) * w3(ja)
+      a_qp = (dxCv_S*(1.0 - eta_q)) + (dxCv_N*eta_q)
+      d_qp = (dyCu_W*(1.0 - xi_q))  + (dyCu_E*xi_q)
+      h_qp = (((((1.0-xi_q)*(1.0-eta_q))*h_c(i,j,1,1)) + ((xi_q*eta_q)*h_c(i,j,2,2))) + &
+              (((xi_q*(1.0-eta_q))*h_c(i,j,2,1)) + (((1.0-xi_q)*eta_q)*h_c(i,j,1,2))))
+      h_qp = max(h_qp, CS%min_h_shelf)
+      dfdx = (((1.0 - eta_q) * (f_c(2,1) - f_c(1,1))) + (eta_q * (f_c(2,2) - f_c(1,2)))) / a_qp
+      dfdy = (((1.0 - xi_q) * (f_c(1,2) - f_c(1,1))) + (xi_q * (f_c(2,2) - f_c(2,1)))) / d_qp
+      bt = ((xi_q * (1.0 - xi_q)) * (eta_q * (1.0 - eta_q))) / (bb_t * bb_t)
+      fq(ia,ja,1) = ((w_t * bt) * (a_qp * d_qp)) * (-rho_g * (h_qp * dfdx))
+      fq(ia,ja,2) = ((w_t * bt) * (a_qp * d_qp)) * (-rho_g * (h_qp * dfdy))
+      xh = x3(ia) - x3(4-ia) ; eh = x3(ja) - x3(4-ja)
+      fo(ia,ja,1) = ((w_t * (bt * eh)) * (a_qp * d_qp)) * (-rho_g * (h_qp * dfdx))
+      fo(ia,ja,2) = ((w_t * (bt * xh)) * (a_qp * d_qp)) * (-rho_g * (h_qp * dfdy))
+    enddo ; enddo
+    do k = 1, 2
+      fb(k) = (((fq(1,1,k) + fq(3,3,k)) + (fq(1,3,k) + fq(3,1,k))) + &
+               ((fq(2,1,k) + fq(2,3,k)) + (fq(1,2,k) + fq(3,2,k)))) + fq(2,2,k)
+    enddo
+    do k = 1, 2
+      fob(k) = (((fo(1,1,k) + fo(3,3,k)) + (fo(1,3,k) + fo(3,1,k))) + &
+                ((fo(2,1,k) + fo(2,3,k)) + (fo(1,2,k) + fo(3,2,k)))) + fo(2,2,k)
+    enddo
+    wo(:) = 0.0 ; ok4 = .false. ; dpath = 1.0
+    ! The damper sets of the four shapes: the tangent set, or where it is not positive definite the Picard set.
+    k10(:) = CS%cpl_blk(CPL_DT+1:CPL_DT+10,i,j)
+    call dg1_ssd_solve4(k10, fb, fob, .true., w4, ok4)
+    if (ok4) dpath = 3.0
+    if (.not.ok4) then
+      k10(:) = CS%cpl_blk(CPL_DP+1:CPL_DP+10,i,j)
+      call dg1_ssd_solve4(k10, fb, fob, .true., w4, ok4)
+      if (ok4) dpath = 2.0
+    endif
+    if (ok4) then
+      wb(1) = w4(1) ; wb(2) = w4(2) ; wo(1) = w4(3) ; wo(2) = w4(4)
+    endif
+    if (.not.ok4) then
+      kb(:) = CS%cpl_blk(CPL_PIC+CPL_BB+1:CPL_PIC+CPL_BB+3,i,j)
+      call dg1_cpl_solve_bb(kb, fb, wb)
+    endif
+    ud(i,j) = wb(1)
+    vd(i,j) = wb(2)
+    uo(i,j) = wo(1)
+    vo(i,j) = wo(2)
+    if (associated(CS%dg_ssd_path)) then
+      pw = ((fb(1) * wb(1)) + (fb(2) * wb(2))) + ((fob(1) * wo(1)) + (fob(2) * wo(2)))
+      CS%dg_ssd_path(i,j) = dpath ; CS%dg_ssd_power(i,j) = pw
+    endif
+  enddo ; enddo
+
+  if (associated(CS%dg_ssd_ub) .and. .not.fine) then
+    CS%dg_ssd_ub(:,:) = ud(:,:) ; CS%dg_ssd_vb(:,:) = vd(:,:) ; CS%dg_ssd_tilt(:,:) = 0.0
+    CS%dg_ssd_uo(:,:) = uo(:,:) ; CS%dg_ssd_vo(:,:) = vo(:,:) ; CS%dg_ssd_twist(:,:) = 0.0
+    do j = G%jsc, G%jec ; do i = G%isc, G%iec
+      if (hmask(i,j) /= 1.0) cycle
+      do b = 1, 2 ; do a = 1, 2
+        f_c(a,b) = surf_c(i, j, a, b) - (0.5 * (s_xy(i-2+a,j-2+b) + s_yx(i-2+a,j-2+b)))
+      enddo ; enddo
+      fx = 0.25 * ((f_c(2,1) + f_c(2,2)) - (f_c(1,1) + f_c(1,2)))
+      fy = 0.25 * ((f_c(1,2) + f_c(2,2)) - (f_c(1,1) + f_c(2,1)))
+      CS%dg_ssd_tilt(i,j) = sqrt((fx * fx) + (fy * fy))
+      CS%dg_ssd_twist(i,j) = 0.25 * abs((f_c(1,1) + f_c(2,2)) - (f_c(2,1) + f_c(1,2)))
+    enddo ; enddo
+  endif
+
+contains
+
+  !> The surface at corner (aa,bb) of cell (ii,jj), with the corner's own flotation test, max(h - D, (1 - r) h)
+  !! [Z ~> m].
+  real function surf_c(ii, jj, aa, bb)
+    integer, intent(in) :: ii, jj, aa, bb !< The cell and the corner
+    surf_c = max(h_c(ii,jj,aa,bb) - CS%bed_node(ii-2+aa,jj-2+bb), (1.0 - rr) * h_c(ii,jj,aa,bb))
+  end function surf_c
+
+  !> 1 if cell (ii,jj) holds ice (hmask 1 or 3), else 0 [nondim].
+  real function ice_c(ii, jj)
+    integer, intent(in) :: ii, jj !< The cell
+    ice_c = 0.0
+    if ((hmask(ii,jj) == 1.0) .or. (hmask(ii,jj) == 3.0)) ice_c = 1.0
+  end function ice_c
+
+  !> True if one of the two v faces at node (ii,jj) is a wall face of an ice cell.
+  logical function wall_v(ii, jj)
+    integer, intent(in) :: ii, jj !< The node
+    integer :: ic
+    wall_v = .false.
+    do ic = ii, ii+1
+      if (ice_c(ic,jj) + ice_c(ic,jj+1) /= 1.0) cycle
+      if (dg1_lim_wall_face(CS%v_face_mask_bdry(ic,jj), CS%v_bdry_val(ic-1,jj), CS%v_bdry_val(ic,jj))) &
+        wall_v = .true.
+    enddo
+  end function wall_v
+
+  !> True if one of the two u faces at node (ii,jj) is a wall face of an ice cell.
+  logical function wall_u(ii, jj)
+    integer, intent(in) :: ii, jj !< The node
+    integer :: jc
+    wall_u = .false.
+    do jc = jj, jj+1
+      if (ice_c(ii,jc) + ice_c(ii+1,jc) /= 1.0) cycle
+      if (dg1_lim_wall_face(CS%u_face_mask_bdry(ii,jc), CS%u_bdry_val(ii,jc-1), CS%u_bdry_val(ii,jc))) &
+        wall_u = .true.
+    enddo
+  end function wall_u
+
+  !> Set the two nodes beyond each wall node to the two nodes inside.
+  subroutine mirror_nodes(s)
+    real, dimension(SZDIB_(G),SZDJB_(G)), intent(inout) :: s !< A node surface [Z ~> m]
+    integer :: ii, jj, mm
+    do jj = G%jsd+2, G%jed-3 ; do ii = G%isd+2, G%ied-3
+      do mm = 1, 2
+        if (wall_y(ii,jj) /= 0) s(ii,jj-mm*wall_y(ii,jj)) = s(ii,jj+mm*wall_y(ii,jj))
+        if (wall_x(ii,jj) /= 0) s(ii-mm*wall_x(ii,jj),jj) = s(ii+mm*wall_x(ii,jj),jj)
+      enddo
+    enddo ; enddo
+  end subroutine mirror_nodes
+
+  !> One zigzag pass of the node surface src along x (alongx) or y into dst, at the nodes i0:i1, j0:j1, with the
+  !! second differences divided by the node spacings (zz_metric).  A node with two valid nodes on each side along
+  !! that axis takes the minmod of the zigzag test; a node at an edge of the ice (no valid node on one side), or
+  !! next to it, with valid nodes on the other side, takes the one-sided fit of a quadratic and a zigzag to the 4
+  !! nodes nearest on its side, limited in the same way.
+  subroutine zz_pass(src, dst, alongx, i0, i1, j0, j1)
+    real, dimension(SZDIB_(G),SZDJB_(G)), intent(in)    :: src !< The node surface before the pass [Z ~> m]
+    real, dimension(SZDIB_(G),SZDJB_(G)), intent(inout) :: dst !< The node surface after the pass [Z ~> m]
+    logical, intent(in) :: alongx  !< The pass is along x, else along y
+    integer, intent(in) :: i0, i1, j0, j1 !< The node range
+    real, dimension(-3:3) :: sk  ! The surfaces at the node and three on each side [Z ~> m]
+    logical, dimension(-3:3) :: okk ! Those nodes are valid
+    real, dimension(-2:3) :: sp ! The spacing of nodes kk-1 and kk [L ~> m]
+    integer :: ii, jj, kk, iq, jq
+    do jj = j0, j1 ; do ii = i0, i1
+      if (.not.ok_p(ii,jj)) cycle
+      do kk = -3, 3
+        iq = ii ; jq = jj
+        if (alongx) then ; iq = ii + kk ; else ; jq = jj + kk ; endif
+        okk(kk) = .false. ; sk(kk) = 0.0
+        if ((iq >= G%IsdB) .and. (iq <= G%IedB) .and. (jq >= G%JsdB) .and. (jq <= G%JedB)) then
+          okk(kk) = ok_p(iq,jq) ; sk(kk) = src(iq,jq)
+        endif
+      enddo
+      do kk = -2, 3
+        iq = ii ; jq = jj
+        if (alongx) then ; iq = ii + kk ; else ; jq = jj + kk ; endif
+        sp(kk) = 0.0
+        if ((iq >= G%IsdB) .and. (iq <= G%IedB) .and. (jq >= G%JsdB) .and. (jq <= G%JedB)) then
+          if (alongx) then ; sp(kk) = spx(iq,jq) ; else ; sp(kk) = spy(iq,jq) ; endif
+        endif
+      enddo
+      call zz_metric(sk, okk, sp, dst(ii,jj))
+    enddo ; enddo
+  end subroutine zz_pass
+
+  !> The zigzag test of one node with second differences divided by the node spacings,
+  !! D(k) = 2 ((s(k+1) - s(k))/d(k+1) - (s(k) - s(k-1))/d(k))/(d(k) + d(k+1)), and the zigzag part d- d+ / 4 times
+  !! their minmod, inside and at the two nodes nearest an edge of the ice.
+  subroutine zz_metric(sk, okk, sp, dv)
+    real, dimension(-3:3), intent(in) :: sk  !< The surfaces at the node and three on each side [Z ~> m]
+    logical, dimension(-3:3), intent(in) :: okk !< Those nodes are valid
+    real, dimension(-2:3), intent(in) :: sp  !< The spacing of nodes k-1 and k [L ~> m]
+    real, intent(inout) :: dv !< The node surface after the test [Z ~> m]
+    real, dimension(-2:2) :: d2 ! The divided second differences where their nodes are valid [Z L-2 ~> m-1]
+    integer :: k2
+    d2(:) = 0.0
+    do k2 = -2, 2
+      if (okk(k2-1) .and. okk(k2) .and. okk(k2+1)) d2(k2) = dg1_ssd_dd2(sk, sp, k2)
+    enddo
+    if (okk(-2) .and. okk(-1) .and. okk(1) .and. okk(2)) then
+      dv = sk(0) + ((0.25 * (sp(0) * sp(1))) * mm3(d2(0), -d2(-1), -d2(1)))
+    else
+      if ((.not.okk(-1)) .and. okk(1) .and. okk(2) .and. okk(3)) then
+        dv = sk(0) + ((0.25 * (sp(1) * sp(2))) * mm3(d2(2), -d2(1), -d2(1)))
+      elseif ((.not.okk(1)) .and. okk(-1) .and. okk(-2) .and. okk(-3)) then
+        dv = sk(0) + ((0.25 * (sp(0) * sp(-1))) * mm3(d2(-2), -d2(-1), -d2(-1)))
+      elseif (okk(-1) .and. (.not.okk(-2)) .and. okk(1) .and. okk(2)) then
+        dv = sk(0) + ((0.25 * (sp(0) * sp(1))) * mm3(d2(0), -d2(1), -d2(1)))
+      elseif (okk(1) .and. (.not.okk(2)) .and. okk(-1) .and. okk(-2)) then
+        dv = sk(0) + ((0.25 * (sp(1) * sp(0))) * mm3(d2(0), -d2(-1), -d2(-1)))
+      endif
+    endif
+  end subroutine zz_metric
+
+  !> The minmod of the zigzag test [Z ~> m].
+  real function mm3(x1, x2, x3)
+    real, intent(in) :: x1, x2, x3 !< The three second differences [Z ~> m]
+    mm3 = dg1_minmod3(x1, x2, x3)
+  end function mm3
+end subroutine dg1_ssd_velocity
+
 !> DG(1) right-hand side M dh/dt = int grad(N).(u h) dA - int N (u.n) h_upwind ds + art visc,
 !! with 2x2 Gauss points in the cell and 2 per face. Specified-flux faces split their flux
 !! equally between the two corners.
@@ -23972,6 +24669,23 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
   real :: f_c, w_c   ! DG1_COUPLED_BUBBLE_TRANSPORT_RAMP: grounded fraction and bubble weight of the cell [nondim]
   real, dimension(3) :: x3, w3 ! The 3-point Gauss abscissae on [0,1] and their weights [nondim]
   real, dimension(3,3,2,2) :: qb9 ! The bubble part of the volume term at the 3x3 points [Z L2 T-1 ~> m3 s-1]
+  logical :: ssd_on ! DG1_SUBSCALE_DAMPER adds its in-cell velocity to the volume term
+  real, dimension(SZDI_(G),SZDJ_(G),2,2) :: fc_s ! DG1_SUBSCALE_DAMPER: the fine-scale corner surfaces [Z ~> m]
+  real, dimension(2,2) :: rhs_d ! DG1_SUBSCALE_DAMPER: the damper part of the volume term of a cell [Z L2 T-1 ~> m3 s-1]
+  real, dimension(2,2) :: dh_d  ! Its corner tendency [Z T-1 ~> m s-1]
+  real, dimension(2,2) :: hp_d  ! The fine-scale corner thickness of the cell [Z ~> m]
+  real :: num_d, den_d ! The Rayleigh quotient sums [Z2 T-1 ~> m2 s-1], [Z2 ~> m2]
+  real :: rdt_d   ! The damping rate times the time step [nondim]
+  real :: sc_d, th_d ! The relaxation and positivity factors of the damper part [nondim]
+  real :: rr_d    ! The ice to ocean density ratio [nondim]
+  real, allocatable, dimension(:,:,:,:) :: dh_all ! DG1_SUBSCALE_DAMPER, dg_ssd_dfe: the damper corner tendency
+                  ! of every cell [Z T-1 ~> m s-1], then the corners after the damper part of the stage [Z ~> m]
+  real, allocatable, dimension(:,:,:,:) :: fc_new ! The fine-scale corner surfaces of those corners [Z ~> m]
+  real, allocatable, dimension(:,:) :: wd1, wd2, wd3, wd4 ! Unused damper velocities [L T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: uo_s, vo_s ! DG1_SUBSCALE_DAMPER: the odd damper velocity of each
+                                                   ! cell [L T-1 ~> m s-1]
+  real, dimension(SZDI_(G),SZDJ_(G)) :: ud_s, vd_s ! DG1_SUBSCALE_DAMPER: the damper velocity of each cell
+                    ! [L T-1 ~> m s-1]
   real :: bb_t, bt_t ! The product of the 2-point Gauss abscissae and the bubble at a point [nondim]
   real, dimension(SZDI_(G),SZDJ_(G)) :: ub_t, vb_t ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARE: the bubble velocity of
                     ! the volume term of each cell [L T-1 ~> m s-1]
@@ -24137,10 +24851,17 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
 
   ! Volume integral over each cell.
   q3_tr = CS%dg_coupled .and. (CS%dg_cpl_quad == 3)
-  if (q3_tr) then
+  ssd_on = CS%dg_ssd
+  if (q3_tr .or. ssd_on) then
     x3(1) = 0.5 - 0.5*sqrt(0.6) ; x3(2) = 0.5 ; x3(3) = 0.5 + 0.5*sqrt(0.6)
     w3(1) = 5.0/18.0 ; w3(2) = 8.0/18.0 ; w3(3) = 5.0/18.0
     bb_t = gp1 * gp2
+  endif
+  if (ssd_on) call dg1_ssd_velocity(CS, G, hmask, h_nodal_in, ud_s, vd_s, uo_s, vo_s, fc_s)
+  rr_d = CS%density_ice / CS%density_ocean_avg
+  if (ssd_on .and. associated(CS%dg_ssd_dfe)) then
+    allocate(dh_all(G%isd:G%ied,G%jsd:G%jed,2,2), source=0.0)
+    CS%dg_ssd_dfe(:,:) = 0.0
   endif
   ! DG1_COUPLED_BUBBLE_TRANSPORT_SHARE: the bubble velocity of each cell's volume term, as the loop below sets it,
   ! the part of it each cell offers its faces, and on each face the part the two cells share (0 where one side has
@@ -24326,7 +25047,89 @@ subroutine DG1_nodal_spatial_operator(CS, G, hmask, h_nodal_in, rhs, uh_ice, vh_
               ((qb9(2,1,a,b) + qb9(2,3,a,b)) + (qb9(1,2,a,b) + qb9(3,2,a,b)))) + qb9(2,2,a,b))
       enddo ; enddo
     endif
+    if (ssd_on) then ; if ((ud_s(i,j) /= 0.0) .or. (vd_s(i,j) /= 0.0) .or. &
+                           (uo_s(i,j) /= 0.0) .or. (vo_s(i,j) /= 0.0)) then
+      ! DG1_SUBSCALE_DAMPER: the damper velocity with the bubble shape, at the 3x3 points.  It is zero on the faces,
+      ! so it adds nothing to the face fluxes, and its volume term sums to zero over the corners: the mean is kept.
+      do ja = 1, 3 ; do ia = 1, 3
+        xi_q = x3(ia) ; eta_q = x3(ja) ; w_t = w3(ia) * w3(ja)
+        a_qp = (dxCv_S*(1.0 - eta_q)) + (dxCv_N*eta_q)
+        d_qp = (dyCu_W*(1.0 - xi_q))  + (dyCu_E*xi_q)
+        h_qp = (((((1.0-xi_q)*(1.0-eta_q))*h_nodal_in(i,j,1,1)) + ((xi_q*eta_q)*h_nodal_in(i,j,2,2))) + &
+                (((xi_q*(1.0-eta_q))*h_nodal_in(i,j,2,1)) + (((1.0-xi_q)*eta_q)*h_nodal_in(i,j,1,2))))
+        bt_t = ((xi_q * (1.0 - xi_q)) * (eta_q * (1.0 - eta_q))) / (bb_t * bb_t)
+        u_qp = bt_t * (ud_s(i,j) + ((x3(ja) - x3(4-ja)) * uo_s(i,j)))
+        v_qp = bt_t * (vd_s(i,j) + ((x3(ia) - x3(4-ia)) * vo_s(i,j)))
+        qb9(ia,ja,1,1) = w_t * h_qp * (((u_qp * (-(1.0 - eta_q))) * d_qp) + ((v_qp * (-(1.0 - xi_q))) * a_qp))
+        qb9(ia,ja,2,1) = w_t * h_qp * (((u_qp * (1.0 - eta_q)) * d_qp) + ((v_qp * (-xi_q)) * a_qp))
+        qb9(ia,ja,1,2) = w_t * h_qp * (((u_qp * (-eta_q)) * d_qp) + ((v_qp * (1.0 - xi_q)) * a_qp))
+        qb9(ia,ja,2,2) = w_t * h_qp * (((u_qp * eta_q) * d_qp) + ((v_qp * xi_q) * a_qp))
+      enddo ; enddo
+      do b = 1, 2 ; do a = 1, 2
+        rhs_d(a,b) = ((((qb9(1,1,a,b) + qb9(3,3,a,b)) + (qb9(1,3,a,b) + qb9(3,1,a,b))) + &
+                       ((qb9(2,1,a,b) + qb9(2,3,a,b)) + (qb9(1,2,a,b) + qb9(3,2,a,b)))) + qb9(2,2,a,b))
+      enddo ; enddo
+      ! The corner tendency of the damper alone, its damping rate r (the Rayleigh quotient of the fine-scale
+      ! corner thickness), the relaxation factor (1 - exp(-r dt))/(r dt) and DG1_SUBSCALE_DAMPER_POSITIVE.
+      call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), rhs_d, dh_d)
+      do b = 1, 2 ; do a = 1, 2
+        hp_d(a,b) = fc_s(i,j,a,b)
+        if ((rr_d * h_nodal_in(i,j,a,b)) - CS%bed_node(i-2+a,j-2+b) <= 0.0) hp_d(a,b) = fc_s(i,j,a,b) / (1.0 - rr_d)
+      enddo ; enddo
+      num_d = -(((hp_d(1,1) * dh_d(1,1)) + (hp_d(2,2) * dh_d(2,2))) + &
+                ((hp_d(2,1) * dh_d(2,1)) + (hp_d(1,2) * dh_d(1,2))))
+      den_d = ((hp_d(1,1)**2) + (hp_d(2,2)**2)) + ((hp_d(2,1)**2) + (hp_d(1,2)**2))
+      rdt_d = 0.0
+      if (den_d > 0.0) rdt_d = (max(num_d, 0.0) / den_d) * dt
+      if (associated(CS%dg_ssd_rdt)) CS%dg_ssd_rdt(i,j) = rdt_d
+      sc_d = 1.0
+      if (rdt_d > 1.0e-6) sc_d = (1.0 - exp(-rdt_d)) / rdt_d
+      if (CS%dg_ssd_pos) then
+        th_d = 1.0
+        do b = 1, 2 ; do a = 1, 2
+          if (sc_d * dh_d(a,b) < 0.0) &
+            th_d = min(th_d, (h_nodal_in(i,j,a,b) - CS%min_h_shelf) / (((-sc_d) * dh_d(a,b)) * dt))
+        enddo ; enddo
+        sc_d = sc_d * max(th_d, 0.0)
+      endif
+      do b = 1, 2 ; do a = 1, 2
+        rhs_d(a,b) = sc_d * rhs_d(a,b)
+      enddo ; enddo
+      do b = 1, 2 ; do a = 1, 2
+        rhs_vol(i,j,a,b) = rhs_vol(i,j,a,b) + rhs_d(a,b)
+      enddo ; enddo
+      if (allocated(dh_all)) call apply_nodal_DG_mass_inverse(CS%Minv_nodal(i,j,:,:,:,:), rhs_d, dh_all(i,j,:,:))
+      if (associated(CS%dg_ssd_dpe)) then
+        ! The potential energy changes at rho_i g s per unit of thickness (grounded and floating ice alike), so the
+        ! damper part changes it at rho_i g sum_c s_c rhs_d(c).
+        do b = 1, 2 ; do a = 1, 2
+          hp_d(a,b) = max(h_nodal_in(i,j,a,b) - CS%bed_node(i-2+a,j-2+b), (1.0 - rr_d) * h_nodal_in(i,j,a,b))
+        enddo ; enddo
+        CS%dg_ssd_dpe(i,j) = (CS%density_ice * CS%g_Earth) * &
+            (((hp_d(1,1) * rhs_d(1,1)) + (hp_d(2,2) * rhs_d(2,2))) + &
+             ((hp_d(2,1) * rhs_d(2,1)) + (hp_d(1,2) * rhs_d(1,2))))
+      endif
+    endif ; endif
   enddo ; enddo
+  ! dg_ssd_dfe: the fine-scale energy after the damper part of the stage alone (corners h + dt dh), against before.
+  if (allocated(dh_all)) then
+    call pass_corner_field(dh_all, G)
+    do b = 1, 2 ; do a = 1, 2 ; do j = G%jsd, G%jed ; do i = G%isd, G%ied
+      dh_all(i,j,a,b) = h_nodal_in(i,j,a,b) + (dt * dh_all(i,j,a,b))
+    enddo ; enddo ; enddo ; enddo
+    allocate(fc_new(G%isd:G%ied,G%jsd:G%jed,2,2))
+    allocate(wd1(G%isd:G%ied,G%jsd:G%jed), wd2(G%isd:G%ied,G%jsd:G%jed))
+    allocate(wd3(G%isd:G%ied,G%jsd:G%jed), wd4(G%isd:G%ied,G%jsd:G%jed))
+    call dg1_ssd_velocity(CS, G, hmask, dh_all, wd1, wd2, wd3, wd4, fc_new, fine_only=.true.)
+    do j = jsc, jec ; do i = isc, iec
+      CS%dg_ssd_dfe(i,j) = ((0.5 * (CS%density_ice * CS%g_Earth)) / dt) * &
+          (((CS%cell_mean_w(i,j,1,1) * ((fc_new(i,j,1,1)**2) - (fc_s(i,j,1,1)**2))) + &
+            (CS%cell_mean_w(i,j,2,2) * ((fc_new(i,j,2,2)**2) - (fc_s(i,j,2,2)**2)))) + &
+           ((CS%cell_mean_w(i,j,2,1) * ((fc_new(i,j,2,1)**2) - (fc_s(i,j,2,1)**2))) + &
+            (CS%cell_mean_w(i,j,1,2) * ((fc_new(i,j,1,2)**2) - (fc_s(i,j,1,2)**2)))))
+    enddo ; enddo
+    deallocate(dh_all, fc_new, wd1, wd2, wd3, wd4)
+  endif
 
   ! East-face fluxes between cells (i,j) and (i+1,j).
   do j = jsc, jec ; do i = isc-1, iec
